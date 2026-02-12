@@ -1,98 +1,108 @@
 # aipane
 
-Multi-AI CLI pane launcher for iTerm2. One command to split your terminal into a grid of AI coding assistants.
+Unified zsh toolkit for daily AI CLI workflows: Claude Code multi-account launch, iTerm2 pane orchestration, usage batch query, session switching, and process cleanup.
 
-```bash
-ai cxdg      # Claude + Codex + Droid + Gemini in a 2x2 grid
-ai cc         # two Claude Code side by side
-ai cx         # Claude + Codex
+## Features
+
+| Command | Description |
+|---|---|
+| `cc [email] [args...]` | Launch Claude Code with account-isolated config directory |
+| `ccd [email] [args...]` | Launch Claude Code with `--dangerously-skip-permissions` |
+| `ai <tools_string>` | Launch multiple AI CLIs in iTerm2 panes (`c/x/d/g`) |
+| `cc-status` | Show login/config state for all Claude accounts |
+| `cc-usage [cmd] [--timeout N]` | Open all Claude accounts in panes and send command (default `/usage`) |
+| `cc-switch [email] [session-id]` | Resume the latest/current project session with another account |
+| `killcc` | Kill detached/zombie Claude-related processes (`TTY=??`) |
+
+## Project Structure
+
+```text
+.
+├── init.zsh
+├── lib/
+│   └── core.zsh
+├── cmd/
+│   ├── cc.zsh
+│   ├── pane.zsh
+│   ├── status.zsh
+│   ├── usage.zsh
+│   ├── switch.zsh
+│   └── kill.zsh
+└── aipane.zsh  # compatibility wrapper (legacy entry)
 ```
-
-## Prerequisites
-
-- **macOS** with [iTerm2](https://iterm2.com/) (AppleScript support required)
-- **zsh**
-- One or more AI CLI tools installed:
-
-| Key | Tool | Install |
-|-----|------|---------|
-| `c` | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `npm install -g @anthropic-ai/claude-code` |
-| `x` | [Codex](https://github.com/openai/codex) | `npm install -g @openai/codex` |
-| `d` | [Droid](https://github.com/nicepkg/droid) | `npm install -g droid-cli` |
-| `g` | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `npm install -g @google/gemini-cli` |
 
 ## Install
 
 ```bash
-git clone https://github.com/Async23/aipane.git
-cd aipane
-echo "source $(pwd)/aipane.zsh" >> ~/.zshrc
+git clone https://github.com/Async23/aipane.git ~/.aipane
+echo 'source ~/.aipane/init.zsh' >> ~/.zshrc
 source ~/.zshrc
 ```
 
-## Usage
+## Optional Configuration
+
+Set these before `source ~/.aipane/init.zsh`:
 
 ```bash
-ai <tools_string>
+export AIPANE_CLAUDE_CMD="claude"                       # e.g. claude-guard
+export AIPANE_ACCOUNTS_BASE="$HOME/.claude-accounts"
+export AIPANE_SHARED_DIR="$AIPANE_ACCOUNTS_BASE/_shared"
+
+export AIPANE_CODEX_LAUNCH_CMD="codex --yolo"
+export AIPANE_DROID_LAUNCH_CMD="droid"
+export AIPANE_GEMINI_LAUNCH_CMD="gemini --yolo"
 ```
 
-Each character in `tools_string` maps to one AI tool. The panes are arranged automatically:
+## Dependencies
 
-| Count | Layout |
-|-------|--------|
-| 1 | single pane |
-| 2 | 2 columns |
-| 3 | 3 columns |
-| 4 | 2x2 grid |
-| 5+ | `ceil(sqrt(N))` columns, rows filled left-to-right, top-to-bottom |
+- macOS + zsh
+- iTerm2 (`ai`, `cc-usage`)
+- `jq` (`cc-status`)
+- Claude Code (`cc`, `ccd`, `cc-usage`, `cc-switch`)
+- Optional: Codex, Droid, Gemini CLI (for `ai`)
 
-### Layout examples
+## Account Layout
 
-```
-ai cx          ai cxdg        ai cccxdg
+`aipane` uses account-isolated config under `~/.claude-accounts/` and shared data in `_shared`:
 
-┌─────┬─────┐  ┌─────┬─────┐  ┌───┬───┬───┐
-│  c  │  x  │  │  c  │  d  │  │ c │ c │ d │
-│     │     │  ├─────┼─────┤  ├───┼───┼───┤
-└─────┴─────┘  │  x  │  g  │  │ c │ x │ g │
-               └─────┴─────┘  └───┴───┴───┘
-```
-
-## Claude Multi-Account Support
-
-`aipane` supports multiple Claude Code accounts via `~/.claude-accounts/`:
-
-```
+```text
 ~/.claude-accounts/
-├── alice@example.com/     # account 1
-├── bob@example.com/       # account 2
-└── _shared/               # (ignored)
+├── alice@example.com/
+│   ├── .claude.json
+│   ├── rules -> ~/.claude/rules
+│   ├── settings.json -> ~/.claude/settings.json
+│   ├── projects -> ../_shared/projects
+│   └── history.jsonl -> ../_shared/history.jsonl
+├── bob@example.com/
+└── _shared/
+    ├── projects/
+    └── history.jsonl
 ```
 
-When your `tools_string` contains multiple `c`s, you'll be prompted to pick an account for each:
+## Examples
 
+```bash
+cc alice@example.com
+ccd bob@example.com --resume 9d47f4f1-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+
+ai cxdg
+ai cc
+
+cc-status
+cc-usage
+cc-usage "/cost this month" --timeout 30
+
+cc-switch alice@example.com
+killcc
 ```
-Claude Code #1 - select account:
-  [1] alice@example.com
-  [2] bob@example.com
-Choose [1]: 1
 
-Claude Code #2 - select account:
-  [1] alice@example.com
-  [2] bob@example.com
-Choose [1]: 2
-```
+## Quick Verification
 
-If only one account exists, it is selected automatically.
-
-## Error Handling
-
-```
-ai: unknown tool 'z' (valid: c/x/d/g)
-ai: requires iTerm2
-ai: no Claude accounts found in ~/.claude-accounts/
+```bash
+source ./init.zsh
+type cc ccd ai cc-status cc-usage cc-switch killcc
 ```
 
 ## License
 
-[MIT](LICENSE)
+MIT
