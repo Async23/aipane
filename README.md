@@ -19,13 +19,14 @@ ai cx         # Claude + Codex
 | `c` | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `npm install -g @anthropic-ai/claude-code` |
 | `x` | [Codex](https://github.com/openai/codex) | `npm install -g @openai/codex` |
 | `d` | [Droid](https://github.com/nicepkg/droid) | `npm install -g droid-cli` |
-| `g` | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `npm install -g @anthropic-ai/gemini-cli` |
+| `g` | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `npm install -g @google/gemini-cli` |
 
 ## Install
 
 ```bash
-git clone https://github.com/Async23/aipane.git ~/code/aipane
-echo 'source ~/code/aipane/aipane.zsh' >> ~/.zshrc
+git clone https://github.com/Async23/aipane.git
+cd aipane
+echo "source $(pwd)/aipane.zsh" >> ~/.zshrc
 source ~/.zshrc
 ```
 
