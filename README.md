@@ -10,9 +10,11 @@ Unified zsh toolkit for daily AI CLI workflows: Claude Code multi-account launch
 | `ccd [email] [args...]` | Launch Claude Code with `--dangerously-skip-permissions` |
 | `ai <tools_string>` | Launch multiple AI CLIs in iTerm2 panes (`c/x/d/g`) |
 | `cc-status` | Show login/config state for all Claude accounts |
-| `cc-usage [cmd] [--timeout N]` | Open all Claude accounts in panes and send command (default `/usage`) |
+| `cc-usage [cmd] [--timeout N] [--yes\|-y]` | Open all Claude accounts in panes and send command (default `/usage`) |
 | `cc-switch [email] [session-id]` | Resume the latest/current project session with another account |
 | `killcc` | Kill detached/zombie Claude-related processes (`TTY=??`) |
+
+**Aliases:** `ccstatus` → `cc-status`, `ccusage` → `cc-usage`
 
 ## Project Structure
 
@@ -71,6 +73,7 @@ export AIPANE_GEMINI_LAUNCH_CMD="gemini --yolo"
 │   ├── .claude.json
 │   ├── rules -> ~/.claude/rules
 │   ├── settings.json -> ~/.claude/settings.json
+│   ├── settings.local.json -> ~/.claude/settings.local.json
 │   ├── projects -> ../_shared/projects
 │   └── history.jsonl -> ../_shared/history.jsonl
 ├── bob@example.com/
@@ -91,6 +94,7 @@ ai cc
 cc-status
 cc-usage
 cc-usage "/cost this month" --timeout 30
+cc-usage -y                                # skip interactive selection, auto layout
 
 cc-switch alice@example.com
 killcc
@@ -102,6 +106,10 @@ killcc
 source ./init.zsh
 type cc ccd ai cc-status cc-usage cc-switch killcc
 ```
+
+---
+
+[中文文档 / Chinese README](README_CN.md)
 
 ## License
 
