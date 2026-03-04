@@ -1,6 +1,6 @@
 # aipane
 
-统一的 zsh 工具集，用于日常 AI CLI 工作流：Claude Code 多账号启动、iTerm2 窗格编排、用量批量查询、会话切换和进程清理。
+统一的 zsh 工具集，用于日常 AI CLI 工作流：Claude Code 多账号启动、tmux 窗格编排、用量批量查询、会话切换和进程清理。
 
 ## 功能
 
@@ -8,7 +8,7 @@
 |---|---|
 | `cc [email] [args...]` | 以账号隔离的配置目录启动 Claude Code |
 | `ccd [email] [args...]` | 以 `--dangerously-skip-permissions` 模式启动 Claude Code |
-| `ai <tools_string>` | 在 iTerm2 窗格中启动多个 AI CLI（`c/x/d/g`） |
+| `ai <tools_string>` | 在 tmux 窗格中启动多个 AI CLI（`c/x/d/g/o`） |
 | `cc-status` | 显示所有 Claude 账号的登录/配置状态 |
 | `cc-usage [cmd] [--timeout N] [--yes\|-y]` | 在窗格中打开所有 Claude 账号并发送命令（默认 `/usage`） |
 | `cc-switch [email] [session-id]` | 使用另一个账号恢复最新/当前项目会话 |
@@ -53,15 +53,16 @@ export AIPANE_SHARED_DIR="$AIPANE_ACCOUNTS_BASE/_shared"
 export AIPANE_CODEX_LAUNCH_CMD="codex --yolo"
 export AIPANE_DROID_LAUNCH_CMD="droid"
 export AIPANE_GEMINI_LAUNCH_CMD="gemini --yolo"
+export AIPANE_OPENCODE_LAUNCH_CMD="opencode"
 ```
 
 ## 依赖
 
 - macOS + zsh
-- iTerm2（`ai`、`cc-usage`）
+- tmux（`ai`、`cc-usage`）（非 tmux 环境会自动创建 session 并 attach）
 - `jq`（`cc-status`）
 - Claude Code（`cc`、`ccd`、`cc-usage`、`cc-switch`）
-- 可选：Codex、Droid、Gemini CLI（用于 `ai`）
+- 可选：Codex、Droid、Gemini、Opencode CLI（用于 `ai`）
 
 ## 账号目录结构
 

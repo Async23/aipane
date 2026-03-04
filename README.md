@@ -1,6 +1,6 @@
 # aipane
 
-Unified zsh toolkit for daily AI CLI workflows: Claude Code multi-account launch, iTerm2 pane orchestration, usage batch query, session switching, and process cleanup.
+Unified zsh toolkit for daily AI CLI workflows: Claude Code multi-account launch, tmux pane orchestration, usage batch query, session switching, and process cleanup.
 
 ## Features
 
@@ -8,7 +8,7 @@ Unified zsh toolkit for daily AI CLI workflows: Claude Code multi-account launch
 |---|---|
 | `cc [email] [args...]` | Launch Claude Code with account-isolated config directory |
 | `ccd [email] [args...]` | Launch Claude Code with `--dangerously-skip-permissions` |
-| `ai <tools_string>` | Launch multiple AI CLIs in iTerm2 panes (`c/x/d/g`) |
+| `ai <tools_string>` | Launch multiple AI CLIs in tmux panes (`c/x/d/g/o`) |
 | `cc-status` | Show login/config state for all Claude accounts |
 | `cc-usage [cmd] [--timeout N] [--yes\|-y]` | Open all Claude accounts in panes and send command (default `/usage`) |
 | `cc-switch [email] [session-id]` | Resume the latest/current project session with another account |
@@ -53,15 +53,16 @@ export AIPANE_SHARED_DIR="$AIPANE_ACCOUNTS_BASE/_shared"
 export AIPANE_CODEX_LAUNCH_CMD="codex --yolo"
 export AIPANE_DROID_LAUNCH_CMD="droid"
 export AIPANE_GEMINI_LAUNCH_CMD="gemini --yolo"
+export AIPANE_OPENCODE_LAUNCH_CMD="opencode"
 ```
 
 ## Dependencies
 
 - macOS + zsh
-- iTerm2 (`ai`, `cc-usage`)
+- tmux (`ai`, `cc-usage`) (outside tmux, these commands auto-create a session and attach)
 - `jq` (`cc-status`)
 - Claude Code (`cc`, `ccd`, `cc-usage`, `cc-switch`)
-- Optional: Codex, Droid, Gemini CLI (for `ai`)
+- Optional: Codex, Droid, Gemini, Opencode CLI (for `ai`)
 
 ## Account Layout
 

@@ -1,5 +1,7 @@
 #!/usr/bin/env zsh
 # Command: killcc
+# Kill detached/zombie AI CLI processes (TTY=??) for:
+#   Claude Code, Codex, Factory Droid, Gemini CLI, Opencode
 
 killcc() {
   local -a pids survivors
@@ -7,14 +9,26 @@ killcc() {
 
   pids=("${(@f)$(
     ps -axo pid=,tty=,command= | awk '
-      $2 == "??" && ($0 ~ /claude/ || $0 ~ /@anthropic-ai\/claude-code/ || $0 ~ /claude-code/) {
-        print $1
+      $2 == "??" {
+        if ($0 ~ /claude/ ||
+            $0 ~ /@anthropic-ai\/claude-code/ ||
+            $0 ~ /claude-code/ ||
+            $0 ~ /claude-guard/ ||
+            $0 ~ /codex/ ||
+            $0 ~ /\/droid\>/ ||
+            $0 ~ /factory-droid/ ||
+            $0 ~ /gemini/ ||
+            $0 ~ /opencode/)
+          print $1
       }
     '
   )}")
 
+  # filter empty entries
+  pids=("${(@)pids:#}")
+
   if (( ${#pids[@]} == 0 )); then
-    print "killcc: no detached Claude processes found"
+    print "killcc: no detached AI CLI processes found"
     return 0
   fi
 

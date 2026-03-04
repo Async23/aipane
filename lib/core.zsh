@@ -14,6 +14,7 @@ typeset -g AIPANE_SHARED_DIR="${AIPANE_SHARED_DIR:-$AIPANE_ACCOUNTS_BASE/_shared
 typeset -g AIPANE_CODEX_LAUNCH_CMD="${AIPANE_CODEX_LAUNCH_CMD:-codex --yolo}"
 typeset -g AIPANE_DROID_LAUNCH_CMD="${AIPANE_DROID_LAUNCH_CMD:-droid}"
 typeset -g AIPANE_GEMINI_LAUNCH_CMD="${AIPANE_GEMINI_LAUNCH_CMD:-gemini --yolo}"
+typeset -g AIPANE_OPENCODE_LAUNCH_CMD="${AIPANE_OPENCODE_LAUNCH_CMD:-opencode}"
 
 _aipane_link_if_missing() {
   local target="$1"
@@ -158,8 +159,19 @@ _aipane_ceil_sqrt() {
   REPLY="$i"
 }
 
-_aipane_require_iterm() {
-  [[ "$TERM_PROGRAM" == "iTerm.app" ]]
+_aipane_ensure_tmux() {
+  if [[ -n "${TMUX:-}" ]]; then
+    REPLY="window" # Create a new window in the current tmux session.
+    return 0
+  fi
+
+  if ! command -v tmux &>/dev/null; then
+    print -u2 "aipane: tmux is required. Install: brew install tmux"
+    return 1
+  fi
+
+  REPLY="session" # Create a detached session, then attach.
+  return 0
 }
 
 _aipane_grid_for_count() {
