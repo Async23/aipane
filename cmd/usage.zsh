@@ -4,10 +4,11 @@
 _aipane_usage_help() {
   cat <<'EOH'
 Usage:
-  cc-usage [command] [--timeout N] [--yes|-y]
+  cc-usage [--new|-n] [command] [--timeout N] [--yes|-y]
 
 Options:
   --timeout N   Wait seconds for Claude Code to start (default: 25)
+  --new, -n     Create a new tmux window (default: use current window in tmux)
   --yes, -y     Skip interactive selection, use all accounts + auto layout
 
 Examples:
@@ -402,139 +403,150 @@ _aipane_usage_select_layout() {
   done
 }
 
-_aipane_usage_build_and_run_applescript() {
-  local pane_count="$1"
-  local cols="$2"
-  local rows="$3"
-  local timeout_seconds="$4"
-  local followup_cmd="$5"
-  local -a rows_per_col start_cmds osa_args
-  shift 5
+_aipane_usage_build_and_run_tmux() {
+  local mode="$1"
+  local pane_count="$2"
+  local cols="$3"
+  local rows="$4"
+  local timeout_seconds="$5"
+  local followup_cmd="$6"
+  local -a rows_per_col start_cmds col_tops pane_ids
+  local new_info window_id root_pane expected v
+  local c needed_rows anchor new_pane
+  local i
+  shift 6
 
   rows_per_col=("${@:1:$cols}")
   shift "$cols"
+  local -a account_names
+  account_names=("${@:1:$pane_count}")
+  shift "$pane_count"
   start_cmds=("$@")
 
-  osa_args=("$pane_count" "$cols" "$rows" "$timeout_seconds" "$followup_cmd")
-  osa_args+=("${rows_per_col[@]}")
-  osa_args+=("${start_cmds[@]}")
+  if (( ${#start_cmds[@]} != pane_count )); then
+    print -u2 "cc-usage: internal error: expected ${pane_count} start commands, got ${#start_cmds[@]}"
+    return 1
+  fi
 
-  osascript - "${osa_args[@]}" <<'APPLESCRIPT' >/dev/null 2>&1 &
-on run argv
-  set paneCount to (item 1 of argv) as integer
-  set colCount to (item 2 of argv) as integer
-  set rowCount to (item 3 of argv) as integer
-  set timeoutSeconds to (item 4 of argv) as integer
-  set followupCmd to item 5 of argv
+  expected=0
+  for v in "${rows_per_col[@]}"; do
+    (( expected += v ))
+  done
+  if (( expected != pane_count )); then
+    print -u2 "cc-usage: internal error: layout mismatch (expected ${pane_count} panes, got ${expected})"
+    return 1
+  fi
 
-  set argIndex to 6
-  set rowSpec to {}
-  repeat with c from 1 to colCount
-    copy ((item argIndex of argv) as integer) to end of rowSpec
-    set argIndex to argIndex + 1
-  end repeat
+  if [[ "$mode" == "here" ]]; then
+    local existing_panes
+    existing_panes="$(tmux display-message -p '#{window_panes}')" || return 1
+    if (( existing_panes != 1 )); then
+      print -u2 "cc-usage: current window has ${existing_panes} panes; use --new to create a new window"
+      return 1
+    fi
+    new_info="$(tmux display-message -p '#{window_id} #{pane_id}')" || return 1
+  elif [[ "$mode" == "window" ]]; then
+    new_info="$(tmux new-window -c "$PWD" -P -F '#{window_id} #{pane_id}')" || return 1
+  elif [[ "$mode" == "session" ]]; then
+    typeset -g _aipane_session="ai-$$"
+    new_info="$(tmux new-session -d -s "$_aipane_session" -c "$PWD" -P -F '#{window_id} #{pane_id}')" || return 1
+  else
+    print -u2 "cc-usage: internal error: unknown tmux mode '${mode}'"
+    return 1
+  fi
 
-  set startCmds to {}
-  repeat with i from 1 to paneCount
-    copy (item argIndex of argv) to end of startCmds
-    set argIndex to argIndex + 1
-  end repeat
+  window_id="${new_info%% *}"
+  root_pane="${new_info#* }"
 
-  tell application "iTerm2"
-    activate
-    if not (exists current window) then
-      create window with default profile
-    end if
+  # Build columns, then rows per column.
+  col_tops=("$root_pane")
+  for (( c = 2; c <= cols; c++ )); do
+    new_pane="$(tmux split-window -h -d -P -F '#{pane_id}' -t "${col_tops[c-1]}")" || return 1
+    col_tops+=("$new_pane")
+    sleep 0.12
+  done
 
-    tell current window
-      tell current tab
-        set colTops to {session 1}
-        if colCount > 1 then
-          repeat with c from 2 to colCount
-            set refSession to item (c - 1) of colTops
-            tell refSession
-              set newTop to (split vertically with default profile)
-            end tell
-            copy newTop to end of colTops
-          end repeat
-        end if
+  for (( c = 1; c <= cols; c++ )); do
+    needed_rows="${rows_per_col[c]}"
+    anchor="${col_tops[c]}"
+    for (( r = 2; r <= needed_rows; r++ )); do
+      new_pane="$(tmux split-window -v -d -P -F '#{pane_id}' -t "$anchor")" || return 1
+      anchor="$new_pane"
+      sleep 0.12
+    done
+  done
 
-        set columnsSessions to {}
-        repeat with c from 1 to colCount
-          set topSession to item c of colTops
-          set neededRows to item c of rowSpec
-          set oneColumn to {topSession}
+  # Reorder panes row-major (top->bottom, left->right).
+  pane_ids=("${(@f)$(tmux list-panes -t "$window_id" -F '#{pane_id} #{pane_top} #{pane_left}' | sort -n -k2,2 -k3,3 | cut -d' ' -f1)}")
+  if (( ${#pane_ids[@]} != pane_count )); then
+    print -u2 "cc-usage: internal error: expected ${pane_count} panes, found ${#pane_ids[@]}"
+    return 1
+  fi
 
-          if neededRows > 1 then
-            set anchorSession to topSession
-            repeat with r from 2 to neededRows
-              tell anchorSession
-                set newRow to (split horizontally with default profile)
-              end tell
-              copy newRow to end of oneColumn
-              set anchorSession to newRow
-            end repeat
-          end if
+  # Set account short names as pane titles.
+  for (( i = 1; i <= pane_count; i++ )); do
+    local _short="${account_names[i]%%@*}"
+    [[ -z "$_short" ]] && _short="${account_names[i]}"
+    tmux select-pane -t "${pane_ids[i]}" -T "$_short"
+  done
 
-          copy oneColumn to end of columnsSessions
-        end repeat
+  # Window-level border format with pane title (only affects this window).
+  tmux set-option -w -t "$window_id" pane-border-format \
+    "#{?pane_active,#[fg=blue]#[bg=blue]#[fg=colour15]#[bold] #P ● ● ● #[bg=default]#[fg=blue]#[default]#[fg=colour8] #{pane_title}#{?pane_synchronized,#{?pane_input_off,, #[fg=red] ▶ ▶ ▶},} ,#[fg=colour8] #P #{pane_title}#{?pane_synchronized,#{?pane_input_off,, #[fg=red] ▶ ▶ ▶},} }"
 
-        set orderedSessions to {}
-        repeat with r from 1 to rowCount
-          repeat with c from 1 to colCount
-            set oneColumn to item c of columnsSessions
-            if r <= (count of oneColumn) then
-              copy (item r of oneColumn) to end of orderedSessions
-            end if
-          end repeat
-        end repeat
+  # Start one Claude Code instance per pane.
+  for (( i = 2; i <= pane_count; i++ )); do
+    tmux send-keys -t "${pane_ids[i]}" "${start_cmds[i]}" Enter
+  done
+  tmux send-keys -t "${pane_ids[1]}" "${start_cmds[1]}" Enter
+  tmux select-pane -t "${pane_ids[1]}"
 
-        repeat with i from 1 to paneCount
-          tell (item i of orderedSessions)
-            write text (item i of startCmds)
-          end tell
-        end repeat
+  # Background poll: once Claude Code is ready, send the follow-up command (default: /usage).
+  {
+    local -a pane_ready
+    local ready_count=0
+    local start_seconds="$SECONDS"
+    local pane_text
 
-        set paneReady to {}
-        repeat with i from 1 to paneCount
-          set end of paneReady to false
-        end repeat
+    for (( i = 1; i <= pane_count; i++ )); do
+      pane_ready[i]=0
+    done
 
-        set readyCount to 0
-        set elapsed to 0
-        repeat while readyCount < paneCount and elapsed < timeoutSeconds
-          repeat with i from 1 to paneCount
-            if item i of paneReady is false then
-              tell (item i of orderedSessions)
-                set paneText to contents
-              end tell
-              if paneText contains "claude code" or paneText contains "Claude Code" then
-                set item i of paneReady to true
-                set readyCount to readyCount + 1
-                tell (item i of orderedSessions)
-                  write text followupCmd newline NO
-                  delay 0.3
-                  write text return newline NO
-                end tell
-              end if
-            end if
-          end repeat
-          if readyCount < paneCount then
-            delay 0.5
-            set elapsed to elapsed + 0.5
-          end if
-        end repeat
-      end tell
-    end tell
-  end tell
-end run
-APPLESCRIPT
+    while (( ready_count < pane_count && (SECONDS - start_seconds) < timeout_seconds )); do
+      for (( i = 1; i <= pane_count; i++ )); do
+        if (( !pane_ready[i] )); then
+          pane_text="$(tmux capture-pane -p -t "${pane_ids[i]}" 2>/dev/null)" || continue
+          if [[ "$pane_text" == *"claude code"* || "$pane_text" == *"Claude Code"* ]]; then
+            pane_ready[i]=1
+            (( ready_count++ ))
+            tmux send-keys -t "${pane_ids[i]}" "$followup_cmd"
+            sleep 0.3
+            tmux send-keys -t "${pane_ids[i]}" Enter
+          fi
+        fi
+      done
+      (( ready_count < pane_count )) && sleep 0.5
+    done
+
+    # Re-set pane titles after Claude Code overrides them.
+    for _retry in 1 2 3; do
+      sleep 3
+      for (( i = 1; i <= pane_count; i++ )); do
+        local _short="${account_names[i]%%@*}"
+        [[ -z "$_short" ]] && _short="${account_names[i]}"
+        tmux select-pane -t "${pane_ids[i]}" -T "$_short" 2>/dev/null
+      done
+    done
+  } &
   disown
+
+  (( rows > 0 )) || true # keep rows in the signature for parity with the old backend
 }
 
 cc-usage() {
   local timeout_seconds=25
   local skip_interactive=0
+  local _new_window=0
   local -a command_parts accounts rows_per_col start_cmds grid_spec_parts
   local arg followup_cmd pane_count cols rows
 
@@ -546,6 +558,10 @@ cc-usage() {
   while (( $# > 0 )); do
     arg="$1"
     case "$arg" in
+      --help|-h)
+        _aipane_usage_help
+        return 0
+        ;;
       --timeout)
         shift
         if (( $# == 0 )) || [[ "$1" != <-> ]]; then
@@ -553,6 +569,9 @@ cc-usage() {
           return 1
         fi
         timeout_seconds="$1"
+        ;;
+      --new|-n)
+        _new_window=1
         ;;
       --yes|-y)
         skip_interactive=1
@@ -575,10 +594,11 @@ cc-usage() {
     return 1
   }
 
-  _aipane_require_iterm || {
-    print -u2 "cc-usage: requires iTerm2"
-    return 1
-  }
+  _aipane_ensure_tmux || return 1
+  local _tmux_mode="$REPLY"
+  if [[ "$_tmux_mode" == "window" && "$_new_window" -eq 0 ]]; then
+    _tmux_mode="here"
+  fi
 
   if (( !skip_interactive && ${#reply[@]} > 1 )); then
     _aipane_usage_select_accounts || return 1
@@ -615,10 +635,15 @@ cc-usage() {
 
   print "Launching ${pane_count} panes..."
 
-  _aipane_usage_build_and_run_applescript \
-    "$pane_count" "$cols" "$rows" "$timeout_seconds" "$followup_cmd" \
+  _aipane_usage_build_and_run_tmux \
+    "$_tmux_mode" "$pane_count" "$cols" "$rows" "$timeout_seconds" "$followup_cmd" \
     "${rows_per_col[@]}" \
-    "${start_cmds[@]}"
+    "${accounts[@]}" \
+    "${start_cmds[@]}" || return 1
+
+  if [[ "$_tmux_mode" == "session" ]]; then
+    tmux attach -t "$_aipane_session"
+  fi
 }
 
 ccusage() {
