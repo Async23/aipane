@@ -1,0 +1,162 @@
+#!/bin/sh
+# rod-cleanup: kill stale leakless/rod Chromium processes and clean up temp dirs
+# Usage: rod-cleanup [--max-age <seconds>]
+# POSIX sh compatible. Designed for launchd/cron.
+
+MAX_AGE=300
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --max-age)
+      shift
+      MAX_AGE="$1"
+      ;;
+  esac
+  shift
+done
+
+LOG_FILE="${HOME}/logs/rod-cleanup.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] rod-cleanup: $*" >> "$LOG_FILE"
+}
+
+# Strip leading zeros to avoid octal interpretation.
+# e.g. "08" -> "8", "00" -> "0"
+strip_leading_zeros() {
+  echo "$1" | sed 's/^0*//' | sed 's/^$/0/'
+}
+
+# Parse ps etime field to seconds.
+# Formats: MM:SS, HH:MM:SS, DD-HH:MM:SS
+etime_to_seconds() {
+  _etime="$1"
+  _days=0
+  _hours=0
+  _mins=0
+  _secs=0
+
+  # Extract days if present (DD-...)
+  case "$_etime" in
+    *-*)
+      _days=$(strip_leading_zeros "${_etime%%-*}")
+      _etime="${_etime#*-}"
+      ;;
+  esac
+
+  # Count colons to distinguish HH:MM:SS from MM:SS
+  _colons=$(echo "$_etime" | tr -cd ':' | wc -c | tr -d ' ')
+
+  if [ "$_colons" -eq 2 ]; then
+    # HH:MM:SS
+    _hours=$(strip_leading_zeros "$(echo "$_etime" | cut -d: -f1)")
+    _mins=$(strip_leading_zeros "$(echo "$_etime" | cut -d: -f2)")
+    _secs=$(strip_leading_zeros "$(echo "$_etime" | cut -d: -f3)")
+  elif [ "$_colons" -eq 1 ]; then
+    # MM:SS
+    _mins=$(strip_leading_zeros "$(echo "$_etime" | cut -d: -f1)")
+    _secs=$(strip_leading_zeros "$(echo "$_etime" | cut -d: -f2)")
+  fi
+
+  echo $(( _days * 86400 + _hours * 3600 + _mins * 60 + _secs ))
+}
+
+# --- 1. Find and kill stale leakless processes ---
+killed_pids=""
+killed_count=0
+
+ps -axo pid=,etime=,command= | while IFS= read -r line; do
+  # Match leakless.*rod pattern
+  case "$line" in
+    *leakless*rod*) ;;
+    *) continue ;;
+  esac
+
+  # Parse pid and etime (first two whitespace-delimited fields)
+  _pid=$(echo "$line" | awk '{print $1}')
+  _etime=$(echo "$line" | awk '{print $2}')
+
+  _elapsed=$(etime_to_seconds "$_etime")
+
+  if [ "$_elapsed" -ge "$MAX_AGE" ]; then
+    echo "$_pid"
+  fi
+done > /tmp/rod-cleanup-pids.$$
+
+stale_pids=$(cat /tmp/rod-cleanup-pids.$$ 2>/dev/null)
+rm -f /tmp/rod-cleanup-pids.$$
+
+if [ -z "$stale_pids" ]; then
+  # --- Check for stale rod user-data dirs even when no processes ---
+  _cleaned_dirs=0
+  for _rod_base in /var/folders/*/*/T/rod/user-data; do
+    if [ -d "$_rod_base" ]; then
+      _dir_count=$(ls -1 "$_rod_base" 2>/dev/null | wc -l | tr -d ' ')
+      if [ "$_dir_count" -gt 0 ]; then
+        rm -rf "$_rod_base"
+        _cleaned_dirs=$(( _cleaned_dirs + _dir_count ))
+      fi
+    fi
+  done
+  if [ "$_cleaned_dirs" -gt 0 ]; then
+    log "cleaned up ${_cleaned_dirs} stale rod user-data dir(s) (no processes found)"
+  fi
+  exit 0
+fi
+
+# SIGTERM the stale leakless processes
+killed_count=$(echo "$stale_pids" | wc -l | tr -d ' ')
+log "killing $killed_count stale leakless process(es): $(echo $stale_pids | tr '\n' ' ')"
+for _pid in $stale_pids; do
+  kill "$_pid" 2>/dev/null
+done
+
+# Wait, then force-kill surviving Chromium children
+sleep 1
+
+force_count=0
+for _pid in $stale_pids; do
+  # Find Chromium children whose parent was a killed leakless process
+  # After parent dies, children may be reparented to PID 1
+  _children=$(ps -axo pid=,ppid=,command= | awk -v ppid="$_pid" '
+    ($2 == ppid || $2 == 1) && $0 ~ /\.cache\/rod\/browser\/.*Chromium/ { print $1 }
+  ')
+  if [ -n "$_children" ]; then
+    for _cpid in $_children; do
+      if kill -0 "$_cpid" 2>/dev/null; then
+        kill -9 "$_cpid" 2>/dev/null
+        force_count=$((force_count + 1))
+      fi
+    done
+  fi
+done
+
+# Also kill any leakless that survived SIGTERM
+for _pid in $stale_pids; do
+  if kill -0 "$_pid" 2>/dev/null; then
+    kill -9 "$_pid" 2>/dev/null
+    log "force-killed surviving leakless PID $_pid"
+  fi
+done
+
+if [ "$force_count" -gt 0 ]; then
+  log "force-killed $force_count orphaned Chromium child process(es)"
+fi
+
+# --- 2. Clean up stale rod user-data dirs ---
+cleaned_dirs=0
+for _rod_base in /var/folders/*/*/T/rod/user-data; do
+  if [ -d "$_rod_base" ]; then
+    _dir_count=$(ls -1 "$_rod_base" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$_dir_count" -gt 0 ]; then
+      rm -rf "$_rod_base"
+      cleaned_dirs=$(( cleaned_dirs + _dir_count ))
+    fi
+  fi
+done
+
+if [ "$cleaned_dirs" -gt 0 ]; then
+  log "cleaned up ${cleaned_dirs} stale rod user-data dir(s)"
+fi
+
+log "done: killed $killed_count leakless + $force_count Chromium children, cleaned $cleaned_dirs dir(s)"
