@@ -1,0 +1,40 @@
+bin/rod-cleanup
+  e07be6b280915a26 1-162
+cmd/killrod.zsh
+  e07be6b280915a26 3,6,9-11,14-22,24-25,29-30,34,41,45-54
+bin/aipane-cleanup
+  e07be6b280915a26 39-40,42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.8",
+  "base_commit_sha": "5297d7589ee66576d7be8cfe25045c9188b6cd5f",
+  "prompts": {
+    "18d57a5492528cee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a2ed01d4-b080-4a61-85b6-35d5fb6b242e",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Async23 <82521294+Async23@users.noreply.github.com>",
+      "messages": [],
+      "total_additions": 3,
+      "total_deletions": 3,
+      "accepted_lines": 3,
+      "overriden_lines": 0
+    },
+    "e07be6b280915a26": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "00591eab-ca32-49fa-a0a1-0ccdf241bab5",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Async23 <82521294+Async23@users.noreply.github.com>",
+      "messages": [],
+      "total_additions": 542,
+      "total_deletions": 50,
+      "accepted_lines": 541,
+      "overriden_lines": 0
+    }
+  }
+}
