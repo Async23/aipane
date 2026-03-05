@@ -1,5 +1,5 @@
 #!/bin/sh
-# aipane-cleanup: kill detached AI CLI processes + orphaned rod Chromium processes
+# aipane-cleanup: kill detached AI CLI processes
 # Designed to run standalone (e.g. via launchd). POSIX sh compatible.
 
 LOG_PREFIX="aipane-cleanup"
@@ -35,30 +35,9 @@ if [ -n "$ai_pids" ]; then
   kill_gracefully $ai_pids
 fi
 
-# --- 2. Orphaned rod Chromium processes (PPID=1) ---
-rod_pids=$(ps -axo pid=,ppid=,command= | awk '$2 == 1 && $0 ~ /\.cache\/rod\/browser\/.*Chromium/ { print $1 }')
-
-rod_count=0
-if [ -n "$rod_pids" ]; then
-  rod_count=$(echo "$rod_pids" | wc -l | tr -d ' ')
-  log "killing $rod_count orphaned rod Chromium process(es): $(echo $rod_pids | tr '\n' ' ')"
-  kill_gracefully $rod_pids
-fi
-
-# --- 3. Clean up stale rod user-data dirs ---
-ROD_TMP="/var/folders/np/mhwdd58141xflc0rkw1_rc0h0000gn/T/rod/user-data"
-if [ -d "$ROD_TMP" ]; then
-  count=$(ls -1 "$ROD_TMP" 2>/dev/null | wc -l | tr -d ' ')
-  if [ "$count" -gt 0 ] 2>/dev/null; then
-    rm -rf "$ROD_TMP"
-    log "cleaned up ${count} stale rod user-data dir(s)"
-  fi
-fi
-
 # --- Summary ---
-total=$((ai_count + rod_count))
-if [ "$total" -gt 0 ]; then
-  log "cleaned up ${total} total process(es)"
+if [ "$ai_count" -gt 0 ]; then
+  log "cleaned up ${ai_count} detached AI CLI process(es)"
 else
-  log "no orphaned processes found"
+  log "no detached AI CLI processes found"
 fi
