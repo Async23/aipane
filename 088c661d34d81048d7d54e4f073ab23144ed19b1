@@ -1,0 +1,131 @@
+cmd/killrod.zsh
+  8d8a7047a0bfe161 3,6-7
+bin/rod-cleanup
+  8d8a7047a0bfe161 2,4-5
+docs/plans/2026-03-05-rod-cleanup-design.md
+  e07be6b280915a26 1-346
+cmd/kill.zsh
+  8d8a7047a0bfe161 3,6-7
+cmd/cc.zsh
+  93dd7a6540a00fc1 29-36
+  a421c5bd1c725db9 13
+cmd/killmcp.zsh
+  8d8a7047a0bfe161 1-8
+lib/core.zsh
+  a421c5bd1c725db9 13,88-118,121,123,131-135,158-159,163
+  18d57a5492528cee 235-237
+bin/aipane-cleanup
+  5bca7312d909bcb5 205-206,216,336
+  8d8a7047a0bfe161 2,4-10,14-121,124,128-149,151-172,175-179,182-190,194-204,207-210,212-215,217-218,220-295,297-335,337-469,471-536
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.15",
+  "base_commit_sha": "088c661d34d81048d7d54e4f073ab23144ed19b1",
+  "prompts": {
+    "18d57a5492528cee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a2ed01d4-b080-4a61-85b6-35d5fb6b242e",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Async23 <82521294+Async23@users.noreply.github.com>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 3,
+      "overriden_lines": 0
+    },
+    "4f484e24e1c45c15": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "c0f486cd-6947-4a4b-ae01-867b7da4ad0d",
+        "model": "custom:GY-GPT-5.4-xhigh"
+      },
+      "human_author": "Async23 <82521294+Async23@users.noreply.github.com>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 1,
+      "accepted_lines": 0,
+      "overriden_lines": 0
+    },
+    "53b3b26db4538f3b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9b61bfa2-c6c3-401c-acce-5ad07350c2eb",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Async23 <82521294+Async23@users.noreply.github.com>",
+      "messages": [],
+      "total_additions": 118,
+      "total_deletions": 0,
+      "accepted_lines": 118,
+      "overriden_lines": 0
+    },
+    "5bca7312d909bcb5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "da918c20-fa51-4641-9024-2e5c8369d19b",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Async23 <82521294+Async23@users.noreply.github.com>",
+      "messages": [],
+      "total_additions": 4,
+      "total_deletions": 2,
+      "accepted_lines": 4,
+      "overriden_lines": 0
+    },
+    "8d8a7047a0bfe161": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "932822f1-521f-4d16-bb00-187fec8b2d11",
+        "model": "custom:GY-GPT-5.4-xhigh"
+      },
+      "human_author": "Async23 <82521294+Async23@users.noreply.github.com>",
+      "messages": [],
+      "total_additions": 551,
+      "total_deletions": 298,
+      "accepted_lines": 530,
+      "overriden_lines": 0
+    },
+    "93dd7a6540a00fc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "389c6233-bfdf-4df3-9f8a-15b854a3c26a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Async23 <82521294+Async23@users.noreply.github.com>",
+      "messages": [],
+      "total_additions": 16,
+      "total_deletions": 8,
+      "accepted_lines": 9,
+      "overriden_lines": 0
+    },
+    "a421c5bd1c725db9": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "14d97fae-3a9e-469c-aa31-85e8db52d427",
+        "model": "custom:GY-GPT-5.4-xhigh"
+      },
+      "human_author": "Async23 <82521294+Async23@users.noreply.github.com>",
+      "messages": [],
+      "total_additions": 43,
+      "total_deletions": 4,
+      "accepted_lines": 43,
+      "overriden_lines": 0
+    },
+    "e07be6b280915a26": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "00591eab-ca32-49fa-a0a1-0ccdf241bab5",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Async23 <82521294+Async23@users.noreply.github.com>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 346,
+      "overriden_lines": 0
+    }
+  }
+}
