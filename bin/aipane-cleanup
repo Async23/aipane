@@ -1,43 +1,536 @@
 #!/bin/sh
-# aipane-cleanup: kill detached AI CLI processes
-# Designed to run standalone (e.g. via launchd). POSIX sh compatible.
+# aipane-cleanup: unified cleanup engine for detached AI CLI, rod, and MCP helpers.
+
+MODE="all"
+VERBOSE=0
+DRY_RUN=0
+FORCE=0
+MAX_AGE=""
+ORPHAN_AGE=""
+SESSION_AGE=""
 
 LOG_PREFIX="aipane-cleanup"
 LOG_FILE="${HOME}/logs/aipane-cleanup.log"
+ROD_DEFAULT_MAX_AGE="${AIPANE_ROD_MAX_AGE:-300}"
+MCP_DEFAULT_MAX_AGE="${AIPANE_MCP_MAX_AGE:-21600}"
+MCP_ORPHAN_DEFAULT_MAX_AGE="${AIPANE_MCP_ORPHAN_MAX_AGE:-900}"
+MCP_SESSION_DEFAULT_MAX_AGE="${AIPANE_MCP_SESSION_MAX_AGE:-}"
+ACTION_COUNT=0
+
+usage() {
+  cat <<'EOF'
+Usage: aipane-cleanup [all|ai|rod|mcp] [options]
+
+Modes:
+  all           Run ai + rod + mcp cleanup (default)
+  ai            Kill detached AI CLI processes (TTY=??)
+  rod           Kill rod/leakless Chromium processes
+  mcp           Kill stale detached/orphaned MCP helper processes
+
+Options:
+  --all, --force        Kill all matches for the selected mode
+  --max-age SECONDS     Override stale age threshold for rod/mcp cleanup
+  --orphan-age SECONDS  Override orphan threshold for mcp cleanup
+  --session-age SECONDS Also kill MCP helpers under old AI session trees
+  --dry-run             Print actions without killing anything
+  --verbose, -v         Print actions to stdout
+  --help, -h            Show this help
+EOF
+}
+
+is_number() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+if [ $# -gt 0 ]; then
+  case "$1" in
+    all|ai|rod|mcp)
+      MODE="$1"
+      shift
+      ;;
+  esac
+fi
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --all|--force)
+      FORCE=1
+      ;;
+    --max-age)
+      shift
+      if ! is_number "$1"; then
+        echo "aipane-cleanup: --max-age expects a non-negative integer" >&2
+        exit 1
+      fi
+      MAX_AGE="$1"
+      ;;
+    --orphan-age)
+      shift
+      if ! is_number "$1"; then
+        echo "aipane-cleanup: --orphan-age expects a non-negative integer" >&2
+        exit 1
+      fi
+      ORPHAN_AGE="$1"
+      ;;
+    --session-age)
+      shift
+      if ! is_number "$1"; then
+        echo "aipane-cleanup: --session-age expects a non-negative integer" >&2
+        exit 1
+      fi
+      SESSION_AGE="$1"
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      ;;
+    --verbose|-v)
+      VERBOSE=1
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "aipane-cleanup: unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+OUTPUT_PREFIX="aipane-cleanup"
+case "$MODE" in
+  ai)
+    OUTPUT_PREFIX="killcc"
+    ;;
+  mcp)
+    OUTPUT_PREFIX="killmcp"
+    ;;
+  rod)
+    if [ "$FORCE" -eq 1 ]; then
+      OUTPUT_PREFIX="killrod"
+    else
+      OUTPUT_PREFIX="rod-cleanup"
+    fi
+    ;;
+esac
+
 mkdir -p "$(dirname "$LOG_FILE")"
 
-log() {
+log_line() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $LOG_PREFIX: $*" >> "$LOG_FILE"
 }
 
-kill_gracefully() {
-  kill $* 2>/dev/null || true
-  sleep 1
-  local survivors=""
-  for pid in $*; do
-    if kill -0 "$pid" 2>/dev/null; then
-      survivors="$survivors $pid"
-    fi
-  done
-  if [ -n "$survivors" ]; then
-    log "forcing remaining process(es):$survivors"
-    kill -9 $survivors 2>/dev/null || true
+say() {
+  if [ "$VERBOSE" -eq 1 ]; then
+    echo "$OUTPUT_PREFIX: $*"
   fi
 }
 
-# --- 1. Detached AI CLI processes (TTY=??) ---
-ai_pids=$(ps -axo pid=,tty=,command= | awk '$2 == "??" && ($0 ~ /claude/ || $0 ~ /claude-code/ || $0 ~ /claude-guard/ || $0 ~ /codex/ || $0 ~ /\/droid/ || $0 ~ /factory-droid/ || $0 ~ /gemini/) { print $1 }')
+record_action() {
+  ACTION_COUNT=$((ACTION_COUNT + 1))
+  log_line "$*"
+  say "$*"
+}
 
-ai_count=0
-if [ -n "$ai_pids" ]; then
-  ai_count=$(echo "$ai_pids" | wc -l | tr -d ' ')
-  log "killing $ai_count detached AI CLI process(es): $(echo $ai_pids | tr '\n' ' ')"
-  kill_gracefully $ai_pids
-fi
+normalize_pids() {
+  printf '%s\n' "$1" | tr ' ' '\n' | awk 'NF' | sort -u
+}
 
-# --- Summary ---
-if [ "$ai_count" -gt 0 ]; then
-  log "cleaned up ${ai_count} detached AI CLI process(es)"
-else
-  log "no detached AI CLI processes found"
-fi
+count_lines() {
+  printf '%s\n' "$1" | awk 'NF { c++ } END { print c + 0 }'
+}
+
+join_lines() {
+  printf '%s\n' "$1" | awk 'NF { printf "%s%s", sep, $1; sep = " " }'
+}
+
+kill_pid_block() {
+  kp_scope="$1"
+  kp_label="$2"
+  kp_pids=$(normalize_pids "$3")
+
+  if [ -z "$kp_pids" ]; then
+    return 0
+  fi
+
+  kp_count=$(count_lines "$kp_pids")
+  kp_joined=$(join_lines "$kp_pids")
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    record_action "$kp_scope: would kill $kp_count $kp_label process(es): $kp_joined"
+    return 0
+  fi
+
+  record_action "$kp_scope: killing $kp_count $kp_label process(es): $kp_joined"
+  for kp_pid in $kp_pids; do
+    kill "$kp_pid" 2>/dev/null || true
+  done
+
+  sleep 1
+
+  kp_survivors=""
+  for kp_pid in $kp_pids; do
+    if kill -0 "$kp_pid" 2>/dev/null; then
+      kp_survivors="$kp_survivors $kp_pid"
+    fi
+  done
+
+  kp_survivors=$(normalize_pids "$kp_survivors")
+  if [ -n "$kp_survivors" ]; then
+    kp_count=$(count_lines "$kp_survivors")
+    kp_joined=$(join_lines "$kp_survivors")
+    record_action "$kp_scope: force-killing $kp_count remaining $kp_label process(es): $kp_joined"
+    for kp_pid in $kp_survivors; do
+      kill -9 "$kp_pid" 2>/dev/null || true
+    done
+  fi
+}
+
+collect_ai_pids() {
+  ps -axo pid=,tty=,command= | awk '
+    $2 == "??" {
+      if ($0 ~ /claude/ ||
+          $0 ~ /@anthropic-ai\/claude-code/ ||
+          $0 ~ /claude-code/ ||
+          $0 ~ /claude-guard/ ||
+          $0 ~ /codex/ ||
+          $0 ~ /\/droid([[:space:]]|$)/ ||
+          $0 ~ /factory-droid/ ||
+          $0 ~ /gemini/ ||
+          $0 ~ /opencode/ ||
+          $0 ~ /agent-browser\/.*daemon/)
+        print $1
+    }
+  ' | sort -u
+}
+
+collect_force_rod_pids() {
+  {
+    ps -axo pid=,command= | awk '$0 ~ /leakless.*rod/ { print $1 }'
+    ps -axo pid=,command= | awk '$0 ~ /\.cache\/rod\/browser\/.*Chromium/ { print $1 }'
+    ps -axo pid=,command= | awk '$0 ~ /ms-playwright\/.*chrome-headless-shell/ { print $1 }'
+  } | sort -u
+}
+
+collect_stale_rod_leakless_pids() {
+  rod_max_age="$1"
+  ps -axo pid=,etime=,command= | awk -v max_age="$rod_max_age" '
+    function to_sec(s, parts, n, days, hours, mins, secs) {
+      days = 0
+      if (s ~ /-/) {
+        split(s, parts, "-")
+        days = parts[1] + 0
+        s = parts[2]
+      }
+      n = split(s, parts, ":")
+      if (n == 3) {
+        hours = parts[1] + 0
+        mins = parts[2] + 0
+        secs = parts[3] + 0
+      } else if (n == 2) {
+        hours = 0
+        mins = parts[1] + 0
+        secs = parts[2] + 0
+      } else {
+        hours = 0
+        mins = 0
+        secs = parts[1] + 0
+      }
+      return (((days * 24) + hours) * 60 + mins) * 60 + secs
+    }
+    $0 ~ /leakless.*rod/ {
+      if (to_sec($2) >= max_age)
+        print $1
+    }
+  ' | sort -u
+}
+
+collect_rod_child_pids() {
+  rod_parent_pids=$(join_lines "$(normalize_pids "$1")")
+  if [ -z "$rod_parent_pids" ]; then
+    return 0
+  fi
+
+  ps -axo pid=,ppid=,command= | awk -v parents="$rod_parent_pids" '
+    BEGIN {
+      split(parents, parts, " ")
+      for (i in parts) {
+        if (parts[i] != "")
+          wanted[parts[i]] = 1
+      }
+    }
+    {
+      cmd = substr($0, index($0, $3))
+      if (($2 in wanted || $2 == 1) && cmd ~ /\.cache\/rod\/browser\/.*Chromium/)
+        print $1
+    }
+  ' | sort -u
+}
+
+cleanup_rod_dirs() {
+  rod_entries=0
+  for rod_base in /var/folders/*/*/T/rod/user-data; do
+    if [ ! -d "$rod_base" ]; then
+      continue
+    fi
+
+    rod_count=$(ls -1 "$rod_base" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${rod_count:-0}" -le 0 ]; then
+      continue
+    fi
+
+    rod_entries=$((rod_entries + rod_count))
+    if [ "$DRY_RUN" -eq 0 ]; then
+      rm -rf "$rod_base" 2>/dev/null || true
+    fi
+  done
+
+  if [ "$rod_entries" -gt 0 ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      record_action "rod: would clean $rod_entries stale rod user-data entr(y/ies)"
+    else
+      record_action "rod: cleaned $rod_entries stale rod user-data entr(y/ies)"
+    fi
+  fi
+}
+
+collect_mcp_pids() {
+  mcp_max_age="$1"
+  mcp_orphan_age="$2"
+  mcp_session_age="$3"
+  tmux_panes=$(tmux list-panes -a -F '#{session_attached} #{window_active} #{pane_dead} #{pane_tty} #{pane_current_command}' 2>/dev/null || true)
+  {
+    printf '%s\n' "$tmux_panes"
+    printf '%s\n' "__AIPANE_PS_BOUNDARY__"
+    ps -axo pid=,ppid=,tty=,etime=,command=
+  } | awk -v force="$FORCE" -v max_age="$mcp_max_age" -v orphan_age="$mcp_orphan_age" -v session_age="$mcp_session_age" '
+    function to_sec(s, parts, n, days, hours, mins, secs) {
+      days = 0
+      if (s ~ /-/) {
+        split(s, parts, "-")
+        days = parts[1] + 0
+        s = parts[2]
+      }
+      n = split(s, parts, ":")
+      if (n == 3) {
+        hours = parts[1] + 0
+        mins = parts[2] + 0
+        secs = parts[3] + 0
+      } else if (n == 2) {
+        hours = 0
+        mins = parts[1] + 0
+        secs = parts[2] + 0
+      } else {
+        hours = 0
+        mins = 0
+        secs = parts[1] + 0
+      }
+      return (((days * 24) + hours) * 60 + mins) * 60 + secs
+    }
+    function is_match(cmd) {
+      return cmd ~ /chrome-devtools-mcp|mcp-obsidian|context7-mcp|excalidraw-mcp|tmux-mcp|repomix-mcp|claude-in-mobile|mcp-server-mobile|playwright-mcp|mcp-atlassian/
+    }
+    function is_protected(cmd) {
+      return cmd ~ /claude|@anthropic-ai\/claude-code|claude-code|claude-guard|codex|\/droid([[:space:]]|$)|factory-droid|gemini|opencode|tmux|zsh|bash|fish/
+    }
+    function is_session_root(cmd) {
+      return cmd ~ /claude-guard|factory-droid|(^|[[:space:]]|\/)(claude|droid|codex|gemini|opencode)([[:space:]]|$)/
+    }
+    function is_shell_cmd(cmd) {
+      return cmd ~ /^(bash|zsh|sh|fish)$/
+    }
+    function tty_key(raw) {
+      gsub(/^\/dev\//, "", raw)
+      return raw
+    }
+    function session_root_for(pid, current, depth) {
+      current = pid
+      depth = 0
+      while (current != "" && current != 0 && depth < 24) {
+        if (!(current in CMD))
+          break
+        if (is_session_root(CMD[current]))
+          return current
+        current = PPID[current]
+        depth++
+      }
+      return ""
+    }
+    BEGIN {
+      reading_tmux = 1
+    }
+    {
+      if (reading_tmux) {
+        if ($0 == "__AIPANE_PS_BOUNDARY__") {
+          reading_tmux = 0
+          next
+        }
+        attached = $1
+        window_active = $2
+        dead = $3
+        tty = tty_key($4)
+        current_cmd = $5
+        if (tty != "") {
+          TMUX_ATTACHED[tty] = attached + 0
+          TMUX_WINDOW_ACTIVE[tty] = window_active + 0
+          TMUX_DEAD[tty] = dead + 0
+          TMUX_CURRENT_CMD[tty] = current_cmd
+        }
+        next
+      }
+
+      pid = $1
+      ppid = $2
+      tty = $3
+      age = to_sec($4)
+      cmd = substr($0, index($0, $5))
+      PPID[pid] = ppid
+      TTY[pid] = tty
+      AGE[pid] = age
+      CMD[pid] = cmd
+      ORDER[++count] = pid
+    }
+    END {
+      session_mode = (session_age != "" && session_age + 0 > 0)
+      for (i = 1; i <= count; i++) {
+        pid = ORDER[i]
+        cmd = CMD[pid]
+
+        if (!is_match(cmd))
+          continue
+
+        if (force == 1) {
+          print pid
+          continue
+        }
+
+        if (PPID[pid] == 1) {
+          if (AGE[pid] >= orphan_age)
+            print pid
+          continue
+        }
+
+        if (session_mode) {
+          root = session_root_for(pid)
+          if (root != "") {
+            root_tty = tty_key(TTY[root])
+            if (AGE[root] >= session_age && root_tty != "" && (root_tty in TMUX_ATTACHED) && TMUX_DEAD[root_tty] == 0 && is_shell_cmd(TMUX_CURRENT_CMD[root_tty]) && (TMUX_ATTACHED[root_tty] == 0 || TMUX_WINDOW_ACTIVE[root_tty] == 0)) {
+              selected[pid] = 1
+              continue
+            }
+          }
+          if (root != "" && AGE[root] >= session_age && TTY[root] == "??") {
+            selected[pid] = 1
+            continue
+          }
+        }
+
+        if (TTY[pid] != "??" || AGE[pid] < max_age)
+          continue
+
+        parent = PPID[pid]
+        protected = 0
+        depth = 0
+        while (parent != "" && parent != 0 && depth < 16) {
+          if (!(parent in CMD))
+            break
+          if (is_protected(CMD[parent])) {
+            protected = 1
+            break
+          }
+          if (TTY[parent] != "" && TTY[parent] != "??") {
+            protected = 1
+            break
+          }
+          parent = PPID[parent]
+          depth++
+        }
+
+        if (!protected)
+          selected[pid] = 1
+      }
+
+      for (pid in selected)
+        print pid
+    }
+  ' | sort -u
+}
+
+run_ai_cleanup() {
+  ai_pids=$(collect_ai_pids)
+  if [ -n "$ai_pids" ]; then
+    kill_pid_block "ai" "detached AI CLI" "$ai_pids"
+  elif [ "$MODE" = "ai" ] && [ "$VERBOSE" -eq 1 ]; then
+    say "no detached AI CLI processes found"
+  fi
+}
+
+run_rod_cleanup() {
+  if [ "$FORCE" -eq 1 ]; then
+    rod_pids=$(collect_force_rod_pids)
+    if [ -n "$rod_pids" ]; then
+      kill_pid_block "rod" "rod" "$rod_pids"
+      cleanup_rod_dirs
+    elif [ "$MODE" = "rod" ] && [ "$VERBOSE" -eq 1 ]; then
+      say "no rod processes found"
+    fi
+    return 0
+  fi
+
+  rod_max_age="${MAX_AGE:-$ROD_DEFAULT_MAX_AGE}"
+  rod_leakless=$(collect_stale_rod_leakless_pids "$rod_max_age")
+  if [ -n "$rod_leakless" ]; then
+    kill_pid_block "rod" "stale rod leakless" "$rod_leakless"
+    rod_children=$(collect_rod_child_pids "$rod_leakless")
+    if [ -n "$rod_children" ]; then
+      kill_pid_block "rod" "orphaned rod Chromium child" "$rod_children"
+    fi
+  elif [ "$MODE" = "rod" ] && [ "$VERBOSE" -eq 1 ]; then
+    say "no stale rod processes found"
+  fi
+
+  cleanup_rod_dirs
+}
+
+run_mcp_cleanup() {
+  mcp_max_age="${MAX_AGE:-$MCP_DEFAULT_MAX_AGE}"
+  mcp_orphan_age="${ORPHAN_AGE:-$MCP_ORPHAN_DEFAULT_MAX_AGE}"
+  mcp_session_age="$SESSION_AGE"
+  if [ -z "$mcp_session_age" ] && is_number "$MCP_SESSION_DEFAULT_MAX_AGE"; then
+    mcp_session_age="$MCP_SESSION_DEFAULT_MAX_AGE"
+  fi
+  mcp_pids=$(collect_mcp_pids "$mcp_max_age" "$mcp_orphan_age" "$mcp_session_age")
+  if [ -n "$mcp_pids" ]; then
+    kill_pid_block "mcp" "stale MCP helper" "$mcp_pids"
+  elif [ "$MODE" = "mcp" ] && [ "$VERBOSE" -eq 1 ]; then
+    say "no stale MCP helper processes found"
+  fi
+}
+
+case "$MODE" in
+  all)
+    run_ai_cleanup
+    run_rod_cleanup
+    run_mcp_cleanup
+    ;;
+  ai)
+    run_ai_cleanup
+    ;;
+  rod)
+    run_rod_cleanup
+    ;;
+  mcp)
+    run_mcp_cleanup
+    ;;
+  *)
+    echo "aipane-cleanup: unsupported mode: $MODE" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

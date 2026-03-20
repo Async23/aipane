@@ -10,6 +10,7 @@ typeset -g _AIPANE_CORE_LOADED=1
 typeset -g AIPANE_CLAUDE_CMD="${AIPANE_CLAUDE_CMD:-claude}"
 typeset -g AIPANE_ACCOUNTS_BASE="${AIPANE_ACCOUNTS_BASE:-$HOME/.claude-accounts}"
 typeset -g AIPANE_SHARED_DIR="${AIPANE_SHARED_DIR:-$AIPANE_ACCOUNTS_BASE/_shared}"
+typeset -g AIPANE_CACHE_DIR="${AIPANE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}}"
 
 typeset -g AIPANE_CODEX_LAUNCH_CMD="${AIPANE_CODEX_LAUNCH_CMD:-codex --yolo}"
 typeset -g AIPANE_DROID_LAUNCH_CMD="${AIPANE_DROID_LAUNCH_CMD:-droid}"
@@ -84,10 +85,42 @@ _aipane_list_accounts() {
   (( ${#reply[@]} > 0 ))
 }
 
+_aipane_cached_name_index() {
+  local cache_name="$1"
+  shift || true
+  local cache_file="$AIPANE_CACHE_DIR/$cache_name"
+  local cached_name
+  local i
+
+  [[ -n "$cache_name" && -r "$cache_file" ]] || return 1
+  IFS= read -r cached_name < "$cache_file" || return 1
+  [[ -n "$cached_name" ]] || return 1
+
+  for (( i = 1; i <= $#; i++ )); do
+    if [[ "${@[i]}" == "$cached_name" ]]; then
+      REPLY="$i"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+_aipane_store_cached_name() {
+  local cache_name="$1"
+  local value="$2"
+
+  [[ -n "$cache_name" && -n "$value" ]] || return 0
+
+  mkdir -p "$AIPANE_CACHE_DIR" || return 1
+  print -r -- "$value" >| "$AIPANE_CACHE_DIR/$cache_name"
+}
+
 _aipane_select_account() {
   local label="$1"
+  local cache_name="$2"
   local -a accounts
-  local i choice
+  local i choice default_choice
 
   _aipane_list_accounts || {
     print -u2 "aipane: no Claude accounts found in $AIPANE_ACCOUNTS_BASE"
@@ -95,6 +128,11 @@ _aipane_select_account() {
   }
 
   accounts=("${reply[@]}")
+  default_choice=1
+
+  if [[ -n "$cache_name" ]]; then
+    _aipane_cached_name_index "$cache_name" "${accounts[@]}" && default_choice="$REPLY"
+  fi
 
   if (( ${#accounts[@]} == 1 )); then
     REPLY="${accounts[1]}"
@@ -117,11 +155,12 @@ _aipane_select_account() {
   done
 
   while true; do
-    read -r "choice?Choose [1]: " < /dev/tty
-    [[ -z "$choice" ]] && choice=1
+    read -r "choice?Choose [${default_choice}]: " < /dev/tty
+    [[ -z "$choice" ]] && choice="$default_choice"
 
     if [[ "$choice" == <-> ]] && (( choice >= 1 && choice <= ${#accounts[@]} )); then
       REPLY="${accounts[$choice]}"
+      [[ -n "$cache_name" ]] && _aipane_store_cached_name "$cache_name" "$REPLY"
       print
       return 0
     fi
@@ -193,9 +232,9 @@ _aipane_grid_for_count() {
     rows=1
     per_col=(1 1)
   elif (( count == 3 )); then
-    cols=3
-    rows=1
-    per_col=(1 1 1)
+    cols=2
+    rows=2
+    per_col=(1 2)
   elif (( count == 4 )); then
     cols=2
     rows=2

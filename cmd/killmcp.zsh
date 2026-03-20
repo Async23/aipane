@@ -1,8 +1,8 @@
 #!/usr/bin/env zsh
-# Command: killrod
+# Command: killmcp
 # Compatibility wrapper around the unified cleanup engine.
 
-killrod() {
+killmcp() {
   local script="$AIPANE_ROOT/bin/aipane-cleanup"
-  command "$script" rod --force --verbose "$@"
+  command "$script" mcp --verbose --session-age 18000 "$@"
 }
