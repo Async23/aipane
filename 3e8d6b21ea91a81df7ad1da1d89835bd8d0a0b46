@@ -1,0 +1,25 @@
+cmd/codex.zsh
+  53b3b26db4538f3b 1-113
+cmd/aliases.zsh
+  53b3b26db4538f3b 1-5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.15",
+  "base_commit_sha": "3e8d6b21ea91a81df7ad1da1d89835bd8d0a0b46",
+  "prompts": {
+    "53b3b26db4538f3b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9b61bfa2-c6c3-401c-acce-5ad07350c2eb",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Async23 <82521294+Async23@users.noreply.github.com>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 118,
+      "overriden_lines": 0
+    }
+  }
+}
