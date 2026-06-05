@@ -8,7 +8,7 @@ Unified zsh toolkit for daily AI CLI workflows: Claude Code multi-account launch
 |---|---|
 | `cc [email] [args...]` | Launch Claude Code with account-isolated config directory |
 | `ccd [email] [args...]` | Launch Claude Code with `--dangerously-skip-permissions` |
-| `ai <tools_string>` | Launch multiple AI CLIs in tmux panes (`c/x/d/g/o`) |
+| `ai [--layout <layout>] <tools_string> [tool_args...]` | Launch AI CLIs in tmux panes (`c/x/d/g/o/r/q/p`) |
 | `cc-status` | Show login/config state for all Claude accounts |
 | `cc-usage [cmd] [--timeout N] [--yes\|-y]` | Open all Claude accounts in panes and send command (default `/usage`) |
 | `cc-switch [email] [session-id]` | Resume the latest/current project session with another account |
@@ -54,6 +54,9 @@ export AIPANE_CODEX_LAUNCH_CMD="codex --yolo"
 export AIPANE_DROID_LAUNCH_CMD="droid"
 export AIPANE_GEMINI_LAUNCH_CMD="gemini --yolo"
 export AIPANE_OPENCODE_LAUNCH_CMD="opencode"
+export AIPANE_CURSOR_LAUNCH_CMD="cursor-agent --force"
+export AIPANE_QODER_LAUNCH_CMD="qodercli"
+export AIPANE_OMP_LAUNCH_CMD="omp --approval-mode=yolo"
 ```
 
 ## Dependencies
@@ -62,7 +65,7 @@ export AIPANE_OPENCODE_LAUNCH_CMD="opencode"
 - tmux (`ai`, `cc-usage`) (outside tmux, these commands auto-create a session and attach)
 - `jq` (`cc-status`)
 - Claude Code (`cc`, `ccd`, `cc-usage`, `cc-switch`)
-- Optional: Codex, Droid, Gemini, Opencode CLI (for `ai`)
+- Optional: Codex, Droid, Gemini, Opencode, Cursor CLI, Qoder CLI, Oh My Pi (`omp`) (for `ai`)
 
 ## Account Layout
 
@@ -90,6 +93,15 @@ cc alice@example.com
 ccd bob@example.com --resume 9d47f4f1-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 
 ai cxdg
+ai cxr                                   # 3 tools prompt for layout first
+ai cxr --layout main-right               # skip the layout prompt
+ai -l columns cxr
+ai x resume 019e680c-d2bd-71a2-9a9a-8cf78a2d8da1
+ai --new x resume 019e680c-d2bd-71a2-9a9a-8cf78a2d8da1
+ai x -- --help                           # pass an ai-looking flag to the tool
+ai q
+ai xq
+ai p
 ai cc
 
 cc-status
@@ -100,6 +112,10 @@ cc-usage -y                                # skip interactive selection, auto la
 cc-switch alice@example.com
 killcc
 ```
+
+For 3 panes, `ai` supports `main-left`, `main-right`, `columns`, and `rows`; custom column specs such as `--layout 1,2` or `--layout 2,1` are also accepted. Use `--layout auto` to skip the prompt and keep the automatic layout.
+
+Tool arguments are forwarded only when the tools string contains a single tool, for example `ai x resume <session-id>` or `ai c --resume <session-id>`. Multi-tool launches such as `ai xg resume <session-id>` are rejected to avoid sending incompatible arguments to multiple CLIs. If a tool argument has the same spelling as an `ai` option, put it after `--`, for example `ai x -- --help`.
 
 ## Quick Verification
 

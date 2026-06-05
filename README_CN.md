@@ -8,7 +8,7 @@
 |---|---|
 | `cc [email] [args...]` | 以账号隔离的配置目录启动 Claude Code |
 | `ccd [email] [args...]` | 以 `--dangerously-skip-permissions` 模式启动 Claude Code |
-| `ai <tools_string>` | 在 tmux 窗格中启动多个 AI CLI（`c/x/d/g/o`） |
+| `ai [--layout <layout>] <tools_string> [tool_args...]` | 启动 AI CLI 或在 tmux 窗格中编排多个 AI CLI（`c/x/d/g/o/r/q/p`） |
 | `cc-status` | 显示所有 Claude 账号的登录/配置状态 |
 | `cc-usage [cmd] [--timeout N] [--yes\|-y]` | 在窗格中打开所有 Claude 账号并发送命令（默认 `/usage`） |
 | `cc-switch [email] [session-id]` | 使用另一个账号恢复最新/当前项目会话 |
@@ -54,6 +54,9 @@ export AIPANE_CODEX_LAUNCH_CMD="codex --yolo"
 export AIPANE_DROID_LAUNCH_CMD="droid"
 export AIPANE_GEMINI_LAUNCH_CMD="gemini --yolo"
 export AIPANE_OPENCODE_LAUNCH_CMD="opencode"
+export AIPANE_CURSOR_LAUNCH_CMD="cursor-agent --force"
+export AIPANE_QODER_LAUNCH_CMD="qodercli"
+export AIPANE_OMP_LAUNCH_CMD="omp --approval-mode=yolo"
 ```
 
 ## 依赖
@@ -62,7 +65,7 @@ export AIPANE_OPENCODE_LAUNCH_CMD="opencode"
 - tmux（`ai`、`cc-usage`）（非 tmux 环境会自动创建 session 并 attach）
 - `jq`（`cc-status`）
 - Claude Code（`cc`、`ccd`、`cc-usage`、`cc-switch`）
-- 可选：Codex、Droid、Gemini、Opencode CLI（用于 `ai`）
+- 可选：Codex、Droid、Gemini、Opencode、Cursor CLI、Qoder CLI、Oh My Pi（`omp`）（用于 `ai`）
 
 ## 账号目录结构
 
@@ -90,6 +93,15 @@ cc alice@example.com
 ccd bob@example.com --resume 9d47f4f1-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 
 ai cxdg
+ai cxr                                   # 3 个工具会先选择布局
+ai cxr --layout main-right               # 跳过布局选择
+ai -l columns cxr
+ai x resume 019e680c-d2bd-71a2-9a9a-8cf78a2d8da1
+ai --new x resume 019e680c-d2bd-71a2-9a9a-8cf78a2d8da1
+ai x -- --help                           # 把类似 ai 选项的参数传给工具
+ai q
+ai xq
+ai p
 ai cc
 
 cc-status
@@ -100,6 +112,10 @@ cc-usage -y                                # 跳过交互式选择，自动布�
 cc-switch alice@example.com
 killcc
 ```
+
+`ai` 的 3 窗格布局支持 `main-left`、`main-right`、`columns`、`rows`，也支持自定义列规格，例如 `--layout 1,2` 或 `--layout 2,1`。使用 `--layout auto` 可以跳过交互提示并沿用自动布局。
+
+工具参数只会在工具串包含单个工具时透传，例如 `ai x resume <session-id>` 或 `ai c --resume <session-id>`。`ai xg resume <session-id>` 这类多工具带参数调用会被拒绝，避免把不兼容参数同时发给多个 CLI。如果工具参数和 `ai` 自身选项同名，放在 `--` 之后，例如 `ai x -- --help`。
 
 ## 快速验证
 
