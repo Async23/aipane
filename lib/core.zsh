@@ -16,6 +16,9 @@ typeset -g AIPANE_CODEX_LAUNCH_CMD="${AIPANE_CODEX_LAUNCH_CMD:-codex --yolo}"
 typeset -g AIPANE_DROID_LAUNCH_CMD="${AIPANE_DROID_LAUNCH_CMD:-droid}"
 typeset -g AIPANE_GEMINI_LAUNCH_CMD="${AIPANE_GEMINI_LAUNCH_CMD:-gemini --yolo}"
 typeset -g AIPANE_OPENCODE_LAUNCH_CMD="${AIPANE_OPENCODE_LAUNCH_CMD:-opencode}"
+typeset -g AIPANE_CURSOR_LAUNCH_CMD="${AIPANE_CURSOR_LAUNCH_CMD:-cursor-agent --force}"
+typeset -g AIPANE_QODER_LAUNCH_CMD="${AIPANE_QODER_LAUNCH_CMD:-qodercli}"
+typeset -g AIPANE_OMP_LAUNCH_CMD="${AIPANE_OMP_LAUNCH_CMD:-omp --approval-mode=yolo}"
 
 _aipane_link_if_missing() {
   local target="$1"
