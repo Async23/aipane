@@ -12,6 +12,7 @@ SESSION_AGE=""
 LOG_PREFIX="aipane-cleanup"
 LOG_FILE="${HOME}/logs/aipane-cleanup.log"
 ROD_DEFAULT_MAX_AGE="${AIPANE_ROD_MAX_AGE:-300}"
+AI_ORPHAN_DEFAULT_MAX_AGE="${AIPANE_AI_ORPHAN_MAX_AGE:-900}"
 MCP_DEFAULT_MAX_AGE="${AIPANE_MCP_MAX_AGE:-21600}"
 MCP_ORPHAN_DEFAULT_MAX_AGE="${AIPANE_MCP_ORPHAN_MAX_AGE:-900}"
 MCP_SESSION_DEFAULT_MAX_AGE="${AIPANE_MCP_SESSION_MAX_AGE:-}"
@@ -30,7 +31,7 @@ Modes:
 Options:
   --all, --force        Kill all matches for the selected mode
   --max-age SECONDS     Override stale age threshold for rod/mcp cleanup
-  --orphan-age SECONDS  Override orphan threshold for mcp cleanup
+  --orphan-age SECONDS  Override orphan threshold for ai/mcp cleanup
   --session-age SECONDS Also kill MCP helpers under old AI session trees
   --dry-run             Print actions without killing anything
   --verbose, -v         Print actions to stdout
@@ -193,20 +194,128 @@ kill_pid_block() {
 
 collect_ai_pids() {
   ps -axo pid=,tty=,command= | awk '
+    function is_ai_cmd(cmd) {
+      return cmd ~ /@anthropic-ai\/claude-code/ ||
+             cmd ~ /@openai\/codex|claude-code|claude-guard|codex-cli|factory-droid|gemini-cli|agent-browser\/.*daemon/ ||
+             cmd ~ /(^|[[:space:]\/])(claude|codex|droid|gemini|opencode)([[:space:]\/]|$)/
+    }
     $2 == "??" {
-      if ($0 ~ /claude/ ||
-          $0 ~ /@anthropic-ai\/claude-code/ ||
-          $0 ~ /claude-code/ ||
-          $0 ~ /claude-guard/ ||
-          $0 ~ /codex/ ||
-          $0 ~ /\/droid([[:space:]]|$)/ ||
-          $0 ~ /factory-droid/ ||
-          $0 ~ /gemini/ ||
-          $0 ~ /opencode/ ||
-          $0 ~ /agent-browser\/.*daemon/)
+      if (is_ai_cmd($0))
         print $1
     }
   ' | sort -u
+}
+
+collect_ai_related_pids() {
+  ai_roots=$(join_lines "$(normalize_pids "$1")")
+  if [ -z "$ai_roots" ]; then
+    return 0
+  fi
+
+  ps -axo pid=,ppid=,pgid=,tty=,command= | awk -v roots="$ai_roots" '
+    function is_ai_cmd(cmd) {
+      return cmd ~ /@anthropic-ai\/claude-code/ ||
+             cmd ~ /@openai\/codex|claude-code|claude-guard|codex-cli|factory-droid|gemini-cli|agent-browser\/.*daemon/ ||
+             cmd ~ /(^|[[:space:]\/])(claude|codex|droid|gemini|opencode)([[:space:]\/]|$)/
+    }
+    BEGIN {
+      split(roots, parts, " ")
+      for (i in parts) {
+        if (parts[i] != "")
+          ROOT[parts[i]] = 1
+      }
+    }
+    {
+      pid = $1
+      ppid = $2
+      pgid = $3
+      tty = $4
+      cmd = substr($0, index($0, $5))
+      PPID[pid] = ppid
+      PGID[pid] = pgid
+      TTY[pid] = tty
+      ORDER[++count] = pid
+      if (pid in ROOT && pgid == pid && is_ai_cmd(cmd))
+        ROOT_PGID[pgid] = 1
+    }
+    END {
+      for (i = 1; i <= count; i++) {
+        pid = ORDER[i]
+        if (pid in ROOT) {
+          selected[pid] = 1
+          continue
+        }
+        if (TTY[pid] == "??" && (PGID[pid] in ROOT_PGID)) {
+          selected[pid] = 1
+          continue
+        }
+
+        parent = PPID[pid]
+        depth = 0
+        while (parent != "" && parent != 0 && depth < 64) {
+          if (parent in ROOT && TTY[pid] == "??") {
+            selected[pid] = 1
+            break
+          }
+          if (!(parent in PPID))
+            break
+          parent = PPID[parent]
+          depth++
+        }
+      }
+
+      for (pid in selected)
+        print pid
+    }
+  ' | sort -u
+}
+
+collect_ai_orphan_child_pids() {
+  ai_orphan_age="$1"
+  candidates=$(ps -axo pid=,ppid=,tty=,etime=,command= | awk -v min_age="$ai_orphan_age" '
+    function to_sec(s, parts, n, days, hours, mins, secs) {
+      days = 0
+      if (s ~ /-/) {
+        split(s, parts, "-")
+        days = parts[1] + 0
+        s = parts[2]
+      }
+      n = split(s, parts, ":")
+      if (n == 3) {
+        hours = parts[1] + 0
+        mins = parts[2] + 0
+        secs = parts[3] + 0
+      } else if (n == 2) {
+        hours = 0
+        mins = parts[1] + 0
+        secs = parts[2] + 0
+      } else {
+        hours = 0
+        mins = 0
+        secs = parts[1] + 0
+      }
+      return (((days * 24) + hours) * 60 + mins) * 60 + secs
+    }
+    function is_tool_cmd(cmd) {
+      return cmd ~ /(^|\/)(Python|python[0-9.]*|node|bun|deno|ruby|perl|php)([[:space:]]|$)/ ||
+             cmd ~ /(^|\/)(bash|zsh|sh|fish)([[:space:]]|$)/
+    }
+    {
+      pid = $1
+      ppid = $2
+      tty = $3
+      age = to_sec($4)
+      cmd = substr($0, index($0, $5))
+      if (ppid == 1 && tty == "??" && age >= min_age && is_tool_cmd(cmd))
+        print pid
+    }
+  ')
+
+  for ai_orphan_pid in $candidates; do
+    if ps eww -p "$ai_orphan_pid" 2>/dev/null | grep -Eq 'CLAUDE_CODE_SESSION_ID=|CLAUDE_CODE_CHILD_SESSION=|CODEX_COMPANION_SESSION_ID='; then
+      printf '%s\n' "$ai_orphan_pid"
+    fi
+  done | sort -u
 }
 
 collect_force_rod_pids() {
@@ -462,10 +571,17 @@ collect_mcp_pids() {
 }
 
 run_ai_cleanup() {
+  ai_orphan_age="${ORPHAN_AGE:-$AI_ORPHAN_DEFAULT_MAX_AGE}"
   ai_pids=$(collect_ai_pids)
   if [ -n "$ai_pids" ]; then
-    kill_pid_block "ai" "detached AI CLI" "$ai_pids"
-  elif [ "$MODE" = "ai" ] && [ "$VERBOSE" -eq 1 ]; then
+    ai_related_pids=$(collect_ai_related_pids "$ai_pids")
+    kill_pid_block "ai" "detached AI CLI tree" "$ai_related_pids"
+  fi
+
+  ai_orphan_pids=$(collect_ai_orphan_child_pids "$ai_orphan_age")
+  if [ -n "$ai_orphan_pids" ]; then
+    kill_pid_block "ai" "orphaned AI child" "$ai_orphan_pids"
+  elif [ -z "$ai_pids" ] && [ "$MODE" = "ai" ] && [ "$VERBOSE" -eq 1 ]; then
     say "no detached AI CLI processes found"
   fi
 }
