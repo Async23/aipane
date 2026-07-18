@@ -8,7 +8,7 @@ A zsh toolkit for daily AI CLI workflows: account-isolated Claude Code launches,
 
 | Command | Description |
 |---|---|
-| `cc [email] [args...]` | Launch Claude Code with an account-isolated config directory; prompts for an account when `email` is omitted |
+| `cc [email] [args...]` | Launch Claude Code with an account-isolated config directory; selects a configured account when `email` is omitted |
 | `ccd [args...]` | Launch Claude Code with the normal config directory and `--dangerously-skip-permissions` |
 | `ai [--new\|-n] [--layout\|-l <layout>] <tools_string> [tool_args...]` | Launch one AI CLI directly or orchestrate multiple CLIs in tmux panes |
 | `codexx [args...]` | Launch `codex --yolo` |
@@ -71,12 +71,12 @@ export AIPANE_OMP_LAUNCH_CMD="omp --approval-mode=yolo"
 
 ## Claude Account Model
 
-Only `cc` uses an account-specific `CLAUDE_CONFIG_DIR`. If the email is omitted—or the first argument starts with `-`—`cc` prompts for one of the directories under `AIPANE_ACCOUNTS_BASE`.
+Only `cc` uses an account-specific `CLAUDE_CONFIG_DIR`. If the email is omitted—or the first argument starts with `-`—`cc` uses the only directory under `AIPANE_ACCOUNTS_BASE` automatically, or prompts when multiple account directories exist. If none exist, pass an email explicitly to create the first account directory.
 
 ```bash
 cc alice@example.com
 cc alice@example.com --resume <session-id>
-cc --continue                         # prompt for an account, then forward --continue
+cc --continue                         # select an account, then forward --continue
 ```
 
 `ccd` deliberately uses Claude Code's normal config directory. It does not accept an account selector:
@@ -86,15 +86,15 @@ ccd
 ccd --resume <session-id>
 ```
 
-The account layout created by `cc` is:
+The account layout used by `cc` and Claude Code is:
 
 ```text
 ~/.claude-accounts/
 ├── alice@example.com/
-│   ├── .claude.json
-│   ├── rules -> ~/.claude/rules
-│   ├── settings.json -> ~/.claude/settings.json
-│   ├── settings.local.json -> ~/.claude/settings.local.json
+│   ├── .claude.json                                      # managed by Claude Code
+│   ├── rules -> ~/.claude/rules                          # optional
+│   ├── settings.json -> ~/.claude/settings.json          # optional
+│   ├── settings.local.json -> ~/.claude/settings.local.json  # optional
 │   ├── projects -> ~/.claude-accounts/_shared/projects
 │   └── history.jsonl -> ~/.claude-accounts/_shared/history.jsonl
 ├── bob@example.com/
@@ -103,7 +103,7 @@ The account layout created by `cc` is:
     └── history.jsonl
 ```
 
-Existing regular files in an account directory are preserved; missing links and shared paths are created on demand.
+`cc` creates the account directory, shared `projects`/`history.jsonl` paths, and their links. Claude Code creates and manages `.claude.json`. Links for `rules`, `settings.json`, and `settings.local.json` are created only when the corresponding source exists under `~/.claude/`. Existing regular files in an account directory are preserved.
 
 ## `ai` Launcher
 
