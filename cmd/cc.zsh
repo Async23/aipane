@@ -37,13 +37,6 @@ _aipane_cc_invoke() {
     cmd+=(--dangerously-skip-permissions)
   fi
 
-  # Default --effort max, fall back to high for older versions
-  if "$AIPANE_CLAUDE_CMD" --effort max --version &>/dev/null; then
-    cmd+=(--effort max)
-  else
-    cmd+=(--effort high)
-  fi
-
 #  if [[ "$mode" == "danger" ]]; then
 #    cmd+=(--model "claude-opus-4-6[1m]")
 #  fi
