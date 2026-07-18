@@ -8,7 +8,7 @@
 
 | 命令 | 说明 |
 |---|---|
-| `cc [email] [args...]` | 使用账号隔离的配置目录启动 Claude Code；省略 `email` 时交互选择账号 |
+| `cc [email] [args...]` | 使用账号隔离的配置目录启动 Claude Code；省略 `email` 时从已配置账号中选择 |
 | `ccd [args...]` | 使用常规配置目录并带 `--dangerously-skip-permissions` 启动 Claude Code |
 | `ai [--new\|-n] [--layout\|-l <layout>] <tools_string> [tool_args...]` | 直接启动一个 AI CLI，或在 tmux 窗格中编排多个 CLI |
 | `codexx [args...]` | 启动 `codex --yolo` |
@@ -71,12 +71,12 @@ export AIPANE_OMP_LAUNCH_CMD="omp --approval-mode=yolo"
 
 ## Claude 账号模型
 
-只有 `cc` 使用账号专属的 `CLAUDE_CONFIG_DIR`。省略邮箱，或者第一个参数以 `-` 开头时，`cc` 会从 `AIPANE_ACCOUNTS_BASE` 下的目录中交互选择账号。
+只有 `cc` 使用账号专属的 `CLAUDE_CONFIG_DIR`。省略邮箱，或者第一个参数以 `-` 开头时，如果 `AIPANE_ACCOUNTS_BASE` 下只有一个账号目录，`cc` 会直接使用；存在多个账号目录时才会交互选择。如果还没有账号目录，请显式传入邮箱来创建第一个目录。
 
 ```bash
 cc alice@example.com
 cc alice@example.com --resume <session-id>
-cc --continue                         # 先选择账号，再透传 --continue
+cc --continue                         # 选择账号后再透传 --continue
 ```
 
 `ccd` 特意使用 Claude Code 的常规配置目录，不接受账号选择参数：
@@ -86,15 +86,15 @@ ccd
 ccd --resume <session-id>
 ```
 
-`cc` 创建的账号目录结构如下：
+`cc` 与 Claude Code 使用的账号目录结构如下：
 
 ```text
 ~/.claude-accounts/
 ├── alice@example.com/
-│   ├── .claude.json
-│   ├── rules -> ~/.claude/rules
-│   ├── settings.json -> ~/.claude/settings.json
-│   ├── settings.local.json -> ~/.claude/settings.local.json
+│   ├── .claude.json                                      # 由 Claude Code 管理
+│   ├── rules -> ~/.claude/rules                          # 可选
+│   ├── settings.json -> ~/.claude/settings.json          # 可选
+│   ├── settings.local.json -> ~/.claude/settings.local.json  # 可选
 │   ├── projects -> ~/.claude-accounts/_shared/projects
 │   └── history.jsonl -> ~/.claude-accounts/_shared/history.jsonl
 ├── bob@example.com/
@@ -103,7 +103,7 @@ ccd --resume <session-id>
     └── history.jsonl
 ```
 
-账号目录中已有的普通文件会被保留；缺少的链接和共享路径会按需创建。
+`cc` 会创建账号目录、共享的 `projects`/`history.jsonl` 路径及其链接；`.claude.json` 由 Claude Code 创建和管理。只有 `~/.claude/` 下存在对应源文件时，才会创建 `rules`、`settings.json` 和 `settings.local.json` 链接。账号目录中已有的普通文件会被保留。
 
 ## `ai` 启动器
 
