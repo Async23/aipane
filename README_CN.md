@@ -14,7 +14,7 @@
 | `codexx [args...]` | 启动 `codex --yolo` |
 | `killcc [options]` | 清理已分离的 AI CLI 进程树和孤立的 AI 子进程 |
 | `killmcp [options]` | 清理过期、已分离或孤立的 MCP 辅助进程 |
-| `killrod [options]` | 强制清理 Rod、Leakless 及其管理的无头 Chromium 进程 |
+| `killrod [options]` | 强制清理匹配的 Rod/Leakless 浏览器进程和 Playwright `chrome-headless-shell` 进程 |
 
 便捷别名：
 
@@ -169,11 +169,13 @@ killrod --dry-run
 
 ```bash
 ./bin/aipane-cleanup [all|ai|rod|mcp] \
-  [--force] [--max-age SECONDS] [--orphan-age SECONDS] \
-  [--session-age SECONDS] [--dry-run] [--verbose]
+  [--all|--force] [--max-age SECONDS] [--orphan-age SECONDS] \
+  [--session-age SECONDS] [--dry-run] [--verbose|-v] [--help|-h]
 ```
 
-`ai` 模式会识别已分离的 Claude、Codex、Droid、Gemini、Grok 和 OpenCode 进程，沿进程树收集相关进程，并检查已知的孤立 AI 子进程。传入 `--session-age` 后，还会清理超过指定时长的已分离 tmux Claude 会话树。
+`ai` 模式会识别已分离的 Claude、Codex、Droid、Gemini、Grok、OpenCode 和 `agent-browser` daemon 进程，沿进程树收集相关进程，并检查已知的孤立 AI 子进程。传入 `--session-age` 后，还会清理超过指定时长的已分离 tmux Claude 会话树。
+
+在 `rod` 模式中，`--force` 会忽略进程年龄，选中所有匹配的 Rod/Leakless Chromium 进程以及所有匹配的 `ms-playwright/.../chrome-headless-shell` 进程。
 
 清理操作记录在 `~/logs/aipane-cleanup.log`。可通过以下环境变量覆盖时间阈值：
 
@@ -189,6 +191,10 @@ killrod --dry-run
 
 ```text
 .
+├── .gitignore
+├── LICENSE
+├── README.md
+├── README_CN.md
 ├── init.zsh                 # zsh 加载入口
 ├── aipane.zsh               # 兼容旧版的入口
 ├── lib/
@@ -204,6 +210,9 @@ killrod --dry-run
 ├── bin/
 │   ├── aipane-cleanup
 │   └── rod-cleanup
+├── docs/
+│   └── plans/
+│       └── 2026-03-05-rod-cleanup-design.md
 └── tests/
     └── aipane-cleanup-ai-protection.sh
 ```

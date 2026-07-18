@@ -11,7 +11,7 @@ Tools:
   x  Codex         (${AIPANE_CODEX_LAUNCH_CMD})
   d  Droid         (${AIPANE_DROID_LAUNCH_CMD})
   g  Grok          (${AIPANE_GROK_LAUNCH_CMD})
-  o  Opencode      (${AIPANE_OPENCODE_LAUNCH_CMD})
+  o  OpenCode      (${AIPANE_OPENCODE_LAUNCH_CMD})
   r  Cursor        (${AIPANE_CURSOR_LAUNCH_CMD})
   q  Qoder         (${AIPANE_QODER_LAUNCH_CMD})
   p  Oh My Pi      (${AIPANE_OMP_LAUNCH_CMD})
