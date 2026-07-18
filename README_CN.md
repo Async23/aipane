@@ -1,6 +1,6 @@
 # aipane
 
-用于日常 AI CLI 工作流的 zsh 工具集：隔离账号配置启动 Claude Code、通过 tmux 窗格编排多个 AI 工具，以及清理相关进程。
+用于日常 AI CLI 工作流的 zsh 工具集：隔离账号配置启动 Claude Code、通过 tmux 窗格编排多个 AI 工具、清理相关进程，以及可选的 tmux 窗口标签多行换行。
 
 [English README](README.md)
 
@@ -47,6 +47,43 @@ git -C ~/.aipane pull --ff-only
 - 其他 `ai` 工具对应的可选 CLI：Codex、Droid、Grok、OpenCode、Cursor CLI、Qoder CLI 或 Oh My Pi（`omp`）
 
 `ai x` 这类单工具调用默认在当前 shell 中运行；未使用 `--new` 或 `--layout` 时不依赖 tmux。
+
+## 可选：tmux 窗口标签多行换行
+
+窗口很多时（例如频繁 `ai --new`），状态栏窗口标签可自动换到最多 3 行，而不是挤在一行被截断。
+
+**不会**被 `init.zsh` 自动加载。个人 tmux 配置（prefix、主题、快捷键、插件）继续放在 `~/.tmux.conf`；这里只接入仓库里的公共片段：
+
+```bash
+# AIPANE_ROOT = 本仓库 clone 路径（默认安装：~/.aipane）
+AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
+
+# 1) 将渲染器放到 PATH（推荐 symlink，不要复制脚本正文）
+ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
+
+# 2) 在 ~/.tmux.conf 中只 source 公共片段
+# source-file $AIPANE_ROOT/conf/tmux-window-wrap.conf
+```
+
+`~/.tmux.conf` 示例：
+
+```tmux
+# OWNED_BY: aipane (tmux-window-wrap) — 改仓库，不要内联复制
+source-file ~/.aipane/conf/tmux-window-wrap.conf
+```
+
+本功能额外依赖：支持多行 `status-format` 的 `tmux`，以及仅用标准库的 `python3`。
+
+```bash
+python3 "$AIPANE_ROOT/tests/test_tmux_window_wrap.py"
+```
+
+| 路径 | 作用 |
+|------|------|
+| `bin/tmux-window-wrap` | 布局 / 渲染 / invalidate CLI |
+| `conf/tmux-window-wrap.conf` | 仅公共 `status-format` + hooks |
+| `tests/test_tmux_window_wrap.py` | 单元 + 真 tmux 集成测试 |
+| [`docs/tmux-window-wrap.md`](docs/tmux-window-wrap.md) | 安装与改动边界 |
 
 ## 可选配置
 

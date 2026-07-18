@@ -5,3 +5,7 @@ DESIGN.md
 *~
 todo.md
 tmp/
+# never publish personal tmux chrome
+conf/local/
+**/.tmux.conf
+**/tmux.conf.local
