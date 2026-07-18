@@ -18,7 +18,7 @@ typeset -g AIPANE_GROK_LAUNCH_CMD="${AIPANE_GROK_LAUNCH_CMD:-grok --always-appro
 typeset -g AIPANE_OPENCODE_LAUNCH_CMD="${AIPANE_OPENCODE_LAUNCH_CMD:-opencode}"
 typeset -g AIPANE_CURSOR_LAUNCH_CMD="${AIPANE_CURSOR_LAUNCH_CMD:-cursor-agent --force}"
 typeset -g AIPANE_QODER_LAUNCH_CMD="${AIPANE_QODER_LAUNCH_CMD:-qodercli}"
-typeset -g AIPANE_OMP_LAUNCH_CMD="${AIPANE_OMP_LAUNCH_CMD:-omp --approval-mode=yolo}"
+typeset -g AIPANE_PI_LAUNCH_CMD="${AIPANE_PI_LAUNCH_CMD:-pi}"
 
 _aipane_link_if_missing() {
   local target="$1"

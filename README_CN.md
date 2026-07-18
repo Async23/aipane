@@ -45,7 +45,7 @@ git -C ~/.aipane pull --ff-only
 - macOS 和 zsh
 - Claude Code：供 `cc`、`ccd` 以及 `ai` 的 `c` 工具使用
 - tmux：供多工具 `ai` 调用，以及使用 `--new` 或 `--layout` 时使用
-- 其他 `ai` 工具对应的可选 CLI：Codex、Droid、Grok、OpenCode、Cursor CLI、Qoder CLI 或 Oh My Pi（`omp`）
+- 其他 `ai` 工具对应的可选 CLI：Codex、Droid、Grok、OpenCode、Cursor CLI、Qoder CLI 或 Pi（`pi`）
 
 `ai x` 这类单工具调用默认在当前 shell 中运行；未使用 `--new` 或 `--layout` 时不依赖 tmux。
 
@@ -116,7 +116,7 @@ export AIPANE_GROK_LAUNCH_CMD="grok --always-approve"
 export AIPANE_OPENCODE_LAUNCH_CMD="opencode"
 export AIPANE_CURSOR_LAUNCH_CMD="cursor-agent --force"
 export AIPANE_QODER_LAUNCH_CMD="qodercli"
-export AIPANE_OMP_LAUNCH_CMD="omp --approval-mode=yolo"
+export AIPANE_PI_LAUNCH_CMD="pi"
 ```
 
 加载这些覆盖值后，`ai --help` 会显示实际生效的启动命令。
@@ -170,7 +170,7 @@ ccd --resume <session-id>
 | `o` | OpenCode | `opencode` |
 | `r` | Cursor | `cursor-agent --force` |
 | `q` | Qoder | `qodercli` |
-| `p` | Oh My Pi | `omp --approval-mode=yolo` |
+| `p` | Pi | `pi` |
 
 示例：
 
