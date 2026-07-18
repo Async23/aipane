@@ -211,10 +211,50 @@ kill_pid_block() {
 
 collect_ai_pids() {
   ps -axo pid=,ppid=,tty=,command= | awk '
-    function is_ai_cmd(cmd) {
-      return cmd ~ /@anthropic-ai\/claude-code/ ||
-             cmd ~ /@openai\/codex|claude-code|claude-guard|codex-cli|factory-droid|gemini-cli|agent-browser\/.*daemon/ ||
-             cmd ~ /(^|[[:space:]\/])(claude|codex|droid|gemini|grok|opencode)([[:space:]\/]|$)/
+    function basename(token, value) {
+      value = token
+      sub(/^.*\//, "", value)
+      return value
+    }
+    function is_ai_executable(token, name) {
+      name = basename(token)
+      return name ~ /^(claude|claude-guard|codex|codex-cli|droid|factory-droid|gemini|gemini-cli|grok|opencode)$/
+    }
+    function is_runtime(token, name) {
+      name = basename(token)
+      return name ~ /^(node|bun|deno|python|python[0-9.]*|ruby|perl|php)$/
+    }
+    function is_package_runner(token, name) {
+      name = basename(token)
+      return name ~ /^(npm|npx|pnpm|yarn|bunx)$/
+    }
+    function is_ai_script(token, name) {
+      name = basename(token)
+      return token ~ /(^|\/)@anthropic-ai\/claude-code(@[^\/[:space:]]*)?(\/|$)/ ||
+             token ~ /(^|\/)@openai\/codex(@[^\/[:space:]]*)?(\/|$)/ ||
+             name ~ /^(claude-code|codex-cli|factory-droid|gemini-cli)$/
+    }
+    function is_ai_cmd(cmd, fields, count, executable, i, limit) {
+      count = split(cmd, fields, /[[:space:]]+/)
+      if (count == 0)
+        return 0
+      executable = fields[1]
+      if (is_ai_executable(executable))
+        return 1
+      if (is_runtime(executable)) {
+        if (count >= 2 && is_ai_script(fields[2]))
+          return 1
+        return count >= 2 && fields[2] ~ /(^|\/)agent-browser(\/|$)/ &&
+               cmd ~ /(^|[[:space:]])daemon([[:space:]]|$)/
+      }
+      if (!is_package_runner(executable))
+        return 0
+      limit = count < 4 ? count : 4
+      for (i = 2; i <= limit; i++) {
+        if (is_ai_script(fields[i]) || is_ai_executable(fields[i]))
+          return 1
+      }
+      return 0
     }
     function is_codex_app_server(cmd) {
       return cmd ~ /^([^[:space:]]*\/)?codex[[:space:]]/ &&
@@ -266,10 +306,50 @@ collect_ai_related_pids() {
   fi
 
   ps -axo pid=,ppid=,pgid=,tty=,command= | awk -v roots="$ai_roots" '
-    function is_ai_cmd(cmd) {
-      return cmd ~ /@anthropic-ai\/claude-code/ ||
-             cmd ~ /@openai\/codex|claude-code|claude-guard|codex-cli|factory-droid|gemini-cli|agent-browser\/.*daemon/ ||
-             cmd ~ /(^|[[:space:]\/])(claude|codex|droid|gemini|grok|opencode)([[:space:]\/]|$)/
+    function basename(token, value) {
+      value = token
+      sub(/^.*\//, "", value)
+      return value
+    }
+    function is_ai_executable(token, name) {
+      name = basename(token)
+      return name ~ /^(claude|claude-guard|codex|codex-cli|droid|factory-droid|gemini|gemini-cli|grok|opencode)$/
+    }
+    function is_runtime(token, name) {
+      name = basename(token)
+      return name ~ /^(node|bun|deno|python|python[0-9.]*|ruby|perl|php)$/
+    }
+    function is_package_runner(token, name) {
+      name = basename(token)
+      return name ~ /^(npm|npx|pnpm|yarn|bunx)$/
+    }
+    function is_ai_script(token, name) {
+      name = basename(token)
+      return token ~ /(^|\/)@anthropic-ai\/claude-code(@[^\/[:space:]]*)?(\/|$)/ ||
+             token ~ /(^|\/)@openai\/codex(@[^\/[:space:]]*)?(\/|$)/ ||
+             name ~ /^(claude-code|codex-cli|factory-droid|gemini-cli)$/
+    }
+    function is_ai_cmd(cmd, fields, count, executable, i, limit) {
+      count = split(cmd, fields, /[[:space:]]+/)
+      if (count == 0)
+        return 0
+      executable = fields[1]
+      if (is_ai_executable(executable))
+        return 1
+      if (is_runtime(executable)) {
+        if (count >= 2 && is_ai_script(fields[2]))
+          return 1
+        return count >= 2 && fields[2] ~ /(^|\/)agent-browser(\/|$)/ &&
+               cmd ~ /(^|[[:space:]])daemon([[:space:]]|$)/
+      }
+      if (!is_package_runner(executable))
+        return 0
+      limit = count < 4 ? count : 4
+      for (i = 2; i <= limit; i++) {
+        if (is_ai_script(fields[i]) || is_ai_executable(fields[i]))
+          return 1
+      }
+      return 0
     }
     BEGIN {
       split(roots, parts, " ")
@@ -507,15 +587,48 @@ collect_tmux_claude_session_pids() {
 
 collect_force_rod_pids() {
   {
-    ps -axo pid=,command= | awk '$0 ~ /leakless.*rod/ { print $1 }'
-    ps -axo pid=,command= | awk '$0 ~ /\.cache\/rod\/browser\/.*Chromium/ { print $1 }'
-    ps -axo pid=,command= | awk '$0 ~ /ms-playwright\/.*chrome-headless-shell/ { print $1 }'
+    ps -axo pid=,command= | awk '
+      function basename(token, value) {
+        value = token
+        sub(/^.*\//, "", value)
+        return value
+      }
+      {
+        cmd = substr($0, index($0, $2))
+        split(cmd, fields, /[[:space:]]+/)
+        if (basename(fields[1]) == "leakless" &&
+            cmd ~ /(^|[\/[:space:]])rod([\/[:space:]-]|$)/)
+          print $1
+      }
+    '
+    ps -axo pid=,command= | awk '
+      {
+        cmd = substr($0, index($0, $2))
+        split(cmd, fields, /[[:space:]]+/)
+        if (fields[1] ~ /\/\.cache\/rod\/browser\/.*\/Chromium([[:space:]]|$)/ ||
+            fields[1] ~ /\/\.cache\/rod\/browser\/.*\/Chromium\.app\//)
+          print $1
+      }
+    '
+    ps -axo pid=,command= | awk '
+      {
+        cmd = substr($0, index($0, $2))
+        split(cmd, fields, /[[:space:]]+/)
+        if (fields[1] ~ /\/ms-playwright\/.*\/chrome-headless-shell$/)
+          print $1
+      }
+    '
   } | sort -u
 }
 
 collect_stale_rod_leakless_pids() {
   rod_max_age="$1"
   ps -axo pid=,etime=,command= | awk -v max_age="$rod_max_age" '
+    function basename(token, value) {
+      value = token
+      sub(/^.*\//, "", value)
+      return value
+    }
     function to_sec(s, parts, n, days, hours, mins, secs) {
       days = 0
       if (s ~ /-/) {
@@ -539,8 +652,12 @@ collect_stale_rod_leakless_pids() {
       }
       return (((days * 24) + hours) * 60 + mins) * 60 + secs
     }
-    $0 ~ /leakless.*rod/ {
-      if (to_sec($2) >= max_age)
+    {
+      cmd = substr($0, index($0, $3))
+      split(cmd, fields, /[[:space:]]+/)
+      if (basename(fields[1]) == "leakless" &&
+          cmd ~ /(^|[\/[:space:]])rod([\/[:space:]-]|$)/ &&
+          to_sec($2) >= max_age)
         print $1
     }
   ' | sort -u
@@ -562,7 +679,10 @@ collect_rod_child_pids() {
     }
     {
       cmd = substr($0, index($0, $3))
-      if (($2 in wanted || $2 == 1) && cmd ~ /\.cache\/rod\/browser\/.*Chromium/)
+      split(cmd, fields, /[[:space:]]+/)
+      if (($2 in wanted || $2 == 1) &&
+          (fields[1] ~ /\/\.cache\/rod\/browser\/.*\/Chromium$/ ||
+           fields[1] ~ /\/\.cache\/rod\/browser\/.*\/Chromium\.app\//))
         print $1
     }
   ' | sort -u
@@ -628,8 +748,42 @@ collect_mcp_pids() {
       }
       return (((days * 24) + hours) * 60 + mins) * 60 + secs
     }
-    function is_match(cmd) {
-      return cmd ~ /chrome-devtools-mcp|mcp-obsidian|context7-mcp|excalidraw-mcp|tmux-mcp|repomix-mcp|claude-in-mobile|mcp-server-mobile|playwright-mcp|mcp-atlassian/
+    function basename(token, value) {
+      value = token
+      sub(/^.*\//, "", value)
+      return value
+    }
+    function is_mcp_token(token) {
+      return token ~ /(^|\/)(chrome-devtools-mcp|mcp-obsidian|context7-mcp|excalidraw-mcp|tmux-mcp|repomix-mcp|claude-in-mobile|mcp-server-mobile|playwright-mcp|mcp-atlassian)(@[^\/[:space:]]*)?(\/|$)/
+    }
+    function is_mcp_runtime(token, name) {
+      name = basename(token)
+      return name ~ /^(node|bun|deno|python|python[0-9.]*|ruby)$/
+    }
+    function is_mcp_package_runner(token, name) {
+      name = basename(token)
+      return name ~ /^(npm|npx|pnpm|yarn|bunx|uv|uvx|pipx)$/
+    }
+    function is_match(cmd, fields, count, executable, i, limit) {
+      count = split(cmd, fields, /[[:space:]]+/)
+      if (count == 0)
+        return 0
+      executable = fields[1]
+      if (is_mcp_token(executable))
+        return 1
+      if (is_mcp_runtime(executable)) {
+        if (count >= 2 && is_mcp_token(fields[2]))
+          return 1
+        return count >= 3 && fields[2] == "-m" && is_mcp_token(fields[3])
+      }
+      if (!is_mcp_package_runner(executable))
+        return 0
+      limit = count < 4 ? count : 4
+      for (i = 2; i <= limit; i++) {
+        if (is_mcp_token(fields[i]))
+          return 1
+      }
+      return 0
     }
     function is_protected(cmd) {
       return cmd ~ /claude|@anthropic-ai\/claude-code|claude-code|claude-guard|codex|\/droid([[:space:]]|$)|factory-droid|gemini|grok|opencode|tmux|zsh|bash|fish/
@@ -803,11 +957,10 @@ run_rod_cleanup() {
     if [ -n "$rod_children" ]; then
       kill_pid_block "rod" "orphaned rod Chromium child" "$rod_children"
     fi
+    cleanup_rod_dirs
   elif [ "$MODE" = "rod" ] && [ "$VERBOSE" -eq 1 ]; then
     say "no stale rod processes found"
   fi
-
-  cleanup_rod_dirs
 }
 
 run_mcp_cleanup() {

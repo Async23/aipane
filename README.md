@@ -218,7 +218,11 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 │   ├── ghostty-tmux-workstation.md
 │   └── tmux-window-wrap.md
 └── tests/
+    ├── ai-contracts.zsh
+    ├── ai-p-launches-pi.zsh
     ├── aipane-cleanup-ai-protection.sh
+    ├── aipane-cleanup-contracts.sh
+    ├── init-reload.zsh
     ├── test_tmux_window_wrap.py
     └── test_workstation_fragments.py
 ```
@@ -226,7 +230,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 ## Verification
 
 ```bash
-zsh -n init.zsh aipane.zsh cmd/*.zsh lib/*.zsh
+zsh -n init.zsh aipane.zsh cmd/*.zsh lib/*.zsh tests/*.zsh
 sh -n bin/aipane-cleanup bin/rod-cleanup tests/*.sh
 
 zsh -fc '
@@ -235,7 +239,11 @@ zsh -fc '
   ai --help >/dev/null
 '
 
+./tests/init-reload.zsh
+./tests/ai-p-launches-pi.zsh
+./tests/ai-contracts.zsh
 ./tests/aipane-cleanup-ai-protection.sh
+./tests/aipane-cleanup-contracts.sh
 
 # optional workstation / window-wrap
 python3 tests/test_workstation_fragments.py

@@ -1,10 +1,11 @@
 #!/usr/bin/env zsh
 # Shared helpers for aipane.
 
-if [[ -n "${_AIPANE_CORE_LOADED:-}" ]]; then
+if [[ "${_AIPANE_CORE_VERSION:-}" == "2" ]]; then
   return 0
 fi
 typeset -g _AIPANE_CORE_LOADED=1
+typeset -g _AIPANE_CORE_VERSION=2
 
 # User-configurable values (export before sourcing init.zsh to override).
 typeset -g AIPANE_CLAUDE_LAUNCH_CMD="${AIPANE_CLAUDE_LAUNCH_CMD:-claude --dangerously-skip-permissions}"
