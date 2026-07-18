@@ -14,7 +14,7 @@ A zsh toolkit for daily AI CLI workflows: account-isolated Claude Code launches,
 | `codexx [args...]` | Launch `codex --yolo` |
 | `killcc [options]` | Clean up detached AI CLI trees and orphaned AI child processes |
 | `killmcp [options]` | Clean up stale detached/orphaned MCP helper processes |
-| `killrod [options]` | Force-clean Rod, Leakless, and managed headless Chromium processes |
+| `killrod [options]` | Force-clean matching Rod/Leakless browser processes and Playwright `chrome-headless-shell` processes |
 
 Convenience aliases:
 
@@ -169,11 +169,13 @@ Direct usage:
 
 ```bash
 ./bin/aipane-cleanup [all|ai|rod|mcp] \
-  [--force] [--max-age SECONDS] [--orphan-age SECONDS] \
-  [--session-age SECONDS] [--dry-run] [--verbose]
+  [--all|--force] [--max-age SECONDS] [--orphan-age SECONDS] \
+  [--session-age SECONDS] [--dry-run] [--verbose|-v] [--help|-h]
 ```
 
-The `ai` mode recognizes detached Claude, Codex, Droid, Gemini, Grok, and OpenCode processes, follows their process trees, and also checks known orphaned AI child processes. `--session-age` additionally enables cleanup of old detached tmux Claude session trees.
+The `ai` mode recognizes detached Claude, Codex, Droid, Gemini, Grok, OpenCode, and `agent-browser` daemon processes, follows their process trees, and also checks known orphaned AI child processes. `--session-age` additionally enables cleanup of old detached tmux Claude session trees.
+
+In `rod` mode, `--force` selects all matching Rod/Leakless Chromium processes and every matching `ms-playwright/.../chrome-headless-shell` process, regardless of age.
 
 Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be overridden with:
 
@@ -189,6 +191,10 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 
 ```text
 .
+├── .gitignore
+├── LICENSE
+├── README.md
+├── README_CN.md
 ├── init.zsh                 # entrypoint sourced by zsh
 ├── aipane.zsh               # compatibility entrypoint
 ├── lib/
@@ -204,6 +210,9 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 ├── bin/
 │   ├── aipane-cleanup
 │   └── rod-cleanup
+├── docs/
+│   └── plans/
+│       └── 2026-03-05-rod-cleanup-design.md
 └── tests/
     └── aipane-cleanup-ai-protection.sh
 ```
