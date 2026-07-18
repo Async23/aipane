@@ -6,7 +6,7 @@ A zsh toolkit for daily AI CLI workflows: account-isolated Claude Code launches,
 
 ## Features
 
-| Command | Description |
+| Command / surface | Description |
 |---|---|
 | `cc [email] [args...]` | Launch Claude Code with an account-isolated config directory; selects a configured account when `email` is omitted |
 | `ccd [args...]` | Launch Claude Code with the normal config directory and `--dangerously-skip-permissions` |
@@ -15,6 +15,7 @@ A zsh toolkit for daily AI CLI workflows: account-isolated Claude Code launches,
 | `killcc [options]` | Clean up detached AI CLI trees and orphaned AI child processes |
 | `killmcp [options]` | Clean up stale detached/orphaned MCP helper processes |
 | `killrod [options]` | Force-clean matching Rod/Leakless browser processes and Playwright `chrome-headless-shell` processes |
+| Optional Ghostty + tmux workstation | Cmd↔tmux key bridge, broadcast, multi-line window list (not loaded by `init.zsh`) |
 
 Convenience aliases:
 
@@ -84,14 +85,20 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `conf/tmux-workstation.conf` | prefix, binds, broadcast, status chrome |
 | `conf/tmux-window-wrap.conf` | multi-line window list |
 | `bin/tmux-window-wrap` | renderer CLI |
-| `tests/test_tmux_window_wrap.py` | window-wrap tests |
+| `tests/test_tmux_window_wrap.py` | window-wrap unit + live tmux tests |
+| `tests/test_workstation_fragments.py` | structural tests for conf fragments |
 | [`docs/ghostty-tmux-workstation.md`](docs/ghostty-tmux-workstation.md) | install + ownership |
 | [`docs/cheatsheet.md`](docs/cheatsheet.md) | key map |
 | [`docs/tmux-window-wrap.md`](docs/tmux-window-wrap.md) | wrap-only notes |
 
+After editing workstation conf or the wrap renderer:
+
 ```bash
+python3 "$AIPANE_ROOT/tests/test_workstation_fragments.py"
 python3 "$AIPANE_ROOT/tests/test_tmux_window_wrap.py"
 ```
+
+If Ghostty is already running, reload config with **Cmd+Shift+,** (`reload_config`) so the include is picked up.
 
 ## Optional Configuration
 
@@ -236,30 +243,27 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 
 ```text
 .
-├── .gitignore
-├── LICENSE
-├── README.md
-├── README_CN.md
-├── init.zsh                 # entrypoint sourced by zsh
+├── init.zsh                 # zsh entrypoint
 ├── aipane.zsh               # compatibility entrypoint
-├── lib/
-│   └── core.zsh             # shared config, account, and layout helpers
-├── cmd/
-│   ├── aliases.zsh
-│   ├── cc.zsh
-│   ├── codex.zsh
-│   ├── kill.zsh
-│   ├── killmcp.zsh
-│   ├── killrod.zsh
-│   └── pane.zsh
+├── lib/core.zsh
+├── cmd/                     # cc, ai/pane, kill*, aliases, …
 ├── bin/
 │   ├── aipane-cleanup
-│   └── rod-cleanup
+│   ├── rod-cleanup
+│   └── tmux-window-wrap     # optional status-bar renderer
+├── conf/                    # optional; not sourced by init.zsh
+│   ├── ghostty-tmux.conf
+│   ├── tmux-workstation.conf
+│   └── tmux-window-wrap.conf
 ├── docs/
+│   ├── cheatsheet.md
+│   ├── ghostty-tmux-workstation.md
+│   ├── tmux-window-wrap.md
 │   └── plans/
-│       └── 2026-03-05-rod-cleanup-design.md
 └── tests/
-    └── aipane-cleanup-ai-protection.sh
+    ├── aipane-cleanup-ai-protection.sh
+    ├── test_tmux_window_wrap.py
+    └── test_workstation_fragments.py
 ```
 
 ## Verification
@@ -275,6 +279,10 @@ zsh -fc '
 '
 
 ./tests/aipane-cleanup-ai-protection.sh
+
+# optional workstation / window-wrap
+python3 tests/test_workstation_fragments.py
+python3 tests/test_tmux_window_wrap.py
 ```
 
 ## License
