@@ -226,7 +226,7 @@ _aipane_pane_build_and_run_tmux() {
   local rows="$4"
   local -a rows_per_col commands col_tops pane_ids
   local new_info window_id root_pane expected v
-  local c needed_rows anchor new_pane
+  local c needed_rows remaining_rows split_percentage anchor new_pane
   local i
   shift 4
 
@@ -284,10 +284,13 @@ _aipane_pane_build_and_run_tmux() {
 
   for (( c = 1; c <= cols; c++ )); do
     needed_rows="${rows_per_col[c]}"
+    remaining_rows="$needed_rows"
     anchor="${col_tops[c]}"
     for (( r = 2; r <= needed_rows; r++ )); do
-      new_pane="$(tmux split-window -v -d -P -F '#{pane_id}' -t "$anchor")" || return 1
+      split_percentage=$(( 100 * (remaining_rows - 1) / remaining_rows ))
+      new_pane="$(tmux split-window -v -d -p "$split_percentage" -P -F '#{pane_id}' -t "$anchor")" || return 1
       anchor="$new_pane"
+      (( remaining_rows-- ))
       sleep 0.12
     done
   done
@@ -302,10 +305,10 @@ _aipane_pane_build_and_run_tmux() {
 
   # Send commands to pane 2..N first, then pane 1 (so focus ends on the first pane).
   for (( i = 2; i <= pane_count; i++ )); do
-    tmux send-keys -t "${pane_ids[i]}" "${commands[i]}" Enter
+    tmux send-keys -t "${pane_ids[i]}" "${commands[i]}" Enter || return 1
   done
-  tmux send-keys -t "${pane_ids[1]}" "${commands[1]}" Enter
-  tmux select-pane -t "${pane_ids[1]}"
+  tmux send-keys -t "${pane_ids[1]}" "${commands[1]}" Enter || return 1
+  tmux select-pane -t "${pane_ids[1]}" || return 1
 
   (( rows > 0 )) || true # keep rows in the signature for parity with the old backend
 }
@@ -379,7 +382,7 @@ ai() {
 
   if [[ -z "$tools_str" ]]; then
     _aipane_pane_help
-    return 0
+    return 1
   fi
 
   for (( i = 1; i <= ${#tools_str}; i++ )); do

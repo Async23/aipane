@@ -843,6 +843,24 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         )
         self.assertLess(rendered - started, 0.5)
 
+    def test_sourcing_config_preserves_external_indexed_hooks(self):
+        external_hooks = {
+            "after-select-window": (
+                "set-environment -g AIPANE_EXTERNAL_AFTER_SELECT preserved"
+            ),
+            "window-linked": (
+                "set-environment -g AIPANE_EXTERNAL_WINDOW_LINKED preserved"
+            ),
+        }
+        for hook, command in external_hooks.items():
+            self.tmux("set-hook", "-g", f"{hook}[99]", command)
+
+        self.source_window_wrap_config()
+
+        for hook, command in external_hooks.items():
+            configured = self.tmux("show-hooks", "-g", hook).stdout
+            self.assertIn(command, configured)
+
     def test_window_wrap_config_connects_all_status_rows_to_complete_cache_keys(self):
         self.source_window_wrap_config()
 
