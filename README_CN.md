@@ -6,7 +6,7 @@
 
 ## 功能
 
-| 命令 | 说明 |
+| 命令 / 表面 | 说明 |
 |---|---|
 | `cc [email] [args...]` | 使用账号隔离的配置目录启动 Claude Code；省略 `email` 时从已配置账号中选择 |
 | `ccd [args...]` | 使用常规配置目录并带 `--dangerously-skip-permissions` 启动 Claude Code |
@@ -15,6 +15,7 @@
 | `killcc [options]` | 清理已分离的 AI CLI 进程树和孤立的 AI 子进程 |
 | `killmcp [options]` | 清理过期、已分离或孤立的 MCP 辅助进程 |
 | `killrod [options]` | 强制清理匹配的 Rod/Leakless 浏览器进程和 Playwright `chrome-headless-shell` 进程 |
+| 可选 Ghostty + tmux 工作台 | Cmd↔tmux 键位桥、广播、窗口标签多行（**不会**被 `init.zsh` 加载） |
 
 便捷别名：
 
@@ -84,14 +85,20 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `conf/tmux-workstation.conf` | prefix、键位、广播、状态栏样式 |
 | `conf/tmux-window-wrap.conf` | 窗口列表多行 |
 | `bin/tmux-window-wrap` | 渲染 CLI |
-| `tests/test_tmux_window_wrap.py` | window-wrap 测试 |
+| `tests/test_tmux_window_wrap.py` | window-wrap 单元 + 真 tmux 测试 |
+| `tests/test_workstation_fragments.py` | conf 片段结构测试 |
 | [`docs/ghostty-tmux-workstation.md`](docs/ghostty-tmux-workstation.md) | 安装与所有权 |
 | [`docs/cheatsheet.md`](docs/cheatsheet.md) | 键位速查 |
 | [`docs/tmux-window-wrap.md`](docs/tmux-window-wrap.md) | 仅换行说明 |
 
+改 workstation conf 或 wrap 渲染器后：
+
 ```bash
+python3 "$AIPANE_ROOT/tests/test_workstation_fragments.py"
 python3 "$AIPANE_ROOT/tests/test_tmux_window_wrap.py"
 ```
+
+若 Ghostty 已在运行，用 **Cmd+Shift+,**（`reload_config`）重载配置以加载 include。
 
 ## 可选配置
 
@@ -236,30 +243,27 @@ killrod --dry-run
 
 ```text
 .
-├── .gitignore
-├── LICENSE
-├── README.md
-├── README_CN.md
-├── init.zsh                 # zsh 加载入口
-├── aipane.zsh               # 兼容旧版的入口
-├── lib/
-│   └── core.zsh             # 公共配置、账号和布局辅助函数
-├── cmd/
-│   ├── aliases.zsh
-│   ├── cc.zsh
-│   ├── codex.zsh
-│   ├── kill.zsh
-│   ├── killmcp.zsh
-│   ├── killrod.zsh
-│   └── pane.zsh
+├── init.zsh                 # zsh 入口
+├── aipane.zsh               # 兼容入口
+├── lib/core.zsh
+├── cmd/                     # cc、ai/pane、kill*、aliases …
 ├── bin/
 │   ├── aipane-cleanup
-│   └── rod-cleanup
+│   ├── rod-cleanup
+│   └── tmux-window-wrap     # 可选状态栏渲染器
+├── conf/                    # 可选；不会被 init.zsh 加载
+│   ├── ghostty-tmux.conf
+│   ├── tmux-workstation.conf
+│   └── tmux-window-wrap.conf
 ├── docs/
+│   ├── cheatsheet.md
+│   ├── ghostty-tmux-workstation.md
+│   ├── tmux-window-wrap.md
 │   └── plans/
-│       └── 2026-03-05-rod-cleanup-design.md
 └── tests/
-    └── aipane-cleanup-ai-protection.sh
+    ├── aipane-cleanup-ai-protection.sh
+    ├── test_tmux_window_wrap.py
+    └── test_workstation_fragments.py
 ```
 
 ## 验证
@@ -275,6 +279,10 @@ zsh -fc '
 '
 
 ./tests/aipane-cleanup-ai-protection.sh
+
+# 可选工作台 / window-wrap
+python3 tests/test_workstation_fragments.py
+python3 tests/test_tmux_window_wrap.py
 ```
 
 ## 许可证
