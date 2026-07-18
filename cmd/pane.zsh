@@ -2,19 +2,19 @@
 # Command: ai
 
 _aipane_pane_help() {
-  cat <<'EOH'
+  cat <<EOH
 Usage:
   ai [--new|-n] [--layout|-l <layout>] <tools_string> [tool_args...]
 
 Tools:
   c  Claude Code   (ccd)
-  x  Codex         (codex --yolo --profile ai-x)
-  d  Droid         (droid)
-  g  Grok          (grok --always-approve)
-  o  Opencode      (opencode)
-  r  Cursor        (cursor-agent --force)
-  q  Qoder         (qodercli)
-  p  Oh My Pi      (omp --approval-mode=yolo)
+  x  Codex         (${AIPANE_CODEX_LAUNCH_CMD})
+  d  Droid         (${AIPANE_DROID_LAUNCH_CMD})
+  g  Grok          (${AIPANE_GROK_LAUNCH_CMD})
+  o  Opencode      (${AIPANE_OPENCODE_LAUNCH_CMD})
+  r  Cursor        (${AIPANE_CURSOR_LAUNCH_CMD})
+  q  Qoder         (${AIPANE_QODER_LAUNCH_CMD})
+  p  Oh My Pi      (${AIPANE_OMP_LAUNCH_CMD})
 
 Layouts:
   auto             Default automatic layout; skips the 3-pane prompt

@@ -1,54 +1,62 @@
 # aipane
 
-统一的 zsh 工具集，用于日常 AI CLI 工作流：Claude Code 多账号启动、tmux 窗格编排、用量批量查询、会话切换和进程清理。
+用于日常 AI CLI 工作流的 zsh 工具集：隔离账号配置启动 Claude Code、通过 tmux 窗格编排多个 AI 工具，以及清理相关进程。
+
+[English README](README.md)
 
 ## 功能
 
 | 命令 | 说明 |
 |---|---|
-| `cc [email] [args...]` | 以账号隔离的配置目录启动 Claude Code |
-| `ccd [email] [args...]` | 以 `--dangerously-skip-permissions` 模式启动 Claude Code |
-| `ai [--layout <layout>] <tools_string> [tool_args...]` | 启动 AI CLI 或在 tmux 窗格中编排多个 AI CLI（`c/x/d/g/o/r/q/p`） |
-| `cc-status` | 显示所有 Claude 账号的登录/配置状态 |
-| `cc-usage [cmd] [--timeout N] [--yes\|-y]` | 在窗格中打开所有 Claude 账号并发送命令（默认 `/usage`） |
-| `cc-switch [email] [session-id]` | 使用另一个账号恢复最新/当前项目会话 |
-| `killcc` | 终止分离的/僵尸 Claude 相关进程（`TTY=??`） |
+| `cc [email] [args...]` | 使用账号隔离的配置目录启动 Claude Code；省略 `email` 时交互选择账号 |
+| `ccd [args...]` | 使用常规配置目录并带 `--dangerously-skip-permissions` 启动 Claude Code |
+| `ai [--new\|-n] [--layout\|-l <layout>] <tools_string> [tool_args...]` | 直接启动一个 AI CLI，或在 tmux 窗格中编排多个 CLI |
+| `codexx [args...]` | 启动 `codex --yolo` |
+| `killcc [options]` | 清理已分离的 AI CLI 进程树和孤立的 AI 子进程 |
+| `killmcp [options]` | 清理过期、已分离或孤立的 MCP 辅助进程 |
+| `killrod [options]` | 强制清理 Rod、Leakless 及其管理的无头 Chromium 进程 |
 
-**别名：** `ccstatus` → `cc-status`、`ccusage` → `cc-usage`
+便捷别名：
 
-## 项目结构
+- `geminii` → `gemini --yolo`
+- `oc` → `opencode`
 
-```text
-.
-├── init.zsh
-├── lib/
-│   └── core.zsh
-├── cmd/
-│   ├── cc.zsh
-│   ├── pane.zsh
-│   ├── status.zsh
-│   ├── usage.zsh
-│   ├── switch.zsh
-│   └── kill.zsh
-└── aipane.zsh  # 兼容性包装器（旧入口）
-```
+> [!WARNING]
+> `ccd`、`codexx` 和部分 `ai` 启动器会关闭对应工具的审批检查；清理命令会终止进程。请先确认命令定义，不确定时先用 `--dry-run` 检查清理范围。
 
 ## 安装
 
 ```bash
 git clone https://github.com/Async23/aipane.git ~/.aipane
-echo 'source ~/.aipane/init.zsh' >> ~/.zshrc
+grep -qxF 'source ~/.aipane/init.zsh' ~/.zshrc 2>/dev/null ||
+  printf '\nsource ~/.aipane/init.zsh\n' >> ~/.zshrc
 source ~/.zshrc
 ```
 
+更新已有安装：
+
+```bash
+git -C ~/.aipane pull --ff-only
+```
+
+## 依赖
+
+- macOS 和 zsh
+- Claude Code：供 `cc`、`ccd` 以及 `ai` 的 `c` 工具使用
+- tmux：供多工具 `ai` 调用，以及使用 `--new` 或 `--layout` 时使用
+- 其他 `ai` 工具对应的可选 CLI：Codex、Droid、Grok、OpenCode、Cursor CLI、Qoder CLI 或 Oh My Pi（`omp`）
+
+`ai x` 这类单工具调用默认在当前 shell 中运行；未使用 `--new` 或 `--layout` 时不依赖 tmux。
+
 ## 可选配置
 
-在 `source ~/.aipane/init.zsh` 之前设置以下环境变量：
+在加载 `init.zsh` 之前设置覆盖值：
 
 ```bash
 export AIPANE_CLAUDE_CMD="claude"                       # 例如 claude-guard
 export AIPANE_ACCOUNTS_BASE="$HOME/.claude-accounts"
 export AIPANE_SHARED_DIR="$AIPANE_ACCOUNTS_BASE/_shared"
+export AIPANE_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}"
 
 export AIPANE_CODEX_LAUNCH_CMD="codex --yolo"
 export AIPANE_DROID_LAUNCH_CMD="droid"
@@ -59,17 +67,26 @@ export AIPANE_QODER_LAUNCH_CMD="qodercli"
 export AIPANE_OMP_LAUNCH_CMD="omp --approval-mode=yolo"
 ```
 
-## 依赖
+加载这些覆盖值后，`ai --help` 会显示实际生效的启动命令。
 
-- macOS + zsh
-- tmux（`ai`、`cc-usage`）（非 tmux 环境会自动创建 session 并 attach）
-- `jq`（`cc-status`）
-- Claude Code（`cc`、`ccd`、`cc-usage`、`cc-switch`）
-- 可选：Codex、Droid、Grok、Opencode、Cursor CLI、Qoder CLI、Oh My Pi（`omp`）（用于 `ai`）
+## Claude 账号模型
 
-## 账号目录结构
+只有 `cc` 使用账号专属的 `CLAUDE_CONFIG_DIR`。省略邮箱，或者第一个参数以 `-` 开头时，`cc` 会从 `AIPANE_ACCOUNTS_BASE` 下的目录中交互选择账号。
 
-`aipane` 在 `~/.claude-accounts/` 下使用账号隔离的配置，共享数据存放在 `_shared` 中：
+```bash
+cc alice@example.com
+cc alice@example.com --resume <session-id>
+cc --continue                         # 先选择账号，再透传 --continue
+```
+
+`ccd` 特意使用 Claude Code 的常规配置目录，不接受账号选择参数：
+
+```bash
+ccd
+ccd --resume <session-id>
+```
+
+`cc` 创建的账号目录结构如下：
 
 ```text
 ~/.claude-accounts/
@@ -78,55 +95,133 @@ export AIPANE_OMP_LAUNCH_CMD="omp --approval-mode=yolo"
 │   ├── rules -> ~/.claude/rules
 │   ├── settings.json -> ~/.claude/settings.json
 │   ├── settings.local.json -> ~/.claude/settings.local.json
-│   ├── projects -> ../_shared/projects
-│   └── history.jsonl -> ../_shared/history.jsonl
+│   ├── projects -> ~/.claude-accounts/_shared/projects
+│   └── history.jsonl -> ~/.claude-accounts/_shared/history.jsonl
 ├── bob@example.com/
 └── _shared/
     ├── projects/
     └── history.jsonl
 ```
 
-## 示例
+账号目录中已有的普通文件会被保留；缺少的链接和共享路径会按需创建。
+
+## `ai` 启动器
+
+工具键及其默认命令：
+
+| 键 | 工具 | 默认命令 |
+|---|---|---|
+| `c` | Claude Code | `ccd` |
+| `x` | Codex | `codex --yolo` |
+| `d` | Droid | `droid` |
+| `g` | Grok | `grok --always-approve` |
+| `o` | OpenCode | `opencode` |
+| `r` | Cursor | `cursor-agent --force` |
+| `q` | Qoder | `qodercli` |
+| `p` | Oh My Pi | `omp --approval-mode=yolo` |
+
+示例：
 
 ```bash
-cc alice@example.com
-ccd bob@example.com --resume 9d47f4f1-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+ai x                                      # 在当前 shell 中运行单个工具
+ai x resume <session-id>                  # 向单个工具透传参数
+ai x -- --help                            # 把类似 ai 选项的参数传给工具
+ai --new x resume <session-id>            # 在新的 tmux 窗口或会话中运行
 
-ai cxdg
-ai cxr                                   # 3 个工具会先选择布局
-ai cxr --layout main-right               # 跳过布局选择
+ai cxdg                                   # 每个字符对应一个窗格
+ai cxr                                    # 交互选择三窗格布局
+ai cxr --layout main-right                # 跳过三窗格布局选择
 ai -l columns cxr
-ai x resume 019e680c-d2bd-71a2-9a9a-8cf78a2d8da1
-ai --new x resume 019e680c-d2bd-71a2-9a9a-8cf78a2d8da1
-ai x -- --help                           # 把类似 ai 选项的参数传给工具
-ai q
-ai xq
-ai p
-ai cc
-
-cc-status
-cc-usage
-cc-usage "/cost this month" --timeout 30
-cc-usage -y                                # 跳过交互式选择，自动布局
-
-cc-switch alice@example.com
-killcc
+ai --new cxdg
+ai cc                                     # 重复的键会启动重复的工具
 ```
 
-`ai` 的 3 窗格布局支持 `main-left`、`main-right`、`columns`、`rows`，也支持自定义列规格，例如 `--layout 1,2` 或 `--layout 2,1`。使用 `--layout auto` 可以跳过交互提示并沿用自动布局。
+可用布局：
 
-工具参数只会在工具串包含单个工具时透传，例如 `ai x resume <session-id>` 或 `ai c --resume <session-id>`。`ai xg resume <session-id>` 这类多工具带参数调用会被拒绝，避免把不兼容参数同时发给多个 CLI。如果工具参数和 `ai` 自身选项同名，放在 `--` 之后，例如 `ai x -- --help`。
+- `auto`：自动网格，并跳过三窗格提示
+- `main-left`、`main-right`：仅适用于恰好三个窗格的非对称布局
+- `columns`、`rows`：每个工具独占一列或一行
+- `1,2`、`2,1` 等自定义列数量；各数字之和必须等于工具数量
 
-## 快速验证
+只有工具串包含一个工具时才能透传参数。多工具调用带额外参数会被拒绝，避免把不兼容参数同时发给多个 CLI。
+
+在 tmux 内，只有当前窗口恰好包含一个窗格时才会复用该窗口；使用 `--new` 可新建窗口。在 tmux 外，窗格调用会创建临时会话并自动 attach。
+
+## 进程清理
+
+三个包装命令与统一清理引擎的对应关系：
+
+```text
+killcc  → aipane-cleanup ai  --verbose
+killmcp → aipane-cleanup mcp --verbose --session-age 18000
+killrod → aipane-cleanup rod --force --verbose
+```
+
+建议先执行 dry run：
 
 ```bash
-source ./init.zsh
-type cc ccd ai cc-status cc-usage cc-switch killcc
+killcc --dry-run
+killmcp --dry-run
+killrod --dry-run
 ```
 
----
+直接调用方式：
 
-[English README](README.md)
+```bash
+./bin/aipane-cleanup [all|ai|rod|mcp] \
+  [--force] [--max-age SECONDS] [--orphan-age SECONDS] \
+  [--session-age SECONDS] [--dry-run] [--verbose]
+```
+
+`ai` 模式会识别已分离的 Claude、Codex、Droid、Gemini、Grok 和 OpenCode 进程，沿进程树收集相关进程，并检查已知的孤立 AI 子进程。传入 `--session-age` 后，还会清理超过指定时长的已分离 tmux Claude 会话树。
+
+清理操作记录在 `~/logs/aipane-cleanup.log`。可通过以下环境变量覆盖时间阈值：
+
+- `AIPANE_AI_ORPHAN_MAX_AGE`（默认 `900`）
+- `AIPANE_AI_SESSION_MAX_AGE`（未设置时禁用）
+- `AIPANE_ROD_MAX_AGE`（默认 `300`）
+- `AIPANE_MCP_MAX_AGE`（默认 `21600`）
+- `AIPANE_MCP_ORPHAN_MAX_AGE`（默认 `900`）
+- `AIPANE_MCP_SESSION_MAX_AGE`（未设置时禁用）
+- `AIPANE_TMUX_BIN`（可选的 tmux 显式路径）
+
+## 项目结构
+
+```text
+.
+├── init.zsh                 # zsh 加载入口
+├── aipane.zsh               # 兼容旧版的入口
+├── lib/
+│   └── core.zsh             # 公共配置、账号和布局辅助函数
+├── cmd/
+│   ├── aliases.zsh
+│   ├── cc.zsh
+│   ├── codex.zsh
+│   ├── kill.zsh
+│   ├── killmcp.zsh
+│   ├── killrod.zsh
+│   └── pane.zsh
+├── bin/
+│   ├── aipane-cleanup
+│   └── rod-cleanup
+└── tests/
+    └── aipane-cleanup-ai-protection.sh
+```
+
+## 验证
+
+```bash
+zsh -n init.zsh aipane.zsh cmd/*.zsh lib/*.zsh
+sh -n bin/aipane-cleanup bin/rod-cleanup tests/*.sh
+
+zsh -fc '
+  source ./init.zsh
+  type cc ccd ai codexx killcc killmcp killrod geminii oc
+  ai --help >/dev/null
+'
+
+./tests/aipane-cleanup-ai-protection.sh
+```
 
 ## 许可证
 
