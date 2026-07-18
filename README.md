@@ -52,7 +52,7 @@ export AIPANE_SHARED_DIR="$AIPANE_ACCOUNTS_BASE/_shared"
 
 export AIPANE_CODEX_LAUNCH_CMD="codex --yolo"
 export AIPANE_DROID_LAUNCH_CMD="droid"
-export AIPANE_GEMINI_LAUNCH_CMD="gemini --yolo"
+export AIPANE_GROK_LAUNCH_CMD="grok --always-approve"
 export AIPANE_OPENCODE_LAUNCH_CMD="opencode"
 export AIPANE_CURSOR_LAUNCH_CMD="cursor-agent --force"
 export AIPANE_QODER_LAUNCH_CMD="qodercli"
@@ -65,7 +65,7 @@ export AIPANE_OMP_LAUNCH_CMD="omp --approval-mode=yolo"
 - tmux (`ai`, `cc-usage`) (outside tmux, these commands auto-create a session and attach)
 - `jq` (`cc-status`)
 - Claude Code (`cc`, `ccd`, `cc-usage`, `cc-switch`)
-- Optional: Codex, Droid, Gemini, Opencode, Cursor CLI, Qoder CLI, Oh My Pi (`omp`) (for `ai`)
+- Optional: Codex, Droid, Grok, Opencode, Cursor CLI, Qoder CLI, Oh My Pi (`omp`) (for `ai`)
 
 ## Account Layout
 
