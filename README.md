@@ -45,7 +45,7 @@ git -C ~/.aipane pull --ff-only
 - macOS and zsh
 - Claude Code for `cc`, `ccd`, and the `c` tool in `ai`
 - tmux for multi-tool `ai` launches, or whenever `--new`/`--layout` is used
-- The corresponding optional CLI for each additional `ai` tool: Codex, Droid, Grok, OpenCode, Cursor CLI, Qoder CLI, or Oh My Pi (`omp`)
+- The corresponding optional CLI for each additional `ai` tool: Codex, Droid, Grok, OpenCode, Cursor CLI, Qoder CLI, or Pi (`pi`)
 
 Single-tool calls such as `ai x` run in the current shell and do not require tmux unless `--new` or `--layout` is supplied.
 
@@ -116,7 +116,7 @@ export AIPANE_GROK_LAUNCH_CMD="grok --always-approve"
 export AIPANE_OPENCODE_LAUNCH_CMD="opencode"
 export AIPANE_CURSOR_LAUNCH_CMD="cursor-agent --force"
 export AIPANE_QODER_LAUNCH_CMD="qodercli"
-export AIPANE_OMP_LAUNCH_CMD="omp --approval-mode=yolo"
+export AIPANE_PI_LAUNCH_CMD="pi"
 ```
 
 `ai --help` displays the effective launcher commands after these overrides are loaded.
@@ -170,7 +170,7 @@ Tool keys and default commands:
 | `o` | OpenCode | `opencode` |
 | `r` | Cursor | `cursor-agent --force` |
 | `q` | Qoder | `qodercli` |
-| `p` | Oh My Pi | `omp --approval-mode=yolo` |
+| `p` | Pi | `pi` |
 
 Examples:
 

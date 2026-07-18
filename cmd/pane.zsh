@@ -14,7 +14,7 @@ Tools:
   o  OpenCode      (${AIPANE_OPENCODE_LAUNCH_CMD})
   r  Cursor        (${AIPANE_CURSOR_LAUNCH_CMD})
   q  Qoder         (${AIPANE_QODER_LAUNCH_CMD})
-  p  Oh My Pi      (${AIPANE_OMP_LAUNCH_CMD})
+  p  Pi             (${AIPANE_PI_LAUNCH_CMD})
 
 Layouts:
   auto             Default automatic layout; skips the 3-pane prompt
@@ -85,7 +85,7 @@ _aipane_tool_command() {
       _aipane_command_with_args "$AIPANE_QODER_LAUNCH_CMD" "$@"
       ;;
     p)
-      _aipane_command_with_args "$AIPANE_OMP_LAUNCH_CMD" "$@"
+      _aipane_command_with_args "$AIPANE_PI_LAUNCH_CMD" "$@"
       ;;
     *)
       print -u2 "ai: internal error: unknown tool '${tool}'"
