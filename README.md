@@ -1,6 +1,6 @@
 # aipane
 
-A zsh toolkit for daily AI CLI workflows: account-isolated Claude Code launches, tmux pane orchestration for multiple AI tools, and process cleanup.
+A zsh toolkit for daily AI CLI workflows: account-isolated Claude Code launches, tmux pane orchestration for multiple AI tools, process cleanup, and an optional multi-line tmux window list.
 
 [中文文档 / Chinese README](README_CN.md)
 
@@ -47,6 +47,43 @@ git -C ~/.aipane pull --ff-only
 - The corresponding optional CLI for each additional `ai` tool: Codex, Droid, Grok, OpenCode, Cursor CLI, Qoder CLI, or Oh My Pi (`omp`)
 
 Single-tool calls such as `ai x` run in the current shell and do not require tmux unless `--new` or `--layout` is supplied.
+
+## Optional: multi-line tmux window list
+
+When many windows are open (for example from `ai --new`), status-bar window labels can wrap across up to three rows instead of being truncated.
+
+This is **not** enabled by `init.zsh`. Keep personal tmux chrome (prefix, theme, keys, plugins) in `~/.tmux.conf`; only wire the published fragment:
+
+```bash
+# AIPANE_ROOT = where you cloned this repo (default install: ~/.aipane)
+AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
+
+# 1) put the renderer on PATH (symlink — do not copy the script body)
+ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
+
+# 2) in ~/.tmux.conf — source the public fragment only
+# source-file $AIPANE_ROOT/conf/tmux-window-wrap.conf
+```
+
+Example `~/.tmux.conf` lines:
+
+```tmux
+# OWNED_BY: aipane (tmux-window-wrap) — edit the repo, not an inlined copy
+source-file ~/.aipane/conf/tmux-window-wrap.conf
+```
+
+Extra dependencies for this feature: `tmux` with multi-line `status-format`, and `python3` (stdlib only).
+
+```bash
+python3 "$AIPANE_ROOT/tests/test_tmux_window_wrap.py"
+```
+
+| Path | Role |
+|------|------|
+| `bin/tmux-window-wrap` | Layout / render / invalidate CLI |
+| `conf/tmux-window-wrap.conf` | Public `status-format` + hooks only |
+| `tests/test_tmux_window_wrap.py` | Unit + live tmux tests |
+| [`docs/tmux-window-wrap.md`](docs/tmux-window-wrap.md) | Install + edit ownership |
 
 ## Optional Configuration
 

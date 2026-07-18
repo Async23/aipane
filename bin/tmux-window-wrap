@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import subprocess
+import sys
+import unicodedata
+import uuid
+
+
+WINDOW_SEPARATOR = "\x1f"
+MAX_STATUS_LINES = 3
+WINDOW_FORMAT = WINDOW_SEPARATOR.join(
+    (
+        "#{window_id}",
+        "#{window_index}",
+        "#{window_name}",
+        "#{window_active}",
+        "#{pane_synchronized}",
+        "#{w: #{window_index}:#{window_name}#{?pane_synchronized, ▶,} }",
+    )
+)
+STATUS_WIDTH_FORMAT = WINDOW_SEPARATOR.join(
+    (
+        "#{w:#{T;=/#{status-left-length}:status-left}}",
+        "#{w:#{T;=/#{status-right-length}:status-right}}",
+    )
+)
+
+
+def display_width(text):
+    width = 0
+    for character in text:
+        category = unicodedata.category(character)
+        if category.startswith("M") or category in {"Cc", "Cf"}:
+            continue
+        width += 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+    return width
+
+
+def window_width(window):
+    if "display_width" in window:
+        return window["display_width"]
+    return display_width(window["label"])
+
+
+def wrap_windows(windows, capacity):
+    lines = []
+    current_line = []
+    used = 0
+    for window in windows:
+        width = window_width(window)
+        if current_line and used + width > capacity:
+            lines.append(current_line)
+            current_line = []
+            used = 0
+        if not current_line and width > capacity:
+            lines.append([window])
+            continue
+        current_line.append(window)
+        used += width
+    if current_line:
+        lines.append(current_line)
+    return lines
+
+
+def visible_continuation_lines(windows, capacity, active_id):
+    maximum_lines = MAX_STATUS_LINES - 1
+    all_lines = wrap_windows(windows, capacity)
+    if len(all_lines) <= maximum_lines:
+        return all_lines
+    if active_id not in {window["id"] for window in windows}:
+        return all_lines[:maximum_lines]
+
+    active_index = next(
+        index for index, window in enumerate(windows) if window["id"] == active_id
+    )
+    visible = [windows[active_index]]
+    for index in range(active_index - 1, -1, -1):
+        candidate = [windows[index], *visible]
+        if len(wrap_windows(candidate, capacity)) > maximum_lines:
+            break
+        visible = candidate
+
+    for window in windows[active_index + 1 :]:
+        candidate = [*visible, window]
+        if len(wrap_windows(candidate, capacity)) > maximum_lines:
+            break
+        visible = candidate
+    return wrap_windows(visible, capacity)
+
+
+def second_line_indent(payload, overflow):
+    requested_indent = max(0, min(payload["left_width"], payload["width"]))
+    if not overflow:
+        return requested_indent
+
+    target = next(
+        (window for window in overflow if window["id"] == payload["active"]),
+        overflow[0],
+    )
+    maximum_indent = max(0, payload["width"] - window_width(target))
+    return min(requested_indent, maximum_indent)
+
+
+def plan(payload):
+    windows = payload["windows"]
+    first_line_capacity = max(
+        0,
+        payload["width"] - payload["left_width"] - payload["right_width"],
+    )
+    used = 0
+    split_at = 0
+    for window in windows:
+        label_width = window_width(window)
+        if used + label_width > first_line_capacity:
+            break
+        used += label_width
+        split_at += 1
+
+    first_line = [window["id"] for window in windows[:split_at]]
+    overflow = windows[split_at:]
+    if not overflow:
+        return {"line_count": 1, "lines": [first_line]}
+    indent = second_line_indent(payload, overflow)
+    continuation_capacity = max(0, payload["width"] - indent)
+    continuation_lines = [
+        [window["id"] for window in line]
+        for line in visible_continuation_lines(
+            overflow,
+            continuation_capacity,
+            payload["active"],
+        )
+    ]
+    lines = [first_line, *continuation_lines]
+    return {"line_count": len(lines), "lines": lines}
+
+
+def render_window(window, active_id):
+    window_range = f"#[range=window|{window['index']}]"
+    synchronized = window.get("synchronized", False)
+    escaped_name = window["name"].replace("#", "##")
+    if window["id"] == active_id:
+        rendered = (
+            f"{window_range}#[fg=blue]#[bg=blue]#[fg=colour15]#[bold]"
+            f" {window['index']}:{escaped_name} "
+        )
+        if synchronized:
+            rendered += "#[fg=red]▶ "
+        return rendered + "#[bg=default]#[fg=blue]#[default]#[norange]"
+
+    rendered = (
+        f"{window_range} #[fg=colour7]{window['index']}:{escaped_name}"
+    )
+    if synchronized:
+        rendered += " #[fg=red]▶#[default]"
+    return rendered + " #[norange]"
+
+
+def render(payload, line):
+    layout = plan(payload)
+    if line >= layout["line_count"]:
+        return ""
+
+    windows_by_id = {window["id"]: window for window in payload["windows"]}
+    if line > 0:
+        overflow = payload["windows"][len(layout["lines"][0]) :]
+        prefix = " " * second_line_indent(payload, overflow)
+    else:
+        prefix = ""
+    return prefix + "".join(
+        render_window(windows_by_id[window_id], payload["active"])
+        for window_id in layout["lines"][line]
+    )
+
+
+def run_tmux(socket_name, *arguments):
+    command = ["tmux"]
+    if socket_name:
+        command.extend(("-L", socket_name))
+    command.extend(arguments)
+    return subprocess.run(
+        command,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+
+def narrowest_client_width(session_id, socket_name, fallback):
+    completed = run_tmux(
+        socket_name,
+        "list-clients",
+        "-t",
+        session_id,
+        "-F",
+        "#{client_width}",
+    )
+    widths = [
+        int(value)
+        for value in completed.stdout.splitlines()
+        if value.isdecimal() and int(value) > 0
+    ]
+    return min(widths) if widths else fallback
+
+
+def refresh_clients(socket_name):
+    completed = run_tmux(
+        socket_name,
+        "list-clients",
+        "-F",
+        "#{client_name}",
+    )
+    for client_name in completed.stdout.splitlines():
+        if client_name:
+            run_tmux(
+                socket_name,
+                "refresh-client",
+                "-S",
+                "-t",
+                client_name,
+            )
+
+
+def invalidate_cache(socket_name):
+    run_tmux(
+        socket_name,
+        "set-environment",
+        "-g",
+        "TMUX_WINDOW_WRAP_GENERATION",
+        uuid.uuid4().hex,
+    )
+    reconcile_status_heights(socket_name)
+    refresh_clients(socket_name)
+
+
+def reconcile_status_heights(socket_name):
+    completed = run_tmux(
+        socket_name,
+        "list-sessions",
+        "-F",
+        WINDOW_SEPARATOR.join(("#{session_id}", "#{session_attached}")),
+    )
+    for record in completed.stdout.splitlines():
+        session_id, attached = record.split(WINDOW_SEPARATOR, 1)
+        if attached == "0":
+            continue
+        widths = run_tmux(
+            socket_name,
+            "display-message",
+            "-p",
+            "-t",
+            session_id,
+            STATUS_WIDTH_FORMAT,
+        ).stdout.strip()
+        left_width, right_width = (
+            int(value) for value in widths.split(WINDOW_SEPARATOR)
+        )
+        payload = load_tmux_payload(
+            argparse.Namespace(
+                session_id=session_id,
+                width=1,
+                left_width=left_width,
+                right_width=right_width,
+                socket_name=socket_name,
+            )
+        )
+        update_status_height(payload, session_id, socket_name)
+
+
+def load_tmux_payload(arguments):
+    completed = run_tmux(
+        arguments.socket_name,
+        "list-windows",
+        "-t",
+        arguments.session_id,
+        "-F",
+        WINDOW_FORMAT,
+    )
+    windows = []
+    active_id = None
+    for record in completed.stdout.removesuffix("\n").split("\n"):
+        window_id, index, name, active, synchronized, label_width = record.split(
+            WINDOW_SEPARATOR, 5
+        )
+        is_synchronized = synchronized == "1"
+        label = f" {index}:{name}"
+        if is_synchronized:
+            label += " ▶"
+        label += " "
+        windows.append(
+            {
+                "id": window_id,
+                "index": index,
+                "name": name,
+                "label": label,
+                "display_width": int(label_width),
+                "synchronized": is_synchronized,
+            }
+        )
+        if active == "1":
+            active_id = window_id
+
+    return {
+        "width": narrowest_client_width(
+            arguments.session_id,
+            arguments.socket_name,
+            arguments.width,
+        ),
+        "left_width": arguments.left_width,
+        "right_width": arguments.right_width,
+        "active": active_id,
+        "windows": windows,
+    }
+
+
+def update_status_height(payload, session_id, socket_name):
+    line_count = plan(payload)["line_count"]
+    desired = "on" if line_count == 1 else str(line_count)
+    current = run_tmux(
+        socket_name,
+        "show-options",
+        "-t",
+        session_id,
+        "-v",
+        "status",
+    ).stdout.strip()
+    if current == "off":
+        return
+    if current != desired:
+        run_tmux(socket_name, "set-option", "-t", session_id, "status", desired)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="tmux-window-wrap")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("plan")
+    invalidate_parser = commands.add_parser("invalidate")
+    invalidate_parser.add_argument("--socket-name")
+    render_parser = commands.add_parser("render")
+    render_parser.add_argument(
+        "--line",
+        type=int,
+        choices=range(MAX_STATUS_LINES),
+        required=True,
+    )
+    render_parser.add_argument("--session-id")
+    render_parser.add_argument("--width", type=int)
+    render_parser.add_argument("--left-width", type=int)
+    render_parser.add_argument("--right-width", type=int)
+    render_parser.add_argument("--socket-name")
+    arguments = parser.parse_args()
+
+    if arguments.command == "plan":
+        json.dump(plan(json.load(sys.stdin)), sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return
+
+    if arguments.command == "invalidate":
+        invalidate_cache(arguments.socket_name)
+        return
+
+    if arguments.session_id:
+        missing = [
+            name
+            for name in ("width", "left_width", "right_width")
+            if getattr(arguments, name) is None
+        ]
+        if missing:
+            parser.error(
+                "runtime render requires --width, --left-width and --right-width"
+            )
+        payload = load_tmux_payload(arguments)
+        if arguments.line == 0:
+            update_status_height(
+                payload,
+                arguments.session_id,
+                arguments.socket_name,
+            )
+    else:
+        payload = json.load(sys.stdin)
+    sys.stdout.write(render(payload, arguments.line) + "\n")
+
+
+if __name__ == "__main__":
+    main()
