@@ -7,11 +7,7 @@ fi
 typeset -g _AIPANE_CORE_LOADED=1
 
 # User-configurable values (export before sourcing init.zsh to override).
-typeset -g AIPANE_CLAUDE_CMD="${AIPANE_CLAUDE_CMD:-claude}"
-typeset -g AIPANE_ACCOUNTS_BASE="${AIPANE_ACCOUNTS_BASE:-$HOME/.claude-accounts}"
-typeset -g AIPANE_SHARED_DIR="${AIPANE_SHARED_DIR:-$AIPANE_ACCOUNTS_BASE/_shared}"
-typeset -g AIPANE_CACHE_DIR="${AIPANE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}}"
-
+typeset -g AIPANE_CLAUDE_LAUNCH_CMD="${AIPANE_CLAUDE_LAUNCH_CMD:-claude --dangerously-skip-permissions}"
 typeset -g AIPANE_CODEX_LAUNCH_CMD="${AIPANE_CODEX_LAUNCH_CMD:-codex --yolo}"
 typeset -g AIPANE_DROID_LAUNCH_CMD="${AIPANE_DROID_LAUNCH_CMD:-droid}"
 typeset -g AIPANE_GROK_LAUNCH_CMD="${AIPANE_GROK_LAUNCH_CMD:-grok --always-approve}"
@@ -19,176 +15,6 @@ typeset -g AIPANE_OPENCODE_LAUNCH_CMD="${AIPANE_OPENCODE_LAUNCH_CMD:-opencode}"
 typeset -g AIPANE_CURSOR_LAUNCH_CMD="${AIPANE_CURSOR_LAUNCH_CMD:-cursor-agent --force}"
 typeset -g AIPANE_QODER_LAUNCH_CMD="${AIPANE_QODER_LAUNCH_CMD:-qodercli}"
 typeset -g AIPANE_PI_LAUNCH_CMD="${AIPANE_PI_LAUNCH_CMD:-pi}"
-
-_aipane_link_if_missing() {
-  local target="$1"
-  local link_path="$2"
-
-  if [[ -L "$link_path" ]]; then
-    if [[ "$(readlink "$link_path")" != "$target" ]]; then
-      ln -sfn "$target" "$link_path"
-    fi
-    return 0
-  fi
-
-  if [[ -e "$link_path" ]]; then
-    return 0
-  fi
-
-  ln -s "$target" "$link_path"
-}
-
-_aipane_account_dir() {
-  local email="$1"
-  local account_dir
-
-  if [[ -z "$email" ]]; then
-    print -u2 "aipane: email is required"
-    return 1
-  fi
-
-  account_dir="$AIPANE_ACCOUNTS_BASE/$email"
-
-  mkdir -p "$account_dir" "$AIPANE_SHARED_DIR/projects" || return 1
-  [[ -f "$AIPANE_SHARED_DIR/history.jsonl" ]] || : > "$AIPANE_SHARED_DIR/history.jsonl"
-
-  if [[ -d "$HOME/.claude/rules" ]]; then
-    _aipane_link_if_missing "$HOME/.claude/rules" "$account_dir/rules"
-  fi
-  if [[ -f "$HOME/.claude/settings.json" ]]; then
-    _aipane_link_if_missing "$HOME/.claude/settings.json" "$account_dir/settings.json"
-  fi
-  if [[ -f "$HOME/.claude/settings.local.json" ]]; then
-    _aipane_link_if_missing "$HOME/.claude/settings.local.json" "$account_dir/settings.local.json"
-  fi
-
-  _aipane_link_if_missing "$AIPANE_SHARED_DIR/projects" "$account_dir/projects"
-  _aipane_link_if_missing "$AIPANE_SHARED_DIR/history.jsonl" "$account_dir/history.jsonl"
-
-  REPLY="$account_dir"
-}
-
-_aipane_list_accounts() {
-  local -a dirs accounts
-  local name
-
-  if [[ ! -d "$AIPANE_ACCOUNTS_BASE" ]]; then
-    reply=()
-    return 1
-  fi
-
-  dirs=("$AIPANE_ACCOUNTS_BASE"/*(/N:t))
-  for name in "${dirs[@]}"; do
-    [[ "$name" == "_shared" ]] && continue
-    accounts+=("$name")
-  done
-
-  accounts=("${(@on)accounts}")
-  reply=("${accounts[@]}")
-  (( ${#reply[@]} > 0 ))
-}
-
-_aipane_cached_name_index() {
-  local cache_name="$1"
-  shift || true
-  local cache_file="$AIPANE_CACHE_DIR/$cache_name"
-  local cached_name
-  local i
-
-  [[ -n "$cache_name" && -r "$cache_file" ]] || return 1
-  IFS= read -r cached_name < "$cache_file" || return 1
-  [[ -n "$cached_name" ]] || return 1
-
-  for (( i = 1; i <= $#; i++ )); do
-    if [[ "${@[i]}" == "$cached_name" ]]; then
-      REPLY="$i"
-      return 0
-    fi
-  done
-
-  return 1
-}
-
-_aipane_store_cached_name() {
-  local cache_name="$1"
-  local value="$2"
-
-  [[ -n "$cache_name" && -n "$value" ]] || return 0
-
-  mkdir -p "$AIPANE_CACHE_DIR" || return 1
-  print -r -- "$value" >| "$AIPANE_CACHE_DIR/$cache_name"
-}
-
-_aipane_select_account() {
-  local label="$1"
-  local cache_name="$2"
-  local -a accounts
-  local i choice default_choice
-
-  _aipane_list_accounts || {
-    print -u2 "aipane: no Claude accounts found in $AIPANE_ACCOUNTS_BASE"
-    return 1
-  }
-
-  accounts=("${reply[@]}")
-  default_choice=1
-
-  if [[ -n "$cache_name" ]]; then
-    _aipane_cached_name_index "$cache_name" "${accounts[@]}" && default_choice="$REPLY"
-  fi
-
-  if (( ${#accounts[@]} == 1 )); then
-    REPLY="${accounts[1]}"
-    if [[ -n "$label" ]]; then
-      print "Claude Code #${label} -> ${REPLY}"
-    fi
-    return 0
-  fi
-
-  if [[ -n "$label" ]]; then
-    print "Claude Code #${label} - select account:"
-  else
-    print "Select Claude account:"
-  fi
-
-  i=1
-  for choice in "${accounts[@]}"; do
-    print "  [${i}] ${choice}"
-    (( i++ ))
-  done
-
-  while true; do
-    read -r "choice?Choose [${default_choice}]: " < /dev/tty
-    [[ -z "$choice" ]] && choice="$default_choice"
-
-    if [[ "$choice" == <-> ]] && (( choice >= 1 && choice <= ${#accounts[@]} )); then
-      REPLY="${accounts[$choice]}"
-      [[ -n "$cache_name" ]] && _aipane_store_cached_name "$cache_name" "$REPLY"
-      print
-      return 0
-    fi
-
-    print "Invalid selection: ${choice}"
-  done
-}
-
-_aipane_shell_join() {
-  REPLY="${(j: :)${(@q)@}}"
-}
-
-_aipane_cc_command_string() {
-  local email="$1"
-  shift || true
-  local -a cmd=(cc "$email" "$@")
-  _aipane_shell_join "${cmd[@]}"
-}
-
-_aipane_ccd_command_string() {
-  local email="$1"
-  shift || true
-  local -a cmd=(ccd "$email" "$@")
-  _aipane_shell_join "${cmd[@]}"
-}
 
 _aipane_ceil_sqrt() {
   local n="$1"
@@ -252,9 +78,4 @@ _aipane_grid_for_count() {
   fi
 
   REPLY="$cols $rows ${(j: :)per_col}"
-}
-
-_aipane_project_dir_key() {
-  local dir="$1"
-  REPLY="${dir//\//-}"
 }

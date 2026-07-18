@@ -7,7 +7,7 @@ Usage:
   ai [--new|-n] [--layout|-l <layout>] <tools_string> [tool_args...]
 
 Tools:
-  c  Claude Code   (ccd)
+  c  Claude Code   (${AIPANE_CLAUDE_LAUNCH_CMD})
   x  Codex         (${AIPANE_CODEX_LAUNCH_CMD})
   d  Droid         (${AIPANE_DROID_LAUNCH_CMD})
   g  Grok          (${AIPANE_GROK_LAUNCH_CMD})
@@ -64,7 +64,7 @@ _aipane_tool_command() {
 
   case "$tool" in
     c)
-      _aipane_command_with_args "ccd" "$@"
+      _aipane_command_with_args "$AIPANE_CLAUDE_LAUNCH_CMD" "$@"
       ;;
     x)
       _aipane_command_with_args "$AIPANE_CODEX_LAUNCH_CMD" "$@"

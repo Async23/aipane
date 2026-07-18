@@ -1,6 +1,6 @@
 # aipane
 
-A zsh toolkit for daily AI CLI workflows: account-isolated Claude Code launches, tmux pane orchestration for multiple AI tools, process cleanup, plus an optional **Ghostty + tmux workstation** (Cmd key bridge, broadcast, multi-line window list).
+A zsh toolkit for daily AI CLI workflows: tmux pane orchestration for multiple AI tools, process cleanup, plus an optional **Ghostty + tmux workstation** (Cmd key bridge, broadcast, multi-line window list).
 
 [中文文档 / Chinese README](README_CN.md)
 
@@ -8,8 +8,6 @@ A zsh toolkit for daily AI CLI workflows: account-isolated Claude Code launches,
 
 | Command / surface | Description |
 |---|---|
-| `cc [email] [args...]` | Launch Claude Code with an account-isolated config directory; selects a configured account when `email` is omitted |
-| `ccd [args...]` | Launch Claude Code with the normal config directory and `--dangerously-skip-permissions` |
 | `ai [--new\|-n] [--layout\|-l <layout>] <tools_string> [tool_args...]` | Launch one AI CLI directly or orchestrate multiple CLIs in tmux panes |
 | `codexx [args...]` | Launch `codex --yolo` |
 | `killcc [options]` | Clean up detached AI CLI trees and orphaned AI child processes |
@@ -23,7 +21,7 @@ Convenience aliases:
 - `oc` → `opencode`
 
 > [!WARNING]
-> `ccd`, `codexx`, and several `ai` launchers disable their tools' approval checks. The cleanup commands terminate processes. Review the command definitions and use `--dry-run` before cleanup when in doubt.
+> `codexx` and several `ai` launchers (including `ai c` for Claude Code) disable their tools' approval checks. The cleanup commands terminate processes. Review the command definitions and use `--dry-run` before cleanup when in doubt.
 
 ## Install
 
@@ -43,7 +41,7 @@ git -C ~/.aipane pull --ff-only
 ## Dependencies
 
 - macOS and zsh
-- Claude Code for `cc`, `ccd`, and the `c` tool in `ai`
+- Claude Code for the `c` tool in `ai` (optional if you never use `c`)
 - tmux for multi-tool `ai` launches, or whenever `--new`/`--layout` is used
 - The corresponding optional CLI for each additional `ai` tool: Codex, Droid, Grok, OpenCode, Cursor CLI, Qoder CLI, or Pi (`pi`)
 
@@ -105,11 +103,7 @@ If Ghostty is already running, reload config with **Cmd+Shift+,** (`reload_confi
 Set overrides before sourcing `init.zsh`:
 
 ```bash
-export AIPANE_CLAUDE_CMD="claude"                       # e.g. claude-guard
-export AIPANE_ACCOUNTS_BASE="$HOME/.claude-accounts"
-export AIPANE_SHARED_DIR="$AIPANE_ACCOUNTS_BASE/_shared"
-export AIPANE_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}"
-
+export AIPANE_CLAUDE_LAUNCH_CMD="claude --dangerously-skip-permissions"  # e.g. claude-guard --dangerously-skip-permissions
 export AIPANE_CODEX_LAUNCH_CMD="codex --yolo"
 export AIPANE_DROID_LAUNCH_CMD="droid"
 export AIPANE_GROK_LAUNCH_CMD="grok --always-approve"
@@ -121,49 +115,13 @@ export AIPANE_PI_LAUNCH_CMD="pi"
 
 `ai --help` displays the effective launcher commands after these overrides are loaded.
 
-## Claude Account Model
-
-Only `cc` uses an account-specific `CLAUDE_CONFIG_DIR`. If the email is omitted—or the first argument starts with `-`—`cc` uses the only account directory under `AIPANE_ACCOUNTS_BASE` automatically, or prompts when multiple account directories exist. If none exist, pass an email explicitly to create the first account directory.
-
-```bash
-cc alice@example.com
-cc alice@example.com --resume <session-id>
-cc --continue                         # select an account, then forward --continue
-```
-
-`ccd` deliberately uses Claude Code's normal config directory. It does not accept an account selector:
-
-```bash
-ccd
-ccd --resume <session-id>
-```
-
-The account layout used by `cc` and Claude Code is:
-
-```text
-~/.claude-accounts/
-├── alice@example.com/
-│   ├── .claude.json                                      # managed by Claude Code
-│   ├── rules -> ~/.claude/rules                          # optional
-│   ├── settings.json -> ~/.claude/settings.json          # optional
-│   ├── settings.local.json -> ~/.claude/settings.local.json  # optional
-│   ├── projects -> ~/.claude-accounts/_shared/projects
-│   └── history.jsonl -> ~/.claude-accounts/_shared/history.jsonl
-├── bob@example.com/
-└── _shared/
-    ├── projects/
-    └── history.jsonl
-```
-
-`cc` creates the account directory, shared `projects`/`history.jsonl` paths, and their links. Claude Code creates and manages `.claude.json`. Links for `rules`, `settings.json`, and `settings.local.json` are created only when the corresponding source exists under `~/.claude/`. Existing regular files in an account directory are preserved.
-
 ## `ai` Launcher
 
 Tool keys and default commands:
 
 | Key | Tool | Default command |
 |---|---|---|
-| `c` | Claude Code | `ccd` |
+| `c` | Claude Code | `claude --dangerously-skip-permissions` |
 | `x` | Codex | `codex --yolo` |
 | `d` | Droid | `droid` |
 | `g` | Grok | `grok --always-approve` |
@@ -246,7 +204,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 ├── init.zsh                 # zsh entrypoint
 ├── aipane.zsh               # compatibility entrypoint
 ├── lib/core.zsh
-├── cmd/                     # cc, ai/pane, kill*, aliases, …
+├── cmd/                     # ai/pane, kill*, codexx, aliases, …
 ├── bin/
 │   ├── aipane-cleanup
 │   ├── rod-cleanup
@@ -258,8 +216,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 ├── docs/
 │   ├── cheatsheet.md
 │   ├── ghostty-tmux-workstation.md
-│   ├── tmux-window-wrap.md
-│   └── plans/
+│   └── tmux-window-wrap.md
 └── tests/
     ├── aipane-cleanup-ai-protection.sh
     ├── test_tmux_window_wrap.py
@@ -274,7 +231,7 @@ sh -n bin/aipane-cleanup bin/rod-cleanup tests/*.sh
 
 zsh -fc '
   source ./init.zsh
-  type cc ccd ai codexx killcc killmcp killrod geminii oc
+  type ai codexx killcc killmcp killrod geminii oc
   ai --help >/dev/null
 '
 

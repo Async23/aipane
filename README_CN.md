@@ -1,6 +1,6 @@
 # aipane
 
-用于日常 AI CLI 工作流的 zsh 工具集：隔离账号配置启动 Claude Code、通过 tmux 窗格编排多个 AI 工具、清理相关进程，以及可选的 **Ghostty + tmux 工作台**（Cmd 键位桥、广播输入、窗口标签多行换行）。
+用于日常 AI CLI 工作流的 zsh 工具集：通过 tmux 窗格编排多个 AI 工具、清理相关进程，以及可选的 **Ghostty + tmux 工作台**（Cmd 键位桥、广播输入、窗口标签多行换行）。
 
 [English README](README.md)
 
@@ -8,8 +8,6 @@
 
 | 命令 / 表面 | 说明 |
 |---|---|
-| `cc [email] [args...]` | 使用账号隔离的配置目录启动 Claude Code；省略 `email` 时从已配置账号中选择 |
-| `ccd [args...]` | 使用常规配置目录并带 `--dangerously-skip-permissions` 启动 Claude Code |
 | `ai [--new\|-n] [--layout\|-l <layout>] <tools_string> [tool_args...]` | 直接启动一个 AI CLI，或在 tmux 窗格中编排多个 CLI |
 | `codexx [args...]` | 启动 `codex --yolo` |
 | `killcc [options]` | 清理已分离的 AI CLI 进程树和孤立的 AI 子进程 |
@@ -23,7 +21,7 @@
 - `oc` → `opencode`
 
 > [!WARNING]
-> `ccd`、`codexx` 和部分 `ai` 启动器会关闭对应工具的审批检查；清理命令会终止进程。请先确认命令定义，不确定时先用 `--dry-run` 检查清理范围。
+> `codexx` 和部分 `ai` 启动器（含 `ai c` 启动 Claude Code）会关闭对应工具的审批检查；清理命令会终止进程。请先确认命令定义，不确定时先用 `--dry-run` 检查清理范围。
 
 ## 安装
 
@@ -43,7 +41,7 @@ git -C ~/.aipane pull --ff-only
 ## 依赖
 
 - macOS 和 zsh
-- Claude Code：供 `cc`、`ccd` 以及 `ai` 的 `c` 工具使用
+- Claude Code：供 `ai` 的 `c` 工具使用（不用 `c` 时可省略）
 - tmux：供多工具 `ai` 调用，以及使用 `--new` 或 `--layout` 时使用
 - 其他 `ai` 工具对应的可选 CLI：Codex、Droid、Grok、OpenCode、Cursor CLI、Qoder CLI 或 Pi（`pi`）
 
@@ -105,11 +103,7 @@ python3 "$AIPANE_ROOT/tests/test_tmux_window_wrap.py"
 在加载 `init.zsh` 之前设置覆盖值：
 
 ```bash
-export AIPANE_CLAUDE_CMD="claude"                       # 例如 claude-guard
-export AIPANE_ACCOUNTS_BASE="$HOME/.claude-accounts"
-export AIPANE_SHARED_DIR="$AIPANE_ACCOUNTS_BASE/_shared"
-export AIPANE_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}"
-
+export AIPANE_CLAUDE_LAUNCH_CMD="claude --dangerously-skip-permissions"  # 例如 claude-guard --dangerously-skip-permissions
 export AIPANE_CODEX_LAUNCH_CMD="codex --yolo"
 export AIPANE_DROID_LAUNCH_CMD="droid"
 export AIPANE_GROK_LAUNCH_CMD="grok --always-approve"
@@ -121,49 +115,13 @@ export AIPANE_PI_LAUNCH_CMD="pi"
 
 加载这些覆盖值后，`ai --help` 会显示实际生效的启动命令。
 
-## Claude 账号模型
-
-只有 `cc` 使用账号专属的 `CLAUDE_CONFIG_DIR`。省略邮箱，或者第一个参数以 `-` 开头时，如果 `AIPANE_ACCOUNTS_BASE` 下只有一个账号目录，`cc` 会直接使用；存在多个账号目录时才会交互选择。如果还没有账号目录，请显式传入邮箱来创建第一个目录。
-
-```bash
-cc alice@example.com
-cc alice@example.com --resume <session-id>
-cc --continue                         # 选择账号后再透传 --continue
-```
-
-`ccd` 特意使用 Claude Code 的常规配置目录，不接受账号选择参数：
-
-```bash
-ccd
-ccd --resume <session-id>
-```
-
-`cc` 与 Claude Code 使用的账号目录结构如下：
-
-```text
-~/.claude-accounts/
-├── alice@example.com/
-│   ├── .claude.json                                      # 由 Claude Code 管理
-│   ├── rules -> ~/.claude/rules                          # 可选
-│   ├── settings.json -> ~/.claude/settings.json          # 可选
-│   ├── settings.local.json -> ~/.claude/settings.local.json  # 可选
-│   ├── projects -> ~/.claude-accounts/_shared/projects
-│   └── history.jsonl -> ~/.claude-accounts/_shared/history.jsonl
-├── bob@example.com/
-└── _shared/
-    ├── projects/
-    └── history.jsonl
-```
-
-`cc` 会创建账号目录、共享的 `projects`/`history.jsonl` 路径及其链接；`.claude.json` 由 Claude Code 创建和管理。只有 `~/.claude/` 下存在对应源文件时，才会创建 `rules`、`settings.json` 和 `settings.local.json` 链接。账号目录中已有的普通文件会被保留。
-
 ## `ai` 启动器
 
 工具键及其默认命令：
 
 | 键 | 工具 | 默认命令 |
 |---|---|---|
-| `c` | Claude Code | `ccd` |
+| `c` | Claude Code | `claude --dangerously-skip-permissions` |
 | `x` | Codex | `codex --yolo` |
 | `d` | Droid | `droid` |
 | `g` | Grok | `grok --always-approve` |
@@ -246,7 +204,7 @@ killrod --dry-run
 ├── init.zsh                 # zsh 入口
 ├── aipane.zsh               # 兼容入口
 ├── lib/core.zsh
-├── cmd/                     # cc、ai/pane、kill*、aliases …
+├── cmd/                     # ai/pane、kill*、codexx、aliases …
 ├── bin/
 │   ├── aipane-cleanup
 │   ├── rod-cleanup
@@ -258,8 +216,7 @@ killrod --dry-run
 ├── docs/
 │   ├── cheatsheet.md
 │   ├── ghostty-tmux-workstation.md
-│   ├── tmux-window-wrap.md
-│   └── plans/
+│   └── tmux-window-wrap.md
 └── tests/
     ├── aipane-cleanup-ai-protection.sh
     ├── test_tmux_window_wrap.py
@@ -274,7 +231,7 @@ sh -n bin/aipane-cleanup bin/rod-cleanup tests/*.sh
 
 zsh -fc '
   source ./init.zsh
-  type cc ccd ai codexx killcc killmcp killrod geminii oc
+  type ai codexx killcc killmcp killrod geminii oc
   ai --help >/dev/null
 '
 
