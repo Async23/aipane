@@ -16,7 +16,18 @@ AI_ORPHAN_DEFAULT_MAX_AGE="${AIPANE_AI_ORPHAN_MAX_AGE:-900}"
 MCP_DEFAULT_MAX_AGE="${AIPANE_MCP_MAX_AGE:-21600}"
 MCP_ORPHAN_DEFAULT_MAX_AGE="${AIPANE_MCP_ORPHAN_MAX_AGE:-900}"
 MCP_SESSION_DEFAULT_MAX_AGE="${AIPANE_MCP_SESSION_MAX_AGE:-}"
+AI_SESSION_DEFAULT_MAX_AGE="${AIPANE_AI_SESSION_MAX_AGE:-}"
 ACTION_COUNT=0
+
+TMUX_BIN="${AIPANE_TMUX_BIN:-}"
+if [ -z "$TMUX_BIN" ]; then
+  for tmux_candidate in "$(command -v tmux 2>/dev/null || true)" /opt/homebrew/bin/tmux /usr/local/bin/tmux /usr/bin/tmux; do
+    if [ -n "$tmux_candidate" ] && [ -x "$tmux_candidate" ]; then
+      TMUX_BIN="$tmux_candidate"
+      break
+    fi
+  done
+fi
 
 usage() {
   cat <<'EOF'
@@ -32,7 +43,7 @@ Options:
   --all, --force        Kill all matches for the selected mode
   --max-age SECONDS     Override stale age threshold for rod/mcp cleanup
   --orphan-age SECONDS  Override orphan threshold for ai/mcp cleanup
-  --session-age SECONDS Also kill MCP helpers under old AI session trees
+  --session-age SECONDS Also kill old detached tmux Claude sessions and MCP helpers under old AI session trees
   --dry-run             Print actions without killing anything
   --verbose, -v         Print actions to stdout
   --help, -h            Show this help
@@ -150,6 +161,12 @@ join_lines() {
   printf '%s\n' "$1" | awk 'NF { printf "%s%s", sep, $1; sep = " " }'
 }
 
+get_tmux_panes() {
+  if [ -n "$TMUX_BIN" ] && [ -x "$TMUX_BIN" ]; then
+    "$TMUX_BIN" list-panes -a -F "$1" 2>/dev/null || true
+  fi
+}
+
 kill_pid_block() {
   kp_scope="$1"
   kp_label="$2"
@@ -193,15 +210,51 @@ kill_pid_block() {
 }
 
 collect_ai_pids() {
-  ps -axo pid=,tty=,command= | awk '
+  ps -axo pid=,ppid=,tty=,command= | awk '
     function is_ai_cmd(cmd) {
       return cmd ~ /@anthropic-ai\/claude-code/ ||
              cmd ~ /@openai\/codex|claude-code|claude-guard|codex-cli|factory-droid|gemini-cli|agent-browser\/.*daemon/ ||
-             cmd ~ /(^|[[:space:]\/])(claude|codex|droid|gemini|opencode)([[:space:]\/]|$)/
+             cmd ~ /(^|[[:space:]\/])(claude|codex|droid|gemini|grok|opencode)([[:space:]\/]|$)/
     }
-    $2 == "??" {
-      if (is_ai_cmd($0))
-        print $1
+    function is_codex_app_server(cmd) {
+      return cmd ~ /^([^[:space:]]*\/)?codex[[:space:]]/ &&
+             cmd ~ /(^|[[:space:]])app-server([[:space:]]|$)/
+    }
+    function is_chatgpt_host(cmd) {
+      return cmd ~ /^\/Applications\/ChatGPT\.app\/Contents\/MacOS\/ChatGPT([[:space:]]|$)/
+    }
+    function has_chatgpt_ancestor(pid, parent, depth) {
+      parent = PPID[pid]
+      depth = 0
+      while (parent != "" && parent != 0 && depth < 64) {
+        if (!(parent in CMD))
+          break
+        if (is_chatgpt_host(CMD[parent]))
+          return 1
+        parent = PPID[parent]
+        depth++
+      }
+      return 0
+    }
+    {
+      pid = $1
+      ppid = $2
+      tty = $3
+      cmd = substr($0, index($0, $4))
+      PPID[pid] = ppid
+      TTY[pid] = tty
+      CMD[pid] = cmd
+      ORDER[++count] = pid
+    }
+    END {
+      for (i = 1; i <= count; i++) {
+        pid = ORDER[i]
+        if (TTY[pid] != "??" || !is_ai_cmd(CMD[pid]))
+          continue
+        if (is_codex_app_server(CMD[pid]) || has_chatgpt_ancestor(pid))
+          continue
+        print pid
+      }
     }
   ' | sort -u
 }
@@ -216,7 +269,7 @@ collect_ai_related_pids() {
     function is_ai_cmd(cmd) {
       return cmd ~ /@anthropic-ai\/claude-code/ ||
              cmd ~ /@openai\/codex|claude-code|claude-guard|codex-cli|factory-droid|gemini-cli|agent-browser\/.*daemon/ ||
-             cmd ~ /(^|[[:space:]\/])(claude|codex|droid|gemini|opencode)([[:space:]\/]|$)/
+             cmd ~ /(^|[[:space:]\/])(claude|codex|droid|gemini|grok|opencode)([[:space:]\/]|$)/
     }
     BEGIN {
       split(roots, parts, " ")
@@ -318,6 +371,140 @@ collect_ai_orphan_child_pids() {
   done | sort -u
 }
 
+collect_tmux_claude_session_pids() {
+  ai_session_age="$1"
+  if ! is_number "$ai_session_age" || [ "$ai_session_age" -le 0 ]; then
+    return 0
+  fi
+
+  tmux_panes=$(get_tmux_panes '#{session_attached} #{pane_dead} #{pane_tty}')
+  if [ -z "$tmux_panes" ]; then
+    return 0
+  fi
+
+  {
+    printf '%s\n' "$tmux_panes"
+    printf '%s\n' "__AIPANE_PS_BOUNDARY__"
+    ps -axo pid=,ppid=,tty=,etime=,command=
+  } | awk -v session_age="$ai_session_age" '
+    function to_sec(s, parts, n, days, hours, mins, secs) {
+      days = 0
+      if (s ~ /-/) {
+        split(s, parts, "-")
+        days = parts[1] + 0
+        s = parts[2]
+      }
+      n = split(s, parts, ":")
+      if (n == 3) {
+        hours = parts[1] + 0
+        mins = parts[2] + 0
+        secs = parts[3] + 0
+      } else if (n == 2) {
+        hours = 0
+        mins = parts[1] + 0
+        secs = parts[2] + 0
+      } else {
+        hours = 0
+        mins = 0
+        secs = parts[1] + 0
+      }
+      return (((days * 24) + hours) * 60 + mins) * 60 + secs
+    }
+    function is_claude_session_cmd(cmd) {
+      return cmd ~ /claude-guard|@anthropic-ai\/claude-code|claude-code/ ||
+             cmd ~ /(^|[[:space:]\/])claude([[:space:]\/]|$)/
+    }
+    function tty_key(raw) {
+      gsub(/^\/dev\//, "", raw)
+      return raw
+    }
+    function has_claude_parent(pid, parent, depth) {
+      parent = PPID[pid]
+      depth = 0
+      while (parent != "" && parent != 0 && depth < 16) {
+        if (!(parent in CMD))
+          break
+        if (is_claude_session_cmd(CMD[parent]))
+          return 1
+        parent = PPID[parent]
+        depth++
+      }
+      return 0
+    }
+    BEGIN {
+      reading_tmux = 1
+    }
+    {
+      if (reading_tmux) {
+        if ($0 == "__AIPANE_PS_BOUNDARY__") {
+          reading_tmux = 0
+          next
+        }
+        attached = $1
+        dead = $2
+        tty = tty_key($3)
+        if (tty != "") {
+          TMUX_ATTACHED[tty] = attached + 0
+          TMUX_DEAD[tty] = dead + 0
+        }
+        next
+      }
+
+      pid = $1
+      ppid = $2
+      tty = tty_key($3)
+      age = to_sec($4)
+      cmd = substr($0, index($0, $5))
+      PPID[pid] = ppid
+      TTY[pid] = tty
+      AGE[pid] = age
+      CMD[pid] = cmd
+      ORDER[++count] = pid
+    }
+    END {
+      for (i = 1; i <= count; i++) {
+        pid = ORDER[i]
+        tty = TTY[pid]
+        if (!is_claude_session_cmd(CMD[pid]))
+          continue
+        if (AGE[pid] < session_age)
+          continue
+        if (tty == "" || tty == "??" || !(tty in TMUX_ATTACHED))
+          continue
+        if (TMUX_DEAD[tty] != 0 || TMUX_ATTACHED[tty] != 0)
+          continue
+        if (has_claude_parent(pid))
+          continue
+        ROOT[pid] = 1
+      }
+
+      for (i = 1; i <= count; i++) {
+        pid = ORDER[i]
+        if (pid in ROOT) {
+          selected[pid] = 1
+          continue
+        }
+
+        parent = PPID[pid]
+        depth = 0
+        while (parent != "" && parent != 0 && depth < 64) {
+          if (parent in ROOT) {
+            selected[pid] = 1
+            break
+          }
+          if (!(parent in PPID))
+            break
+          parent = PPID[parent]
+          depth++
+        }
+      }
+
+      for (pid in selected)
+        print pid
+    }
+  ' | sort -u
+}
+
 collect_force_rod_pids() {
   {
     ps -axo pid=,command= | awk '$0 ~ /leakless.*rod/ { print $1 }'
@@ -412,7 +599,7 @@ collect_mcp_pids() {
   mcp_max_age="$1"
   mcp_orphan_age="$2"
   mcp_session_age="$3"
-  tmux_panes=$(tmux list-panes -a -F '#{session_attached} #{window_active} #{pane_dead} #{pane_tty} #{pane_current_command}' 2>/dev/null || true)
+  tmux_panes=$(get_tmux_panes '#{session_attached} #{window_active} #{pane_dead} #{pane_tty} #{pane_current_command}')
   {
     printf '%s\n' "$tmux_panes"
     printf '%s\n' "__AIPANE_PS_BOUNDARY__"
@@ -445,10 +632,10 @@ collect_mcp_pids() {
       return cmd ~ /chrome-devtools-mcp|mcp-obsidian|context7-mcp|excalidraw-mcp|tmux-mcp|repomix-mcp|claude-in-mobile|mcp-server-mobile|playwright-mcp|mcp-atlassian/
     }
     function is_protected(cmd) {
-      return cmd ~ /claude|@anthropic-ai\/claude-code|claude-code|claude-guard|codex|\/droid([[:space:]]|$)|factory-droid|gemini|opencode|tmux|zsh|bash|fish/
+      return cmd ~ /claude|@anthropic-ai\/claude-code|claude-code|claude-guard|codex|\/droid([[:space:]]|$)|factory-droid|gemini|grok|opencode|tmux|zsh|bash|fish/
     }
     function is_session_root(cmd) {
-      return cmd ~ /claude-guard|factory-droid|(^|[[:space:]]|\/)(claude|droid|codex|gemini|opencode)([[:space:]]|$)/
+      return cmd ~ /claude-guard|factory-droid|(^|[[:space:]]|\/)(claude|droid|codex|gemini|grok|opencode)([[:space:]]|$)/
     }
     function is_shell_cmd(cmd) {
       return cmd ~ /^(bash|zsh|sh|fish)$/
@@ -572,17 +759,27 @@ collect_mcp_pids() {
 
 run_ai_cleanup() {
   ai_orphan_age="${ORPHAN_AGE:-$AI_ORPHAN_DEFAULT_MAX_AGE}"
+  ai_session_age="$SESSION_AGE"
+  if [ -z "$ai_session_age" ] && is_number "$AI_SESSION_DEFAULT_MAX_AGE"; then
+    ai_session_age="$AI_SESSION_DEFAULT_MAX_AGE"
+  fi
+
   ai_pids=$(collect_ai_pids)
   if [ -n "$ai_pids" ]; then
     ai_related_pids=$(collect_ai_related_pids "$ai_pids")
     kill_pid_block "ai" "detached AI CLI tree" "$ai_related_pids"
   fi
 
+  ai_tmux_session_pids=$(collect_tmux_claude_session_pids "$ai_session_age")
+  if [ -n "$ai_tmux_session_pids" ]; then
+    kill_pid_block "ai" "old detached tmux Claude session tree" "$ai_tmux_session_pids"
+  fi
+
   ai_orphan_pids=$(collect_ai_orphan_child_pids "$ai_orphan_age")
   if [ -n "$ai_orphan_pids" ]; then
     kill_pid_block "ai" "orphaned AI child" "$ai_orphan_pids"
-  elif [ -z "$ai_pids" ] && [ "$MODE" = "ai" ] && [ "$VERBOSE" -eq 1 ]; then
-    say "no detached AI CLI processes found"
+  elif [ -z "$ai_pids" ] && [ -z "$ai_tmux_session_pids" ] && [ "$MODE" = "ai" ] && [ "$VERBOSE" -eq 1 ]; then
+    say "no detached AI CLI or old detached tmux Claude session processes found"
   fi
 }
 
