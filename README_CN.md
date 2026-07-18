@@ -1,6 +1,6 @@
 # aipane
 
-用于日常 AI CLI 工作流的 zsh 工具集：隔离账号配置启动 Claude Code、通过 tmux 窗格编排多个 AI 工具、清理相关进程，以及可选的 tmux 窗口标签多行换行。
+用于日常 AI CLI 工作流的 zsh 工具集：隔离账号配置启动 Claude Code、通过 tmux 窗格编排多个 AI 工具、清理相关进程，以及可选的 **Ghostty + tmux 工作台**（Cmd 键位桥、广播输入、窗口标签多行换行）。
 
 [English README](README.md)
 
@@ -48,42 +48,50 @@ git -C ~/.aipane pull --ff-only
 
 `ai x` 这类单工具调用默认在当前 shell 中运行；未使用 `--new` 或 `--layout` 时不依赖 tmux。
 
-## 可选：tmux 窗口标签多行换行
+## 可选：Ghostty + tmux 工作台
 
-窗口很多时（例如频繁 `ai --new`），状态栏窗口标签可自动换到最多 3 行，而不是挤在一行被截断。
+为多 AI CLI 窗格准备的终端壳层。**不会**被 `init.zsh` 加载。个人字体/主题/TPM 仍放本机；公共片段只做 **include/source**。
 
-**不会**被 `init.zsh` 自动加载。个人 tmux 配置（prefix、主题、快捷键、插件）继续放在 `~/.tmux.conf`；这里只接入仓库里的公共片段：
+| 部分 | 作用 |
+|------|------|
+| Ghostty Cmd 桥 | `Cmd+S/T/W/D/[]/…` → tmux `C-Space` 组合 |
+| Shift+Enter | tmux 里给 Codex 等稳定换行（→ Ctrl+J） |
+| tmux workstation | zoom 保持导航、广播/单格豁免、pane 顶栏、vi 复制 |
+| window-wrap | 状态栏窗口标签最多 3 行 |
+| copy-mode `Y` | 可选长截图，依赖 [tmux-shot](https://github.com/Async23/tmux-shot) |
 
 ```bash
-# AIPANE_ROOT = 本仓库 clone 路径（默认安装：~/.aipane）
 AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
-
-# 1) 将渲染器放到 PATH（推荐 symlink，不要复制脚本正文）
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
-
-# 2) 在 ~/.tmux.conf 中只 source 公共片段
-# source-file $AIPANE_ROOT/conf/tmux-window-wrap.conf
 ```
 
-`~/.tmux.conf` 示例：
+**Ghostty**（`~/.config/ghostty/config`）— 个人外观 + include：
+
+```ini
+config-file = /path/to/aipane/conf/ghostty-tmux.conf
+```
+
+**tmux**（`~/.tmux.conf`）：
 
 ```tmux
-# OWNED_BY: aipane (tmux-window-wrap) — 改仓库，不要内联复制
+source-file ~/.aipane/conf/tmux-workstation.conf
 source-file ~/.aipane/conf/tmux-window-wrap.conf
-```
-
-本功能额外依赖：支持多行 `status-format` 的 `tmux`，以及仅用标准库的 `python3`。
-
-```bash
-python3 "$AIPANE_ROOT/tests/test_tmux_window_wrap.py"
 ```
 
 | 路径 | 作用 |
 |------|------|
-| `bin/tmux-window-wrap` | 布局 / 渲染 / invalidate CLI |
-| `conf/tmux-window-wrap.conf` | 仅公共 `status-format` + hooks |
-| `tests/test_tmux_window_wrap.py` | 单元 + 真 tmux 集成测试 |
-| [`docs/tmux-window-wrap.md`](docs/tmux-window-wrap.md) | 安装与改动边界 |
+| `conf/ghostty-tmux.conf` | Cmd 桥 + Shift+Enter |
+| `conf/tmux-workstation.conf` | prefix、键位、广播、状态栏样式 |
+| `conf/tmux-window-wrap.conf` | 窗口列表多行 |
+| `bin/tmux-window-wrap` | 渲染 CLI |
+| `tests/test_tmux_window_wrap.py` | window-wrap 测试 |
+| [`docs/ghostty-tmux-workstation.md`](docs/ghostty-tmux-workstation.md) | 安装与所有权 |
+| [`docs/cheatsheet.md`](docs/cheatsheet.md) | 键位速查 |
+| [`docs/tmux-window-wrap.md`](docs/tmux-window-wrap.md) | 仅换行说明 |
+
+```bash
+python3 "$AIPANE_ROOT/tests/test_tmux_window_wrap.py"
+```
 
 ## 可选配置
 

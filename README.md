@@ -1,6 +1,6 @@
 # aipane
 
-A zsh toolkit for daily AI CLI workflows: account-isolated Claude Code launches, tmux pane orchestration for multiple AI tools, process cleanup, and an optional multi-line tmux window list.
+A zsh toolkit for daily AI CLI workflows: account-isolated Claude Code launches, tmux pane orchestration for multiple AI tools, process cleanup, plus an optional **Ghostty + tmux workstation** (Cmd key bridge, broadcast, multi-line window list).
 
 [中文文档 / Chinese README](README_CN.md)
 
@@ -48,42 +48,50 @@ git -C ~/.aipane pull --ff-only
 
 Single-tool calls such as `ai x` run in the current shell and do not require tmux unless `--new` or `--layout` is supplied.
 
-## Optional: multi-line tmux window list
+## Optional: Ghostty + tmux workstation
 
-When many windows are open (for example from `ai --new`), status-bar window labels can wrap across up to three rows instead of being truncated.
+Terminal shell tuned for many AI CLI panes. **Not** loaded by `init.zsh`. Personal font/theme/TPM stay in your home configs; public fragments are only **included**.
 
-This is **not** enabled by `init.zsh`. Keep personal tmux chrome (prefix, theme, keys, plugins) in `~/.tmux.conf`; only wire the published fragment:
+| Piece | What it does |
+|-------|----------------|
+| Ghostty Cmd bridge | `Cmd+S/T/W/D/[]/…` → tmux `C-Space` chords |
+| Shift+Enter | Newline for Codex/other CLIs under tmux (`→` Ctrl+J) |
+| tmux workstation | zoom-aware nav, broadcast + per-pane mute, pane top bar, vi copy-mode |
+| window-wrap | status window labels wrap up to 3 lines |
+| `Y` in copy-mode | optional long screenshot via [tmux-shot](https://github.com/Async23/tmux-shot) |
 
 ```bash
-# AIPANE_ROOT = where you cloned this repo (default install: ~/.aipane)
 AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
-
-# 1) put the renderer on PATH (symlink — do not copy the script body)
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
-
-# 2) in ~/.tmux.conf — source the public fragment only
-# source-file $AIPANE_ROOT/conf/tmux-window-wrap.conf
 ```
 
-Example `~/.tmux.conf` lines:
+**Ghostty** (`~/.config/ghostty/config`) — personal look + include:
+
+```ini
+config-file = /path/to/aipane/conf/ghostty-tmux.conf
+```
+
+**tmux** (`~/.tmux.conf`):
 
 ```tmux
-# OWNED_BY: aipane (tmux-window-wrap) — edit the repo, not an inlined copy
+source-file ~/.aipane/conf/tmux-workstation.conf
 source-file ~/.aipane/conf/tmux-window-wrap.conf
-```
-
-Extra dependencies for this feature: `tmux` with multi-line `status-format`, and `python3` (stdlib only).
-
-```bash
-python3 "$AIPANE_ROOT/tests/test_tmux_window_wrap.py"
 ```
 
 | Path | Role |
 |------|------|
-| `bin/tmux-window-wrap` | Layout / render / invalidate CLI |
-| `conf/tmux-window-wrap.conf` | Public `status-format` + hooks only |
-| `tests/test_tmux_window_wrap.py` | Unit + live tmux tests |
-| [`docs/tmux-window-wrap.md`](docs/tmux-window-wrap.md) | Install + edit ownership |
+| `conf/ghostty-tmux.conf` | Cmd bridge + Shift+Enter |
+| `conf/tmux-workstation.conf` | prefix, binds, broadcast, status chrome |
+| `conf/tmux-window-wrap.conf` | multi-line window list |
+| `bin/tmux-window-wrap` | renderer CLI |
+| `tests/test_tmux_window_wrap.py` | window-wrap tests |
+| [`docs/ghostty-tmux-workstation.md`](docs/ghostty-tmux-workstation.md) | install + ownership |
+| [`docs/cheatsheet.md`](docs/cheatsheet.md) | key map |
+| [`docs/tmux-window-wrap.md`](docs/tmux-window-wrap.md) | wrap-only notes |
+
+```bash
+python3 "$AIPANE_ROOT/tests/test_tmux_window_wrap.py"
+```
 
 ## Optional Configuration
 
