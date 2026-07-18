@@ -8,9 +8,9 @@ Usage:
 
 Tools:
   c  Claude Code   (ccd)
-  x  Codex         (codex --yolo)
+  x  Codex         (codex --yolo --profile ai-x)
   d  Droid         (droid)
-  g  Gemini        (gemini --yolo)
+  g  Grok          (grok --always-approve)
   o  Opencode      (opencode)
   r  Cursor        (cursor-agent --force)
   q  Qoder         (qodercli)
@@ -73,7 +73,7 @@ _aipane_tool_command() {
       _aipane_command_with_args "$AIPANE_DROID_LAUNCH_CMD" "$@"
       ;;
     g)
-      _aipane_command_with_args "$AIPANE_GEMINI_LAUNCH_CMD" "$@"
+      _aipane_command_with_args "$AIPANE_GROK_LAUNCH_CMD" "$@"
       ;;
     o)
       _aipane_command_with_args "$AIPANE_OPENCODE_LAUNCH_CMD" "$@"
