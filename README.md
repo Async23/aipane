@@ -71,7 +71,7 @@ export AIPANE_OMP_LAUNCH_CMD="omp --approval-mode=yolo"
 
 ## Claude Account Model
 
-Only `cc` uses an account-specific `CLAUDE_CONFIG_DIR`. If the email is omitted—or the first argument starts with `-`—`cc` uses the only directory under `AIPANE_ACCOUNTS_BASE` automatically, or prompts when multiple account directories exist. If none exist, pass an email explicitly to create the first account directory.
+Only `cc` uses an account-specific `CLAUDE_CONFIG_DIR`. If the email is omitted—or the first argument starts with `-`—`cc` uses the only account directory under `AIPANE_ACCOUNTS_BASE` automatically, or prompts when multiple account directories exist. If none exist, pass an email explicitly to create the first account directory.
 
 ```bash
 cc alice@example.com
