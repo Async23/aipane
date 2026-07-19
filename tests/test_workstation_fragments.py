@@ -22,8 +22,8 @@ WS_DOC = ROOT / "docs" / "ghostty-tmux-workstation.md"
 class GhosttyFragmentTests(unittest.TestCase):
     def test_ghostty_fragment_defines_one_shot_cmd_bridge_and_shift_enter(self):
         text = GHOSTTY_CONF.read_text(encoding="utf-8")
-        self.assertIn("keybind = cmd+s=unbind", text)
-        self.assertNotIn("keybind = cmd+s=text:\\x00", text)
+        self.assertIn("keybind = cmd+s=text:\\x00", text)
+        self.assertNotIn("keybind = cmd+s=unbind", text)
         self.assertIn("keybind = super+alt+p=text:\\x00Q", text)
         self.assertIn("keybind = cmd+t=text:\\x00c", text)
         self.assertIn("keybind = cmd+d=text:\\x00|", text)
@@ -135,8 +135,8 @@ class DocsPointerTests(unittest.TestCase):
         self.assertIn("`Cmd+Opt+P`", doc)
 
         cheatsheet = CHEATSHEET.read_text(encoding="utf-8")
+        self.assertIn("| `Cmd+S` | prefix only |", cheatsheet)
         self.assertIn("| `Cmd+Opt+P` | popup pane ID list |", cheatsheet)
-        self.assertNotIn("| `Cmd+S` | prefix only |", cheatsheet)
 
 
 if __name__ == "__main__":

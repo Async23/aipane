@@ -53,7 +53,7 @@ git -C ~/.aipane pull --ff-only
 
 | 部分 | 作用 |
 |------|------|
-| Ghostty Cmd 桥 | 单次 `Cmd+T/W/D/[]/…` 组合；`Cmd+Opt+P` 显示 pane ID |
+| Ghostty Cmd 桥 | `Cmd+S` prefix；单次 `Cmd+T/W/D/[]/…`；`Cmd+Opt+P` 显示 pane ID |
 | Shift+Enter | tmux 里给 Codex 等稳定换行（→ Ctrl+J） |
 | tmux workstation | zoom 保持导航、广播/单格豁免、pane 顶栏、vi 复制 |
 | window-wrap | 状态栏窗口标签最多 3 行 |
