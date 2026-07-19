@@ -53,7 +53,7 @@ Terminal shell tuned for many AI CLI panes. **Not** loaded by `init.zsh`. Person
 
 | Piece | What it does |
 |-------|----------------|
-| Ghostty Cmd bridge | `Cmd+S/T/W/D/[]/…` → tmux `C-Space` chords |
+| Ghostty Cmd bridge | one-shot `Cmd+T/W/D/[]/…` chords; `Cmd+Opt+P` shows pane IDs |
 | Shift+Enter | Newline for Codex/other CLIs under tmux (`→` Ctrl+J) |
 | tmux workstation | zoom-aware nav, broadcast + per-pane mute, pane top bar, vi copy-mode |
 | window-wrap | status window labels wrap up to 3 lines |

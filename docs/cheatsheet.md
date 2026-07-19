@@ -1,12 +1,13 @@
 # Ghostty + tmux cheatsheet (aipane workstation)
 
-Prefix is **Ctrl-Space**. In Ghostty, **Cmd+S** sends prefix; many Cmd chords send prefix+key in one shot.
+Prefix remains **Ctrl-Space** for direct tmux use. Ghostty Cmd shortcuts send
+complete prefix+key chords in one shot; there is no prefix-only Cmd shortcut.
 
 ## Ghostty Cmd bridge
 
 | Key | Action |
 |-----|--------|
-| `Cmd+S` | prefix only |
+| `Cmd+Opt+P` | popup pane ID list |
 | `Cmd+T` | new window |
 | `Cmd+W` | kill pane |
 | `Cmd+D` / `Cmd+Shift+D` | split L-R / T-B |
@@ -103,6 +104,6 @@ prefix+v → move → v (or C-v rect) → y (clipboard) or Y (tmux-shot)
 
 | Key | Action |
 |-----|--------|
-| `prefix Q` | popup pane id list |
+| `prefix Q` / `Cmd+Opt+P` | popup pane ID list |
 | double-click status window label | zoom that window's pane |
 | multi-line window list | `tmux-window-wrap` when labels overflow |
