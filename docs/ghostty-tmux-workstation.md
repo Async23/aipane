@@ -40,6 +40,10 @@ config-file = /Users/YOU/.aipane/conf/ghostty-tmux.conf
 
 Use an absolute path (or a path Ghostty can resolve). Reload Ghostty config after edits.
 
+Cmd shortcuts are one-shot; `Cmd+S` is intentionally unbound rather than acting
+as a prefix-only starter. Use `Cmd+Opt+P` for the pane ID popup, or
+`Ctrl-Space` when direct access to the tmux prefix is needed.
+
 ### tmux (`~/.tmux.conf`)
 
 ```tmux

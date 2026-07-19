@@ -20,9 +20,11 @@ WS_DOC = ROOT / "docs" / "ghostty-tmux-workstation.md"
 
 
 class GhosttyFragmentTests(unittest.TestCase):
-    def test_ghostty_fragment_defines_cmd_bridge_and_shift_enter(self):
+    def test_ghostty_fragment_defines_one_shot_cmd_bridge_and_shift_enter(self):
         text = GHOSTTY_CONF.read_text(encoding="utf-8")
-        self.assertIn("keybind = cmd+s=text:\\x00", text)
+        self.assertIn("keybind = cmd+s=unbind", text)
+        self.assertNotIn("keybind = cmd+s=text:\\x00", text)
+        self.assertIn("keybind = super+alt+p=text:\\x00Q", text)
         self.assertIn("keybind = cmd+t=text:\\x00c", text)
         self.assertIn("keybind = cmd+d=text:\\x00|", text)
         self.assertIn("keybind = shift+enter=text:\\x0a", text)
@@ -38,6 +40,7 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
         self.assertIn("synchronize-panes", text)
         self.assertIn("window_zoomed_flag", text)
         self.assertIn("bind v copy-mode", text)
+        self.assertIn("bind Q display-popup", text)
         self.assertIn("tmux-shot-capture", text)
         # stay a fragment: no TPM / no personal home paths
         self.assertNotIn("@plugin", text)
@@ -97,6 +100,7 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
             ).stdout
             self.assertRegex(keys, re.compile(r"prefix\s+B\s+.*synchronize-panes"))
             self.assertRegex(keys, re.compile(r"prefix\s+v\s+.*copy-mode"))
+            self.assertRegex(keys, re.compile(r"prefix\s+Q\s+.*display-popup"))
             fmt0 = subprocess.run(
                 [
                     "tmux",
@@ -128,6 +132,11 @@ class DocsPointerTests(unittest.TestCase):
         self.assertIn("conf/ghostty-tmux.conf", doc)
         self.assertIn("conf/tmux-workstation.conf", doc)
         self.assertIn("conf/tmux-window-wrap.conf", doc)
+        self.assertIn("`Cmd+Opt+P`", doc)
+
+        cheatsheet = CHEATSHEET.read_text(encoding="utf-8")
+        self.assertIn("| `Cmd+Opt+P` | popup pane ID list |", cheatsheet)
+        self.assertNotIn("| `Cmd+S` | prefix only |", cheatsheet)
 
 
 if __name__ == "__main__":
