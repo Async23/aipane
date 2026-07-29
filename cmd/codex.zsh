@@ -3,5 +3,5 @@
 # Codex launcher.
 
 codexx() {
-  codex --yolo "$@"
+  codex --yolo --disable plugins "$@"
 }
