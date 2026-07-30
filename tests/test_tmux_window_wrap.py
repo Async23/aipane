@@ -285,7 +285,9 @@ class WindowWrapCliTests(unittest.TestCase):
                     for level in levels
                 )
                 self.assertIn(
-                    f" {expected}#[fg=colour15]18:theme ",
+                    "#[range=window|18]"
+                    "#[fg=blue]#[bg=blue]#[fg=colour15]#[bold]"
+                    f"{expected}#[fg=colour15]18:theme ",
                     rendered,
                 )
 
@@ -330,15 +332,16 @@ class WindowWrapCliTests(unittest.TestCase):
             rendered,
         )
         self.assertIn(
+            "#[range=window|2]#[fg=colour7]"
             "#[fg=#0A0A0A]▓#[fg=colour7]2:two ",
             rendered,
         )
         self.assertIn(
-            " #[fg=#080000]▓#[fg=colour15]3:three ",
+            "#[fg=#080000]▓#[fg=colour15]3:three ",
             rendered,
         )
 
-    def test_busy_codex_activity_uses_one_column_per_running_pane(self):
+    def test_busy_codex_activity_replaces_left_padding(self):
         windows = [
             {
                 "id": "@1",
@@ -352,7 +355,7 @@ class WindowWrapCliTests(unittest.TestCase):
 
         result = self.run_plan(
             {
-                "width": 11,
+                "width": 10,
                 "left_width": 0,
                 "right_width": 0,
                 "active": "@1",
@@ -388,7 +391,6 @@ class WindowWrapCliTests(unittest.TestCase):
         rendered = self.run_render(payload, 0)
 
         self.assertIn(
-            " "
             "#{?#{==:#{@tmux-window-wrap-color-scheme},dark},"
             "#{?#{==:#{@tmux-window-wrap-animation-tick},0},"
             "#[fg=#000001]▓#[fg=#00000D]▓,"
