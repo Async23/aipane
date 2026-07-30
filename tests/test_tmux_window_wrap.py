@@ -17,6 +17,48 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "bin/tmux-window-wrap"
 CONFIG = ROOT / "conf/tmux-window-wrap.conf"
+TEST_ACTIVITY_PALETTES = {
+    "light": {
+        "inactive": (
+            "111111",
+            "222222",
+            "333333",
+            "444444",
+            "555555",
+            "666666",
+            "777777",
+        ),
+        "active": (
+            "110000",
+            "220000",
+            "330000",
+            "440000",
+            "550000",
+            "660000",
+            "770000",
+        ),
+    },
+    "dark": {
+        "inactive": (
+            "001100",
+            "002200",
+            "003300",
+            "004400",
+            "005500",
+            "006600",
+            "007700",
+        ),
+        "active": (
+            "000011",
+            "000022",
+            "000033",
+            "000044",
+            "000055",
+            "000066",
+            "000077",
+        ),
+    },
+}
 
 
 class WindowWrapCliTests(unittest.TestCase):
@@ -165,6 +207,204 @@ class WindowWrapCliTests(unittest.TestCase):
             "    #[range=window|3] #[fg=colour7]3:c #[norange]",
         )
 
+    def test_render_offsets_busy_codex_activity_by_half_a_cycle(self):
+        payload = {
+            "width": 80,
+            "left_width": 4,
+            "right_width": 5,
+            "active": "@1",
+            "activity_palettes": TEST_ACTIVITY_PALETTES,
+            "color_scheme": "light",
+            "windows": [
+                {
+                    "id": "@1",
+                    "index": "18",
+                    "name": "theme",
+                    "label": " 18:theme ",
+                    "busy_codex_count": 2,
+                },
+            ],
+        }
+        expected_levels = (
+            (0, 6),
+            (1, 5),
+            (2, 4),
+            (3, 3),
+            (4, 2),
+            (5, 1),
+            (6, 0),
+            (5, 1),
+            (4, 2),
+            (3, 3),
+            (2, 4),
+            (1, 5),
+        )
+
+        for animation_tick, levels in enumerate(expected_levels):
+            with self.subTest(animation_tick=animation_tick):
+                payload["animation_tick"] = animation_tick
+                rendered = self.run_render(payload, 0)
+                expected = "".join(
+                    f"#[fg=#{TEST_ACTIVITY_PALETTES['light']['active'][level]}]▓"
+                    for level in levels
+                )
+                self.assertIn(
+                    f" 18:{expected}#[fg=colour15]theme ",
+                    rendered,
+                )
+
+    def test_render_distributes_activity_phases_across_windows(self):
+        payload = {
+            "width": 80,
+            "left_width": 4,
+            "right_width": 5,
+            "active": "@3",
+            "animation_tick": 1,
+            "activity_palettes": TEST_ACTIVITY_PALETTES,
+            "color_scheme": "light",
+            "windows": [
+                {
+                    "id": "@1",
+                    "index": "1",
+                    "name": "one",
+                    "label": " 1:one ",
+                    "busy_codex_count": 1,
+                },
+                {
+                    "id": "@2",
+                    "index": "2",
+                    "name": "two",
+                    "label": " 2:two ",
+                    "busy_codex_count": 1,
+                },
+                {
+                    "id": "@3",
+                    "index": "3",
+                    "name": "three",
+                    "label": " 3:three ",
+                    "busy_codex_count": 1,
+                },
+            ],
+        }
+
+        rendered = self.run_render(payload, 0)
+
+        self.assertIn(
+            "1:#[fg=#222222]▓#[fg=colour7]one ",
+            rendered,
+        )
+        self.assertIn(
+            "2:#[fg=#666666]▓#[fg=colour7]two ",
+            rendered,
+        )
+        self.assertIn(
+            " 3:#[fg=#440000]▓#[fg=colour15]three ",
+            rendered,
+        )
+
+    def test_busy_codex_activity_uses_one_column_per_running_pane(self):
+        windows = [
+            {
+                "id": "@1",
+                "index": "1",
+                "name": "a",
+                "label": " 1:a ",
+                "busy_codex_count": 2,
+            },
+            {"id": "@2", "index": "2", "name": "b", "label": " 2:b "},
+        ]
+
+        result = self.run_plan(
+            {
+                "width": 11,
+                "left_width": 0,
+                "right_width": 0,
+                "active": "@1",
+                "windows": windows,
+            }
+        )
+
+        self.assertEqual(
+            result,
+            {"line_count": 2, "lines": [["@1"], ["@2"]]},
+        )
+
+    def test_render_can_defer_activity_frames_to_a_tmux_option(self):
+        payload = {
+            "width": 80,
+            "left_width": 4,
+            "right_width": 5,
+            "active": "@1",
+            "animation_option": "@tmux-window-wrap-animation-tick",
+            "color_scheme_option": "@tmux-window-wrap-color-scheme",
+            "activity_palettes": TEST_ACTIVITY_PALETTES,
+            "windows": [
+                {
+                    "id": "@1",
+                    "index": "18",
+                    "name": "theme",
+                    "label": " 18:theme ",
+                    "busy_codex_count": 2,
+                },
+            ],
+        }
+
+        rendered = self.run_render(payload, 0)
+
+        self.assertIn(
+            " 18:"
+            "#{?#{==:#{@tmux-window-wrap-color-scheme},dark},"
+            "#{?#{==:#{@tmux-window-wrap-animation-tick},0},"
+            "#[fg=#000011]▓#[fg=#000077]▓,"
+            "#{?#{==:#{@tmux-window-wrap-animation-tick},1},"
+            "#[fg=#000022]▓#[fg=#000066]▓,",
+            rendered,
+        )
+        self.assertIn(
+            "#{?#{==:#{@tmux-window-wrap-animation-tick},0},"
+            "#[fg=#110000]▓#[fg=#770000]▓,"
+            "#{?#{==:#{@tmux-window-wrap-animation-tick},1},"
+            "#[fg=#220000]▓#[fg=#660000]▓,",
+            rendered,
+        )
+        self.assertIn(
+            "}#[fg=colour15]theme ",
+            rendered,
+        )
+
+    def test_inactive_activity_restores_window_name_colour(self):
+        payload = {
+            "width": 80,
+            "left_width": 4,
+            "right_width": 5,
+            "active": "@2",
+            "animation_tick": 0,
+            "activity_palettes": TEST_ACTIVITY_PALETTES,
+            "color_scheme": "dark",
+            "windows": [
+                {
+                    "id": "@1",
+                    "index": "18",
+                    "name": "theme",
+                    "label": " 18:theme ",
+                    "busy_codex_count": 1,
+                },
+                {
+                    "id": "@2",
+                    "index": "19",
+                    "name": "active",
+                    "label": " 19:active ",
+                },
+            ],
+        }
+
+        rendered = self.run_render(payload, 0)
+
+        self.assertIn(
+            "18:#[fg=#001100]▓#[fg=colour7]theme ",
+            rendered,
+        )
+
     def test_render_indents_the_third_line(self):
         payload = {
             "width": 20,
@@ -310,7 +550,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             check=check,
         )
 
-    def render_runtime(self, line, width):
+    def render_runtime(self, line, width, animation_tick=0):
         return subprocess.run(
             [
                 SCRIPT,
@@ -325,6 +565,8 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
                 "4",
                 "--right-width",
                 "5",
+                "--animation-tick",
+                str(animation_tick),
                 "--socket-name",
                 self.socket_name,
             ],
@@ -540,6 +782,92 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             self.tmux("show-options", "-t", self.session_id, "-v", "status")
             .stdout.strip(),
             "on",
+        )
+
+    def test_runtime_counts_each_busy_codex_title_in_the_same_window(self):
+        first_pane = self.tmux(
+            "display-message",
+            "-p",
+            "-t",
+            "wrap:1",
+            "#{pane_id}",
+        ).stdout.strip()
+        second_pane = self.tmux(
+            "split-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            "wrap:1",
+            "sleep 120",
+        ).stdout.strip()
+        self.tmux("select-pane", "-t", first_pane, "-T", "⠋ first task")
+        self.tmux("select-pane", "-t", second_pane, "-T", "⠦ second task")
+
+        rendered = self.render_runtime(line=0, width=80, animation_tick=0)
+        self.assertEqual(rendered.count("▓"), 2)
+
+        self.tmux("select-pane", "-t", first_pane, "-T", "first task")
+        rendered = self.render_runtime(line=0, width=80, animation_tick=1)
+        self.assertEqual(rendered.count("▓"), 1)
+
+        self.tmux(
+            "select-pane",
+            "-t",
+            second_pane,
+            "-T",
+            "[ ! ] Action Required",
+        )
+        rendered = self.render_runtime(line=0, width=80, animation_tick=2)
+        self.assertIn("1:手册", rendered)
+        self.assertNotIn("▓", rendered)
+
+        self.tmux("select-pane", "-t", second_pane, "-T", "⠋")
+        rendered = self.render_runtime(line=0, width=80, animation_tick=3)
+        self.assertEqual(rendered.count("▓"), 1)
+
+    def test_attached_status_advances_activity_at_ten_fps(self):
+        first_pane = self.tmux(
+            "display-message",
+            "-p",
+            "-t",
+            "wrap:1",
+            "#{pane_id}",
+        ).stdout.strip()
+        second_pane = self.tmux(
+            "split-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            "wrap:1",
+            "sleep 120",
+        ).stdout.strip()
+        self.tmux("select-pane", "-t", first_pane, "-T", "⠋ first task")
+        self.tmux("select-pane", "-t", second_pane, "-T", "⠦ second task")
+        self.source_window_wrap_config()
+        _, master_fd = self.attach_client(width=80)
+        self.wait_for_client_count(1)
+        self.wait_for_status_text(master_fd, "▓", timeout=1)
+
+        seen_ticks = set()
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline and len(seen_ticks) < 6:
+            tick = self.tmux(
+                "show-options",
+                "-g",
+                "-v",
+                "@tmux-window-wrap-animation-tick",
+            ).stdout.strip()
+            seen_ticks.add(tick)
+            time.sleep(0.02)
+
+        self.assertGreaterEqual(
+            len(seen_ticks),
+            6,
+            f"expected at least six 10 FPS ticks, saw {seen_ticks!r}",
         )
 
     def test_runtime_accepts_unicode_line_separators_in_window_names(self):
@@ -864,6 +1192,21 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
     def test_window_wrap_config_connects_all_status_rows_to_complete_cache_keys(self):
         self.source_window_wrap_config()
 
+        animation_fps = self.tmux(
+            "show-options",
+            "-g",
+            "-v",
+            "@tmux-window-wrap-animation-fps",
+        ).stdout.strip()
+        status_interval = self.tmux(
+            "show-options", "-g", "-v", "status-interval"
+        ).stdout.strip()
+        color_scheme = self.tmux(
+            "show-options",
+            "-g",
+            "-v",
+            "@tmux-window-wrap-color-scheme",
+        ).stdout.strip()
         first_row = self.tmux(
             "show-options", "-g", "-v", "status-format[0]"
         ).stdout.strip()
@@ -874,6 +1217,22 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "show-options", "-g", "-v", "status-format[2]"
         ).stdout.strip()
 
+        self.assertEqual(animation_fps, "10")
+        self.assertEqual(status_interval, "15")
+        self.assertIn(color_scheme, {"light", "dark"})
+        for palette_option in (
+            "@tmux-window-wrap-activity-light-inactive",
+            "@tmux-window-wrap-activity-light-active",
+            "@tmux-window-wrap-activity-dark-inactive",
+            "@tmux-window-wrap-activity-dark-active",
+        ):
+            palette = self.tmux(
+                "show-options",
+                "-g",
+                "-v",
+                palette_option,
+            ).stdout.strip()
+            self.assertEqual(len(palette.split(",")), 7)
         self.assertIn("#{T;=/#{status-left-length}:status-left}", first_row)
         self.assertIn("tmux-window-wrap render --line 0", first_row)
         self.assertIn("#{T;=/#{status-right-length}:status-right}", first_row)
@@ -883,9 +1242,20 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "TMUX_WINDOW_WRAP_GENERATION=#{TMUX_WINDOW_WRAP_GENERATION}",
             "TMUX_WINDOW_WRAP_WINDOWS=#{W:",
             "#{q:window_name}_#{pane_synchronized}",
+            "#{P:#{m/r:^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]( |$),#{pane_title}}}",
             "TMUX_WINDOW_WRAP_CLIENTS=#{L:",
             "#{q:client_name}_#{client_width}",
             "TMUX_WINDOW_WRAP_ACTIVE=#{q:window_id}:#{window_index}",
+            "--animation-option @tmux-window-wrap-animation-tick",
+            "--color-scheme-option @tmux-window-wrap-color-scheme",
+            "--light-inactive-palette "
+            "#{@tmux-window-wrap-activity-light-inactive}",
+            "--light-active-palette "
+            "#{@tmux-window-wrap-activity-light-active}",
+            "--dark-inactive-palette "
+            "#{@tmux-window-wrap-activity-dark-inactive}",
+            "--dark-active-palette "
+            "#{@tmux-window-wrap-activity-dark-active}",
         )
         for cache_key in cache_keys:
             self.assertIn(cache_key, first_row)
@@ -893,6 +1263,21 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             self.assertIn(cache_key, third_row)
         self.assertNotIn("#[align=right", second_row)
         self.assertNotIn("#[align=right", third_row)
+        self.assertIn(
+            "--store-option @tmux-window-wrap-row-0",
+            first_row,
+        )
+        self.assertIn(
+            "--store-option @tmux-window-wrap-row-1",
+            second_row,
+        )
+        self.assertIn(
+            "--store-option @tmux-window-wrap-row-2",
+            third_row,
+        )
+        self.assertIn("#{E:@tmux-window-wrap-row-0}", first_row)
+        self.assertIn("#{E:@tmux-window-wrap-row-1}", second_row)
+        self.assertIn("#{E:@tmux-window-wrap-row-2}", third_row)
 
         for hook in (
             "client-attached",
@@ -909,6 +1294,11 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
 
         # conf must stay a public fragment: no personal prefix/plugins.
         conf_text = CONFIG.read_text()
+        self.assertIn(
+            "tmux-window-wrap animate "
+            "--fps #{@tmux-window-wrap-animation-fps}",
+            conf_text,
+        )
         self.assertNotIn("set -g prefix", conf_text)
         self.assertNotIn("@plugin", conf_text)
         self.assertNotIn("tpm", conf_text.lower())

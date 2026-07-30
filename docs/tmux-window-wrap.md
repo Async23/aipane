@@ -2,11 +2,58 @@
 
 Optional multi-line tmux status window list (up to 3 rows).
 
+## Codex activity indicators
+
+Each Codex pane whose terminal title starts with Codex's working spinner adds
+one fixed dark-shade cell between the window index and name:
+
+```text
+18:theme       # no running Codex pane
+18:▓theme      # one running Codex pane
+18:▓▓theme     # two running Codex panes
+18:▓▓▓theme    # three running Codex panes
+```
+
+The glyph never changes; only its foreground colour moves through seven
+perceptual contrast levels. The 12-frame level sequence is
+`0 1 2 3 4 5 6 5 4 3 2 1`. Every busy Codex in the session participates in
+one global phase distribution, including panes in different windows. Two
+indicators use phases `0/6`, three use `0/4/8`, and four use `0/3/6/9`.
+Therefore two running panes start at the widest contrast and follow
+`0/6 → 1/5 → 2/4 → 3/3 → 4/2 → 5/1 → 6/0 → 5/1 → 4/2 → 3/3 → 2/4 → 1/5`.
+This keeps multiple Codex panes distinguishable without synchronizing their
+breathing animation. Idle panes and panes showing `[ ! ] Action Required` are
+not counted.
+
+Detection depends on the Codex terminal-title `activity` item and animations
+being enabled. The indicator width is included in wrapping calculations, and
+a lightweight driver advances a tmux animation option every approximately
+`100ms` (`10 FPS`) while any busy Codex pane exists. One full loop takes
+`1.2s`. Window layout stays cached, so each frame is expanded by tmux without
+rerunning the Python layout renderer. The fragment does not lower tmux's
+global `status-interval`.
+
+Four seven-colour palettes cover active/inactive windows in light/dark terminal
+themes:
+
+```tmux
+set -g @tmux-window-wrap-activity-light-inactive 'RRGGBB,...'
+set -g @tmux-window-wrap-activity-light-active 'RRGGBB,...'
+set -g @tmux-window-wrap-activity-dark-inactive 'RRGGBB,...'
+set -g @tmux-window-wrap-activity-dark-active 'RRGGBB,...'
+```
+
+Set personal palettes before sourcing `conf/tmux-window-wrap.conf`. The public
+fragment supplies neutral fallbacks. On macOS the animation driver checks the
+system appearance and updates `@tmux-window-wrap-color-scheme` automatically.
+After each indicator, the renderer restores the normal window-name foreground
+colour.
+
 ## Files
 
 | Path | Role |
 |------|------|
-| `bin/tmux-window-wrap` | `plan` / `render` / `invalidate` CLI |
+| `bin/tmux-window-wrap` | `plan` / `render` / `animate` / `invalidate` CLI |
 | `conf/tmux-window-wrap.conf` | Public fragment: `status-format` + lifecycle hooks |
 | `tests/test_tmux_window_wrap.py` | Unit + live tmux tests |
 

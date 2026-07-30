@@ -1,14 +1,68 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import subprocess
 import sys
+import time
 import unicodedata
 import uuid
 
 
 WINDOW_SEPARATOR = "\x1f"
 MAX_STATUS_LINES = 3
+CODEX_ACTIVITY_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+CODEX_BUSY_PANES_FORMAT = (
+    f"#{{P:#{{m/r:^[{CODEX_ACTIVITY_SPINNER}]( |$),#{{pane_title}}}}}}"
+)
+CODEX_ACTIVITY_GLYPH = "▓"
+CODEX_ACTIVITY_LEVEL_SEQUENCE = (0, 1, 2, 3, 4, 5, 6, 5, 4, 3, 2, 1)
+DEFAULT_CODEX_ACTIVITY_FPS = 10
+ANIMATION_TICK_OPTION = "@tmux-window-wrap-animation-tick"
+COLOR_SCHEME_OPTION = "@tmux-window-wrap-color-scheme"
+ANIMATOR_OWNER_ENVIRONMENT = "TMUX_WINDOW_WRAP_ANIMATOR_OWNER"
+DEFAULT_ACTIVITY_PALETTES = {
+    "light": {
+        "inactive": (
+            "D4D4D4",
+            "C0C0C0",
+            "ACACAC",
+            "989898",
+            "848484",
+            "707070",
+            "5C5C5C",
+        ),
+        "active": (
+            "6F8790",
+            "617781",
+            "536873",
+            "465A65",
+            "394C57",
+            "2D3E49",
+            "22303A",
+        ),
+    },
+    "dark": {
+        "inactive": (
+            "50545C",
+            "686C74",
+            "80848C",
+            "989CA4",
+            "B0B4BC",
+            "C8CCD4",
+            "E0E4EC",
+        ),
+        "active": (
+            "4F86B1",
+            "47769C",
+            "3F6687",
+            "375772",
+            "30485E",
+            "293A4B",
+            "222D39",
+        ),
+    },
+}
 WINDOW_FORMAT = WINDOW_SEPARATOR.join(
     (
         "#{window_id}",
@@ -16,6 +70,7 @@ WINDOW_FORMAT = WINDOW_SEPARATOR.join(
         "#{window_name}",
         "#{window_active}",
         "#{pane_synchronized}",
+        CODEX_BUSY_PANES_FORMAT,
         "#{w: #{window_index}:#{window_name}#{?pane_synchronized, ▶,} }",
     )
 )
@@ -39,8 +94,128 @@ def display_width(text):
 
 def window_width(window):
     if "display_width" in window:
-        return window["display_width"]
-    return display_width(window["label"])
+        base_width = window["display_width"]
+    else:
+        base_width = display_width(window["label"])
+    return base_width + max(0, int(window.get("busy_codex_count", 0)))
+
+
+def parse_palette(value):
+    colours = tuple(
+        colour.strip().removeprefix("#").upper()
+        for colour in value.split(",")
+    )
+    hexadecimal = set("0123456789ABCDEF")
+    if len(colours) != 7 or any(
+        len(colour) != 6 or not set(colour) <= hexadecimal
+        for colour in colours
+    ):
+        raise argparse.ArgumentTypeError(
+            "palette must contain exactly seven comma-separated RRGGBB colours"
+        )
+    return colours
+
+
+def distribute_codex_activity_phases(windows):
+    counts = [
+        max(0, int(window.get("busy_codex_count", 0)))
+        for window in windows
+    ]
+    total = sum(counts)
+    if total == 0:
+        return {window["id"]: () for window in windows}
+
+    cycle_length = len(CODEX_ACTIVITY_LEVEL_SEQUENCE)
+    phase_by_ordinal = tuple(
+        ordinal * cycle_length // total
+        for ordinal in range(total)
+    )
+    phases_by_window = {}
+    cursor = 0
+    for window, count in zip(windows, counts):
+        phases_by_window[window["id"]] = phase_by_ordinal[cursor : cursor + count]
+        cursor += count
+    return phases_by_window
+
+
+def codex_activity_levels(phase_offsets, animation_tick):
+    start = int(animation_tick) % len(CODEX_ACTIVITY_LEVEL_SEQUENCE)
+    return tuple(
+        CODEX_ACTIVITY_LEVEL_SEQUENCE[
+            (start + phase_offset)
+            % len(CODEX_ACTIVITY_LEVEL_SEQUENCE)
+        ]
+        for phase_offset in phase_offsets
+    )
+
+
+def codex_activity_indicator(phase_offsets, animation_tick, palette):
+    return "".join(
+        f"#[fg=#{palette[level]}]{CODEX_ACTIVITY_GLYPH}"
+        for level in codex_activity_levels(phase_offsets, animation_tick)
+    )
+
+
+def animated_codex_activity_indicator(
+    phase_offsets,
+    animation_option,
+    palette,
+):
+    indicators = [
+        codex_activity_indicator(phase_offsets, tick, palette)
+        for tick in range(len(CODEX_ACTIVITY_LEVEL_SEQUENCE))
+    ]
+    if not any(indicators):
+        return ""
+
+    option_reference = "#{" + animation_option + "}"
+    expression = indicators[-1]
+    for tick in range(len(indicators) - 2, -1, -1):
+        condition = "#{==:" + option_reference + f",{tick}" + "}"
+        expression = (
+            "#{?"
+            + condition
+            + ","
+            + indicators[tick]
+            + ","
+            + expression
+            + "}"
+        )
+    return expression
+
+
+def codex_activity_indicator_format(
+    phase_offsets,
+    animation_option,
+    color_scheme_option,
+    light_palette,
+    dark_palette,
+):
+    light_indicator = animated_codex_activity_indicator(
+        phase_offsets,
+        animation_option,
+        light_palette,
+    )
+    if not light_indicator:
+        return ""
+    if not color_scheme_option:
+        return light_indicator
+
+    dark_indicator = animated_codex_activity_indicator(
+        phase_offsets,
+        animation_option,
+        dark_palette,
+    )
+    scheme_reference = "#{" + color_scheme_option + "}"
+    return (
+        "#{?#{==:"
+        + scheme_reference
+        + ",dark},"
+        + dark_indicator
+        + ","
+        + light_indicator
+        + "}"
+    )
 
 
 def wrap_windows(windows, capacity):
@@ -135,21 +310,50 @@ def plan(payload):
     return {"line_count": len(lines), "lines": lines}
 
 
-def render_window(window, active_id):
+def render_window(
+    window,
+    active_id,
+    animation_tick,
+    activity_phase_offsets,
+    activity_palettes,
+    color_scheme,
+    animation_option=None,
+    color_scheme_option=None,
+):
     window_range = f"#[range=window|{window['index']}]"
     synchronized = window.get("synchronized", False)
+    active = window["id"] == active_id
+    palette_role = "active" if active else "inactive"
+    if animation_option:
+        codex_activity = codex_activity_indicator_format(
+            activity_phase_offsets,
+            animation_option,
+            color_scheme_option,
+            activity_palettes["light"][palette_role],
+            activity_palettes["dark"][palette_role],
+        )
+    else:
+        codex_activity = codex_activity_indicator(
+            activity_phase_offsets,
+            animation_tick,
+            activity_palettes[color_scheme][palette_role],
+        )
+    if codex_activity:
+        name_colour = "colour15" if active else "colour7"
+        codex_activity += f"#[fg={name_colour}]"
     escaped_name = window["name"].replace("#", "##")
-    if window["id"] == active_id:
+    if active:
         rendered = (
             f"{window_range}#[fg=blue]#[bg=blue]#[fg=colour15]#[bold]"
-            f" {window['index']}:{escaped_name} "
+            f" {window['index']}:{codex_activity}{escaped_name} "
         )
         if synchronized:
             rendered += "#[fg=red]▶ "
         return rendered + "#[bg=default]#[fg=blue]#[default]#[norange]"
 
     rendered = (
-        f"{window_range} #[fg=colour7]{window['index']}:{escaped_name}"
+        f"{window_range} #[fg=colour7]{window['index']}:"
+        f"{codex_activity}{escaped_name}"
     )
     if synchronized:
         rendered += " #[fg=red]▶#[default]"
@@ -161,6 +365,17 @@ def render(payload, line):
     if line >= layout["line_count"]:
         return ""
 
+    animation_tick = payload.get("animation_tick", 0)
+    animation_option = payload.get("animation_option")
+    color_scheme = payload.get("color_scheme", "light")
+    color_scheme_option = payload.get("color_scheme_option")
+    activity_palettes = payload.get(
+        "activity_palettes",
+        DEFAULT_ACTIVITY_PALETTES,
+    )
+    activity_phases_by_window = distribute_codex_activity_phases(
+        payload["windows"]
+    )
     windows_by_id = {window["id"]: window for window in payload["windows"]}
     if line > 0:
         overflow = payload["windows"][len(layout["lines"][0]) :]
@@ -168,7 +383,16 @@ def render(payload, line):
     else:
         prefix = ""
     return prefix + "".join(
-        render_window(windows_by_id[window_id], payload["active"])
+        render_window(
+            windows_by_id[window_id],
+            payload["active"],
+            animation_tick,
+            activity_phases_by_window[window_id],
+            activity_palettes,
+            color_scheme,
+            animation_option,
+            color_scheme_option,
+        )
         for window_id in layout["lines"][line]
     )
 
@@ -219,6 +443,125 @@ def refresh_clients(socket_name):
                 "-t",
                 client_name,
             )
+
+
+def animation_probe(socket_name):
+    completed = run_tmux(
+        socket_name,
+        "list-panes",
+        "-a",
+        "-F",
+        WINDOW_SEPARATOR.join(
+            (
+                f"#{{{ANIMATOR_OWNER_ENVIRONMENT}}}",
+                "#{session_attached}",
+                "#{pane_title}",
+            )
+        ),
+    )
+    records = completed.stdout.splitlines()
+    if not records:
+        return None, False
+
+    owner = None
+    busy = False
+    for record in records:
+        record_owner, attached, title = record.split(WINDOW_SEPARATOR, 2)
+        if owner is None:
+            owner = record_owner
+        if (
+            attached != "0"
+            and title
+            and title[0] in CODEX_ACTIVITY_SPINNER
+            and (len(title) == 1 or title[1] == " ")
+        ):
+            busy = True
+    return owner, busy
+
+
+def detect_color_scheme():
+    if sys.platform == "darwin":
+        try:
+            completed = subprocess.run(
+                ["defaults", "read", "-g", "AppleInterfaceStyle"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        except OSError:
+            return "light"
+        return "dark" if completed.stdout.strip().lower() == "dark" else "light"
+
+    colorfgbg = os.environ.get("COLORFGBG", "")
+    try:
+        background = int(colorfgbg.rsplit(";", 1)[-1])
+    except ValueError:
+        return "light"
+    return "dark" if background <= 8 else "light"
+
+
+def animate_status(socket_name, fps):
+    owner = uuid.uuid4().hex
+    try:
+        run_tmux(
+            socket_name,
+            "set-environment",
+            "-g",
+            ANIMATOR_OWNER_ENVIRONMENT,
+            owner,
+        )
+    except subprocess.CalledProcessError:
+        return
+
+    busy = False
+    last_tick = None
+    color_scheme = None
+    next_probe = 0.0
+    next_scheme_probe = 0.0
+    while True:
+        now = time.monotonic()
+        try:
+            if now >= next_probe:
+                current_owner, busy = animation_probe(socket_name)
+                if current_owner != owner:
+                    return
+                next_probe = now + (1.0 if busy else 0.25)
+                if not busy:
+                    last_tick = None
+
+            if now >= next_scheme_probe:
+                detected_scheme = detect_color_scheme()
+                if detected_scheme != color_scheme:
+                    run_tmux(
+                        socket_name,
+                        "set-option",
+                        "-g",
+                        COLOR_SCHEME_OPTION,
+                        detected_scheme,
+                    )
+                    color_scheme = detected_scheme
+                next_scheme_probe = now + 5.0
+
+            if busy:
+                absolute_tick = int(now * fps)
+                tick = absolute_tick % len(CODEX_ACTIVITY_LEVEL_SEQUENCE)
+                if tick != last_tick:
+                    run_tmux(
+                        socket_name,
+                        "set-option",
+                        "-g",
+                        ANIMATION_TICK_OPTION,
+                        str(tick),
+                    )
+                    last_tick = tick
+                next_tick = (absolute_tick + 1) / fps
+                wake_at = min(next_probe, next_tick, next_scheme_probe)
+            else:
+                wake_at = min(next_probe, next_scheme_probe)
+        except subprocess.CalledProcessError:
+            return
+
+        time.sleep(max(0.01, wake_at - time.monotonic()))
 
 
 def invalidate_cache(socket_name):
@@ -279,9 +622,15 @@ def load_tmux_payload(arguments):
     windows = []
     active_id = None
     for record in completed.stdout.removesuffix("\n").split("\n"):
-        window_id, index, name, active, synchronized, label_width = record.split(
-            WINDOW_SEPARATOR, 5
-        )
+        (
+            window_id,
+            index,
+            name,
+            active,
+            synchronized,
+            busy_codex_panes,
+            label_width,
+        ) = record.split(WINDOW_SEPARATOR, 6)
         is_synchronized = synchronized == "1"
         label = f" {index}:{name}"
         if is_synchronized:
@@ -295,6 +644,7 @@ def load_tmux_payload(arguments):
                 "label": label,
                 "display_width": int(label_width),
                 "synchronized": is_synchronized,
+                "busy_codex_count": busy_codex_panes.count("1"),
             }
         )
         if active == "1":
@@ -308,6 +658,51 @@ def load_tmux_payload(arguments):
         ),
         "left_width": arguments.left_width,
         "right_width": arguments.right_width,
+        "animation_tick": (
+            getattr(arguments, "animation_tick", None)
+            if getattr(arguments, "animation_tick", None) is not None
+            else int(
+                time.monotonic()
+                * getattr(
+                    arguments,
+                    "animation_fps",
+                    DEFAULT_CODEX_ACTIVITY_FPS,
+                )
+            )
+        ),
+        "animation_option": getattr(arguments, "animation_option", None),
+        "color_scheme": getattr(arguments, "color_scheme", "light"),
+        "color_scheme_option": getattr(
+            arguments,
+            "color_scheme_option",
+            None,
+        ),
+        "activity_palettes": {
+            "light": {
+                "inactive": getattr(
+                    arguments,
+                    "light_inactive_palette",
+                    DEFAULT_ACTIVITY_PALETTES["light"]["inactive"],
+                ),
+                "active": getattr(
+                    arguments,
+                    "light_active_palette",
+                    DEFAULT_ACTIVITY_PALETTES["light"]["active"],
+                ),
+            },
+            "dark": {
+                "inactive": getattr(
+                    arguments,
+                    "dark_inactive_palette",
+                    DEFAULT_ACTIVITY_PALETTES["dark"]["inactive"],
+                ),
+                "active": getattr(
+                    arguments,
+                    "dark_active_palette",
+                    DEFAULT_ACTIVITY_PALETTES["dark"]["active"],
+                ),
+            },
+        },
         "active": active_id,
         "windows": windows,
     }
@@ -336,6 +731,13 @@ def main():
     commands.add_parser("plan")
     invalidate_parser = commands.add_parser("invalidate")
     invalidate_parser.add_argument("--socket-name")
+    animate_parser = commands.add_parser("animate")
+    animate_parser.add_argument(
+        "--fps",
+        type=float,
+        default=DEFAULT_CODEX_ACTIVITY_FPS,
+    )
+    animate_parser.add_argument("--socket-name")
     render_parser = commands.add_parser("render")
     render_parser.add_argument(
         "--line",
@@ -347,8 +749,49 @@ def main():
     render_parser.add_argument("--width", type=int)
     render_parser.add_argument("--left-width", type=int)
     render_parser.add_argument("--right-width", type=int)
+    render_parser.add_argument("--animation-tick", type=int)
+    render_parser.add_argument(
+        "--animation-fps",
+        type=float,
+        default=DEFAULT_CODEX_ACTIVITY_FPS,
+    )
+    render_parser.add_argument("--animation-option")
+    render_parser.add_argument(
+        "--color-scheme",
+        choices=("light", "dark"),
+        default="light",
+    )
+    render_parser.add_argument("--color-scheme-option")
+    render_parser.add_argument(
+        "--light-inactive-palette",
+        type=parse_palette,
+        default=DEFAULT_ACTIVITY_PALETTES["light"]["inactive"],
+    )
+    render_parser.add_argument(
+        "--light-active-palette",
+        type=parse_palette,
+        default=DEFAULT_ACTIVITY_PALETTES["light"]["active"],
+    )
+    render_parser.add_argument(
+        "--dark-inactive-palette",
+        type=parse_palette,
+        default=DEFAULT_ACTIVITY_PALETTES["dark"]["inactive"],
+    )
+    render_parser.add_argument(
+        "--dark-active-palette",
+        type=parse_palette,
+        default=DEFAULT_ACTIVITY_PALETTES["dark"]["active"],
+    )
+    render_parser.add_argument("--store-option")
     render_parser.add_argument("--socket-name")
     arguments = parser.parse_args()
+    if (
+        arguments.command == "render"
+        and arguments.animation_fps <= 0
+    ):
+        parser.error("--animation-fps must be greater than zero")
+    if arguments.command == "animate" and arguments.fps <= 0:
+        parser.error("--fps must be greater than zero")
 
     if arguments.command == "plan":
         json.dump(plan(json.load(sys.stdin)), sys.stdout, separators=(",", ":"))
@@ -357,6 +800,10 @@ def main():
 
     if arguments.command == "invalidate":
         invalidate_cache(arguments.socket_name)
+        return
+
+    if arguments.command == "animate":
+        animate_status(arguments.socket_name, arguments.fps)
         return
 
     if arguments.session_id:
@@ -378,7 +825,21 @@ def main():
             )
     else:
         payload = json.load(sys.stdin)
-    sys.stdout.write(render(payload, arguments.line) + "\n")
+    rendered = render(payload, arguments.line)
+    if arguments.store_option:
+        if not arguments.session_id:
+            parser.error("--store-option requires --session-id")
+        run_tmux(
+            arguments.socket_name,
+            "set-option",
+            "-t",
+            arguments.session_id,
+            arguments.store_option,
+            rendered,
+        )
+        sys.stdout.write("\n")
+        return
+    sys.stdout.write(rendered + "\n")
 
 
 if __name__ == "__main__":
