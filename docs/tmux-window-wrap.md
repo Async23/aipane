@@ -14,13 +14,13 @@ one fixed dark-shade cell between the window index and name:
 18:▓▓▓theme    # three running Codex panes
 ```
 
-The glyph never changes; only its foreground colour moves through seven
-perceptual contrast levels. The 12-frame level sequence is
-`0 1 2 3 4 5 6 5 4 3 2 1`. Every busy Codex in the session participates in
+The glyph never changes; only its foreground colour moves through thirteen
+perceptual contrast levels. The 24-frame level sequence is
+`0 1 ... 11 12 11 ... 2 1`. Every busy Codex in the session participates in
 one global phase distribution, including panes in different windows. Two
-indicators use phases `0/6`, three use `0/4/8`, and four use `0/3/6/9`.
+indicators use phases `0/12`, three use `0/8/16`, and four use `0/6/12/18`.
 Therefore two running panes start at the widest contrast and follow
-`0/6 → 1/5 → 2/4 → 3/3 → 4/2 → 5/1 → 6/0 → 5/1 → 4/2 → 3/3 → 2/4 → 1/5`.
+`0/12 → 1/11 → ... → 11/1 → 12/0 → 11/1 → ... → 1/11`.
 This keeps multiple Codex panes distinguishable without synchronizing their
 breathing animation. Idle panes and panes showing `[ ! ] Action Required` are
 not counted.
@@ -28,13 +28,13 @@ not counted.
 Detection depends on the Codex terminal-title `activity` item and animations
 being enabled. The indicator width is included in wrapping calculations, and
 a lightweight driver advances a tmux animation option every approximately
-`100ms` (`10 FPS`) while any busy Codex pane exists. One full loop takes
+`50ms` (`20 FPS`) while any busy Codex pane exists. One full loop takes
 `1.2s`. Window layout stays cached, so each frame is expanded by tmux without
 rerunning the Python layout renderer. The fragment does not lower tmux's
 global `status-interval`.
 
-Four seven-colour palettes cover active/inactive windows in light/dark terminal
-themes:
+Four thirteen-colour palettes cover active/inactive windows in light/dark
+terminal themes:
 
 ```tmux
 set -g @tmux-window-wrap-activity-light-inactive 'RRGGBB,...'

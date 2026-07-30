@@ -16,8 +16,12 @@ CODEX_BUSY_PANES_FORMAT = (
     f"#{{P:#{{m/r:^[{CODEX_ACTIVITY_SPINNER}]( |$),#{{pane_title}}}}}}"
 )
 CODEX_ACTIVITY_GLYPH = "▓"
-CODEX_ACTIVITY_LEVEL_SEQUENCE = (0, 1, 2, 3, 4, 5, 6, 5, 4, 3, 2, 1)
-DEFAULT_CODEX_ACTIVITY_FPS = 10
+CODEX_ACTIVITY_LEVEL_COUNT = 13
+CODEX_ACTIVITY_LEVEL_SEQUENCE = (
+    *range(CODEX_ACTIVITY_LEVEL_COUNT),
+    *range(CODEX_ACTIVITY_LEVEL_COUNT - 2, 0, -1),
+)
+DEFAULT_CODEX_ACTIVITY_FPS = 20
 ANIMATION_TICK_OPTION = "@tmux-window-wrap-animation-tick"
 COLOR_SCHEME_OPTION = "@tmux-window-wrap-color-scheme"
 ANIMATOR_OWNER_ENVIRONMENT = "TMUX_WINDOW_WRAP_ANIMATOR_OWNER"
@@ -25,40 +29,64 @@ DEFAULT_ACTIVITY_PALETTES = {
     "light": {
         "inactive": (
             "D4D4D4",
+            "CACACA",
             "C0C0C0",
+            "B6B6B6",
             "ACACAC",
+            "A2A2A2",
             "989898",
+            "8E8E8E",
             "848484",
+            "7A7A7A",
             "707070",
+            "666666",
             "5C5C5C",
         ),
         "active": (
             "6F8790",
+            "687F89",
             "617781",
+            "5A707A",
             "536873",
+            "4D616C",
             "465A65",
+            "40535E",
             "394C57",
+            "334550",
             "2D3E49",
+            "283742",
             "22303A",
         ),
     },
     "dark": {
         "inactive": (
             "50545C",
+            "5C6068",
             "686C74",
+            "747880",
             "80848C",
+            "8C9098",
             "989CA4",
+            "A4A8B0",
             "B0B4BC",
+            "BCC0C8",
             "C8CCD4",
+            "D4D8E0",
             "E0E4EC",
         ),
         "active": (
             "4F86B1",
+            "4B7EA7",
             "47769C",
+            "436E92",
             "3F6687",
+            "3B5F7D",
             "375772",
+            "345068",
             "30485E",
+            "2D4155",
             "293A4B",
+            "263442",
             "222D39",
         ),
     },
@@ -106,12 +134,13 @@ def parse_palette(value):
         for colour in value.split(",")
     )
     hexadecimal = set("0123456789ABCDEF")
-    if len(colours) != 7 or any(
+    if len(colours) != CODEX_ACTIVITY_LEVEL_COUNT or any(
         len(colour) != 6 or not set(colour) <= hexadecimal
         for colour in colours
     ):
         raise argparse.ArgumentTypeError(
-            "palette must contain exactly seven comma-separated RRGGBB colours"
+            "palette must contain exactly "
+            f"{CODEX_ACTIVITY_LEVEL_COUNT} comma-separated RRGGBB colours"
         )
     return colours
 
