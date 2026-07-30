@@ -15,7 +15,8 @@ also send complete prefix+key chords.
 | `Cmd+D` / `Cmd+Shift+D` | split L-R / T-B |
 | `Cmd+[` / `Cmd+]` | prev / next pane |
 | `Cmd+Shift+[` / `]` | prev / next window |
-| `Cmd+I` / `Cmd+Shift+I` | rename window / session |
+| `Cmd+I` | centered popup rename window |
+| `Cmd+Shift+I` | rename session |
 | `Cmd+Shift+Enter` | zoom pane |
 | `Cmd+1…9` / `Cmd+0` | select window (0 = last) |
 | `Cmd+Opt+I` | broadcast on/off (window) |
@@ -43,6 +44,7 @@ also send complete prefix+key chords.
 | `prefix 1-9` | select window |
 | `prefix 0` / `Cmd+0` | last window |
 | `prefix p` / `n` | prev / next window |
+| `prefix ,` / `Cmd+I` | centered popup rename current window |
 | `Option+,` / `Option+.` (`M-</>`) | reorder window left / right |
 | `prefix w` | window list (tmux default) |
 

@@ -7,7 +7,7 @@ Optional terminal shell for multi-agent CLI work. **Not** loaded by `init.zsh`.
 | Layer | Feature |
 |-------|---------|
 | Ghostty | Cmd chords → tmux prefix (`C-Space`); Shift+Enter → newline for AI CLIs |
-| tmux | zoom-aware pane nav, broadcast + per-pane mute, pane top bar, copy-mode `v`/`Y` |
+| tmux | centered window rename popup, zoom-aware pane nav, broadcast + per-pane mute, pane top bar, copy-mode `v`/`Y` |
 | window-wrap | multi-line status window list (separate conf) |
 | tmux-shot | optional; `Y` in copy-mode via [tmux-shot](https://github.com/Async23/tmux-shot) |
 
@@ -18,6 +18,7 @@ Optional terminal shell for multi-agent CLI work. **Not** loaded by `init.zsh`.
 | `conf/ghostty-tmux.conf` | Ghostty keybind bridge + Shift+Enter |
 | `conf/tmux-workstation.conf` | tmux prefix, binds, broadcast, status chrome |
 | `conf/tmux-window-wrap.conf` | multi-line window list |
+| `bin/tmux-rename-window-popup` | stable-target window rename UI (requires `fzf`) |
 | `bin/tmux-window-wrap` | renderer (symlink to `~/.local/bin`) |
 | `docs/cheatsheet.md` | key map |
 
@@ -26,8 +27,11 @@ Optional terminal shell for multi-agent CLI work. **Not** loaded by `init.zsh`.
 ```bash
 AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
 
+ln -sf "$AIPANE_ROOT/bin/tmux-rename-window-popup" ~/.local/bin/tmux-rename-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
 ```
+
+The rename popup requires `fzf` on `PATH`.
 
 ### Ghostty (`~/.config/ghostty/config`)
 
@@ -42,7 +46,10 @@ Use an absolute path (or a path Ghostty can resolve). Reload Ghostty config afte
 
 `Cmd+S` remains the prefix-only starter for general tmux commands. Pane ID
 lookup does not require the two-step sequence: use `Cmd+Opt+P` for its one-shot
-popup. `Ctrl-Space` also provides direct access to the tmux prefix.
+popup. `Cmd+I` opens a centered window rename popup prefilled with the current
+name; the binding expands and captures `window_id` before the popup opens, so
+index renumbering cannot change the target. `Ctrl-Space` also provides direct
+access to the tmux prefix.
 
 ### tmux (`~/.tmux.conf`)
 

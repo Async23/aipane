@@ -5,8 +5,10 @@ Drives the shipped conf files under conf/ (not re-implemented copies).
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -15,6 +17,7 @@ GHOSTTY_CONF = ROOT / "conf" / "ghostty-tmux.conf"
 TMUX_WS = ROOT / "conf" / "tmux-workstation.conf"
 TMUX_WRAP = ROOT / "conf" / "tmux-window-wrap.conf"
 WRAP_BIN = ROOT / "bin" / "tmux-window-wrap"
+RENAME_BIN = ROOT / "bin" / "tmux-rename-window-popup"
 CHEATSHEET = ROOT / "docs" / "cheatsheet.md"
 WS_DOC = ROOT / "docs" / "ghostty-tmux-workstation.md"
 
@@ -41,7 +44,13 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
         self.assertIn("window_zoomed_flag", text)
         self.assertIn("bind v copy-mode", text)
         self.assertIn("bind Q display-popup", text)
+        self.assertIn("bind , run-shell -C", text)
+        self.assertIn("AIPANE_RENAME_WINDOW_TARGET=#{window_id}", text)
+        self.assertIn("-w 52 -h 5", text)
+        self.assertIn('-T "#[align=centre] Rename window #I "', text)
+        self.assertIn("tmux-rename-window-popup", text)
         self.assertIn("tmux-shot-capture", text)
+        self.assertTrue(RENAME_BIN.is_file())
         # stay a fragment: no TPM / no personal home paths
         self.assertNotIn("@plugin", text)
         self.assertNotIn("/Users/", text)
@@ -101,6 +110,15 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
             self.assertRegex(keys, re.compile(r"prefix\s+B\s+.*synchronize-panes"))
             self.assertRegex(keys, re.compile(r"prefix\s+v\s+.*copy-mode"))
             self.assertRegex(keys, re.compile(r"prefix\s+Q\s+.*display-popup"))
+            self.assertRegex(
+                keys,
+                re.compile(
+                    r"prefix\s+,\s+.*run-shell -C.*display-popup"
+                    r".*align=centre"
+                    r".*AIPANE_RENAME_WINDOW_TARGET=#\{window_id\}"
+                    r".*tmux-rename-window-popup"
+                ),
+            )
             fmt0 = subprocess.run(
                 [
                     "tmux",
@@ -124,6 +142,155 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
             )
 
 
+class RenameWindowPopupTests(unittest.TestCase):
+    def setUp(self):
+        self.socket = f"rename-popup-{os.getpid()}-{id(self)}"
+        subprocess.run(
+            [
+                "tmux",
+                "-L",
+                self.socket,
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "rename",
+                "-n",
+                "original",
+                "sleep 30",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.window_id = self.tmux(
+            "display-message", "-p", "-t", "rename:0", "#{window_id}"
+        ).stdout.strip()
+        socket_path = self.tmux(
+            "display-message", "-p", "#{socket_path}"
+        ).stdout.strip()
+        server_pid = self.tmux(
+            "display-message", "-p", "#{pid}"
+        ).stdout.strip()
+        pane_id = self.tmux(
+            "display-message", "-p", "-t", "rename:0", "#{pane_id}"
+        ).stdout.strip()
+        self.tmux_environment = f"{socket_path},{server_pid},{pane_id.lstrip('%')}"
+        self.pane_id = pane_id
+
+    def tearDown(self):
+        subprocess.run(
+            ["tmux", "-L", self.socket, "kill-server"],
+            check=False,
+            capture_output=True,
+        )
+
+    def tmux(self, *args):
+        return subprocess.run(
+            ["tmux", "-L", self.socket, *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def run_helper(self, fake_fzf_body, new_name=None, target=None):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_fzf = Path(temp_dir) / "fzf"
+            fake_fzf.write_text(
+                "#!/bin/sh\n" + fake_fzf_body,
+                encoding="utf-8",
+            )
+            fake_fzf.chmod(0o755)
+
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "TMUX": self.tmux_environment,
+                    "TMUX_PANE": self.pane_id,
+                    "AIPANE_FZF_BIN": str(fake_fzf),
+                }
+            )
+            environment["AIPANE_RENAME_WINDOW_TARGET"] = (
+                self.window_id if target is None else target
+            )
+            if new_name is not None:
+                environment["AIPANE_TEST_NEW_NAME"] = new_name
+
+            return subprocess.run(
+                [str(RENAME_BIN)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+    def test_helper_renames_stable_window_id_with_literal_name(self):
+        new_name = "  -release $HOME; 'quoted' 中文  "
+        result = self.run_helper(
+            "printf '%s\\n' \"$AIPANE_TEST_NEW_NAME\"\n",
+            new_name=new_name,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actual_name = self.tmux(
+            "display-message", "-p", "-t", self.window_id, "#{window_name}"
+        ).stdout.rstrip("\n")
+        self.assertEqual(actual_name, new_name)
+
+    def test_helper_uses_query_only_fzf_mode_without_blank_candidate(self):
+        new_name = "query-only"
+        result = self.run_helper(
+            """
+byte_count=$(wc -c | tr -d ' ')
+[ "$byte_count" = 0 ] || exit 90
+case "$*" in
+  *enter:accept-or-print-query*) ;;
+  *) exit 91 ;;
+esac
+printf '%s\\n' "$AIPANE_TEST_NEW_NAME"
+""",
+            new_name=new_name,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actual_name = self.tmux(
+            "display-message", "-p", "-t", self.window_id, "#{window_name}"
+        ).stdout.rstrip("\n")
+        self.assertEqual(actual_name, new_name)
+
+    def test_helper_layout_uses_short_prompt_and_english_right_aligned_footer(self):
+        text = RENAME_BIN.read_text(encoding="utf-8")
+
+        self.assertIn("--prompt='› '", text)
+        self.assertIn('--footer="$footer_text"', text)
+        self.assertIn("--footer-border=none", text)
+        self.assertIn("footer_hint='Enter Save · Esc Cancel'", text)
+        self.assertIn("footer_hint_width=23", text)
+        self.assertNotIn("--header=", text)
+        self.assertNotIn("新名称", text)
+        self.assertNotIn("保存", text)
+        self.assertNotIn("取消", text)
+
+    def test_helper_rejects_unexpanded_window_id(self):
+        result = self.run_helper(
+            "exit 99\n",
+            target="#{window_id}",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid window target", result.stderr)
+
+    def test_helper_cancel_keeps_window_name(self):
+        result = self.run_helper("exit 130\n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actual_name = self.tmux(
+            "display-message", "-p", "-t", self.window_id, "#{window_name}"
+        ).stdout.rstrip("\n")
+        self.assertEqual(actual_name, "original")
+
+
 class DocsPointerTests(unittest.TestCase):
     def test_docs_exist_and_name_public_confs(self):
         self.assertTrue(CHEATSHEET.is_file())
@@ -132,11 +299,13 @@ class DocsPointerTests(unittest.TestCase):
         self.assertIn("conf/ghostty-tmux.conf", doc)
         self.assertIn("conf/tmux-workstation.conf", doc)
         self.assertIn("conf/tmux-window-wrap.conf", doc)
+        self.assertIn("bin/tmux-rename-window-popup", doc)
         self.assertIn("`Cmd+Opt+P`", doc)
 
         cheatsheet = CHEATSHEET.read_text(encoding="utf-8")
         self.assertIn("| `Cmd+S` | prefix only |", cheatsheet)
         self.assertIn("| `Cmd+Opt+P` | popup pane ID list |", cheatsheet)
+        self.assertIn("| `Cmd+I` | centered popup rename window |", cheatsheet)
 
 
 if __name__ == "__main__":

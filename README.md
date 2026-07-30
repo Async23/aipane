@@ -53,7 +53,7 @@ Terminal shell tuned for many AI CLI panes. **Not** loaded by `init.zsh`. Person
 
 | Piece | What it does |
 |-------|----------------|
-| Ghostty Cmd bridge | `Cmd+S` prefix; one-shot `Cmd+T/W/D/[]/…`; `Cmd+Opt+P` shows pane IDs |
+| Ghostty Cmd bridge | `Cmd+S` prefix; one-shot `Cmd+T/W/D/[]/…`; `Cmd+I` renames in a centered popup; `Cmd+Opt+P` shows pane IDs |
 | Shift+Enter | Newline for Codex/other CLIs under tmux (`→` Ctrl+J) |
 | tmux workstation | zoom-aware nav, broadcast + per-pane mute, pane top bar, vi copy-mode |
 | window-wrap | status window labels wrap up to 3 lines |
@@ -61,8 +61,11 @@ Terminal shell tuned for many AI CLI panes. **Not** loaded by `init.zsh`. Person
 
 ```bash
 AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
+ln -sf "$AIPANE_ROOT/bin/tmux-rename-window-popup" ~/.local/bin/tmux-rename-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
 ```
+
+The rename popup requires `fzf` on `PATH`.
 
 **Ghostty** (`~/.config/ghostty/config`) — personal look + include:
 
@@ -82,6 +85,7 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `conf/ghostty-tmux.conf` | Cmd bridge + Shift+Enter |
 | `conf/tmux-workstation.conf` | prefix, binds, broadcast, status chrome |
 | `conf/tmux-window-wrap.conf` | multi-line window list |
+| `bin/tmux-rename-window-popup` | centered stable-target window rename UI |
 | `bin/tmux-window-wrap` | renderer CLI |
 | `tests/test_tmux_window_wrap.py` | window-wrap unit + live tmux tests |
 | `tests/test_workstation_fragments.py` | structural tests for conf fragments |
@@ -208,6 +212,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 ├── bin/
 │   ├── aipane-cleanup
 │   ├── rod-cleanup
+│   ├── tmux-rename-window-popup
 │   └── tmux-window-wrap     # optional status-bar renderer
 ├── conf/                    # optional; not sourced by init.zsh
 │   ├── ghostty-tmux.conf
@@ -231,7 +236,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 
 ```bash
 zsh -n init.zsh aipane.zsh cmd/*.zsh lib/*.zsh tests/*.zsh
-sh -n bin/aipane-cleanup bin/rod-cleanup tests/*.sh
+sh -n bin/aipane-cleanup bin/rod-cleanup bin/tmux-rename-window-popup tests/*.sh
 
 zsh -fc '
   source ./init.zsh
