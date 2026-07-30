@@ -125,7 +125,12 @@ def window_width(window):
         base_width = window["display_width"]
     else:
         base_width = display_width(window["label"])
-    return base_width + max(0, int(window.get("busy_codex_count", 0)))
+    busy_codex_count = max(
+        0,
+        int(window.get("busy_codex_count", 0)),
+    )
+    activity_width = max(0, busy_codex_count - 1)
+    return base_width + activity_width
 
 
 def parse_palette(value):
@@ -372,16 +377,20 @@ def render_window(
         codex_activity += f"#[fg={name_colour}]"
     escaped_name = window["name"].replace("#", "##")
     if active:
+        inner_padding = "" if codex_activity else " "
         rendered = (
-            f"{window_range}#[fg=blue]#[bg=blue]#[fg=colour15]#[bold]"
-            f" {codex_activity}{window['index']}:{escaped_name} "
+            f"{window_range}#[fg=blue]#[bg=blue]"
+            f"#[fg=colour15]#[bold]"
+            f"{inner_padding}{codex_activity}"
+            f"{window['index']}:{escaped_name} "
         )
         if synchronized:
             rendered += "#[fg=red]▶ "
         return rendered + "#[bg=default]#[fg=blue]#[default]#[norange]"
 
+    leading_padding = "" if codex_activity else " "
     rendered = (
-        f"{window_range} #[fg=colour7]{codex_activity}"
+        f"{window_range}{leading_padding}#[fg=colour7]{codex_activity}"
         f"{window['index']}:{escaped_name}"
     )
     if synchronized:

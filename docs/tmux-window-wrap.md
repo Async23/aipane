@@ -25,6 +25,11 @@ This keeps multiple Codex panes distinguishable without synchronizing their
 breathing animation. Idle panes and panes showing `[ ! ] Action Required` are
 not counted.
 
+For any window with an activity indicator, the normal left padding is omitted
+so the indicator begins flush with the preceding window label and index. The
+first indicator replaces that omitted padding; additional indicators add one
+column each.
+
 Detection depends on the Codex terminal-title `activity` item and animations
 being enabled. The indicator width is included in wrapping calculations, and
 a lightweight driver advances a tmux animation option every approximately
