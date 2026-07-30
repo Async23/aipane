@@ -374,15 +374,15 @@ def render_window(
     if active:
         rendered = (
             f"{window_range}#[fg=blue]#[bg=blue]#[fg=colour15]#[bold]"
-            f" {window['index']}:{codex_activity}{escaped_name} "
+            f" {codex_activity}{window['index']}:{escaped_name} "
         )
         if synchronized:
             rendered += "#[fg=red]▶ "
         return rendered + "#[bg=default]#[fg=blue]#[default]#[norange]"
 
     rendered = (
-        f"{window_range} #[fg=colour7]{window['index']}:"
-        f"{codex_activity}{escaped_name}"
+        f"{window_range} #[fg=colour7]{codex_activity}"
+        f"{window['index']}:{escaped_name}"
     )
     if synchronized:
         rendered += " #[fg=red]▶#[default]"

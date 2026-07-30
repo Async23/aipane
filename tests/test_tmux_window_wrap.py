@@ -285,7 +285,7 @@ class WindowWrapCliTests(unittest.TestCase):
                     for level in levels
                 )
                 self.assertIn(
-                    f" 18:{expected}#[fg=colour15]theme ",
+                    f" {expected}#[fg=colour15]18:theme ",
                     rendered,
                 )
 
@@ -326,15 +326,15 @@ class WindowWrapCliTests(unittest.TestCase):
         rendered = self.run_render(payload, 0)
 
         self.assertIn(
-            "1:#[fg=#020202]▓#[fg=colour7]one ",
+            "#[fg=#020202]▓#[fg=colour7]1:one ",
             rendered,
         )
         self.assertIn(
-            "2:#[fg=#0A0A0A]▓#[fg=colour7]two ",
+            "#[fg=#0A0A0A]▓#[fg=colour7]2:two ",
             rendered,
         )
         self.assertIn(
-            " 3:#[fg=#080000]▓#[fg=colour15]three ",
+            " #[fg=#080000]▓#[fg=colour15]3:three ",
             rendered,
         )
 
@@ -388,7 +388,7 @@ class WindowWrapCliTests(unittest.TestCase):
         rendered = self.run_render(payload, 0)
 
         self.assertIn(
-            " 18:"
+            " "
             "#{?#{==:#{@tmux-window-wrap-color-scheme},dark},"
             "#{?#{==:#{@tmux-window-wrap-animation-tick},0},"
             "#[fg=#000001]▓#[fg=#00000D]▓,"
@@ -404,7 +404,7 @@ class WindowWrapCliTests(unittest.TestCase):
             rendered,
         )
         self.assertIn(
-            "}#[fg=colour15]theme ",
+            "}#[fg=colour15]18:theme ",
             rendered,
         )
 
@@ -437,7 +437,7 @@ class WindowWrapCliTests(unittest.TestCase):
         rendered = self.run_render(payload, 0)
 
         self.assertIn(
-            "18:#[fg=#000100]▓#[fg=colour7]theme ",
+            "#[fg=#000100]▓#[fg=colour7]18:theme ",
             rendered,
         )
 

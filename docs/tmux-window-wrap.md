@@ -5,13 +5,13 @@ Optional multi-line tmux status window list (up to 3 rows).
 ## Codex activity indicators
 
 Each Codex pane whose terminal title starts with Codex's working spinner adds
-one fixed dark-shade cell between the window index and name:
+one fixed dark-shade cell before the window index:
 
 ```text
 18:theme       # no running Codex pane
-18:▓theme      # one running Codex pane
-18:▓▓theme     # two running Codex panes
-18:▓▓▓theme    # three running Codex panes
+▓18:theme      # one running Codex pane
+▓▓18:theme     # two running Codex panes
+▓▓▓18:theme    # three running Codex panes
 ```
 
 The glyph never changes; only its foreground colour moves through thirteen
