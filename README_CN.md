@@ -53,7 +53,7 @@ git -C ~/.aipane pull --ff-only
 
 | 部分 | 作用 |
 |------|------|
-| Ghostty Cmd 桥 | `Cmd+S` prefix；单次 `Cmd+T/W/D/[]/…`；`Cmd+Opt+P` 显示 pane ID |
+| Ghostty Cmd 桥 | `Cmd+S` prefix；单次 `Cmd+T/W/D/[]/…`；`Cmd+I` 中央弹窗重命名；`Cmd+Opt+P` 显示 pane ID |
 | Shift+Enter | tmux 里给 Codex 等稳定换行（→ Ctrl+J） |
 | tmux workstation | zoom 保持导航、广播/单格豁免、pane 顶栏、vi 复制 |
 | window-wrap | 状态栏窗口标签最多 3 行 |
@@ -61,8 +61,11 @@ git -C ~/.aipane pull --ff-only
 
 ```bash
 AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
+ln -sf "$AIPANE_ROOT/bin/tmux-rename-window-popup" ~/.local/bin/tmux-rename-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
 ```
+
+重命名弹窗要求 `PATH` 中存在 `fzf`。
 
 **Ghostty**（`~/.config/ghostty/config`）— 个人外观 + include：
 
@@ -82,6 +85,7 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `conf/ghostty-tmux.conf` | Cmd 桥 + Shift+Enter |
 | `conf/tmux-workstation.conf` | prefix、键位、广播、状态栏样式 |
 | `conf/tmux-window-wrap.conf` | 窗口列表多行 |
+| `bin/tmux-rename-window-popup` | 中央弹窗、稳定目标的窗口重命名 UI |
 | `bin/tmux-window-wrap` | 渲染 CLI |
 | `tests/test_tmux_window_wrap.py` | window-wrap 单元 + 真 tmux 测试 |
 | `tests/test_workstation_fragments.py` | conf 片段结构测试 |
@@ -208,6 +212,7 @@ killrod --dry-run
 ├── bin/
 │   ├── aipane-cleanup
 │   ├── rod-cleanup
+│   ├── tmux-rename-window-popup
 │   └── tmux-window-wrap     # 可选状态栏渲染器
 ├── conf/                    # 可选；不会被 init.zsh 加载
 │   ├── ghostty-tmux.conf
@@ -231,7 +236,7 @@ killrod --dry-run
 
 ```bash
 zsh -n init.zsh aipane.zsh cmd/*.zsh lib/*.zsh tests/*.zsh
-sh -n bin/aipane-cleanup bin/rod-cleanup tests/*.sh
+sh -n bin/aipane-cleanup bin/rod-cleanup bin/tmux-rename-window-popup tests/*.sh
 
 zsh -fc '
   source ./init.zsh

@@ -1,0 +1,87 @@
+#!/bin/sh
+# tmux-rename-window-popup: edit a stable tmux window target in an fzf popup.
+
+TMUX_BIN="${AIPANE_TMUX_BIN:-tmux}"
+FZF_BIN="${AIPANE_FZF_BIN:-fzf}"
+TARGET="${AIPANE_RENAME_WINDOW_TARGET:-}"
+
+fail() {
+  message="Rename window: $*"
+  "$TMUX_BIN" display-message "$message" 2>/dev/null || true
+  printf '%s\n' "$message" >&2
+  exit 1
+}
+
+if ! command -v "$TMUX_BIN" >/dev/null 2>&1; then
+  printf 'Rename window: tmux not found: %s\n' "$TMUX_BIN" >&2
+  exit 127
+fi
+
+if ! command -v "$FZF_BIN" >/dev/null 2>&1; then
+  fail "fzf not found"
+fi
+
+case "$TARGET" in
+  @*) target_number=${TARGET#@} ;;
+  *) fail "invalid window target" ;;
+esac
+
+case "$target_number" in
+  ''|*[!0-9]*) fail "invalid window target" ;;
+esac
+
+current_name=$(
+  "$TMUX_BIN" display-message -p -t "$TARGET" '#{window_name}' 2>/dev/null
+) || fail "window $TARGET no longer exists"
+
+terminal_size=$(
+  { stty size </dev/tty; } 2>/dev/null || printf '5 62\n'
+)
+popup_columns=${terminal_size##* }
+case "$popup_columns" in
+  ''|*[!0-9]*) popup_columns=62 ;;
+esac
+
+footer_hint='Enter Save · Esc Cancel'
+footer_hint_width=23
+footer_padding=$((popup_columns - footer_hint_width - 3))
+if [ "$footer_padding" -lt 0 ]; then
+  footer_padding=0
+fi
+footer_text=$(printf '%*s%s' "$footer_padding" '' "$footer_hint")
+
+fzf_output=$(
+  env FZF_DEFAULT_OPTS= FZF_DEFAULT_OPTS_FILE= \
+    "$FZF_BIN" \
+      --layout=reverse \
+      --border=none \
+      --info=hidden \
+      --no-separator \
+      --no-scrollbar \
+      --no-mouse \
+      --no-multi \
+      --disabled \
+      --pointer=' ' \
+      --gutter=' ' \
+      --footer-border=none \
+      --footer="$footer_text" \
+      --prompt='› ' \
+      --query="$current_name" \
+      --bind='enter:accept-or-print-query,esc:abort,ctrl-u:clear-query' \
+      </dev/null
+)
+fzf_status=$?
+
+case "$fzf_status" in
+  0) ;;
+  1|130) exit 0 ;;
+  *) fail "fzf exited with status $fzf_status" ;;
+esac
+
+new_name=$(printf '%s\n' "$fzf_output" | sed -n '1p')
+if [ -z "$new_name" ] || [ "$new_name" = "$current_name" ]; then
+  exit 0
+fi
+
+"$TMUX_BIN" rename-window -t "$TARGET" -- "$new_name" ||
+  fail "window $TARGET could not be renamed"
