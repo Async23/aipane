@@ -52,7 +52,8 @@ popup. `Cmd+I` opens a centered window rename popup prefilled with the current
 name; the binding expands and captures `window_id` before the popup opens, so
 index renumbering cannot change the target. `Ctrl-Space` also provides direct
 access to the tmux prefix. Use `prefix P` to open the complete indexed terminal
-colour palette; scroll with the arrow keys and press `q` to close it.
+colour palette, grouped into ANSI colours, an RGB cube, and grayscale. Scroll
+with the arrow keys and press `q` or `Esc` to close it.
 
 ### tmux (`~/.tmux.conf`)
 

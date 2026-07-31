@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -302,7 +303,7 @@ printf '%s\\n' "$AIPANE_TEST_NEW_NAME"
 
 
 class ColourPalettePopupTests(unittest.TestCase):
-    def test_print_mode_renders_every_index_in_eight_columns(self):
+    def test_print_mode_groups_ansi_rgb_cube_and_grayscale_colours(self):
         result = subprocess.run(
             [str(COLOUR_PALETTE_BIN), "--print"],
             check=True,
@@ -315,13 +316,117 @@ class ColourPalettePopupTests(unittest.TestCase):
             for line in result.stdout.splitlines()
             if "\x1b[48;5;" in line
         ]
-        self.assertEqual(len(colour_lines), 32)
-        self.assertTrue(
-            all(line.count("\x1b[48;5;") == 8 for line in colour_lines)
+        colour_rows = [
+            [int(value) for value in re.findall(r"\x1b\[48;5;(\d+)m", line)]
+            for line in colour_lines
+        ]
+
+        self.assertIn("ANSI colours (0-15)", result.stdout)
+        self.assertIn(
+            "RGB cube (16-231): R blocks, G rows, B columns",
+            result.stdout,
         )
-        self.assertEqual(result.stdout.count("\x1b[48;5;"), 256)
-        for colour in range(256):
-            self.assertIn(f"\x1b[48;5;{colour}m", result.stdout)
+        self.assertIn("Grayscale (232-255)", result.stdout)
+        self.assertEqual(colour_rows[:2], [list(range(8)), list(range(8, 16))])
+
+        expected_cube_rows = []
+        for left_red in (0, 2, 4):
+            right_red = left_red + 1
+            for green in range(6):
+                expected_cube_rows.append(
+                    [
+                        16 + 36 * left_red + 6 * green + blue
+                        for blue in range(6)
+                    ]
+                    + [
+                        16 + 36 * right_red + 6 * green + blue
+                        for blue in range(6)
+                    ]
+                )
+        self.assertEqual(colour_rows[2:20], expected_cube_rows)
+        self.assertEqual(
+            colour_rows[20:],
+            [list(range(232, 244)), list(range(244, 256))],
+        )
+
+        all_colours = [colour for row in colour_rows for colour in row]
+        self.assertEqual(len(all_colours), 256)
+        self.assertEqual(sorted(all_colours), list(range(256)))
+
+    def test_interactive_mode_starts_at_top_scrolls_and_quits(self):
+        for exit_key in ("q", "Escape"):
+            socket = f"palette-popup-{os.getpid()}-{id(self)}-{exit_key}"
+            session = "palette"
+            subprocess.run(
+                [
+                    "tmux",
+                    "-L",
+                    socket,
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-x",
+                    "86",
+                    "-y",
+                    "20",
+                    "-s",
+                    session,
+                    str(COLOUR_PALETTE_BIN),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            try:
+                time.sleep(0.1)
+                first_screen = subprocess.run(
+                    ["tmux", "-L", socket, "capture-pane", "-p", "-t", session],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+                self.assertEqual(
+                    first_screen.splitlines()[0],
+                    "tmux 256-colour palette",
+                )
+
+                subprocess.run(
+                    ["tmux", "-L", socket, "send-keys", "-t", session, "Down"],
+                    check=True,
+                    capture_output=True,
+                )
+                time.sleep(0.1)
+                self.assertEqual(
+                    subprocess.run(
+                        ["tmux", "-L", socket, "has-session", "-t", session],
+                        check=False,
+                        capture_output=True,
+                    ).returncode,
+                    0,
+                    "Down must scroll rather than trigger the Esc binding",
+                )
+
+                subprocess.run(
+                    ["tmux", "-L", socket, "send-keys", "-t", session, exit_key],
+                    check=True,
+                    capture_output=True,
+                )
+                time.sleep(0.2)
+                self.assertNotEqual(
+                    subprocess.run(
+                        ["tmux", "-L", socket, "has-session", "-t", session],
+                        check=False,
+                        capture_output=True,
+                    ).returncode,
+                    0,
+                )
+            finally:
+                subprocess.run(
+                    ["tmux", "-L", socket, "kill-server"],
+                    check=False,
+                    capture_output=True,
+                )
 
 
 class DocsPointerTests(unittest.TestCase):
@@ -340,7 +445,11 @@ class DocsPointerTests(unittest.TestCase):
         self.assertIn("| `Cmd+S` | prefix only |", cheatsheet)
         self.assertIn("| `Cmd+Opt+P` | popup pane ID list |", cheatsheet)
         self.assertIn("| `Cmd+I` | centered popup rename window |", cheatsheet)
-        self.assertIn("| `prefix P` | indexed colour palette (`0–255`) |", cheatsheet)
+        self.assertIn(
+            "| `prefix P` | indexed colour palette "
+            "(`0–255`; `q`/`Esc` closes) |",
+            cheatsheet,
+        )
 
 
 if __name__ == "__main__":

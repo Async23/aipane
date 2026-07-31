@@ -108,7 +108,7 @@ prefix+v → move → v (or C-v rect) → y (clipboard) or Y (tmux-shot)
 
 | Key | Action |
 |-----|--------|
-| `prefix P` | indexed colour palette (`0–255`) |
+| `prefix P` | indexed colour palette (`0–255`; `q`/`Esc` closes) |
 | `prefix Q` / `Cmd+Opt+P` | popup pane ID list |
 | double-click status window label | zoom that window's pane |
 | multi-line window list | `tmux-window-wrap` when labels overflow |

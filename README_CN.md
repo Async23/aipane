@@ -59,7 +59,13 @@ git -C ~/.aipane pull --ff-only
 | window-wrap | 状态栏窗口标签最多 3 行 |
 | copy-mode `Y` | 可选长截图，依赖 [tmux-shot](https://github.com/Async23/tmux-shot) |
 
-![tmux 终端 256 色表弹窗](docs/assets/tmux-colour-palette.png)
+**深色主题**
+
+![深色主题下的 tmux 终端 256 色表弹窗](docs/assets/tmux-colour-palette-dark.png)
+
+**浅色主题**
+
+![浅色主题下的 tmux 终端 256 色表弹窗](docs/assets/tmux-colour-palette-light.png)
 
 ```bash
 AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
