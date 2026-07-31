@@ -3,19 +3,185 @@
 
 set -eu
 
-render_palette() {
-  printf 'tmux 256-colour palette\n\n'
+print_swatch() {
+  colour=$1
+  printf '\033[48;5;%dm  \033[0m%3d ' "$colour" "$colour"
+}
 
-  colour=0
-  while [ "$colour" -lt 256 ]; do
-    printf '\033[48;5;%dm    \033[0m %3d  ' "$colour" "$colour"
+print_range() {
+  colour=$1
+  last=$2
+  columns=$3
+  column=0
+
+  while [ "$colour" -le "$last" ]; do
+    print_swatch "$colour"
     colour=$((colour + 1))
-    if [ $((colour % 8)) -eq 0 ]; then
+    column=$((column + 1))
+    if [ $((column % columns)) -eq 0 ]; then
       printf '\n'
     fi
   done
 
+  if [ $((column % columns)) -ne 0 ]; then
+    printf '\n'
+  fi
+}
+
+print_rgb_pair() {
+  left_red=$1
+  right_red=$2
+
+  printf '   R=%d%35sR=%d\n' "$left_red" '' "$right_red"
+
+  green=0
+  while [ "$green" -lt 6 ]; do
+    printf 'G%d ' "$green"
+    blue=0
+    while [ "$blue" -lt 6 ]; do
+      colour=$((16 + 36 * left_red + 6 * green + blue))
+      print_swatch "$colour"
+      blue=$((blue + 1))
+    done
+
+    printf '  G%d ' "$green"
+    blue=0
+    while [ "$blue" -lt 6 ]; do
+      colour=$((16 + 36 * right_red + 6 * green + blue))
+      print_swatch "$colour"
+      blue=$((blue + 1))
+    done
+    printf '\n'
+
+    green=$((green + 1))
+  done
+}
+
+render_palette() {
+  printf 'tmux 256-colour palette\n\n'
+
+  printf 'ANSI colours (0-15)\n'
+  printf 'base    '
+  print_range 0 7 8
+  printf 'bright  '
+  print_range 8 15 8
+
+  printf '\nRGB cube (16-231): R blocks, G rows, B columns\n'
+  print_rgb_pair 0 1
   printf '\n'
+  print_rgb_pair 2 3
+  printf '\n'
+  print_rgb_pair 4 5
+
+  printf '\nGrayscale (232-255)\n'
+  print_range 232 255 12
+}
+
+restore_tty() {
+  stty "$saved_tty" <"$tty_path" 2>/dev/null || true
+  printf '\033[?25h'
+}
+
+read_key() {
+  key_action=ignore
+  key=$(dd bs=1 count=1 <"$tty_path" 2>/dev/null) || return 1
+
+  case "$key" in
+    q|"$control_c") key_action=quit ;;
+    j) key_action=down ;;
+    k) key_action=up ;;
+    g) key_action=top ;;
+    G) key_action=bottom ;;
+    ' ') key_action=page_down ;;
+    b) key_action=page_up ;;
+    "$escape")
+      stty -echo -icanon min 0 time 1 <"$tty_path"
+      second=$(dd bs=1 count=1 <"$tty_path" 2>/dev/null) || second=''
+
+      if [ -z "$second" ]; then
+        key_action=quit
+      elif [ "$second" = '[' ]; then
+        third=$(dd bs=1 count=1 <"$tty_path" 2>/dev/null) || third=''
+        case "$third" in
+          A) key_action=up ;;
+          B) key_action=down ;;
+          H) key_action=top ;;
+          F) key_action=bottom ;;
+          5)
+            dd bs=1 count=1 <"$tty_path" >/dev/null 2>&1 || true
+            key_action=page_up
+            ;;
+          6)
+            dd bs=1 count=1 <"$tty_path" >/dev/null 2>&1 || true
+            key_action=page_down
+            ;;
+        esac
+      fi
+
+      stty -echo -icanon min 1 time 0 <"$tty_path"
+      ;;
+  esac
+}
+
+render_screen() {
+  dimensions=$(stty size <"$tty_path" 2>/dev/null || printf '38 86')
+  screen_rows=${dimensions%% *}
+  case "$screen_rows" in
+    ''|*[!0-9]*|0|1) screen_rows=38 ;;
+  esac
+
+  page_rows=$((screen_rows - 1))
+  max_top=$((total_lines - page_rows + 1))
+  [ "$max_top" -ge 1 ] || max_top=1
+  [ "$top_line" -le "$max_top" ] || top_line=$max_top
+  [ "$top_line" -ge 1 ] || top_line=1
+  bottom_line=$((top_line + page_rows - 1))
+
+  printf '\033[H\033[2J'
+  printf '%s\n' "$palette" | sed -n "${top_line},${bottom_line}p"
+  printf '\033[%d;1H\033[2Karrows/j/k scroll | q / Esc close' "$screen_rows"
+}
+
+show_palette() {
+  tty_path=/dev/tty
+  if [ ! -r "$tty_path" ]; then
+    render_palette
+    return 0
+  fi
+
+  saved_tty=$(stty -g <"$tty_path") || {
+    render_palette
+    return 0
+  }
+  trap 'restore_tty' 0
+  trap 'restore_tty; exit 130' 1 2 15
+
+  palette=$(render_palette)
+  total_lines=$(printf '%s\n' "$palette" | wc -l | tr -d ' ')
+  top_line=1
+  escape=$(printf '\033')
+  control_c=$(printf '\003')
+  stty -echo -icanon min 1 time 0 <"$tty_path"
+  printf '\033[?25l'
+  render_screen
+
+  while :; do
+    read_key || break
+    case "$key_action" in
+      quit) break ;;
+      up) top_line=$((top_line - 1)) ;;
+      down) top_line=$((top_line + 1)) ;;
+      page_up) top_line=$((top_line - page_rows)) ;;
+      page_down) top_line=$((top_line + page_rows)) ;;
+      top) top_line=1 ;;
+      bottom) top_line=$max_top ;;
+      *) continue ;;
+    esac
+    render_screen
+  done
+
+  restore_tty
+  trap - 0 1 2 15
 }
 
 case "${1:-}" in
@@ -23,13 +189,7 @@ case "${1:-}" in
     render_palette
     ;;
   '')
-    if command -v less >/dev/null 2>&1; then
-      render_palette | less -R
-    else
-      render_palette
-      printf 'Press Enter to close...' >&2
-      IFS= read -r _reply </dev/tty || true
-    fi
+    show_palette
     ;;
   *)
     printf 'usage: tmux-colour-palette [--print]\n' >&2

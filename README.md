@@ -59,7 +59,13 @@ Terminal shell tuned for many AI CLI panes. **Not** loaded by `init.zsh`. Person
 | window-wrap | status window labels wrap up to 3 lines |
 | `Y` in copy-mode | optional long screenshot via [tmux-shot](https://github.com/Async23/tmux-shot) |
 
-![tmux indexed colour palette popup](docs/assets/tmux-colour-palette.png)
+**Dark theme**
+
+![tmux indexed colour palette popup in dark theme](docs/assets/tmux-colour-palette-dark.png)
+
+**Light theme**
+
+![tmux indexed colour palette popup in light theme](docs/assets/tmux-colour-palette-light.png)
 
 ```bash
 AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
