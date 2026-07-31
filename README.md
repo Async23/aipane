@@ -55,13 +55,16 @@ Terminal shell tuned for many AI CLI panes. **Not** loaded by `init.zsh`. Person
 |-------|----------------|
 | Ghostty Cmd bridge | `Cmd+S` prefix; one-shot `Cmd+T/W/D/[]/…`; `Cmd+I` renames in a centered popup; `Cmd+Opt+P` shows pane IDs |
 | Shift+Enter | Newline for Codex/other CLIs under tmux (`→` Ctrl+J) |
-| tmux workstation | zoom-aware nav, broadcast + per-pane mute, pane top bar, vi copy-mode |
+| tmux workstation | zoom-aware nav, broadcast + per-pane mute, pane top bar, 256-colour palette, vi copy-mode |
 | window-wrap | status window labels wrap up to 3 lines |
 | `Y` in copy-mode | optional long screenshot via [tmux-shot](https://github.com/Async23/tmux-shot) |
+
+![tmux indexed colour palette popup](docs/assets/tmux-colour-palette.png)
 
 ```bash
 AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
 ln -sf "$AIPANE_ROOT/bin/tmux-rename-window-popup" ~/.local/bin/tmux-rename-window-popup
+ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
 ```
 
@@ -86,6 +89,7 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `conf/tmux-workstation.conf` | prefix, binds, broadcast, status chrome |
 | `conf/tmux-window-wrap.conf` | multi-line window list |
 | `bin/tmux-rename-window-popup` | centered stable-target window rename UI |
+| `bin/tmux-colour-palette` | indexed terminal colour palette (`0–255`) |
 | `bin/tmux-window-wrap` | renderer CLI |
 | `tests/test_tmux_window_wrap.py` | window-wrap unit + live tmux tests |
 | `tests/test_workstation_fragments.py` | structural tests for conf fragments |
@@ -213,6 +217,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 │   ├── aipane-cleanup
 │   ├── rod-cleanup
 │   ├── tmux-rename-window-popup
+│   ├── tmux-colour-palette
 │   └── tmux-window-wrap     # optional status-bar renderer
 ├── conf/                    # optional; not sourced by init.zsh
 │   ├── ghostty-tmux.conf
@@ -236,7 +241,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 
 ```bash
 zsh -n init.zsh aipane.zsh cmd/*.zsh lib/*.zsh tests/*.zsh
-sh -n bin/aipane-cleanup bin/rod-cleanup bin/tmux-rename-window-popup tests/*.sh
+sh -n bin/aipane-cleanup bin/rod-cleanup bin/tmux-colour-palette bin/tmux-rename-window-popup tests/*.sh
 
 zsh -fc '
   source ./init.zsh
