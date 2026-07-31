@@ -2,38 +2,97 @@
 
 Optional multi-line tmux status window list (up to 3 rows).
 
-## Codex activity indicators
+## Agent activity indicators
 
-Each Codex pane whose terminal title starts with Codex's working spinner adds
-one fixed dark-shade cell before the window index:
+Each busy agent pane adds one fixed dark-shade cell before the window index:
 
 ```text
-18:theme       # no running Codex pane
-▓18:theme      # one running Codex pane
-▓▓18:theme     # two running Codex panes
-▓▓▓18:theme    # three running Codex panes
+18:theme       # no busy agent pane
+▓18:theme      # one busy agent pane
+▓▓18:theme     # two busy agent panes
+▓▓▓18:theme    # three busy agent panes
 ```
 
 The glyph never changes; only its foreground colour moves through thirteen
 perceptual contrast levels. The 24-frame level sequence is
-`0 1 ... 11 12 11 ... 2 1`. Every busy Codex in the session participates in
+`0 1 ... 11 12 11 ... 2 1`. Every busy pane in the session participates in
 one global phase distribution, including panes in different windows. Two
 indicators use phases `0/12`, three use `0/8/16`, and four use `0/6/12/18`.
 Therefore two running panes start at the widest contrast and follow
 `0/12 → 1/11 → ... → 11/1 → 12/0 → 11/1 → ... → 1/11`.
-This keeps multiple Codex panes distinguishable without synchronizing their
-breathing animation. Idle panes and panes showing `[ ! ] Action Required` are
-not counted.
+This keeps multiple agent panes distinguishable without synchronizing their
+breathing animation.
+
+Busy state has two inputs:
+
+- Codex is detected automatically when a pane title starts with its working
+  spinner. Idle panes and panes showing `[ ! ] Action Required` are not counted.
+- Other agents can call `tmux-window-wrap activity busy` and
+  `tmux-window-wrap activity idle`. The command stores the pane's current
+  command in `@tmux-window-wrap-activity`; a marker is honored only while that
+  command still owns the pane, so a marker left by an abnormal exit is ignored.
+
+### Kimi Code hooks
+
+Kimi Code can drive the pane-local marker through lifecycle hooks in
+`~/.kimi-code/config.toml`:
+
+```toml
+[[hooks]]
+event = "SessionStart"
+command = "$HOME/.local/bin/tmux-window-wrap activity idle"
+timeout = 5
+
+[[hooks]]
+event = "UserPromptSubmit"
+command = "$HOME/.local/bin/tmux-window-wrap activity busy"
+timeout = 5
+
+[[hooks]]
+event = "PermissionRequest"
+command = "$HOME/.local/bin/tmux-window-wrap activity idle"
+timeout = 5
+
+[[hooks]]
+event = "PermissionResult"
+command = "$HOME/.local/bin/tmux-window-wrap activity busy"
+timeout = 5
+
+[[hooks]]
+event = "Stop"
+command = "$HOME/.local/bin/tmux-window-wrap activity idle"
+timeout = 5
+
+[[hooks]]
+event = "StopFailure"
+command = "$HOME/.local/bin/tmux-window-wrap activity idle"
+timeout = 5
+
+[[hooks]]
+event = "Interrupt"
+command = "$HOME/.local/bin/tmux-window-wrap activity idle"
+timeout = 5
+
+[[hooks]]
+event = "SessionEnd"
+command = "$HOME/.local/bin/tmux-window-wrap activity idle"
+timeout = 5
+```
+
+The helper uses `TMUX_PANE`, which Kimi inherits from tmux. Run `/reload` in an
+idle Kimi session or start a new Kimi process after changing the hook
+configuration. Outside tmux, the helper is a silent no-op.
 
 For any window with an activity indicator, the normal left padding is omitted
 so the indicator begins flush with the preceding window label and index. The
 first indicator replaces that omitted padding; additional indicators add one
 column each.
 
-Detection depends on the Codex terminal-title `activity` item and animations
-being enabled. The indicator width is included in wrapping calculations, and
-a lightweight driver advances a tmux animation option every approximately
-`50ms` (`20 FPS`) while any busy Codex pane exists. One full loop takes
+Automatic Codex detection depends on the terminal-title `activity` item and
+animations being enabled. External-agent detection depends on its lifecycle
+hooks. The indicator width is included in wrapping calculations, and a
+lightweight driver advances a tmux animation option every approximately
+`50ms` (`20 FPS`) while any busy agent pane exists. One full loop takes
 `1.2s`. Window layout stays cached, so each frame is expanded by tmux without
 rerunning the Python layout renderer. The fragment does not lower tmux's
 global `status-interval`.
