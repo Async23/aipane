@@ -18,6 +18,7 @@ TMUX_WS = ROOT / "conf" / "tmux-workstation.conf"
 TMUX_WRAP = ROOT / "conf" / "tmux-window-wrap.conf"
 WRAP_BIN = ROOT / "bin" / "tmux-window-wrap"
 RENAME_BIN = ROOT / "bin" / "tmux-rename-window-popup"
+COLOUR_PALETTE_BIN = ROOT / "bin" / "tmux-colour-palette"
 CHEATSHEET = ROOT / "docs" / "cheatsheet.md"
 WS_DOC = ROOT / "docs" / "ghostty-tmux-workstation.md"
 
@@ -43,14 +44,17 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
         self.assertIn("synchronize-panes", text)
         self.assertIn("window_zoomed_flag", text)
         self.assertIn("bind v copy-mode", text)
+        self.assertIn("bind P display-popup", text)
         self.assertIn("bind Q display-popup", text)
         self.assertIn("bind , run-shell -C", text)
         self.assertIn("AIPANE_RENAME_WINDOW_TARGET=#{window_id}", text)
         self.assertIn("-w 52 -h 5", text)
         self.assertIn('-T "#[align=centre] Rename window #I "', text)
         self.assertIn("tmux-rename-window-popup", text)
+        self.assertIn("tmux-colour-palette", text)
         self.assertIn("tmux-shot-capture", text)
         self.assertTrue(RENAME_BIN.is_file())
+        self.assertTrue(COLOUR_PALETTE_BIN.is_file())
         # stay a fragment: no TPM / no personal home paths
         self.assertNotIn("@plugin", text)
         self.assertNotIn("/Users/", text)
@@ -109,6 +113,12 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
             ).stdout
             self.assertRegex(keys, re.compile(r"prefix\s+B\s+.*synchronize-panes"))
             self.assertRegex(keys, re.compile(r"prefix\s+v\s+.*copy-mode"))
+            self.assertRegex(
+                keys,
+                re.compile(
+                    r"prefix\s+P\s+.*display-popup.*tmux-colour-palette"
+                ),
+            )
             self.assertRegex(keys, re.compile(r"prefix\s+Q\s+.*display-popup"))
             self.assertRegex(
                 keys,
@@ -291,6 +301,29 @@ printf '%s\\n' "$AIPANE_TEST_NEW_NAME"
         self.assertEqual(actual_name, "original")
 
 
+class ColourPalettePopupTests(unittest.TestCase):
+    def test_print_mode_renders_every_index_in_eight_columns(self):
+        result = subprocess.run(
+            [str(COLOUR_PALETTE_BIN), "--print"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        colour_lines = [
+            line
+            for line in result.stdout.splitlines()
+            if "\x1b[48;5;" in line
+        ]
+        self.assertEqual(len(colour_lines), 32)
+        self.assertTrue(
+            all(line.count("\x1b[48;5;") == 8 for line in colour_lines)
+        )
+        self.assertEqual(result.stdout.count("\x1b[48;5;"), 256)
+        for colour in range(256):
+            self.assertIn(f"\x1b[48;5;{colour}m", result.stdout)
+
+
 class DocsPointerTests(unittest.TestCase):
     def test_docs_exist_and_name_public_confs(self):
         self.assertTrue(CHEATSHEET.is_file())
@@ -300,12 +333,14 @@ class DocsPointerTests(unittest.TestCase):
         self.assertIn("conf/tmux-workstation.conf", doc)
         self.assertIn("conf/tmux-window-wrap.conf", doc)
         self.assertIn("bin/tmux-rename-window-popup", doc)
+        self.assertIn("bin/tmux-colour-palette", doc)
         self.assertIn("`Cmd+Opt+P`", doc)
 
         cheatsheet = CHEATSHEET.read_text(encoding="utf-8")
         self.assertIn("| `Cmd+S` | prefix only |", cheatsheet)
         self.assertIn("| `Cmd+Opt+P` | popup pane ID list |", cheatsheet)
         self.assertIn("| `Cmd+I` | centered popup rename window |", cheatsheet)
+        self.assertIn("| `prefix P` | indexed colour palette (`0–255`) |", cheatsheet)
 
 
 if __name__ == "__main__":

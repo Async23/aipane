@@ -1,0 +1,38 @@
+#!/bin/sh
+# tmux-colour-palette: render indexed terminal colours 0 through 255.
+
+set -eu
+
+render_palette() {
+  printf 'tmux 256-colour palette\n\n'
+
+  colour=0
+  while [ "$colour" -lt 256 ]; do
+    printf '\033[48;5;%dm    \033[0m %3d  ' "$colour" "$colour"
+    colour=$((colour + 1))
+    if [ $((colour % 8)) -eq 0 ]; then
+      printf '\n'
+    fi
+  done
+
+  printf '\n'
+}
+
+case "${1:-}" in
+  --print)
+    render_palette
+    ;;
+  '')
+    if command -v less >/dev/null 2>&1; then
+      render_palette | less -R
+    else
+      render_palette
+      printf 'Press Enter to close...' >&2
+      IFS= read -r _reply </dev/tty || true
+    fi
+    ;;
+  *)
+    printf 'usage: tmux-colour-palette [--print]\n' >&2
+    exit 2
+    ;;
+esac
