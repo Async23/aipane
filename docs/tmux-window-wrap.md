@@ -83,6 +83,30 @@ The helper uses `TMUX_PANE`, which Kimi inherits from tmux. Run `/reload` in an
 idle Kimi session or start a new Kimi process after changing the hook
 configuration. Outside tmux, the helper is a silent no-op.
 
+### Pi extension
+
+Pi can report its lifecycle through the installable
+[`@async23/pi-tmux-window-wrap`](https://github.com/Async23/pi-packages/tree/main/packages/tmux-window-wrap)
+package:
+
+```bash
+pi install npm:@async23/pi-tmux-window-wrap
+```
+
+Restart Pi after installation, or run `/reload` in an idle session. The
+extension marks the pane busy on `agent_start` and clears it on
+`agent_settled`, after retries, compaction, and queued follow-ups have
+finished. It also clears stale state on session startup and shutdown.
+
+To pulse the current window indicator for 1.2 seconds:
+
+```text
+/tmux-window-wrap-test
+```
+
+Outside tmux, or when `~/.local/bin/tmux-window-wrap` is unavailable, the
+extension is a silent no-op.
+
 For any window with an activity indicator, the normal left padding is omitted
 so the indicator begins flush with the preceding window label and index. The
 first indicator replaces that omitted padding; additional indicators add one
