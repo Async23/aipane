@@ -104,6 +104,23 @@ class WindowWrapCliTests(unittest.TestCase):
     def run_render(self, payload, line):
         return self.run_cli(["render", "--line", str(line)], payload).rstrip("\n")
 
+    def test_activity_without_tmux_pane_is_a_silent_noop(self):
+        environment = os.environ.copy()
+        environment.pop("TMUX", None)
+        environment.pop("TMUX_PANE", None)
+
+        completed = subprocess.run(
+            [SCRIPT, "activity", "busy"],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=environment,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(completed.stderr, "")
+
     def test_windows_stay_on_one_line_when_they_fit(self):
         result = self.run_plan(
             {
@@ -231,7 +248,7 @@ class WindowWrapCliTests(unittest.TestCase):
             "    #[range=window|3] #[fg=colour7]3:c #[norange]",
         )
 
-    def test_render_offsets_busy_codex_activity_by_half_a_cycle(self):
+    def test_render_offsets_busy_activity_by_half_a_cycle(self):
         payload = {
             "width": 80,
             "left_width": 4,
@@ -245,7 +262,7 @@ class WindowWrapCliTests(unittest.TestCase):
                     "index": "18",
                     "name": "theme",
                     "label": " 18:theme ",
-                    "busy_codex_count": 2,
+                    "busy_activity_count": 2,
                 },
             ],
         }
@@ -306,21 +323,21 @@ class WindowWrapCliTests(unittest.TestCase):
                     "index": "1",
                     "name": "one",
                     "label": " 1:one ",
-                    "busy_codex_count": 1,
+                    "busy_activity_count": 1,
                 },
                 {
                     "id": "@2",
                     "index": "2",
                     "name": "two",
                     "label": " 2:two ",
-                    "busy_codex_count": 1,
+                    "busy_activity_count": 1,
                 },
                 {
                     "id": "@3",
                     "index": "3",
                     "name": "three",
                     "label": " 3:three ",
-                    "busy_codex_count": 1,
+                    "busy_activity_count": 1,
                 },
             ],
         }
@@ -341,14 +358,14 @@ class WindowWrapCliTests(unittest.TestCase):
             rendered,
         )
 
-    def test_busy_codex_activity_replaces_left_padding(self):
+    def test_busy_activity_replaces_left_padding(self):
         windows = [
             {
                 "id": "@1",
                 "index": "1",
                 "name": "a",
                 "label": " 1:a ",
-                "busy_codex_count": 2,
+                "busy_activity_count": 2,
             },
             {"id": "@2", "index": "2", "name": "b", "label": " 2:b "},
         ]
@@ -383,7 +400,7 @@ class WindowWrapCliTests(unittest.TestCase):
                     "index": "18",
                     "name": "theme",
                     "label": " 18:theme ",
-                    "busy_codex_count": 2,
+                    "busy_activity_count": 2,
                 },
             ],
         }
@@ -425,7 +442,7 @@ class WindowWrapCliTests(unittest.TestCase):
                     "index": "18",
                     "name": "theme",
                     "label": " 18:theme ",
-                    "busy_codex_count": 1,
+                    "busy_activity_count": 1,
                 },
                 {
                     "id": "@2",
@@ -612,6 +629,22 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             capture_output=True,
             check=True,
         ).stdout.rstrip("\n")
+
+    def set_pane_activity(self, pane_id, state):
+        return subprocess.run(
+            [
+                SCRIPT,
+                "activity",
+                state,
+                "--pane",
+                pane_id,
+                "--socket-name",
+                self.socket_name,
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
 
     def attach_client(self, width, height=24):
         master_fd, slave_fd = pty.openpty()
@@ -865,6 +898,54 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         rendered = self.render_runtime(line=0, width=80, animation_tick=3)
         self.assertEqual(rendered.count("▓"), 1)
 
+    def test_runtime_counts_externally_marked_pane_and_ignores_stale_marker(self):
+        pane_id = self.tmux(
+            "display-message",
+            "-p",
+            "-t",
+            "wrap:1",
+            "#{pane_id}",
+        ).stdout.strip()
+        self.tmux("select-pane", "-t", pane_id, "-T", "Kimi session")
+
+        self.set_pane_activity(pane_id, "busy")
+
+        marker = self.tmux(
+            "show-options",
+            "-p",
+            "-q",
+            "-v",
+            "-t",
+            pane_id,
+            "@tmux-window-wrap-activity",
+        ).stdout.strip()
+        self.assertEqual(marker, "sleep")
+        rendered = self.render_runtime(line=0, width=80, animation_tick=0)
+        self.assertEqual(rendered.count("▓"), 1)
+
+        self.tmux(
+            "set-option",
+            "-p",
+            "-t",
+            pane_id,
+            "@tmux-window-wrap-activity",
+            "stale-command",
+        )
+        rendered = self.render_runtime(line=0, width=80, animation_tick=1)
+        self.assertNotIn("▓", rendered)
+
+        self.set_pane_activity(pane_id, "idle")
+        marker = self.tmux(
+            "show-options",
+            "-p",
+            "-q",
+            "-v",
+            "-t",
+            pane_id,
+            "@tmux-window-wrap-activity",
+        ).stdout.strip()
+        self.assertEqual(marker, "")
+
     def test_attached_status_advances_activity_at_twenty_fps(self):
         first_pane = self.tmux(
             "display-message",
@@ -884,7 +965,8 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "sleep 120",
         ).stdout.strip()
         self.tmux("select-pane", "-t", first_pane, "-T", "⠋ first task")
-        self.tmux("select-pane", "-t", second_pane, "-T", "⠦ second task")
+        self.tmux("select-pane", "-t", second_pane, "-T", "Kimi session")
+        self.set_pane_activity(second_pane, "busy")
         self.source_window_wrap_config()
         _, master_fd = self.attach_client(width=80)
         self.wait_for_client_count(1)
@@ -1280,7 +1362,9 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "TMUX_WINDOW_WRAP_GENERATION=#{TMUX_WINDOW_WRAP_GENERATION}",
             "TMUX_WINDOW_WRAP_WINDOWS=#{W:",
             "#{q:window_name}_#{pane_synchronized}",
-            "#{P:#{m/r:^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]( |$),#{pane_title}}}",
+            "#{P:#{||:#{m/r:^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]( |$),#{pane_title}},"
+            "#{&&:#{m/r:^.+$,#{@tmux-window-wrap-activity}},"
+            "#{==:#{@tmux-window-wrap-activity},#{pane_current_command}}}}}",
             "TMUX_WINDOW_WRAP_CLIENTS=#{L:",
             "#{q:client_name}_#{client_width}",
             "TMUX_WINDOW_WRAP_ACTIVE=#{q:window_id}:#{window_index}",
