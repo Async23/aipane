@@ -219,19 +219,36 @@ def animated_activity_indicator(
         return ""
 
     option_reference = "#{" + animation_option + "}"
-    expression = indicators[-1]
-    for tick in range(len(indicators) - 2, -1, -1):
-        condition = "#{==:" + option_reference + f",{tick}" + "}"
-        expression = (
+
+    def balanced_lookup(start, end):
+        if end - start == 1:
+            return indicators[start]
+        midpoint = (start + end) // 2
+        condition = (
+            "#{e|<:" + option_reference + f",{midpoint}" + "}"
+        )
+        return (
             "#{?"
             + condition
             + ","
-            + indicators[tick]
+            + balanced_lookup(start, midpoint)
             + ","
-            + expression
+            + balanced_lookup(midpoint, end)
             + "}"
         )
-    return expression
+
+    valid_tick = (
+        "#{m/r:^([0-9]|1[0-9]|2[0-3])$," + option_reference + "}"
+    )
+    return (
+        "#{?"
+        + valid_tick
+        + ","
+        + balanced_lookup(0, len(indicators))
+        + ","
+        + indicators[-1]
+        + "}"
+    )
 
 
 def activity_indicator_format(
@@ -374,13 +391,19 @@ def render_window(
     synchronized = window.get("synchronized", False)
     active = window["id"] == active_id
     palette_role = "active" if active else "inactive"
-    if animation_option:
+    if animation_option and color_scheme_option:
         pane_activity = activity_indicator_format(
             activity_phase_offsets,
             animation_option,
             color_scheme_option,
             activity_palettes["light"][palette_role],
             activity_palettes["dark"][palette_role],
+        )
+    elif animation_option:
+        pane_activity = animated_activity_indicator(
+            activity_phase_offsets,
+            animation_option,
+            activity_palettes[color_scheme][palette_role],
         )
     else:
         pane_activity = activity_indicator(
@@ -602,6 +625,7 @@ def animate_status(socket_name, fps):
                         detected_scheme,
                     )
                     color_scheme = detected_scheme
+                    invalidate_cache(socket_name)
                 next_scheme_probe = now + 5.0
 
             if busy:

@@ -118,8 +118,11 @@ hooks. The indicator width is included in wrapping calculations, and a
 lightweight driver advances a tmux animation option every approximately
 `50ms` (`20 FPS`) while any busy agent pane exists. One full loop takes
 `1.2s`. Window layout stays cached, so each frame is expanded by tmux without
-rerunning the Python layout renderer. The fragment does not lower tmux's
-global `status-interval`.
+rerunning the Python layout renderer. The cached 24-frame colour lookup uses a
+balanced format tree, keeping per-frame expansion depth logarithmic without
+changing the frame sequence. Only the current light or dark palette is cached;
+a system appearance change updates the cache key and reruns the renderer once.
+The fragment does not lower tmux's global `status-interval`.
 
 Four thirteen-colour palettes cover active/inactive windows in light/dark
 terminal themes:

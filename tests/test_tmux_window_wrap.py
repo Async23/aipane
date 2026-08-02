@@ -2,6 +2,7 @@ import fcntl
 import json
 import os
 import pty
+import runpy
 import select
 import signal
 import struct
@@ -86,6 +87,22 @@ TEST_ACTIVITY_PALETTES = {
 
 
 class WindowWrapCliTests(unittest.TestCase):
+    @staticmethod
+    def maximum_tmux_format_depth(value):
+        depth = 0
+        maximum = 0
+        index = 0
+        while index < len(value):
+            if value.startswith("#{", index):
+                depth += 1
+                maximum = max(maximum, depth)
+                index += 2
+                continue
+            if value[index] == "}":
+                depth -= 1
+            index += 1
+        return maximum
+
     def run_cli(self, arguments, payload):
         completed = subprocess.run(
             [SCRIPT, *arguments],
@@ -120,6 +137,63 @@ class WindowWrapCliTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout, "")
         self.assertEqual(completed.stderr, "")
+
+    def test_animator_invalidates_cache_when_color_scheme_changes(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        animate_status = namespace["animate_status"]
+        script_globals = animate_status.__globals__
+        owner = {"value": None}
+        events = []
+
+        class AnimationStopped(Exception):
+            pass
+
+        class FakeTime:
+            @staticmethod
+            def monotonic():
+                return 0.0
+
+            @staticmethod
+            def sleep(_seconds):
+                raise AssertionError("animation loop did not invalidate cache")
+
+        def fake_run_tmux(_socket_name, *arguments):
+            events.append(arguments)
+            if arguments[0] == "set-environment":
+                owner["value"] = arguments[-1]
+            return subprocess.CompletedProcess(
+                ["tmux", *arguments],
+                0,
+                stdout="",
+                stderr="",
+            )
+
+        def stop_on_invalidation(socket_name):
+            events.append(("invalidate-cache", socket_name))
+            raise AnimationStopped
+
+        script_globals["run_tmux"] = fake_run_tmux
+        script_globals["animation_probe"] = lambda _socket: (
+            owner["value"],
+            False,
+        )
+        script_globals["detect_color_scheme"] = lambda: "dark"
+        script_globals["invalidate_cache"] = stop_on_invalidation
+        script_globals["time"] = FakeTime
+
+        with self.assertRaises(AnimationStopped):
+            animate_status("test-socket", 20)
+
+        self.assertIn(
+            (
+                "set-option",
+                "-g",
+                "@tmux-window-wrap-color-scheme",
+                "dark",
+            ),
+            events,
+        )
+        self.assertIn(("invalidate-cache", "test-socket"), events)
 
     def test_windows_stay_on_one_line_when_they_fit(self):
         result = self.run_plan(
@@ -408,24 +482,48 @@ class WindowWrapCliTests(unittest.TestCase):
         rendered = self.run_render(payload, 0)
 
         self.assertIn(
-            "#{?#{==:#{@tmux-window-wrap-color-scheme},dark},"
-            "#{?#{==:#{@tmux-window-wrap-animation-tick},0},"
-            "#[fg=#000001]▓#[fg=#00000D]▓,"
-            "#{?#{==:#{@tmux-window-wrap-animation-tick},1},"
-            "#[fg=#000002]▓#[fg=#00000C]▓,",
+            "#{?#{==:#{@tmux-window-wrap-color-scheme},dark},",
             rendered,
         )
         self.assertIn(
-            "#{?#{==:#{@tmux-window-wrap-animation-tick},0},"
-            "#[fg=#010000]▓#[fg=#0D0000]▓,"
-            "#{?#{==:#{@tmux-window-wrap-animation-tick},1},"
-            "#[fg=#020000]▓#[fg=#0C0000]▓,",
+            "#{m/r:^([0-9]|1[0-9]|2[0-3])$,"
+            "#{@tmux-window-wrap-animation-tick}}",
             rendered,
         )
+        self.assertIn(
+            "#{e|<:#{@tmux-window-wrap-animation-tick},12}",
+            rendered,
+        )
+        self.assertIn("#[fg=#000001]▓#[fg=#00000D]▓", rendered)
+        self.assertIn("#[fg=#010000]▓#[fg=#0D0000]▓", rendered)
         self.assertIn(
             "}#[fg=colour15]18:theme ",
             rendered,
         )
+
+    def test_deferred_activity_lookup_has_logarithmic_format_depth(self):
+        rendered = self.run_render(
+            {
+                "width": 80,
+                "left_width": 4,
+                "right_width": 5,
+                "active": "@1",
+                "animation_option": "@tmux-window-wrap-animation-tick",
+                "color_scheme_option": "@tmux-window-wrap-color-scheme",
+                "windows": [
+                    {
+                        "id": "@1",
+                        "index": "1",
+                        "name": "busy",
+                        "label": " 1:busy ",
+                        "busy_activity_count": 1,
+                    },
+                ],
+            },
+            0,
+        )
+
+        self.assertLessEqual(self.maximum_tmux_format_depth(rendered), 10)
 
     def test_inactive_activity_restores_window_name_colour(self):
         payload = {
@@ -946,6 +1044,126 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         ).stdout.strip()
         self.assertEqual(marker, "")
 
+    def test_deferred_activity_matches_every_direct_frame_and_scheme(self):
+        animation_option = "@tmux-window-wrap-test-animation-tick"
+        color_scheme_option = "@tmux-window-wrap-test-color-scheme"
+        deferred_option = "@tmux-window-wrap-test-deferred-frame"
+        explicit_deferred_option = (
+            "@tmux-window-wrap-test-explicit-deferred-frame"
+        )
+        direct_option = "@tmux-window-wrap-test-direct-frame"
+        payload = {
+            "width": 80,
+            "left_width": 4,
+            "right_width": 5,
+            "active": "@2",
+            "activity_palettes": TEST_ACTIVITY_PALETTES,
+            "windows": [
+                {
+                    "id": "@1",
+                    "index": "1",
+                    "name": "inactive",
+                    "label": " 1:inactive ",
+                    "busy_activity_count": 1,
+                },
+                {
+                    "id": "@2",
+                    "index": "2",
+                    "name": "active",
+                    "label": " 2:active ",
+                    "busy_activity_count": 2,
+                },
+            ],
+        }
+
+        def render_payload(render_payload):
+            return subprocess.run(
+                [SCRIPT, "render", "--line", "0"],
+                input=json.dumps(render_payload),
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.rstrip("\n")
+
+        def expose_activity_colours(rendered):
+            for scheme, roles in TEST_ACTIVITY_PALETTES.items():
+                for role, colours in roles.items():
+                    for level, colour in enumerate(colours):
+                        token = f"<{scheme[0]}{role[0]}{level:02d}>"
+                        rendered = rendered.replace(
+                            f"#[fg=#{colour}]▓",
+                            token,
+                        )
+            return rendered
+
+        def expand_option(option_name):
+            return self.tmux(
+                "display-message",
+                "-p",
+                "-t",
+                self.session_id,
+                f"#{{E:{option_name}}}",
+            ).stdout.rstrip("\n")
+
+        deferred_payload = {
+            **payload,
+            "animation_option": animation_option,
+            "color_scheme_option": color_scheme_option,
+        }
+        deferred = expose_activity_colours(render_payload(deferred_payload))
+        self.tmux("set-option", "-g", deferred_option, deferred)
+
+        for color_scheme in ("light", "dark"):
+            explicit_deferred_payload = {
+                **payload,
+                "animation_option": animation_option,
+                "color_scheme": color_scheme,
+            }
+            explicit_deferred = expose_activity_colours(
+                render_payload(explicit_deferred_payload)
+            )
+            self.tmux(
+                "set-option",
+                "-g",
+                explicit_deferred_option,
+                explicit_deferred,
+            )
+            self.tmux(
+                "set-option",
+                "-g",
+                color_scheme_option,
+                color_scheme,
+            )
+            for animation_tick in range(24):
+                with self.subTest(
+                    color_scheme=color_scheme,
+                    animation_tick=animation_tick,
+                ):
+                    self.tmux(
+                        "set-option",
+                        "-g",
+                        animation_option,
+                        str(animation_tick),
+                    )
+                    direct_payload = {
+                        **payload,
+                        "animation_tick": animation_tick,
+                        "color_scheme": color_scheme,
+                    }
+                    direct = expose_activity_colours(
+                        render_payload(direct_payload)
+                    )
+                    self.tmux("set-option", "-g", direct_option, direct)
+
+                    self.assertEqual(
+                        expand_option(deferred_option),
+                        expand_option(direct_option),
+                    )
+                    self.assertEqual(
+                        expand_option(explicit_deferred_option),
+                        expand_option(direct_option),
+                    )
+
     def test_attached_status_advances_activity_at_twenty_fps(self):
         first_pane = self.tmux(
             "display-message",
@@ -989,6 +1207,79 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             8,
             f"expected at least eight 20 FPS ticks, saw {seen_ticks!r}",
         )
+
+    def test_attached_status_rebuilds_cache_when_color_scheme_changes(self):
+        pane_id = self.tmux(
+            "display-message",
+            "-p",
+            "-t",
+            "wrap:1",
+            "#{pane_id}",
+        ).stdout.strip()
+        self.tmux("select-pane", "-t", pane_id, "-T", "⠋ theme test")
+        self.source_window_wrap_config()
+        _, master_fd = self.attach_client(width=80)
+        self.wait_for_client_count(1)
+        self.wait_for_status_text(master_fd, "▓", timeout=1)
+
+        palette_markers = {
+            "light": "6F8790",
+            "dark": "4F86B1",
+        }
+
+        def cached_rows():
+            return "".join(
+                self.tmux(
+                    "show-options",
+                    "-t",
+                    self.session_id,
+                    "-q",
+                    "-v",
+                    f"@tmux-window-wrap-row-{line}",
+                ).stdout
+                for line in range(3)
+            )
+
+        def wait_for_single_scheme(expected_scheme, timeout):
+            deadline = time.monotonic() + timeout
+            unexpected_scheme = (
+                "dark" if expected_scheme == "light" else "light"
+            )
+            while time.monotonic() < deadline:
+                rows = cached_rows()
+                if (
+                    palette_markers[expected_scheme] in rows
+                    and palette_markers[unexpected_scheme] not in rows
+                ):
+                    return
+                time.sleep(0.02)
+            self.fail(
+                f"status cache did not switch to {expected_scheme} palette"
+            )
+
+        initial_scheme = self.tmux(
+            "show-options",
+            "-g",
+            "-v",
+            "@tmux-window-wrap-color-scheme",
+        ).stdout.strip()
+        wait_for_single_scheme(initial_scheme, timeout=2)
+
+        next_scheme = "dark" if initial_scheme == "light" else "light"
+        self.tmux(
+            "set-option",
+            "-g",
+            "@tmux-window-wrap-color-scheme",
+            next_scheme,
+        )
+        subprocess.run(
+            [SCRIPT, "invalidate", "--socket-name", self.socket_name],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+        wait_for_single_scheme(next_scheme, timeout=1)
 
     def test_runtime_accepts_unicode_line_separators_in_window_names(self):
         for separator in ("\u0085", "\u2028", "\u2029"):
@@ -1369,7 +1660,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "#{q:client_name}_#{client_width}",
             "TMUX_WINDOW_WRAP_ACTIVE=#{q:window_id}:#{window_index}",
             "--animation-option @tmux-window-wrap-animation-tick",
-            "--color-scheme-option @tmux-window-wrap-color-scheme",
+            "--color-scheme #{@tmux-window-wrap-color-scheme}",
             "--light-inactive-palette "
             "#{@tmux-window-wrap-activity-light-inactive}",
             "--light-active-palette "
