@@ -322,6 +322,110 @@ class WindowWrapCliTests(unittest.TestCase):
             "    #[range=window|3] #[fg=colour7]3:c #[norange]",
         )
 
+    def test_render_adds_subscript_count_only_for_multiple_panes(self):
+        payload = {
+            "width": 80,
+            "left_width": 4,
+            "right_width": 5,
+            "active": "@2",
+            "windows": [
+                {
+                    "id": "@1",
+                    "index": "1",
+                    "name": "one",
+                    "label": " 1:one ",
+                    "pane_count": 1,
+                },
+                {
+                    "id": "@2",
+                    "index": "2",
+                    "name": "many",
+                    "label": " 2:many ",
+                    "pane_count": 12,
+                },
+            ],
+        }
+
+        rendered = self.run_render(payload, 0)
+
+        self.assertIn("1:one ", rendered)
+        self.assertNotIn("1₁:one", rendered)
+        self.assertIn("2₁₂:many ", rendered)
+
+    def test_render_supports_plain_and_off_pane_count_styles(self):
+        expected_by_style = {
+            "plain": "2[4]:many ",
+            "off": "2:many ",
+        }
+        for style, expected in expected_by_style.items():
+            with self.subTest(style=style):
+                payload = {
+                    "width": 80,
+                    "left_width": 4,
+                    "right_width": 5,
+                    "active": "@2",
+                    "pane_count_style": style,
+                    "windows": [
+                        {
+                            "id": "@2",
+                            "index": "2",
+                            "name": "many",
+                            "label": " 2:many ",
+                            "pane_count": 4,
+                        },
+                    ],
+                }
+
+                self.assertIn(expected, self.run_render(payload, 0))
+
+    def test_pane_count_width_participates_in_wrapping(self):
+        result = self.run_plan(
+            {
+                "width": 10,
+                "left_width": 0,
+                "right_width": 0,
+                "active": "@1",
+                "windows": [
+                    {"id": "@1", "label": " 1:a "},
+                    {
+                        "id": "@2",
+                        "label": " 2:b ",
+                        "pane_count": 2,
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(
+            result,
+            {"line_count": 2, "lines": [["@1"], ["@2"]]},
+        )
+
+    def test_busy_activity_stays_flush_with_subscript_window_index(self):
+        payload = {
+            "width": 80,
+            "left_width": 4,
+            "right_width": 5,
+            "active": "@2",
+            "animation_tick": 0,
+            "activity_palettes": TEST_ACTIVITY_PALETTES,
+            "color_scheme": "light",
+            "windows": [
+                {
+                    "id": "@2",
+                    "index": "2",
+                    "name": "many",
+                    "label": " 2:many ",
+                    "pane_count": 4,
+                    "busy_activity_count": 3,
+                },
+            ],
+        }
+
+        rendered = self.run_render(payload, 0)
+
+        self.assertIn("▓#[fg=colour15]2₄:many ", rendered)
+
     def test_render_offsets_busy_activity_by_half_a_cycle(self):
         payload = {
             "width": 80,
@@ -703,26 +807,35 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             check=check,
         )
 
-    def render_runtime(self, line, width, animation_tick=0):
+    def render_runtime(
+        self,
+        line,
+        width,
+        animation_tick=0,
+        pane_count_style=None,
+    ):
+        arguments = [
+            SCRIPT,
+            "render",
+            "--line",
+            str(line),
+            "--session-id",
+            self.session_id,
+            "--width",
+            str(width),
+            "--left-width",
+            "4",
+            "--right-width",
+            "5",
+            "--animation-tick",
+            str(animation_tick),
+            "--socket-name",
+            self.socket_name,
+        ]
+        if pane_count_style is not None:
+            arguments.extend(("--pane-count-style", pane_count_style))
         return subprocess.run(
-            [
-                SCRIPT,
-                "render",
-                "--line",
-                str(line),
-                "--session-id",
-                self.session_id,
-                "--width",
-                str(width),
-                "--left-width",
-                "4",
-                "--right-width",
-                "5",
-                "--animation-tick",
-                str(animation_tick),
-                "--socket-name",
-                self.socket_name,
-            ],
+            arguments,
             text=True,
             capture_output=True,
             check=True,
@@ -953,6 +1066,61 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "on",
         )
 
+    def test_runtime_pane_count_survives_zoom_and_disappears_at_one(self):
+        first_pane = self.tmux(
+            "display-message",
+            "-p",
+            "-t",
+            "wrap:1",
+            "#{pane_id}",
+        ).stdout.strip()
+        second_pane = self.tmux(
+            "split-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            "wrap:1",
+            "sleep 120",
+        ).stdout.strip()
+
+        rendered = self.render_runtime(line=0, width=80)
+        self.assertIn("1₂:手册", rendered)
+
+        self.tmux("resize-pane", "-Z", "-t", first_pane)
+        rendered = self.render_runtime(line=0, width=80)
+        self.assertIn("1₂:手册", rendered)
+
+        self.tmux("kill-pane", "-t", second_pane)
+        rendered = self.render_runtime(line=0, width=80)
+        self.assertIn("1:手册", rendered)
+        self.assertNotIn("1₁:手册", rendered)
+
+    def test_runtime_supports_plain_and_off_pane_count_styles(self):
+        self.tmux(
+            "split-window",
+            "-d",
+            "-t",
+            "wrap:1",
+            "sleep 120",
+        )
+
+        plain = self.render_runtime(
+            line=0,
+            width=80,
+            pane_count_style="plain",
+        )
+        off = self.render_runtime(
+            line=0,
+            width=80,
+            pane_count_style="off",
+        )
+
+        self.assertIn("1[2]:手册", plain)
+        self.assertIn("1:手册", off)
+        self.assertNotIn("1₂:手册", off)
+
     def test_runtime_counts_each_busy_codex_title_in_the_same_window(self):
         first_pane = self.tmux(
             "display-message",
@@ -989,7 +1157,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "[ ! ] Action Required",
         )
         rendered = self.render_runtime(line=0, width=80, animation_tick=2)
-        self.assertIn("1:手册", rendered)
+        self.assertIn("1₂:手册", rendered)
         self.assertNotIn("▓", rendered)
 
         self.tmux("select-pane", "-t", second_pane, "-T", "⠋")
@@ -1280,6 +1448,41 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         )
 
         wait_for_single_scheme(next_scheme, timeout=1)
+
+    def test_attached_status_refreshes_pane_count_after_split_and_kill(self):
+        self.source_window_wrap_config()
+        _, master_fd = self.attach_client(width=80)
+        self.wait_for_client_count(1)
+        self.wait_for_status_text(master_fd, "1:手册", timeout=3)
+        self.drain_client_output(master_fd)
+
+        started = time.monotonic()
+        second_pane = self.tmux(
+            "split-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            "wrap:1",
+            "sleep 120",
+        ).stdout.strip()
+        rendered = self.wait_for_status_text(
+            master_fd,
+            "1₂:手册",
+            timeout=0.5,
+        )
+        self.assertLess(rendered - started, 0.5)
+
+        self.drain_client_output(master_fd)
+        started = time.monotonic()
+        self.tmux("kill-pane", "-t", second_pane)
+        rendered = self.wait_for_status_text(
+            master_fd,
+            "1:手册",
+            timeout=0.5,
+        )
+        self.assertLess(rendered - started, 0.5)
 
     def test_runtime_accepts_unicode_line_separators_in_window_names(self):
         for separator in ("\u0085", "\u2028", "\u2029"):
@@ -1600,6 +1803,24 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             configured = self.tmux("show-hooks", "-g", hook).stdout
             self.assertIn(command, configured)
 
+    def test_sourcing_config_preserves_pane_count_style_override(self):
+        self.tmux(
+            "set-option",
+            "-g",
+            "@tmux-window-wrap-pane-count-style",
+            "plain",
+        )
+
+        self.source_window_wrap_config()
+
+        configured = self.tmux(
+            "show-options",
+            "-g",
+            "-v",
+            "@tmux-window-wrap-pane-count-style",
+        ).stdout.strip()
+        self.assertEqual(configured, "plain")
+
     def test_window_wrap_config_connects_all_status_rows_to_complete_cache_keys(self):
         self.source_window_wrap_config()
 
@@ -1618,6 +1839,12 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "-v",
             "@tmux-window-wrap-color-scheme",
         ).stdout.strip()
+        pane_count_style = self.tmux(
+            "show-options",
+            "-g",
+            "-v",
+            "@tmux-window-wrap-pane-count-style",
+        ).stdout.strip()
         first_row = self.tmux(
             "show-options", "-g", "-v", "status-format[0]"
         ).stdout.strip()
@@ -1631,6 +1858,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         self.assertEqual(animation_fps, "20")
         self.assertEqual(status_interval, "15")
         self.assertIn(color_scheme, {"light", "dark"})
+        self.assertEqual(pane_count_style, "subscript")
         for palette_option in (
             "@tmux-window-wrap-activity-light-inactive",
             "@tmux-window-wrap-activity-light-active",
@@ -1661,6 +1889,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "TMUX_WINDOW_WRAP_ACTIVE=#{q:window_id}:#{window_index}",
             "--animation-option @tmux-window-wrap-animation-tick",
             "--color-scheme #{@tmux-window-wrap-color-scheme}",
+            "--pane-count-style #{@tmux-window-wrap-pane-count-style}",
             "--light-inactive-palette "
             "#{@tmux-window-wrap-activity-light-inactive}",
             "--light-active-palette "

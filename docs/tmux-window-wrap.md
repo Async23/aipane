@@ -2,6 +2,33 @@
 
 Optional multi-line tmux status window list (up to 3 rows).
 
+## Pane count annotations
+
+Window labels show the pane total as subscript digits when a window owns more
+than one pane:
+
+```text
+1:single       # one pane; the implicit count stays hidden
+2₄:grid         # four panes
+3₁₂:large-grid  # twelve panes; multi-digit totals stay exact
+```
+
+The annotation follows the window index, inherits its style, remains visible
+while a pane is zoomed, and participates in the renderer's width and wrapping
+calculations. Busy activity cells remain flush with the combined index, for
+example `▓▓▓2₄:grid` means three busy agent panes in a four-pane window.
+
+The public default is `subscript`. Set the option before sourcing
+`conf/tmux-window-wrap.conf` to select a compatibility style or disable the
+annotation:
+
+```tmux
+set -g @tmux-window-wrap-pane-count-style 'plain'  # 2[4]:grid
+set -g @tmux-window-wrap-pane-count-style 'off'    # 2:grid
+```
+
+Accepted values are `subscript`, `plain`, and `off`.
+
 ## Agent activity indicators
 
 Each busy agent pane adds one fixed dark-shade cell before the window index:
