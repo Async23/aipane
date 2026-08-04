@@ -40,6 +40,9 @@ ACTIVITY_LEVEL_SEQUENCE = (
 DEFAULT_ACTIVITY_FPS = 20
 ANIMATION_TICK_OPTION = "@tmux-window-wrap-animation-tick"
 COLOR_SCHEME_OPTION = "@tmux-window-wrap-color-scheme"
+DEFAULT_PANE_COUNT_STYLE = "subscript"
+PANE_COUNT_STYLES = ("subscript", "plain", "off")
+SUBSCRIPT_DIGITS = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
 ANIMATOR_OWNER_ENVIRONMENT = "TMUX_WINDOW_WRAP_ANIMATOR_OWNER"
 DEFAULT_ACTIVITY_PALETTES = {
     "light": {
@@ -136,17 +139,31 @@ def display_width(text):
     return width
 
 
-def window_width(window):
+def pane_count_annotation(window, style=DEFAULT_PANE_COUNT_STYLE):
+    pane_count = max(1, int(window.get("pane_count", 1)))
+    if pane_count == 1 or style == "off":
+        return ""
+    if style == "subscript":
+        return str(pane_count).translate(SUBSCRIPT_DIGITS)
+    if style == "plain":
+        return f"[{pane_count}]"
+    raise ValueError(f"unsupported pane count style: {style}")
+
+
+def window_width(window, pane_count_style=DEFAULT_PANE_COUNT_STYLE):
     if "display_width" in window:
         base_width = window["display_width"]
     else:
         base_width = display_width(window["label"])
+    pane_count_width = display_width(
+        pane_count_annotation(window, pane_count_style)
+    )
     busy_activity_count = max(
         0,
         int(window.get("busy_activity_count", 0)),
     )
     activity_width = max(0, busy_activity_count - 1)
-    return base_width + activity_width
+    return base_width + pane_count_width + activity_width
 
 
 def parse_palette(value):
@@ -285,12 +302,16 @@ def activity_indicator_format(
     )
 
 
-def wrap_windows(windows, capacity):
+def wrap_windows(
+    windows,
+    capacity,
+    pane_count_style=DEFAULT_PANE_COUNT_STYLE,
+):
     lines = []
     current_line = []
     used = 0
     for window in windows:
-        width = window_width(window)
+        width = window_width(window, pane_count_style)
         if current_line and used + width > capacity:
             lines.append(current_line)
             current_line = []
@@ -305,9 +326,14 @@ def wrap_windows(windows, capacity):
     return lines
 
 
-def visible_continuation_lines(windows, capacity, active_id):
+def visible_continuation_lines(
+    windows,
+    capacity,
+    active_id,
+    pane_count_style=DEFAULT_PANE_COUNT_STYLE,
+):
     maximum_lines = MAX_STATUS_LINES - 1
-    all_lines = wrap_windows(windows, capacity)
+    all_lines = wrap_windows(windows, capacity, pane_count_style)
     if len(all_lines) <= maximum_lines:
         return all_lines
     if active_id not in {window["id"] for window in windows}:
@@ -319,16 +345,22 @@ def visible_continuation_lines(windows, capacity, active_id):
     visible = [windows[active_index]]
     for index in range(active_index - 1, -1, -1):
         candidate = [windows[index], *visible]
-        if len(wrap_windows(candidate, capacity)) > maximum_lines:
+        if (
+            len(wrap_windows(candidate, capacity, pane_count_style))
+            > maximum_lines
+        ):
             break
         visible = candidate
 
     for window in windows[active_index + 1 :]:
         candidate = [*visible, window]
-        if len(wrap_windows(candidate, capacity)) > maximum_lines:
+        if (
+            len(wrap_windows(candidate, capacity, pane_count_style))
+            > maximum_lines
+        ):
             break
         visible = candidate
-    return wrap_windows(visible, capacity)
+    return wrap_windows(visible, capacity, pane_count_style)
 
 
 def second_line_indent(payload, overflow):
@@ -340,12 +372,23 @@ def second_line_indent(payload, overflow):
         (window for window in overflow if window["id"] == payload["active"]),
         overflow[0],
     )
-    maximum_indent = max(0, payload["width"] - window_width(target))
+    maximum_indent = max(
+        0,
+        payload["width"]
+        - window_width(
+            target,
+            payload.get("pane_count_style", DEFAULT_PANE_COUNT_STYLE),
+        ),
+    )
     return min(requested_indent, maximum_indent)
 
 
 def plan(payload):
     windows = payload["windows"]
+    pane_count_style = payload.get(
+        "pane_count_style",
+        DEFAULT_PANE_COUNT_STYLE,
+    )
     first_line_capacity = max(
         0,
         payload["width"] - payload["left_width"] - payload["right_width"],
@@ -353,7 +396,7 @@ def plan(payload):
     used = 0
     split_at = 0
     for window in windows:
-        label_width = window_width(window)
+        label_width = window_width(window, pane_count_style)
         if used + label_width > first_line_capacity:
             break
         used += label_width
@@ -371,6 +414,7 @@ def plan(payload):
             overflow,
             continuation_capacity,
             payload["active"],
+            pane_count_style,
         )
     ]
     lines = [first_line, *continuation_lines]
@@ -386,6 +430,7 @@ def render_window(
     color_scheme,
     animation_option=None,
     color_scheme_option=None,
+    pane_count_style=DEFAULT_PANE_COUNT_STYLE,
 ):
     window_range = f"#[range=window|{window['index']}]"
     synchronized = window.get("synchronized", False)
@@ -415,13 +460,17 @@ def render_window(
         name_colour = "colour15" if active else "colour7"
         pane_activity += f"#[fg={name_colour}]"
     escaped_name = window["name"].replace("#", "##")
+    index_label = (
+        f"{window['index']}"
+        f"{pane_count_annotation(window, pane_count_style)}"
+    )
     if active:
         inner_padding = "" if pane_activity else " "
         rendered = (
             f"{window_range}#[fg=blue]#[bg=blue]"
             f"#[fg=colour15]#[bold]"
             f"{inner_padding}{pane_activity}"
-            f"{window['index']}:{escaped_name} "
+            f"{index_label}:{escaped_name} "
         )
         if synchronized:
             rendered += "#[fg=red]▶ "
@@ -430,7 +479,7 @@ def render_window(
     leading_padding = "" if pane_activity else " "
     rendered = (
         f"{window_range}{leading_padding}#[fg=colour7]{pane_activity}"
-        f"{window['index']}:{escaped_name}"
+        f"{index_label}:{escaped_name}"
     )
     if synchronized:
         rendered += " #[fg=red]▶#[default]"
@@ -446,6 +495,10 @@ def render(payload, line):
     animation_option = payload.get("animation_option")
     color_scheme = payload.get("color_scheme", "light")
     color_scheme_option = payload.get("color_scheme_option")
+    pane_count_style = payload.get(
+        "pane_count_style",
+        DEFAULT_PANE_COUNT_STYLE,
+    )
     activity_palettes = payload.get(
         "activity_palettes",
         DEFAULT_ACTIVITY_PALETTES,
@@ -469,6 +522,7 @@ def render(payload, line):
             color_scheme,
             animation_option,
             color_scheme_option,
+            pane_count_style,
         )
         for window_id in layout["lines"][line]
     )
@@ -764,7 +818,7 @@ def load_tmux_payload(arguments):
             name,
             active,
             synchronized,
-            busy_panes,
+            pane_activity_flags,
             label_width,
         ) = record.split(WINDOW_SEPARATOR, 6)
         is_synchronized = synchronized == "1"
@@ -780,7 +834,9 @@ def load_tmux_payload(arguments):
                 "label": label,
                 "display_width": int(label_width),
                 "synchronized": is_synchronized,
-                "busy_activity_count": busy_panes.count("1"),
+                # The pane iterator emits one 0/1 activity flag per pane.
+                "pane_count": len(pane_activity_flags),
+                "busy_activity_count": pane_activity_flags.count("1"),
             }
         )
         if active == "1":
@@ -812,6 +868,10 @@ def load_tmux_payload(arguments):
             arguments,
             "color_scheme_option",
             None,
+        ),
+        "pane_count_style": (
+            getattr(arguments, "pane_count_style", None)
+            or DEFAULT_PANE_COUNT_STYLE
         ),
         "activity_palettes": {
             "light": {
@@ -903,6 +963,10 @@ def main():
     )
     render_parser.add_argument("--color-scheme-option")
     render_parser.add_argument(
+        "--pane-count-style",
+        choices=PANE_COUNT_STYLES,
+    )
+    render_parser.add_argument(
         "--light-inactive-palette",
         type=parse_palette,
         default=DEFAULT_ACTIVITY_PALETTES["light"]["inactive"],
@@ -978,6 +1042,8 @@ def main():
             )
     else:
         payload = json.load(sys.stdin)
+        if arguments.pane_count_style is not None:
+            payload["pane_count_style"] = arguments.pane_count_style
     rendered = render(payload, arguments.line)
     if arguments.store_option:
         if not arguments.session_id:
