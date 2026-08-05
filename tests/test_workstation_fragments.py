@@ -14,10 +14,13 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+README = ROOT / "README.md"
+README_CN = ROOT / "README_CN.md"
 GHOSTTY_CONF = ROOT / "conf" / "ghostty-tmux.conf"
 TMUX_WS = ROOT / "conf" / "tmux-workstation.conf"
 TMUX_WRAP = ROOT / "conf" / "tmux-window-wrap.conf"
 WRAP_BIN = ROOT / "bin" / "tmux-window-wrap"
+WINDOW_JUMP_BIN = ROOT / "bin" / "tmux-window-jump"
 RENAME_BIN = ROOT / "bin" / "tmux-rename-window-popup"
 COLOUR_PALETTE_BIN = ROOT / "bin" / "tmux-colour-palette"
 CHEATSHEET = ROOT / "docs" / "cheatsheet.md"
@@ -34,6 +37,10 @@ class GhosttyFragmentTests(unittest.TestCase):
         self.assertIn("keybind = cmd+d=text:\\x00|", text)
         self.assertIn("keybind = shift+enter=text:\\x0a", text)
         self.assertIn("macos-option-as-alt = true", text)
+        for digit in range(10):
+            self.assertIn(
+                f"keybind = cmd+digit_{digit}=text:\\x00{digit}", text
+            )
         # public fragment must not pin personal fonts
         self.assertNotIn("font-family", text)
 
@@ -54,6 +61,8 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
         self.assertIn("tmux-rename-window-popup", text)
         self.assertIn("tmux-colour-palette", text)
         self.assertIn("tmux-shot-capture", text)
+        self.assertTrue(WINDOW_JUMP_BIN.is_file())
+        self.assertTrue(os.access(WINDOW_JUMP_BIN, os.X_OK))
         self.assertTrue(RENAME_BIN.is_file())
         self.assertTrue(COLOUR_PALETTE_BIN.is_file())
         # stay a fragment: no TPM / no personal home paths
@@ -106,6 +115,21 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 text=True,
             ).stdout.strip()
             self.assertEqual(prefix, "C-Space")
+            jump_timeout = subprocess.run(
+                [
+                    "tmux",
+                    "-L",
+                    socket,
+                    "show-options",
+                    "-g",
+                    "-v",
+                    "@tmux-window-jump-timeout-ms",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(jump_timeout, "700")
             keys = subprocess.run(
                 ["tmux", "-L", socket, "list-keys", "-T", "prefix"],
                 check=True,
@@ -121,6 +145,22 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 ),
             )
             self.assertRegex(keys, re.compile(r"prefix\s+Q\s+.*display-popup"))
+            for digit in range(1, 10):
+                self.assertRegex(
+                    keys,
+                    re.compile(
+                        rf"prefix\s+{digit}\s+.*run-shell"
+                        rf".*tmux-window-jump.*select {digit}"
+                        rf".*select-window.*:={digit}"
+                    ),
+                )
+            self.assertRegex(
+                keys,
+                re.compile(
+                    r"prefix\s+0\s+.*run-shell.*tmux-window-jump.*end"
+                    r".*select-window.*\{end\}"
+                ),
+            )
             self.assertRegex(
                 keys,
                 re.compile(
@@ -450,6 +490,18 @@ class DocsPointerTests(unittest.TestCase):
             "(`0–255`; `q`/`Esc` closes) |",
             cheatsheet,
         )
+
+    def test_window_jump_install_option_and_repeat_behavior_are_documented(self):
+        readme = README.read_text(encoding="utf-8")
+        readme_cn = README_CN.read_text(encoding="utf-8")
+        workstation = WS_DOC.read_text(encoding="utf-8")
+        cheatsheet = CHEATSHEET.read_text(encoding="utf-8")
+
+        for text in (readme, readme_cn, workstation, cheatsheet):
+            self.assertIn("tmux-window-jump", text)
+        self.assertIn("@tmux-window-jump-timeout-ms", workstation)
+        self.assertIn("1 → 11 → 21", cheatsheet)
+        self.assertIn("9 → 19 → 29", cheatsheet)
 
 
 if __name__ == "__main__":

@@ -55,7 +55,7 @@ git -C ~/.aipane pull --ff-only
 |------|------|
 | Ghostty Cmd 桥 | `Cmd+S` prefix；单次 `Cmd+T/W/D/[]/…`；`Cmd+I` 中央弹窗重命名；`Cmd+Opt+P` 显示 pane ID |
 | Shift+Enter | tmux 里给 Codex 等稳定换行（→ Ctrl+J） |
-| tmux workstation | zoom 保持导航、广播/单格豁免、pane 顶栏、256 色表、vi 复制 |
+| tmux workstation | 数字连按跳窗、zoom 保持导航、广播/单格豁免、pane 顶栏、256 色表、vi 复制 |
 | window-wrap | 状态栏窗口标签最多 3 行 |
 | copy-mode `Y` | 可选长截图，依赖 [tmux-shot](https://github.com/Async23/tmux-shot) |
 
@@ -71,6 +71,7 @@ git -C ~/.aipane pull --ff-only
 AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
 ln -sf "$AIPANE_ROOT/bin/tmux-rename-window-popup" ~/.local/bin/tmux-rename-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
+ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
 ```
 
@@ -96,7 +97,9 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `conf/tmux-window-wrap.conf` | 窗口列表多行 |
 | `bin/tmux-rename-window-popup` | 中央弹窗、稳定目标的窗口重命名 UI |
 | `bin/tmux-colour-palette` | 终端索引色表（`0–255`） |
+| `bin/tmux-window-jump` | 同数字连按、精确 index 的窗口选择器 |
 | `bin/tmux-window-wrap` | 渲染 CLI |
+| `tests/test_tmux_window_jump.py` | window-jump 行为 + 真 tmux 测试 |
 | `tests/test_tmux_window_wrap.py` | window-wrap 单元 + 真 tmux 测试 |
 | `tests/test_workstation_fragments.py` | conf 片段结构测试 |
 | [`docs/ghostty-tmux-workstation.md`](docs/ghostty-tmux-workstation.md) | 安装与所有权 |
@@ -106,6 +109,7 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 改 workstation conf 或 wrap 渲染器后：
 
 ```bash
+python3 "$AIPANE_ROOT/tests/test_tmux_window_jump.py"
 python3 "$AIPANE_ROOT/tests/test_workstation_fragments.py"
 python3 "$AIPANE_ROOT/tests/test_tmux_window_wrap.py"
 ```
@@ -226,6 +230,7 @@ killrod --dry-run
 │   ├── rod-cleanup
 │   ├── tmux-rename-window-popup
 │   ├── tmux-colour-palette
+│   ├── tmux-window-jump
 │   └── tmux-window-wrap     # 可选状态栏渲染器
 ├── conf/                    # 可选；不会被 init.zsh 加载
 │   ├── ghostty-tmux.conf
@@ -241,6 +246,7 @@ killrod --dry-run
     ├── aipane-cleanup-ai-protection.sh
     ├── aipane-cleanup-contracts.sh
     ├── init-reload.zsh
+    ├── test_tmux_window_jump.py
     ├── test_tmux_window_wrap.py
     └── test_workstation_fragments.py
 ```
@@ -249,7 +255,7 @@ killrod --dry-run
 
 ```bash
 zsh -n init.zsh aipane.zsh cmd/*.zsh lib/*.zsh tests/*.zsh
-sh -n bin/aipane-cleanup bin/rod-cleanup bin/tmux-colour-palette bin/tmux-rename-window-popup tests/*.sh
+sh -n bin/aipane-cleanup bin/rod-cleanup bin/tmux-colour-palette bin/tmux-rename-window-popup bin/tmux-window-jump tests/*.sh
 
 zsh -fc '
   source ./init.zsh
@@ -264,6 +270,7 @@ zsh -fc '
 ./tests/aipane-cleanup-contracts.sh
 
 # 可选工作台 / window-wrap
+python3 tests/test_tmux_window_jump.py
 python3 tests/test_workstation_fragments.py
 python3 tests/test_tmux_window_wrap.py
 ```
