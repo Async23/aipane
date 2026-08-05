@@ -6,7 +6,9 @@ Drives the shipped conf files under conf/ (not re-implemented copies).
 from __future__ import annotations
 
 import os
+import pty
 import re
+import signal
 import subprocess
 import tempfile
 import time
@@ -61,6 +63,7 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
         self.assertIn("tmux-rename-window-popup", text)
         self.assertIn("tmux-colour-palette", text)
         self.assertIn("tmux-shot-capture", text)
+        self.assertEqual(text.count("#{q:session_id}"), 20)
         self.assertTrue(WINDOW_JUMP_BIN.is_file())
         self.assertTrue(os.access(WINDOW_JUMP_BIN, os.X_OK))
         self.assertTrue(RENAME_BIN.is_file())
@@ -191,6 +194,133 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 check=False,
                 capture_output=True,
             )
+
+    def test_digit_binding_passes_literal_session_id_to_window_jump(self):
+        socket = f"ws-jump-binding-{os.getpid()}-{id(self)}"
+        child_pid = None
+        master_fd = None
+        with tempfile.TemporaryDirectory() as temp_home:
+            tmux_environment = os.environ.copy()
+            tmux_environment.pop("TMUX", None)
+            tmux_environment.pop("TMUX_PANE", None)
+            tmux_environment["HOME"] = temp_home
+            tmux_environment["TERM"] = "xterm-256color"
+
+            def tmux(*args: str, check: bool = True):
+                return subprocess.run(
+                    ["tmux", "-L", socket, *args],
+                    check=check,
+                    capture_output=True,
+                    text=True,
+                    env=tmux_environment,
+                )
+
+            helper_dir = Path(temp_home) / ".local" / "bin"
+            helper_dir.mkdir(parents=True)
+            (helper_dir / "tmux-window-jump").symlink_to(WINDOW_JUMP_BIN)
+            try:
+                tmux(
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "jump-binding",
+                    "sleep 30",
+                )
+                tmux("source-file", str(TMUX_WS))
+                tmux(
+                    "move-window",
+                    "-s",
+                    "jump-binding:0",
+                    "-t",
+                    "jump-binding:1",
+                )
+                tmux(
+                    "new-window",
+                    "-d",
+                    "-t",
+                    "jump-binding:2",
+                    "sleep 30",
+                )
+                tmux("select-window", "-t", "jump-binding:2")
+
+                child_pid, master_fd = pty.fork()
+                if child_pid == 0:
+                    os.execvpe(
+                        "tmux",
+                        [
+                            "tmux",
+                            "-L",
+                            socket,
+                            "attach-session",
+                            "-t",
+                            "jump-binding",
+                        ],
+                        tmux_environment,
+                    )
+
+                client_line = ""
+                for _ in range(50):
+                    client_line = tmux(
+                        "list-clients",
+                        "-F",
+                        "#{client_pid}\t#{client_name}",
+                    ).stdout.strip()
+                    if client_line:
+                        break
+                    time.sleep(0.02)
+                self.assertTrue(client_line, "tmux client did not attach")
+                client_pid, _, client_target = client_line.partition("\t")
+                self.assertTrue(client_pid)
+                self.assertTrue(client_target)
+
+                tmux(
+                    "switch-client",
+                    "-c",
+                    client_target,
+                    "-T",
+                    "prefix",
+                )
+                key_table = tmux(
+                    "display-message",
+                    "-p",
+                    "-c",
+                    client_target,
+                    "#{client_key_table}",
+                ).stdout.strip()
+                self.assertEqual(key_table, "prefix")
+                tmux(
+                    "send-keys",
+                    "-K",
+                    "-c",
+                    client_target,
+                    "1",
+                )
+
+                current_window = ""
+                for _ in range(50):
+                    current_window = tmux(
+                        "display-message",
+                        "-p",
+                        "-t",
+                        "jump-binding",
+                        "#{window_index}",
+                    ).stdout.strip()
+                    if current_window == "1":
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(current_window, "1")
+            finally:
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGHUP)
+                    except ProcessLookupError:
+                        pass
+                    os.waitpid(child_pid, 0)
+                if master_fd is not None:
+                    os.close(master_fd)
+                tmux("kill-server", check=False)
 
 
 class RenameWindowPopupTests(unittest.TestCase):
