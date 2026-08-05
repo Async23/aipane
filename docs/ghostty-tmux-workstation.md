@@ -7,7 +7,7 @@ Optional terminal shell for multi-agent CLI work. **Not** loaded by `init.zsh`.
 | Layer | Feature |
 |-------|---------|
 | Ghostty | Cmd chords → tmux prefix (`C-Space`); Shift+Enter → newline for AI CLIs |
-| tmux | centered window rename popup, 256-colour palette, zoom-aware pane nav, broadcast + per-pane mute, pane top bar, copy-mode `v`/`Y` |
+| tmux | repeated-digit window jump, centered rename popup, 256-colour palette, zoom-aware pane nav, broadcast + per-pane mute, pane top bar, copy-mode `v`/`Y` |
 | window-wrap | multi-line status window list (separate conf) |
 | tmux-shot | optional; `Y` in copy-mode via [tmux-shot](https://github.com/Async23/tmux-shot) |
 
@@ -20,6 +20,7 @@ Optional terminal shell for multi-agent CLI work. **Not** loaded by `init.zsh`.
 | `conf/tmux-window-wrap.conf` | multi-line window list |
 | `bin/tmux-rename-window-popup` | stable-target window rename UI (requires `fzf`) |
 | `bin/tmux-colour-palette` | indexed terminal colour palette (`0–255`) |
+| `bin/tmux-window-jump` | repeated-digit exact-index window selector |
 | `bin/tmux-window-wrap` | renderer (symlink to `~/.local/bin`) |
 | `docs/cheatsheet.md` | key map |
 
@@ -30,6 +31,7 @@ AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
 
 ln -sf "$AIPANE_ROOT/bin/tmux-rename-window-popup" ~/.local/bin/tmux-rename-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
+ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
 ```
 
@@ -70,6 +72,29 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 
 Then: `tmux source-file ~/.tmux.conf`
 
+### Repeated-digit window jump
+
+`Cmd+1…9` on the main number row and direct `prefix 1…9` select the exact tmux
+window index on the first press. Repeating the same shortcut within 700ms adds
+ten each time:
+`1 → 11 → 21` and `9 → 19 → 29`. The timeout slides after every accepted
+press. A different digit or an external window change starts a new chain.
+
+If a target does not exist, tmux stays on the last valid window, displays one
+message, and ignores repeats of that digit until 700ms of silence. `Cmd+0` and
+`prefix 0` remain independent: they select the final window and reset the
+digit chain. If `tmux-window-jump` is not installed, `1…9` and `0` safely fall
+back to their original one-shot behavior.
+
+Override the timeout before sourcing `tmux-workstation.conf`:
+
+```tmux
+set -g @tmux-window-jump-timeout-ms 700
+```
+
+The default is `700`; an empty, zero, or nonnumeric value also falls back to
+`700`.
+
 ## Ownership
 
 Canonical sources live in this repo. Personal configs only **include/source** them.
@@ -82,3 +107,11 @@ Not in this package: `claude-guard`, `pane-col.sh`, company skills, full agent h
 
 - [tmux-window-wrap.md](./tmux-window-wrap.md)
 - [cheatsheet.md](./cheatsheet.md)
+
+## Verify
+
+```bash
+python3 tests/test_tmux_window_jump.py
+python3 tests/test_workstation_fragments.py
+python3 tests/test_tmux_window_wrap.py
+```

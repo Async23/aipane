@@ -18,7 +18,8 @@ also send complete prefix+key chords.
 | `Cmd+I` | centered popup rename window |
 | `Cmd+Shift+I` | rename session |
 | `Cmd+Shift+Enter` | zoom pane |
-| `Cmd+1…9` / `Cmd+0` | select window (0 = last) |
+| `Cmd+1…9` | select exact index; repeat within 700ms to add 10 |
+| `Cmd+0` | select last window and reset digit chain |
 | `Cmd+Opt+I` | broadcast on/off (window) |
 | `Cmd+Opt+Shift+I` | this pane join/leave broadcast |
 | `Shift+Enter` | newline for AI CLIs (→ Ctrl+J) |
@@ -41,12 +42,26 @@ also send complete prefix+key chords.
 
 | Key | Action |
 |-----|--------|
-| `prefix 1-9` | select window |
+| `prefix 1-9` | select exact index; repeat within 700ms to add 10 |
 | `prefix 0` / `Cmd+0` | last window |
 | `prefix p` / `n` | prev / next window |
 | `prefix ,` / `Cmd+I` | centered popup rename current window |
 | `Option+,` / `Option+.` (`M-</>`) | reorder window left / right |
 | `prefix w` | window list (tmux default) |
+
+The `Cmd` bindings use the main number row. Repeated presses are handled by
+`tmux-window-jump` with a sliding 700ms timeout:
+
+```text
+Cmd+1 → 1 → 11 → 21
+Cmd+9 → 9 → 19 → 29
+```
+
+Each repeated digit must still include `Cmd` (or the tmux prefix). A different
+digit starts a new chain. Ordinary terminal input does not reset the chain,
+but switching to another window does. A missing target leaves the current
+window selected, reports the failure once, and waits for 700ms of silence
+before restarting.
 
 ## Sessions
 

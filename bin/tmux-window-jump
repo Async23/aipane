@@ -1,0 +1,105 @@
+#!/bin/sh
+
+set -eu
+
+usage() {
+  echo "usage: tmux-window-jump select DIGIT CLIENT_KEY SESSION_ID" >&2
+  echo "       tmux-window-jump end CLIENT_KEY SESSION_ID" >&2
+  exit 64
+}
+
+command=${1-}
+case "$command" in
+  select)
+    [ "$#" -eq 4 ] || usage
+    digit=$2
+    client_key=$3
+    session_id=$4
+    case "$digit" in
+      [1-9]) ;;
+      *) usage ;;
+    esac
+    ;;
+  end)
+    [ "$#" -eq 3 ] || usage
+    client_key=$2
+    session_id=$3
+    ;;
+  *) usage ;;
+esac
+
+case "$client_key" in
+  ''|*[!0-9]*) usage ;;
+esac
+
+session_key=${session_id#\$}
+case "$session_key" in
+  ''|*[!0-9]*) usage ;;
+esac
+
+state_option="@tmux-window-jump-${client_key}-${session_key}"
+if [ "$command" = end ]; then
+  tmux set-option -gu "$state_option"
+  tmux select-window -t "${session_id}:{end}"
+  exit 0
+fi
+
+timeout_ms=$(tmux show-option -gqv @tmux-window-jump-timeout-ms)
+case "$timeout_ms" in
+  ''|0|*[!0-9]*) timeout_ms=700 ;;
+esac
+timeout_delay=$(
+  printf '%d.%03d' "$((timeout_ms / 1000))" "$((timeout_ms % 1000))"
+)
+
+save_state() {
+  saved_state="${1}:${2}:${3}:$$:${4}"
+  tmux set-option -gq "$state_option" "$saved_state"
+  expire_command="current=\$(tmux show-option -gqv \"$state_option\"); [ \"\$current\" != \"$saved_state\" ] || tmux set-option -gu \"$state_option\""
+  tmux run-shell -b -d "$timeout_delay" "$expire_command"
+}
+
+state=$(tmux show-option -gqv "$state_option")
+current_index=$(tmux display-message -p -t "$session_id" '#{window_index}')
+
+last_digit=
+press_count=0
+last_target=
+state_status=active
+if [ -n "$state" ]; then
+  IFS=: read -r last_digit press_count last_target _token state_status <<EOF
+$state
+EOF
+fi
+
+if [ "$last_digit" = "$digit" ] && [ "$current_index" = "$last_target" ]; then
+  if [ "$state_status" = blocked ]; then
+    save_state "$last_digit" "$press_count" "$last_target" blocked
+    exit 0
+  fi
+  press_count=$((press_count + 1))
+else
+  press_count=1
+fi
+
+target=$((digit + (press_count - 1) * 10))
+target_exists=false
+window_indexes=$(tmux list-windows -t "$session_id" -F '#{window_index}')
+for window_index in $window_indexes; do
+  if [ "$window_index" = "$target" ]; then
+    target_exists=true
+    break
+  fi
+done
+
+if [ "$target_exists" = false ]; then
+  save_state "$digit" "$press_count" "$current_index" blocked
+  tmux display-message -c "$client_key" \
+    "Window ${target} does not exist" 2>/dev/null ||
+    tmux display-message -t "$session_id" \
+      "Window ${target} does not exist" 2>/dev/null || true
+  exit 0
+fi
+
+tmux select-window -t "${session_id}:=${target}"
+save_state "$digit" "$press_count" "$target" active
