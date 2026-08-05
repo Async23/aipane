@@ -27,6 +27,7 @@ export AIPANE_OPENCODE_LAUNCH_CMD="sleep 120"
 export AIPANE_CURSOR_LAUNCH_CMD="sleep 120"
 export AIPANE_QODER_LAUNCH_CMD="sleep 120"
 export AIPANE_PI_LAUNCH_CMD="sleep 120"
+export AIPANE_KIMI_LAUNCH_CMD="sleep 120"
 
 source "$ROOT_DIR/init.zsh"
 

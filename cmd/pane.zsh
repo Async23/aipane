@@ -15,6 +15,7 @@ Tools:
   r  Cursor        (${AIPANE_CURSOR_LAUNCH_CMD})
   q  Qoder         (${AIPANE_QODER_LAUNCH_CMD})
   p  Pi             (${AIPANE_PI_LAUNCH_CMD})
+  k  Kimi Code     (${AIPANE_KIMI_LAUNCH_CMD})
 
 Layouts:
   auto             Default automatic layout; skips the 3-pane prompt
@@ -43,6 +44,7 @@ Examples:
   ai cc
   ai p
   ai g
+  ai k
 EOH
 }
 
@@ -86,6 +88,9 @@ _aipane_tool_command() {
       ;;
     p)
       _aipane_command_with_args "$AIPANE_PI_LAUNCH_CMD" "$@"
+      ;;
+    k)
+      _aipane_command_with_args "$AIPANE_KIMI_LAUNCH_CMD" "$@"
       ;;
     *)
       print -u2 "ai: internal error: unknown tool '${tool}'"
@@ -388,9 +393,9 @@ ai() {
   for (( i = 1; i <= ${#tools_str}; i++ )); do
     ch="${tools_str[i]}"
     case "$ch" in
-      c|x|d|g|o|r|q|p) tools+=("$ch") ;;
+      c|x|d|g|o|r|q|p|k) tools+=("$ch") ;;
       *)
-        print -u2 "ai: unknown tool '${ch}' (valid: c/x/d/g/o/r/q/p)"
+        print -u2 "ai: unknown tool '${ch}' (valid: c/x/d/g/o/r/q/p/k)"
         return 1
         ;;
     esac
