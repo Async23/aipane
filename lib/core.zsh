@@ -16,6 +16,7 @@ typeset -g AIPANE_OPENCODE_LAUNCH_CMD="${AIPANE_OPENCODE_LAUNCH_CMD:-opencode}"
 typeset -g AIPANE_CURSOR_LAUNCH_CMD="${AIPANE_CURSOR_LAUNCH_CMD:-cursor-agent --force}"
 typeset -g AIPANE_QODER_LAUNCH_CMD="${AIPANE_QODER_LAUNCH_CMD:-qodercli}"
 typeset -g AIPANE_PI_LAUNCH_CMD="${AIPANE_PI_LAUNCH_CMD:-pi}"
+typeset -g AIPANE_KIMI_LAUNCH_CMD="${AIPANE_KIMI_LAUNCH_CMD:-kimi --yolo}"
 
 _aipane_ceil_sqrt() {
   local n="$1"
