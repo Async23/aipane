@@ -17,14 +17,6 @@ Tools:
   p  Pi             (${AIPANE_PI_LAUNCH_CMD})
   k  Kimi Code     (${AIPANE_KIMI_LAUNCH_CMD})
 
-Layouts:
-  auto             Default automatic layout; skips the 3-pane prompt
-  main-left        3 panes: first tool on the left, remaining tools stacked right
-  main-right       3 panes: first two tools stacked left, third tool on the right
-  columns          One column per tool
-  rows             One row per tool
-  1,2              Custom columns; each number is the pane count in that column
-
 Notes:
   Single-tool calls run in the current pane unless --new or --layout is used.
   Tool arguments are supported only for single-tool calls.
