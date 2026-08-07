@@ -160,8 +160,9 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
             self.assertRegex(
                 keys,
                 re.compile(
-                    r"prefix\s+0\s+.*run-shell.*tmux-window-jump.*end"
-                    r".*select-window.*\{end\}"
+                    r"prefix\s+0\s+.*run-shell"
+                    r".*tmux-window-jump.*select 0"
+                    r".*select-window.*:=10"
                 ),
             )
             self.assertRegex(

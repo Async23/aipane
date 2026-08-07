@@ -77,14 +77,14 @@ Then: `tmux source-file ~/.tmux.conf`
 `Cmd+1…9` on the main number row and direct `prefix 1…9` select the exact tmux
 window index on the first press. Repeating the same shortcut within 700ms adds
 ten each time:
-`1 → 11 → 21` and `9 → 19 → 29`. The timeout slides after every accepted
-press. A different digit or an external window change starts a new chain.
+`1 → 11 → 21` and `9 → 19 → 29`. `Cmd+0` / `prefix 0` use the same chain for
+decades: `10 → 20 → 30`. The timeout slides after every accepted press. A
+different digit or an external window change starts a new chain.
 
 If a target does not exist, tmux stays on the last valid window, displays one
-message, and ignores repeats of that digit until 700ms of silence. `Cmd+0` and
-`prefix 0` remain independent: they select the final window and reset the
-digit chain. If `tmux-window-jump` is not installed, `1…9` and `0` safely fall
-back to their original one-shot behavior.
+message, and ignores repeats of that digit until 700ms of silence. If
+`tmux-window-jump` is not installed, `1…9` fall back to one-shot `:=N` and `0`
+falls back to one-shot `:=10`.
 
 Override the timeout before sourcing `tmux-workstation.conf`:
 

@@ -149,6 +149,37 @@ class TmuxWindowJumpTests(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(self.current_window(), 11)
 
+    def test_zero_presses_select_decades(self):
+        self.add_windows_through(20)
+
+        first = self.run_jump(0)
+        second = self.run_jump(0)
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.current_window(), 20)
+
+    def test_zero_missing_target_stays_put_and_blocks_until_silence(self):
+        self.tmux(
+            "set-option", "-g", "@tmux-window-jump-timeout-ms", "80"
+        )
+
+        # setUp has windows 1-11, so 10 exists but 20 does not yet.
+        first = self.run_jump(0)
+        missing = self.run_jump(0)
+        self.add_windows_through(20)
+        blocked = self.run_jump(0)
+        time.sleep(0.15)
+        restarted = self.run_jump(0)
+        advanced = self.run_jump(0)
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(missing.returncode, 0, missing.stderr)
+        self.assertEqual(blocked.returncode, 0, blocked.stderr)
+        self.assertEqual(restarted.returncode, 0, restarted.stderr)
+        self.assertEqual(advanced.returncode, 0, advanced.stderr)
+        self.assertEqual(self.current_window(), 20)
+
     def test_press_after_timeout_starts_again_at_base_index(self):
         self.tmux(
             "set-option", "-g", "@tmux-window-jump-timeout-ms", "80"
