@@ -576,25 +576,66 @@ def refresh_clients(socket_name):
             )
 
 
-def animation_probe(socket_name):
+def global_environment_value(socket_name, name):
     completed = run_tmux(
         socket_name,
-        "list-panes",
-        "-a",
-        "-F",
-        WINDOW_SEPARATOR.join(
-            (
-                f"#{{{ANIMATOR_OWNER_ENVIRONMENT}}}",
-                "#{session_attached}",
-                "#{pane_title}",
-                PANE_ACTIVITY_REFERENCE,
-                "#{pane_current_command}",
-            )
-        ),
+        "show-environment",
+        "-g",
+        name,
     )
+    assignment = completed.stdout.rstrip("\n")
+    prefix = f"{name}="
+    if not assignment.startswith(prefix):
+        return None
+    return assignment[len(prefix) :]
+
+
+def tmux_has_sessions(socket_name):
+    completed = run_tmux(
+        socket_name,
+        "list-sessions",
+        "-F",
+        "#{session_id}",
+    )
+    return bool(completed.stdout.splitlines())
+
+
+def animation_probe(socket_name):
+    try:
+        completed = run_tmux(
+            socket_name,
+            "list-panes",
+            "-a",
+            "-F",
+            WINDOW_SEPARATOR.join(
+                (
+                    f"#{{{ANIMATOR_OWNER_ENVIRONMENT}}}",
+                    "#{session_attached}",
+                    "#{pane_title}",
+                    PANE_ACTIVITY_REFERENCE,
+                    "#{pane_current_command}",
+                )
+            ),
+        )
+    except subprocess.CalledProcessError as pane_error:
+        if tmux_has_sessions(socket_name):
+            raise pane_error
+        return (
+            global_environment_value(
+                socket_name,
+                ANIMATOR_OWNER_ENVIRONMENT,
+            ),
+            False,
+        )
     records = completed.stdout.splitlines()
     if not records:
-        return None, False
+        return (
+            global_environment_value(
+                socket_name,
+                ANIMATOR_OWNER_ENVIRONMENT,
+            ),
+            False,
+        )
 
     owner = None
     busy = False
@@ -712,6 +753,8 @@ def invalidate_cache(socket_name):
         "TMUX_WINDOW_WRAP_GENERATION",
         uuid.uuid4().hex,
     )
+    if not tmux_has_sessions(socket_name):
+        return
     reconcile_status_heights(socket_name)
     refresh_clients(socket_name)
 

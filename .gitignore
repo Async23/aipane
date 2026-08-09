@@ -5,6 +5,8 @@ DESIGN.md
 *~
 todo.md
 tmp/
+__pycache__/
+*.py[cod]
 # never publish personal tmux chrome
 conf/local/
 **/.tmux.conf

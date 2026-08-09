@@ -1,0 +1,346 @@
+#!/usr/bin/env zsh
+# ai-restore — after tmux-resurrect restores the window/pane structure, resume the
+# AI CLI session that each pane was running.
+#
+# How it works (see ../docs/session-restore-design.md in this repository):
+#   - tmux-resurrect saves the FULL command line of every pane's foreground program.
+#   - aipane's gold-case launch puts the session id straight into that command line
+#     (pi/grok/claude via --session-id, cursor via a pre-created chat id), and any
+#     `resume`-style launch already carries its id too.
+#   - So the last resurrect dump already pairs each pane's coordinate with a command
+#     line that contains the session id. We parse it and re-issue the right resume
+#     command into the matching restored pane.
+#
+# Trigger: @resurrect-hook-post-restore-all 'ai-restore'  (runs after restore settles).
+# Manual : ai-restore            (act) | ai-restore --dry-run (print plan only)
+#
+# Safety: a pane is only touched if it is currently sitting at an idle shell, so we
+# never clobber a program resurrect already re-ran, and re-running ai-restore is safe.
+
+emulate -L zsh
+setopt no_nomatch pipefail
+
+export PATH="/opt/homebrew/bin:$HOME/.local/bin:$HOME/.grok/bin:$HOME/.kimi-code/bin:$PATH"
+
+typeset -a TMUX_CMD
+TMUX_CMD=("${(@z)${AIPANE_TMUX:-tmux}}")
+run_tmux() { command "${TMUX_CMD[@]}" "$@"; }
+
+# ---- options -------------------------------------------------------------
+typeset DRYRUN=0 DUMP="" DELAY="${AI_RESTORE_SETTLE_DELAY:-0.4}"
+while (( $# > 0 )); do
+  case "$1" in
+    --dry-run|-n) DRYRUN=1 ;;
+    --dump) shift; DUMP="$1" ;;
+    --delay) shift; DELAY="$1" ;;
+    -h|--help)
+      print "usage: ai-restore [--dry-run] [--dump FILE] [--delay SECS]"
+      return 0 2>/dev/null || exit 0 ;;
+    *) DUMP="$1" ;;
+  esac
+  shift
+done
+
+typeset STATE_DIR="${AIPANE_STATE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/aipane}"
+typeset LOG="$STATE_DIR/ai-restore.log"
+typeset COORDS="$STATE_DIR/coords-last.json"
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+log() { print -r -- "$(date '+%F %T') $*" >>"$LOG" 2>/dev/null; }
+
+# Coordinate -> session id/tool map produced by aipane-snapshot at save time. The
+# tool tag is part of the identity: a stale binding from another tool must never be
+# interpreted as the detected pane's session id.
+typeset -A COORDS_SID COORDS_TOOL
+if [[ -r "$COORDS" ]] && command -v python3 &>/dev/null; then
+  local _cl
+  while IFS=$'\t' read -r _cl _sid _tool; do
+    if [[ -n "$_cl" ]]; then
+      COORDS_SID[$_cl]="$_sid"
+      COORDS_TOOL[$_cl]="$_tool"
+    fi
+  done < <(python3 -c '
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for coord,rec in d.items():
+    sid=(rec or {}).get("sid","")
+    tool=(rec or {}).get("tool","")
+    if sid: print(f"{coord}\t{sid}\t{tool}")
+' "$COORDS" 2>/dev/null)
+fi
+
+# ---- resolve the dump ----------------------------------------------------
+if [[ -z "$DUMP" ]]; then
+  local dir
+  dir="$(run_tmux show-option -gqv @resurrect-dir 2>/dev/null)"
+  [[ -n "$dir" ]] || dir="${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect"
+  DUMP="$dir/last"
+fi
+if [[ ! -e "$DUMP" ]]; then
+  log "no resurrect dump at $DUMP"
+  print -u2 "ai-restore: no resurrect dump at $DUMP"
+  return 1 2>/dev/null || exit 1
+fi
+
+# lowercase-hex UUID matcher (matches both v4 and codex/grok's uuidv7)
+typeset UUID_RE='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+
+# Only auto-run panes whose exact session id is recoverable ("resume"). Panes with
+# no recoverable id ("fresh") are left as an idle shell by default — re-launching a
+# brand-new AI there has no recovery value and costs tokens. Set AI_RESTORE_FRESH=1
+# to also re-launch fresh panes.
+typeset RESTORE_FRESH="${AI_RESTORE_FRESH:-0}"
+
+# Base launch commands used to rebuild a resume line. Honor direct command overrides
+# when they are present; otherwise use plain binaries from a bare hook environment.
+typeset PI_BASE="${AIPANE_PI_LAUNCH_CMD:-pi}"
+typeset GROK_BASE="${AIPANE_GROK_LAUNCH_CMD:-grok --always-approve}"
+typeset CLAUDE_BASE="${AIPANE_CLAUDE_LAUNCH_CMD:-claude --dangerously-skip-permissions}"
+typeset CURSOR_BASE="${AIPANE_CURSOR_LAUNCH_CMD:-cursor-agent --force}"
+typeset CODEX_BASE="${AIPANE_CODEX_LAUNCH_CMD:-codex --yolo}"
+typeset OPENCODE_BASE="${AIPANE_OPENCODE_LAUNCH_CMD:-opencode}"
+typeset KIMI_BASE="${AIPANE_KIMI_LAUNCH_CMD:-kimi --yolo}"
+
+# Migrate exact retired local overrides that can survive in an already-running
+# Ghostty shell or a restored tmux global environment.
+[[ "$CLAUDE_BASE" == "claude-guard --dangerously-skip-permissions" ]] &&
+  CLAUDE_BASE="claude --dangerously-skip-permissions"
+[[ "$CODEX_BASE" == "codexx" ]] &&
+  CODEX_BASE="codex --yolo --disable plugins"
+
+# detect_tool <full_cmd> <cur_cmd> -> REPLY in {pi,grok,claude,cursor,codex,opencode,kimi} or ""
+detect_tool() {
+  local full="$1" cur="$2" prog
+  REPLY=""
+  # cursor-agent runs under node with a versioned path; match by substring.
+  if [[ "$full" == *cursor-agent* ]]; then REPLY=cursor; return; fi
+  prog="${full%% *}"; prog="${prog:t}"      # basename of argv[0]
+  case "$prog" in
+    pi)                REPLY=pi ;;
+    grok|grok-*)       REPLY=grok ;;
+    # Compatibility: recognize commands captured in pre-removal resurrect dumps.
+    claude|claude-guard) REPLY=claude ;;
+    codex|codexx|codex-*) REPLY=codex ;;
+    opencode|opencode-*) REPLY=opencode ;;   # Mach-O binary, argv0 = opencode
+    kimi|kimi-*)         REPLY=kimi ;;        # Mach-O SEA, argv0 = kimi
+    node|"")
+      # node wrapper without cursor-agent: fall back to the (truncated) current command
+      case "$cur" in
+        grok-*)  REPLY=grok ;;
+        codex-*) REPLY=codex ;;
+        pi|pi-*) REPLY=pi ;;
+      esac ;;
+    *)
+      case "$cur" in
+        grok-*)     REPLY=grok ;;
+        codex-*)    REPLY=codex ;;
+        opencode)   REPLY=opencode ;;
+        kimi)       REPLY=kimi ;;
+      esac ;;
+  esac
+}
+
+# extract_uuid <string> -> REPLY (first uuid-shaped token) or ""
+extract_uuid() {
+  REPLY=""
+  if [[ "$1" =~ "$UUID_RE" ]]; then REPLY="${MATCH:l}"; fi
+}
+
+# coord_tool_matches <detected tool name> <snapshot tool tag>
+coord_tool_matches() {
+  local detected="$1" recorded="$2" tag
+  case "$detected" in
+    pi) tag=p ;;
+    grok) tag=g ;;
+    claude) tag=c ;;
+    cursor) tag=r ;;
+    codex) tag=x ;;
+    opencode) tag=o ;;
+    kimi) tag=k ;;
+    *) return 1 ;;
+  esac
+  [[ "$recorded" == "$tag" || "$recorded" == "$detected" ]]
+}
+
+# codex_session_exists <uuid> — a resume id is safe only when Codex has a local
+# rollout for it. This turns corrupt/stale registry data into a visible skip.
+codex_session_exists() {
+  local sid="$1" root="${CODEX_HOME:-$HOME/.codex}"
+  local -a matches
+  matches=(
+    "$root"/sessions/**/*-"$sid".jsonl(N)
+    "$root"/archived_sessions/**/*-"$sid".jsonl(N)
+  )
+  (( ${#matches[@]} > 0 ))
+}
+
+# build_resume <tool> <full_cmd> <title> <coord_sid> -> REPLY = command to send, or ""
+# id precedence: command-line argv (gold-case) > coords-snapshot (codex/opencode/kimi
+# via their hook, keyed by coordinate) > codex title. opencode/kimi ids are not UUIDs
+# and never appear in argv, so for them the coords-snapshot is the only id source.
+# Sets REPLY_KIND = resume|fresh|invalid for logging.
+build_resume() {
+  local tool="$1" full="$2" title="$3" coord_sid="$4" id
+  REPLY=""; REPLY_KIND=""; REPLY_SID=""
+  extract_uuid "$full"; id="$REPLY"
+  [[ -z "$id" && -n "$coord_sid" ]] && id="$coord_sid"
+  case "$tool" in
+    pi)
+      # --session-id is idempotent on pi: resumes if present, creates if not.
+      if [[ -n "$id" ]]; then REPLY="$PI_BASE --session-id $id"; REPLY_KIND=resume
+      else REPLY="$PI_BASE"; REPLY_KIND=fresh; fi ;;
+    cursor)
+      if [[ -n "$id" ]]; then REPLY="$CURSOR_BASE --resume $id"; REPLY_KIND=resume
+      else REPLY="$CURSOR_BASE"; REPLY_KIND=fresh; fi ;;
+    grok)
+      if [[ -n "$id" ]]; then REPLY="$GROK_BASE --resume $id"; REPLY_KIND=resume
+      else REPLY="$GROK_BASE"; REPLY_KIND=fresh; fi ;;
+    claude)
+      if [[ -n "$id" ]]; then REPLY="$CLAUDE_BASE --resume $id"; REPLY_KIND=resume
+      else REPLY="$CLAUDE_BASE"; REPLY_KIND=fresh; fi ;;
+    codex)
+      # codex id is not in argv on a bare launch, but its pane title is usually the
+      # session uuid — use that as a fallback.
+      if [[ -z "$id" ]]; then extract_uuid "$title"; id="$REPLY"; fi
+      if [[ -n "$id" ]]; then
+        REPLY="$CODEX_BASE resume $id"
+        if codex_session_exists "$id"; then REPLY_KIND=resume
+        else REPLY_KIND=invalid; fi
+      else REPLY="$CODEX_BASE"; REPLY_KIND=fresh; fi ;;
+    opencode)
+      # id (ses_...) comes only from the coords-snapshot (recorded by the opencode
+      # plugin on the first message). opencode --continue is global "last session",
+      # too ambiguous across panes to trust, so with no id we fall back to fresh.
+      if [[ -n "$id" ]]; then REPLY="$OPENCODE_BASE --session $id"; REPLY_KIND=resume
+      else REPLY="$OPENCODE_BASE"; REPLY_KIND=fresh; fi ;;
+    kimi)
+      # id from the coords-snapshot (recorded by the kimi SessionStart hook). Without
+      # it, kimi --continue reliably resumes the last session FOR THIS CWD (the pane's
+      # cwd is already restored), so that is still a genuine resume rather than fresh.
+      if [[ -n "$id" ]]; then REPLY="$KIMI_BASE --session $id"; REPLY_KIND=resume
+      else REPLY="$KIMI_BASE --continue"; REPLY_KIND=resume; fi ;;
+  esac
+  [[ -n "$id" ]] && REPLY_SID="$id"
+}
+
+# pane_is_idle_shell <target> -> 0 if the pane's foreground is a plain shell
+pane_is_idle_shell() {
+  local cc
+  cc="$(run_tmux display-message -p -t "$1" '#{pane_current_command}' 2>/dev/null)" || return 1
+  case "${cc:l}" in
+    zsh|-zsh|bash|-bash|sh|-sh|fish|-fish|"") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+tool_tag() {
+  case "$1" in
+    pi) REPLY=p ;;
+    grok) REPLY=g ;;
+    claude) REPLY=c ;;
+    cursor) REPLY=r ;;
+    codex) REPLY=x ;;
+    opencode) REPLY=o ;;
+    kimi) REPLY=k ;;
+    *) REPLY=""; return 1 ;;
+  esac
+}
+
+# Once a resume is sent, bind it to the pane id allocated by the new tmux server.
+# Without this handoff, a later autosave could lose the mapping before an AI hook
+# happens to run, making a second server restart unrecoverable.
+record_restored_binding() {
+  local target="$1" tool="$2" sid="$3" cmd="$4"
+  local pane_id socket_path server_pid tag
+  [[ -n "$sid" ]] || return 0
+  command -v aipane-bind &>/dev/null || { log "cannot rebind $target: aipane-bind missing"; return 0; }
+  pane_id="$(run_tmux display-message -p -t "$target" '#{pane_id}' 2>/dev/null)" || return 0
+  socket_path="$(run_tmux display-message -p -t "$target" '#{socket_path}' 2>/dev/null)" || return 0
+  server_pid="$(run_tmux display-message -p -t "$target" '#{pid}' 2>/dev/null)" || return 0
+  tool_tag "$tool"; tag="$REPLY"
+  if TMUX="$socket_path,$server_pid,0" command aipane-bind \
+      --tool "$tag" --sid "$sid" --pane "$pane_id" --cmd "$cmd" >/dev/null 2>&1; then
+    log "rebound $target ($pane_id) to $tool/$sid"
+  else
+    log "cannot rebind $target ($pane_id) to $tool/$sid"
+  fi
+}
+
+# ---- walk the dump -------------------------------------------------------
+typeset -i n_ai=0 n_sent=0 n_skip=0
+log "=== ai-restore start (dump=$DUMP dryrun=$DRYRUN) ==="
+(( DRYRUN )) && print "ai-restore dry-run  (dump: $DUMP)"
+
+local line
+local -a f
+local session win pane_idx title cwd cur full tool cmd target coord_sid coord_tool resume_sid
+while IFS= read -r line; do
+  [[ "$line" == pane$'\t'* ]] || continue
+  f=("${(@ps:\t:)line}")
+  (( ${#f[@]} >= 11 )) || continue
+  session="${f[2]}"; win="${f[3]}"; pane_idx="${f[6]}"; title="${f[7]}"
+  cwd="${f[8]#:}"; cur="${f[10]}"
+  full="${(j:\t:)f[11,-1]}"; full="${full#:}"
+
+  detect_tool "$full" "$cur"; tool="$REPLY"
+  [[ -n "$tool" ]] || continue
+  (( n_ai++ ))
+
+  target="${session}:${win}.${pane_idx}"
+
+  coord_sid="${COORDS_SID[$target]:-}"
+  coord_tool="${COORDS_TOOL[$target]:-}"
+  if [[ -n "$coord_sid" ]] && ! coord_tool_matches "$tool" "$coord_tool"; then
+    log "ignore $target snapshot id: detected=$tool recorded=${coord_tool:-missing}"
+    coord_sid=""
+  fi
+
+  build_resume "$tool" "$full" "$title" "$coord_sid"; cmd="$REPLY"; resume_sid="$REPLY_SID"
+  [[ -n "$cmd" ]] || { (( n_skip++ )); continue; }
+
+  # Invalid ids are always skipped. Fresh panes are skipped unless opted in.
+  local skip_fresh=0 skip_invalid=0 label="$REPLY_KIND"
+  if [[ "$REPLY_KIND" == fresh && "$RESTORE_FRESH" != 1 ]]; then
+    skip_fresh=1; label="skip"
+  elif [[ "$REPLY_KIND" == invalid ]]; then
+    skip_invalid=1
+  fi
+
+  if (( DRYRUN )); then
+    printf '  %-22s %-6s %-6s %s\n' "$target" "$tool" "$label" "$cmd"
+    continue
+  fi
+
+  if (( skip_fresh )); then
+    log "skip $target ($tool): fresh, no recoverable id"; (( n_skip++ )); continue
+  fi
+  if (( skip_invalid )); then
+    log "skip $target ($tool): session id has no local Codex rollout"; (( n_skip++ )); continue
+  fi
+
+  if ! run_tmux has-session -t "$session" 2>/dev/null; then
+    log "skip $target ($tool): session gone"; (( n_skip++ )); continue
+  fi
+  if ! pane_is_idle_shell "$target"; then
+    log "skip $target ($tool): pane busy (not idle shell)"; (( n_skip++ )); continue
+  fi
+
+  if run_tmux send-keys -t "$target" "$cmd" Enter 2>/dev/null; then
+    log "sent $target ($tool/$REPLY_KIND): $cmd"; (( n_sent++ ))
+    record_restored_binding "$target" "$tool" "$resume_sid" "$cmd"
+  else
+    log "FAIL send $target ($tool): $cmd"; (( n_skip++ ))
+  fi
+  sleep "$DELAY"
+done < "$DUMP"
+
+log "=== ai-restore done: ai_panes=$n_ai sent=$n_sent skipped=$n_skip ==="
+if (( DRYRUN )); then
+  print "\nsummary: ai_panes=$n_ai (dry-run, nothing sent)"
+else
+  run_tmux display-message "ai-restore: resumed $n_sent AI pane(s), skipped $n_skip" 2>/dev/null
+fi
+return 0 2>/dev/null || exit 0

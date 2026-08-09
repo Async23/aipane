@@ -300,6 +300,10 @@ _aipane_pane_build_and_run_tmux() {
     return 1
   fi
 
+  # Expose the resolved pane ids (column-major, aligned with commands[]) so the
+  # caller can record pane→session bindings. See lib/session.zsh.
+  typeset -ga _aipane_result_panes=("${pane_ids[@]}")
+
   # Send commands to pane 2..N first, then pane 1 (so focus ends on the first pane).
   for (( i = 2; i <= pane_count; i++ )); do
     tmux send-keys -t "${pane_ids[i]}" "${commands[i]}" Enter || return 1
@@ -402,8 +406,10 @@ ai() {
   fi
 
   if (( pane_count == 1 && _new_window == 0 )) && [[ -z "$_layout_spec" ]]; then
-    _aipane_tool_command "${tools[1]}" "${tool_args[@]}" || return 1
-    eval "$REPLY"
+    _aipane_prepare_launch "${tools[1]}" "${tool_args[@]}" || return 1
+    local _cmd="$REPLY" _sid="$REPLY_SID"
+    _aipane_registry_record "${TMUX_PANE:-}" "${tools[1]}" "$_sid" "$_cmd"
+    eval "$_cmd"
     return $?
   fi
 
@@ -428,15 +434,25 @@ ai() {
     _tmux_mode="here"
   fi
 
+  local -a sids
   for ch in "${tools[@]}"; do
-    _aipane_tool_command "$ch" "${tool_args[@]}" || return 1
+    _aipane_prepare_launch "$ch" "${tool_args[@]}" || return 1
     commands+=("$REPLY")
+    sids+=("$REPLY_SID")
   done
 
+  typeset -ga _aipane_result_panes=()
   _aipane_pane_build_and_run_tmux \
     "$_tmux_mode" "$pane_count" "$cols" "$rows" \
     "${rows_per_col[@]}" \
     "${commands[@]}" || return 1
+
+  # Record pane→session bindings (pane_ids are column-major, aligned with commands/tools/sids).
+  if (( ${#_aipane_result_panes[@]} == pane_count )); then
+    for (( i = 1; i <= pane_count; i++ )); do
+      _aipane_registry_record "${_aipane_result_panes[i]}" "${tools[i]}" "${sids[i]}" "${commands[i]}"
+    done
+  fi
 
   if [[ "$_tmux_mode" == "session" ]]; then
     tmux attach -t "$_aipane_session"

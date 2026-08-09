@@ -1,0 +1,122 @@
+#!/opt/homebrew/bin/python3
+"""aipane-snapshot — pair each live pane's tmux coordinate with its recorded AI
+session id, at the same instant tmux-resurrect writes its dump.
+
+Why: gold-case tools (pi/grok/claude/cursor) put their id straight into the pane's
+command line, so ai-restore reads it back from the resurrect dump directly. codex
+has no launch-time id — its id only reaches us later via the notify hook, keyed by
+the pane's unique id (%N). But %N does not survive a server restart, and the dump
+stores coordinates, not %N. So at save time we resolve %N -> coordinate here and
+emit a coordinate -> sid map that ai-restore can consult after restore.
+
+Trigger: @resurrect-hook-post-save-layout '$HOME/.local/bin/aipane-snapshot'
+(resurrect passes the just-written dump path as argv[1]; we only need the timing.)
+
+Output: $AIPANE_STATE_DIR/coords-last.json
+  { "session:win.pane": {"sid": "...", "tool": "x", "cwd": "..."}, ... }
+"""
+import json
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+STATE_DIR = Path(
+    os.environ.get("AIPANE_STATE_DIR")
+    or (Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "aipane")
+)
+REGISTRY = Path(os.environ.get("AIPANE_REGISTRY") or (STATE_DIR / "registry.jsonl"))
+OUT = STATE_DIR / "coords-last.json"
+TMUX = shlex.split(os.environ.get("AIPANE_TMUX", "tmux"))
+
+
+def current_server_identity() -> tuple[str, str] | None:
+    """Return the current tmux server's (socket path, pid)."""
+    fmt = "#{socket_path}\t#{pid}"
+    try:
+        out = subprocess.run(
+            [*TMUX, "display-message", "-p", "-F", fmt],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+    except Exception:
+        return None
+    parts = out.split("\t")
+    if len(parts) != 2 or not all(parts):
+        return None
+    return parts[0], parts[1]
+
+
+def latest_by_pane(socket_path: str, server_pid: str) -> dict:
+    """pane (%N) -> latest binding recorded by this exact tmux server."""
+    result: dict[str, dict] = {}
+    if not REGISTRY.is_file():
+        return result
+    try:
+        with REGISTRY.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("sock") != socket_path or rec.get("srv") != server_pid:
+                    continue
+                pane = rec.get("pane")
+                if not pane:
+                    continue
+                # append-only log → last occurrence wins
+                result[pane] = {"sid": rec.get("sid", ""), "tool": rec.get("tool", "")}
+    except OSError:
+        pass
+    return result
+
+
+def live_panes() -> list[tuple[str, str, str]]:
+    """[(pane_id %N, 'session:win.pane', cwd), ...] for every current pane."""
+    fmt = "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_path}"
+    try:
+        out = subprocess.run(
+            [*TMUX, "list-panes", "-a", "-F", fmt],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return []
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3:
+            rows.append((parts[0], parts[1], parts[2]))
+    return rows
+
+
+def main() -> int:
+    server = current_server_identity()
+    by_pane = latest_by_pane(*server) if server else {}
+    coords: dict[str, dict] = {}
+    for pane_id, coord, cwd in live_panes():
+        rec = by_pane.get(pane_id)
+        if not rec or not rec.get("sid"):
+            continue  # only useful when we actually have an id (mainly codex)
+        coords[coord] = {"sid": rec["sid"], "tool": rec.get("tool", ""), "cwd": cwd}
+
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = OUT.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(coords, ensure_ascii=False, indent=0), encoding="utf-8")
+        tmp.replace(OUT)
+    except OSError as exc:
+        print(f"aipane-snapshot: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

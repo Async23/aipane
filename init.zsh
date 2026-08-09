@@ -1,11 +1,11 @@
 #!/usr/bin/env zsh
 # aipane entrypoint
 
-if [[ "${_AIPANE_INIT_VERSION:-}" == "2" ]]; then
+if [[ "${_AIPANE_INIT_VERSION:-}" == "3" ]]; then
   return 0
 fi
 typeset -g _AIPANE_INIT_LOADED=1
-typeset -g _AIPANE_INIT_VERSION=2
+typeset -g _AIPANE_INIT_VERSION=3
 
 # Remove only the public functions owned by the retired multi-account module.
 # A user-defined function with the same short name must remain untouched.
@@ -16,6 +16,19 @@ fi
 if (( $+functions[ccd] )) &&
    [[ "${functions[ccd]}" == *'_aipane_cc_invoke "danger" --no-account-dir "$@"'* ]]; then
   unfunction ccd
+fi
+
+# Remove only the retired launcher shortcuts that were defined by aipane.
+# User-owned functions and aliases with the same names must remain untouched.
+if (( $+functions[codexx] )) &&
+   [[ "${functions[codexx]}" == *'codex --yolo --disable plugins "$@"'* ]]; then
+  unfunction codexx
+fi
+if (( $+aliases[geminii] )) && [[ "${aliases[geminii]}" == 'gemini --yolo' ]]; then
+  unalias geminii
+fi
+if (( $+aliases[oc] )) && [[ "${aliases[oc]}" == 'opencode' ]]; then
+  unalias oc
 fi
 
 for _aipane_legacy_f in \
@@ -37,6 +50,7 @@ unset _aipane_legacy_f
 typeset -g AIPANE_ROOT="${${(%):-%N}:A:h}"
 
 source "$AIPANE_ROOT/lib/core.zsh"
+source "$AIPANE_ROOT/lib/session.zsh"
 
 for _aipane_f in "$AIPANE_ROOT"/cmd/*.zsh(N); do
   source "$_aipane_f"

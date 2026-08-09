@@ -9,19 +9,13 @@
 | 命令 / 表面 | 说明 |
 |---|---|
 | `ai [--new\|-n] [--layout\|-l <layout>] <tools_string> [tool_args...]` | 直接启动一个 AI CLI，或在 tmux 窗格中编排多个 CLI |
-| `codexx [args...]` | 启动 `codex --yolo` |
 | `killcc [options]` | 清理已分离的 AI CLI 进程树和孤立的 AI 子进程 |
 | `killmcp [options]` | 清理过期、已分离或孤立的 MCP 辅助进程 |
 | `killrod [options]` | 强制清理匹配的 Rod/Leakless 浏览器进程和 Playwright `chrome-headless-shell` 进程 |
 | 可选 Ghostty + tmux 工作台 | Cmd↔tmux 键位桥、广播、窗口标签多行（**不会**被 `init.zsh` 加载） |
 
-便捷别名：
-
-- `geminii` → `gemini --yolo`
-- `oc` → `opencode`
-
 > [!WARNING]
-> `codexx` 和部分 `ai` 启动器（含 `ai c` 启动 Claude Code）会关闭对应工具的审批检查；清理命令会终止进程。请先确认命令定义，不确定时先用 `--dry-run` 检查清理范围。
+> 部分 `ai` 启动器（含 `ai c` 启动 Claude Code）会关闭对应工具的审批检查；清理命令会终止进程。请先确认命令定义，不确定时先用 `--dry-run` 检查清理范围。
 
 ## 安装
 
@@ -121,7 +115,7 @@ python3 "$AIPANE_ROOT/tests/test_tmux_window_wrap.py"
 在加载 `init.zsh` 之前设置覆盖值：
 
 ```bash
-export AIPANE_CLAUDE_LAUNCH_CMD="claude --dangerously-skip-permissions"  # 例如 claude-guard --dangerously-skip-permissions
+export AIPANE_CLAUDE_LAUNCH_CMD="claude --dangerously-skip-permissions"
 export AIPANE_CODEX_LAUNCH_CMD="codex --yolo"
 export AIPANE_DROID_LAUNCH_CMD="droid"
 export AIPANE_GROK_LAUNCH_CMD="grok --always-approve"
@@ -224,7 +218,7 @@ killrod --dry-run
 ├── init.zsh                 # zsh 入口
 ├── aipane.zsh               # 兼容入口
 ├── lib/core.zsh
-├── cmd/                     # ai/pane、kill*、codexx、aliases …
+├── cmd/                     # ai/pane 与 kill* 命令
 ├── bin/
 │   ├── aipane-cleanup
 │   ├── rod-cleanup
@@ -259,7 +253,10 @@ sh -n bin/aipane-cleanup bin/rod-cleanup bin/tmux-colour-palette bin/tmux-rename
 
 zsh -fc '
   source ./init.zsh
-  type ai codexx killcc killmcp killrod geminii oc
+  type ai killcc killmcp killrod
+  for retired in codexx geminii oc; do
+    (( $+functions[$retired] || $+aliases[$retired] )) && exit 1
+  done
   ai --help >/dev/null
 '
 

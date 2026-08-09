@@ -195,6 +195,54 @@ class WindowWrapCliTests(unittest.TestCase):
         )
         self.assertIn(("invalidate-cache", "test-socket"), events)
 
+    def test_animation_probe_reads_owner_without_panes(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        animation_probe = namespace["animation_probe"]
+        socket_name = f"window-wrap-empty-test-{uuid.uuid4().hex}"
+        socket_path = (
+            Path(os.environ.get("TMUX_TMPDIR", "/tmp"))
+            / f"tmux-{os.getuid()}"
+            / socket_name
+        )
+        environment = os.environ.copy()
+        environment.pop("TMUX", None)
+
+        def tmux(*arguments, check=True):
+            return subprocess.run(
+                ["tmux", "-L", socket_name, *arguments],
+                text=True,
+                capture_output=True,
+                check=check,
+                env=environment,
+            )
+
+        try:
+            tmux(
+                "-f",
+                "/dev/null",
+                "start-server",
+                ";",
+                "set-option",
+                "-g",
+                "exit-empty",
+                "off",
+            )
+            owner = uuid.uuid4().hex
+            tmux(
+                "set-environment",
+                "-g",
+                "TMUX_WINDOW_WRAP_ANIMATOR_OWNER",
+                owner,
+            )
+
+            self.assertEqual(
+                animation_probe(socket_name),
+                (owner, False),
+            )
+        finally:
+            tmux("kill-server", check=False)
+            socket_path.unlink(missing_ok=True)
+
     def test_windows_stay_on_one_line_when_they_fit(self):
         result = self.run_plan(
             {
@@ -1331,6 +1379,63 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
                         expand_option(explicit_deferred_option),
                         expand_option(direct_option),
                     )
+
+    def test_animator_waits_for_first_session_after_config_load(self):
+        self.tmux("set-option", "-g", "exit-empty", "off")
+        self.tmux("kill-session", "-t", "wrap")
+        self.source_window_wrap_config()
+        time.sleep(0.5)
+
+        self.tmux(
+            "new-session",
+            "-d",
+            "-s",
+            "wrap",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "-n",
+            "delayed",
+            "sleep 120",
+        )
+        self.session_id = self.tmux(
+            "display-message",
+            "-p",
+            "-t",
+            "wrap",
+            "#{session_id}",
+        ).stdout.strip()
+        pane_id = self.tmux(
+            "display-message",
+            "-p",
+            "-t",
+            "wrap:1",
+            "#{pane_id}",
+        ).stdout.strip()
+        self.tmux("select-pane", "-t", pane_id, "-T", "⠋ delayed session")
+
+        _, master_fd = self.attach_client(width=80)
+        self.wait_for_client_count(1)
+        self.wait_for_status_text(master_fd, "▓", timeout=1)
+
+        seen_ticks = set()
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline and len(seen_ticks) < 8:
+            tick = self.tmux(
+                "show-options",
+                "-g",
+                "-v",
+                "@tmux-window-wrap-animation-tick",
+            ).stdout.strip()
+            seen_ticks.add(tick)
+            time.sleep(0.01)
+
+        self.assertGreaterEqual(
+            len(seen_ticks),
+            8,
+            f"animator exited before the first session; saw {seen_ticks!r}",
+        )
 
     def test_attached_status_advances_activity_at_twenty_fps(self):
         first_pane = self.tmux(
