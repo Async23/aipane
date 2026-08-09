@@ -9,19 +9,13 @@ A zsh toolkit for daily AI CLI workflows: tmux pane orchestration for multiple A
 | Command / surface | Description |
 |---|---|
 | `ai [--new\|-n] [--layout\|-l <layout>] <tools_string> [tool_args...]` | Launch one AI CLI directly or orchestrate multiple CLIs in tmux panes |
-| `codexx [args...]` | Launch `codex --yolo` |
 | `killcc [options]` | Clean up detached AI CLI trees and orphaned AI child processes |
 | `killmcp [options]` | Clean up stale detached/orphaned MCP helper processes |
 | `killrod [options]` | Force-clean matching Rod/Leakless browser processes and Playwright `chrome-headless-shell` processes |
 | Optional Ghostty + tmux workstation | Cmd↔tmux key bridge, broadcast, multi-line window list (not loaded by `init.zsh`) |
 
-Convenience aliases:
-
-- `geminii` → `gemini --yolo`
-- `oc` → `opencode`
-
 > [!WARNING]
-> `codexx` and several `ai` launchers (including `ai c` for Claude Code) disable their tools' approval checks. The cleanup commands terminate processes. Review the command definitions and use `--dry-run` before cleanup when in doubt.
+> Several `ai` launchers (including `ai c` for Claude Code) disable their tools' approval checks. The cleanup commands terminate processes. Review the command definitions and use `--dry-run` before cleanup when in doubt.
 
 ## Install
 
@@ -121,7 +115,7 @@ If Ghostty is already running, reload config with **Cmd+Shift+,** (`reload_confi
 Set overrides before sourcing `init.zsh`:
 
 ```bash
-export AIPANE_CLAUDE_LAUNCH_CMD="claude --dangerously-skip-permissions"  # e.g. claude-guard --dangerously-skip-permissions
+export AIPANE_CLAUDE_LAUNCH_CMD="claude --dangerously-skip-permissions"
 export AIPANE_CODEX_LAUNCH_CMD="codex --yolo"
 export AIPANE_DROID_LAUNCH_CMD="droid"
 export AIPANE_GROK_LAUNCH_CMD="grok --always-approve"
@@ -224,7 +218,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 ├── init.zsh                 # zsh entrypoint
 ├── aipane.zsh               # compatibility entrypoint
 ├── lib/core.zsh
-├── cmd/                     # ai/pane, kill*, codexx, aliases, …
+├── cmd/                     # ai/pane and kill* commands
 ├── bin/
 │   ├── aipane-cleanup
 │   ├── rod-cleanup
@@ -259,7 +253,10 @@ sh -n bin/aipane-cleanup bin/rod-cleanup bin/tmux-colour-palette bin/tmux-rename
 
 zsh -fc '
   source ./init.zsh
-  type ai codexx killcc killmcp killrod geminii oc
+  type ai killcc killmcp killrod
+  for retired in codexx geminii oc; do
+    (( $+functions[$retired] || $+aliases[$retired] )) && exit 1
+  done
   ai --help >/dev/null
 '
 

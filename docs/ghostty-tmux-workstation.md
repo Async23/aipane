@@ -101,7 +101,7 @@ Canonical sources live in this repo. Personal configs only **include/source** th
 
 Do not paste large keybind or `status-format` blocks back into home copies.
 
-Not in this package: `claude-guard`, `pane-col.sh`, company skills, full agent home dirs.
+Not in this package: `pane-col.sh`, company skills, full agent home dirs.
 
 ## Related
 

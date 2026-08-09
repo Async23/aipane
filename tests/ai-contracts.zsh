@@ -5,9 +5,11 @@ set -eu
 ROOT_DIR="${0:A:h:h}"
 TMUX_BIN="$(command -v tmux)"
 SOCKET_NAME="aipane-ai-contracts-$$"
+TEST_DIR="$(mktemp -d -t aipane-ai-contracts.XXXXXX)"
 
 cleanup() {
   command "$TMUX_BIN" -L "$SOCKET_NAME" kill-server >/dev/null 2>&1 || true
+  rm -rf "$TEST_DIR"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -19,6 +21,8 @@ tmux() {
 }
 
 export TMUX="aipane-test"
+export AIPANE_STATE_DIR="$TEST_DIR/state"
+export AIPANE_REGISTRY="$AIPANE_STATE_DIR/registry.jsonl"
 export AIPANE_CLAUDE_LAUNCH_CMD="sleep 120"
 export AIPANE_CODEX_LAUNCH_CMD="sleep 120"
 export AIPANE_DROID_LAUNCH_CMD="sleep 120"

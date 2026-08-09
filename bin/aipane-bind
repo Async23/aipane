@@ -1,0 +1,44 @@
+#!/usr/bin/env zsh
+# aipane-bind — record a pane→AI-session binding into the aipane registry.
+#
+# Used by:
+#   - the codex notify wrapper (aipane-codex-notify), to record codex's thread-id
+#     once codex knows it (codex has no launch-time --session-id, unlike gold-case tools);
+#   - manual/debug use.
+#
+# It reuses lib/session.zsh's _aipane_registry_record so the on-disk format stays
+# identical to what `ai` writes at launch (last-writer-wins JSONL).
+#
+# Usage:
+#   aipane-bind --tool x --sid <uuid> [--pane %N] [--cmd "..."]
+# pane defaults to $TMUX_PANE (the pane the caller runs in).
+
+emulate -L zsh
+setopt no_nomatch
+
+typeset self="${0:A}"
+typeset root="${self:h:h}"
+if [[ ! -r "$root/lib/session.zsh" ]]; then
+  print -u2 "aipane-bind: cannot locate lib/session.zsh from $self"
+  exit 1
+fi
+source "$root/lib/session.zsh"
+
+typeset tool="" sid="" pane="${TMUX_PANE:-}" cmd=""
+while (( $# > 0 )); do
+  case "$1" in
+    --tool) shift; tool="$1" ;;
+    --sid)  shift; sid="$1" ;;
+    --pane) shift; pane="$1" ;;
+    --cmd)  shift; cmd="$1" ;;
+    -h|--help) print "usage: aipane-bind --tool T --sid ID [--pane %N] [--cmd CMD]"; exit 0 ;;
+    *) print -u2 "aipane-bind: unknown arg '$1'"; exit 2 ;;
+  esac
+  shift
+done
+
+[[ -n "$sid"  ]] || { print -u2 "aipane-bind: --sid required"; exit 2; }
+[[ -n "$pane" ]] || { print -u2 "aipane-bind: no pane (set --pane or run inside tmux)"; exit 0; }
+[[ -n "$tool" ]] || tool="?"
+
+_aipane_registry_record "$pane" "$tool" "$sid" "$cmd"

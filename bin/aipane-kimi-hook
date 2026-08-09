@@ -1,0 +1,38 @@
+#!/bin/sh
+# aipane-kimi-hook — record a kimi pane→session binding from a kimi lifecycle hook.
+#
+# Kimi Code runs hook commands and pipes a JSON payload on stdin whose base fields
+# include `session_id` (present from SessionStart onward). kimi hook commands run as
+# children of the kimi process, so they inherit $TMUX_PANE — exactly what aipane-bind
+# needs. kimi has no launch-time --session-id (it is a lazy/resume-by-id tool like
+# codex), so this hook is how we learn its id.
+#
+# Wiring: ~/.kimi-code/config.toml
+#   [[hooks]]
+#   event = "SessionStart"
+#   command = "$HOME/.local/bin/aipane-kimi-hook"
+#   timeout = 5
+#
+# Contract with kimi: never block or fail the agent. We read stdin, record in the
+# background, and always exit 0 (allow). All errors are swallowed.
+
+PAYLOAD=$(cat 2>/dev/null)
+PYTHON="${AIPANE_PYTHON:-/opt/homebrew/bin/python3}"
+BIND="$HOME/.local/bin/aipane-bind"
+
+if [ -n "$PAYLOAD" ] && [ -x "$BIND" ]; then
+  (
+    sid=$(printf '%s' "$PAYLOAD" | "$PYTHON" -c \
+      'import json,sys
+try:
+    p=json.load(sys.stdin)
+    print(p.get("session_id") or p.get("sessionId") or p.get("session-id") or "")
+except Exception:
+    print("")' 2>/dev/null)
+    if [ -n "$sid" ] && [ -n "$TMUX_PANE" ]; then
+      "$BIND" --tool k --sid "$sid" --pane "$TMUX_PANE" --cmd "kimi" >/dev/null 2>&1
+    fi
+  ) &
+fi
+
+exit 0

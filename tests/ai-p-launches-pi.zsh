@@ -33,6 +33,8 @@ chmod +x "$FAKE_BIN/pi" "$FAKE_BIN/omp"
 
 export PATH="$FAKE_BIN:/usr/bin:/bin"
 export AIPANE_TEST_CAPTURE="$CAPTURE_FILE"
+export AIPANE_STATE_DIR="$TEST_DIR/state"
+export AIPANE_REGISTRY="$AIPANE_STATE_DIR/registry.jsonl"
 unset AIPANE_PI_LAUNCH_CMD
 
 source "$ROOT_DIR/init.zsh"

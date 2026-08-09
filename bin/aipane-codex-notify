@@ -1,0 +1,40 @@
+#!/bin/sh
+# aipane-codex-notify — thin wrapper around the user's codex `notify` program.
+#
+# codex calls its `notify` program after each turn with a JSON payload that carries
+# both the session id (`thread-id`) and, via the inherited environment, $TMUX_PANE.
+# We use that to record the codex pane→session binding (codex is the only core tool
+# with no launch-time --session-id), then delegate unchanged to the real notifier so
+# the user's notifications keep working.
+#
+# Wiring: config.toml  notify = ["/Users/YOU/.local/bin/aipane-codex-notify"]
+#
+# This must never break codex: the binding runs in the background and all failures
+# are swallowed; the real notifier is always exec'd.
+
+PAYLOAD="$1"
+REAL_NOTIFY="${AIPANE_CODEX_REAL_NOTIFY:-$HOME/.codex/bin/codex-notify.py}"
+PYTHON="${AIPANE_PYTHON:-/opt/homebrew/bin/python3}"
+BIND="$HOME/.local/bin/aipane-bind"
+
+# Record the binding (best-effort, backgrounded, never blocks or fails codex).
+if [ -n "$PAYLOAD" ] && [ -x "$BIND" ]; then
+  (
+    tid=$(printf '%s' "$PAYLOAD" | "$PYTHON" -c \
+      'import json,sys
+try:
+    p=json.load(sys.stdin)
+    print(p.get("thread-id") or p.get("thread_id") or "")
+except Exception:
+    print("")' 2>/dev/null)
+    [ -n "$tid" ] && "$BIND" --tool x --sid "$tid" >/dev/null 2>&1
+  ) &
+fi
+
+# Delegate to the real notifier (preserve original behavior exactly).
+if [ -x "$REAL_NOTIFY" ]; then
+  exec "$REAL_NOTIFY" "$@"
+elif [ -f "$REAL_NOTIFY" ]; then
+  exec "$PYTHON" "$REAL_NOTIFY" "$@"
+fi
+exit 0
