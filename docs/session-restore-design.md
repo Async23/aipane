@@ -10,9 +10,8 @@
 
 - tmux-resurrect 保存结构后，`ai-restore` 负责在原 pane 续接 AI 会话。
 - `ai-restart --dry-run` 刷新快照并预览本次可恢复的 pane。
-- `ai-restart` 确认后批量重生这些 pane，再调用 `ai-restore`。
-- `prefix A`（默认是 `Ctrl-Space` 后按 `A`）可在 popup 中执行，不需要手动逐个退出。
-- 默认检测到任一 `busy` Agent Activity 就整体中止；旧进程显示 `unknown` 时，popup
+- 从 tmux 外的独立终端执行 `ai-restart`，确认后批量重生这些 pane，再调用 `ai-restore`。
+- 默认检测到任一 `busy` Agent Activity 就整体中止；旧进程显示 `unknown` 时，命令
   要求明确确认所有任务已空闲。非交互覆盖必须使用 `--force`。
 - Qoder 与 Droid 暂不在恢复范围内。
 

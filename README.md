@@ -194,9 +194,9 @@ The default command aborts the whole operation if any selected Agent Activity
 marker is busy. For an older Agent process that has not reported its state, the
 interactive command shows `unknown` and requires an explicit confirmation that
 all tasks are idle. `--yes` alone never accepts `unknown`; `--force` is the
-non-interactive override. In the workstation key map, press `prefix A`
-(`Ctrl-Space`, then `A`) to run the interactive command in a popup, so no spare
-shell pane is needed. This requires tmux-resurrect and the session-restore hooks described in
+non-interactive override. Run the command from a separate terminal outside
+tmux so it can safely replace every selected AI pane. This requires
+tmux-resurrect and the session-restore hooks described in
 [`docs/session-restore-design.md`](docs/session-restore-design.md).
 
 ## Process Cleanup
