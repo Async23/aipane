@@ -70,7 +70,6 @@ before restarting.
 |-----|--------|
 | `prefix N` | new session |
 | `prefix W` | kill session (confirm) |
-| `prefix A` | preview, confirm, restart, and resume restorable AI panes |
 | `prefix s` | session tree (tmux default) |
 | `prefix d` | detach |
 

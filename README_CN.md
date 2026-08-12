@@ -191,8 +191,8 @@ ai-restart --force    # 允许重启当前标记为 busy 的 pane
 默认情况下，只要选中的 Agent Activity 中有一个为 `busy`，整次操作就会中止。
 旧 Agent 进程尚未上报状态时会显示 `unknown`，交互命令要求你明确确认所有任务均已
 空闲。单独使用 `--yes` 不会接受 `unknown`；非交互场景必须显式使用 `--force`。
-工作台键位中可按 `prefix A`（`Ctrl-Space` 后按 `A`），在 popup 中运行交互命令，
-不需要预留普通 shell pane。该功能依赖 tmux-resurrect 以及
+请从 tmux 外的独立终端运行该命令，以便安全替换所有选中的 AI pane。该功能依赖
+tmux-resurrect 以及
 [`docs/session-restore-design.md`](docs/session-restore-design.md) 中的会话恢复 hooks。
 
 ## 进程清理
