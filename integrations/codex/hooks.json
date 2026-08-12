@@ -50,7 +50,7 @@
           {
             "type": "command",
             "command": "$HOME/.local/bin/tmux-window-wrap activity idle",
-            "timeout": 5
+            "timeout": 3
           }
         ]
       }

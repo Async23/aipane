@@ -147,6 +147,29 @@ class SessionRestoreTests(unittest.TestCase):
             )
             self.assertIn("invalid", matching_line)
 
+    def test_restore_exposes_machine_readable_recovery_plan(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            result = self.run_restore(
+                tmp,
+                coord={"sid": VALID_CODEX_SID, "tool": "x"},
+                title="custom-title",
+                saved_codex_ids={VALID_CODEX_SID},
+                plan_json=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(result.stdout)
+            self.assertEqual(plan["target"], "0:4.1")
+            self.assertEqual(plan["tool"], "codex")
+            self.assertEqual(plan["kind"], "resume")
+            self.assertTrue(plan["restorable"])
+            self.assertEqual(plan["cwd"], str(tmp))
+            self.assertEqual(
+                plan["command"],
+                f"codex --yolo --disable plugins resume {VALID_CODEX_SID}",
+            )
+
     def test_successful_restore_rebinds_session_to_the_new_pane_id(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
@@ -226,6 +249,7 @@ class SessionRestoreTests(unittest.TestCase):
         title: str,
         saved_codex_ids: set[str],
         dry_run: bool = True,
+        plan_json: bool = False,
         extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         state_dir = tmp / "state"
@@ -273,7 +297,9 @@ class SessionRestoreTests(unittest.TestCase):
         if extra_env:
             env.update(extra_env)
         args = ["zsh", str(RESTORE)]
-        if dry_run:
+        if plan_json:
+            args.append("--plan-json")
+        elif dry_run:
             args.append("--dry-run")
         args.extend(["--dump", str(dump)])
         return subprocess.run(

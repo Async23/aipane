@@ -1,5 +1,10 @@
 {
   "hooks": {
+    "sessionStart": [
+      {
+        "command": "$HOME/.local/bin/tmux-window-wrap activity idle"
+      }
+    ],
     "beforeSubmitPrompt": [
       {
         "command": "$HOME/.local/bin/tmux-window-wrap activity busy"

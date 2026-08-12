@@ -67,6 +67,7 @@ ln -sf "$AIPANE_ROOT/bin/tmux-rename-window-popup" ~/.local/bin/tmux-rename-wind
 ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
 ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
+ln -sf "$AIPANE_ROOT/bin/ai-restart" ~/.local/bin/ai-restart
 ```
 
 重命名弹窗要求 `PATH` 中存在 `fzf`。
@@ -93,6 +94,7 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `bin/tmux-colour-palette` | 终端索引色表（`0–255`） |
 | `bin/tmux-window-jump` | 同数字连按、精确 index 的窗口选择器 |
 | `bin/tmux-window-wrap` | 渲染 CLI |
+| `bin/ai-restart` | 原地安全重启并续接可恢复的 AI pane |
 | [`integrations/`](integrations/README.md) | Agent 生命周期 hook 片段与 OpenCode Adapter |
 | `tests/test_agent_activity_integrations.py` | Agent Activity 契约测试 |
 | `tests/test_tmux_window_jump.py` | window-jump 行为 + 真 tmux 测试 |
@@ -174,6 +176,25 @@ ai cc                                     # 重复的键会启动重复的工具
 
 在 tmux 内，只有当前窗口恰好包含一个窗格时才会复用该窗口；使用 `--new` 可新建窗口。在 tmux 外，窗格调用会创建临时会话并自动 attach。
 
+## 重启 AI Pane
+
+`ai-restart` 会刷新 tmux-resurrect 快照，找出拥有可恢复会话的 AI pane，
+将这些 pane 重生为空闲 shell，再交给 `ai-restore` 续接原会话。pane ID、
+布局和工作目录保持不变。Qoder 和 Droid 因尚未支持会话恢复而直接忽略。
+
+```bash
+ai-restart --dry-run  # 刷新快照并预览，不重启 pane
+ai-restart            # 预览、确认，然后重启并恢复
+ai-restart --force    # 允许重启当前标记为 busy 的 pane
+```
+
+默认情况下，只要选中的 Agent Activity 中有一个为 `busy`，整次操作就会中止。
+旧 Agent 进程尚未上报状态时会显示 `unknown`，交互命令要求你明确确认所有任务均已
+空闲。单独使用 `--yes` 不会接受 `unknown`；非交互场景必须显式使用 `--force`。
+工作台键位中可按 `prefix A`（`Ctrl-Space` 后按 `A`），在 popup 中运行交互命令，
+不需要预留普通 shell pane。该功能依赖 tmux-resurrect 以及
+[`docs/session-restore-design.md`](docs/session-restore-design.md) 中的会话恢复 hooks。
+
 ## 进程清理
 
 三个包装命令与统一清理引擎的对应关系：
@@ -224,6 +245,8 @@ killrod --dry-run
 ├── cmd/                     # ai/pane 与 kill* 命令
 ├── bin/
 │   ├── aipane-cleanup
+│   ├── ai-restart
+│   ├── ai-restore
 │   ├── rod-cleanup
 │   ├── tmux-rename-window-popup
 │   ├── tmux-colour-palette
@@ -251,6 +274,7 @@ killrod --dry-run
     ├── aipane-cleanup-ai-protection.sh
     ├── aipane-cleanup-contracts.sh
     ├── init-reload.zsh
+    ├── test_ai_restart.py
     ├── test_agent_activity_integrations.py
     ├── test_tmux_window_jump.py
     ├── test_tmux_window_wrap.py
@@ -279,6 +303,7 @@ zsh -fc '
 ./tests/aipane-cleanup-contracts.sh
 
 # 可选工作台 / window-wrap
+python3 tests/test_ai_restart.py
 python3 tests/test_agent_activity_integrations.py
 python3 tests/test_tmux_window_jump.py
 python3 tests/test_workstation_fragments.py

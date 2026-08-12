@@ -67,6 +67,7 @@ ln -sf "$AIPANE_ROOT/bin/tmux-rename-window-popup" ~/.local/bin/tmux-rename-wind
 ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
 ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
+ln -sf "$AIPANE_ROOT/bin/ai-restart" ~/.local/bin/ai-restart
 ```
 
 The rename popup requires `fzf` on `PATH`.
@@ -93,6 +94,7 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `bin/tmux-colour-palette` | indexed terminal colour palette (`0–255`) |
 | `bin/tmux-window-jump` | repeated-digit exact-index window selector |
 | `bin/tmux-window-wrap` | renderer CLI |
+| `bin/ai-restart` | safely restart and resume restorable AI panes in place |
 | [`integrations/`](integrations/README.md) | Agent lifecycle hook fragments and OpenCode Adapter |
 | `tests/test_agent_activity_integrations.py` | Agent Activity contract tests |
 | `tests/test_tmux_window_jump.py` | window-jump behavior + live tmux tests |
@@ -174,6 +176,29 @@ Tool arguments are supported only when the tools string contains one tool. Multi
 
 Inside tmux, a pane layout reuses the current window only when it has one pane; use `--new` to create a new window. Outside tmux, pane launches create a temporary session and attach to it.
 
+## Restart AI Panes
+
+`ai-restart` refreshes the tmux-resurrect snapshot, finds AI panes with a
+recoverable session, replaces those panes with an idle shell, and delegates the
+resume commands to `ai-restore`. Pane IDs, layout, and working directories stay
+unchanged. Qoder and Droid are ignored because their session restore is not
+implemented.
+
+```bash
+ai-restart --dry-run  # refresh snapshot and preview; does not restart panes
+ai-restart            # preview, confirm, then restart and resume
+ai-restart --force    # allow panes currently marked busy
+```
+
+The default command aborts the whole operation if any selected Agent Activity
+marker is busy. For an older Agent process that has not reported its state, the
+interactive command shows `unknown` and requires an explicit confirmation that
+all tasks are idle. `--yes` alone never accepts `unknown`; `--force` is the
+non-interactive override. In the workstation key map, press `prefix A`
+(`Ctrl-Space`, then `A`) to run the interactive command in a popup, so no spare
+shell pane is needed. This requires tmux-resurrect and the session-restore hooks described in
+[`docs/session-restore-design.md`](docs/session-restore-design.md).
+
 ## Process Cleanup
 
 The wrappers map to the unified cleanup engine as follows:
@@ -224,6 +249,8 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 ├── cmd/                     # ai/pane and kill* commands
 ├── bin/
 │   ├── aipane-cleanup
+│   ├── ai-restart
+│   ├── ai-restore
 │   ├── rod-cleanup
 │   ├── tmux-rename-window-popup
 │   ├── tmux-colour-palette
@@ -251,6 +278,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
     ├── aipane-cleanup-ai-protection.sh
     ├── aipane-cleanup-contracts.sh
     ├── init-reload.zsh
+    ├── test_ai_restart.py
     ├── test_agent_activity_integrations.py
     ├── test_tmux_window_jump.py
     ├── test_tmux_window_wrap.py
@@ -279,6 +307,7 @@ zsh -fc '
 ./tests/aipane-cleanup-contracts.sh
 
 # optional workstation / window-wrap
+python3 tests/test_ai_restart.py
 python3 tests/test_agent_activity_integrations.py
 python3 tests/test_tmux_window_jump.py
 python3 tests/test_workstation_fragments.py
