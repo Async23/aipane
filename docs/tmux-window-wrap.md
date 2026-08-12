@@ -54,6 +54,10 @@ AI Tool integrations report state with `tmux-window-wrap activity busy` and
 `tmux-window-wrap activity idle`. The command stores the pane's current command
 in `@tmux-window-wrap-activity`; a marker is honored only while that command
 still owns the pane, so a marker left by an abnormal exit is ignored.
+Every call also records the current command in
+`@tmux-window-wrap-activity-reporter`. This lets destructive maintenance tools
+distinguish a reported `idle` state from an older Agent process whose state is
+unknown; the reporter option does not affect statusline rendering.
 
 ### Agent Activity Interface
 

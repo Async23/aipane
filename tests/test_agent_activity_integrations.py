@@ -49,9 +49,16 @@ class AgentActivityIntegrationTests(unittest.TestCase):
                 hooks = self.load_json_hooks(tool)
                 self.assert_nested_event(hooks, "StopFailure", IDLE_COMMAND)
 
+    def test_codex_session_end_respects_three_second_timeout_limit(self):
+        hooks = self.load_json_hooks("codex")
+
+        session_end_hook = hooks["SessionEnd"][0]["hooks"][0]
+        self.assertEqual(session_end_hook["timeout"], 3)
+
     def test_cursor_hook_fragment_implements_turn_level_contract(self):
         hooks = self.load_json_hooks("cursor")
 
+        self.assertEqual(hooks["sessionStart"][0]["command"], IDLE_COMMAND)
         self.assertEqual(hooks["beforeSubmitPrompt"][0]["command"], BUSY_COMMAND)
         self.assertEqual(hooks["stop"][0]["command"], IDLE_COMMAND)
         self.assertEqual(hooks["sessionEnd"][0]["command"], IDLE_COMMAND)

@@ -1280,6 +1280,16 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "@tmux-window-wrap-activity",
         ).stdout.strip()
         self.assertEqual(marker, "")
+        reporter = self.tmux(
+            "show-options",
+            "-p",
+            "-q",
+            "-v",
+            "-t",
+            pane_id,
+            "@tmux-window-wrap-activity-reporter",
+        ).stdout.strip()
+        self.assertEqual(reporter, "sleep")
 
     def test_deferred_activity_matches_every_direct_frame_and_scheme(self):
         animation_option = "@tmux-window-wrap-test-animation-tick"

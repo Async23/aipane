@@ -4,7 +4,17 @@
 > 尤其是各 pane 里的 **AI agent CLI 会话**（以及普通 shell / lazygit / yazi 等）。
 > 本文记录已敲定的事实、决策与设计不变量，供后续在 aipane 中落地。
 >
-> 状态：设计阶段（尚未实现）。实测环境 macOS 26.5.2 / tmux 3.7b。
+> 状态：核心恢复链路与原地批量重启均已实现；后文保留历史决策和验证记录。
+
+## 当前使用方式
+
+- tmux-resurrect 保存结构后，`ai-restore` 负责在原 pane 续接 AI 会话。
+- `ai-restart --dry-run` 刷新快照并预览本次可恢复的 pane。
+- `ai-restart` 确认后批量重生这些 pane，再调用 `ai-restore`。
+- `prefix A`（默认是 `Ctrl-Space` 后按 `A`）可在 popup 中执行，不需要手动逐个退出。
+- 默认检测到任一 `busy` Agent Activity 就整体中止；旧进程显示 `unknown` 时，popup
+  要求明确确认所有任务已空闲。非交互覆盖必须使用 `--force`。
+- Qoder 与 Droid 暂不在恢复范围内。
 
 ## 0. 一个绕不开的前提
 

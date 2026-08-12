@@ -13,6 +13,7 @@ WINDOW_SEPARATOR = "\x1f"
 MAX_STATUS_LINES = 3
 PANE_ACTIVITY_OPTION = "@tmux-window-wrap-activity"
 PANE_ACTIVITY_REFERENCE = "#{" + PANE_ACTIVITY_OPTION + "}"
+PANE_ACTIVITY_REPORTER_OPTION = "@tmux-window-wrap-activity-reporter"
 MARKED_BUSY_PANE_FORMAT = (
     "#{&&:#{m/r:^.+$,"
     + PANE_ACTIVITY_REFERENCE
@@ -744,7 +745,7 @@ def invalidate_cache(socket_name):
 
 
 def update_pane_activity(socket_name, pane_id, state):
-    current = run_tmux(
+    current_activity = run_tmux(
         socket_name,
         "show-options",
         "-p",
@@ -754,23 +755,43 @@ def update_pane_activity(socket_name, pane_id, state):
         pane_id,
         PANE_ACTIVITY_OPTION,
     ).stdout.strip()
-    if state == "busy":
-        desired = run_tmux(
+    current_reporter = run_tmux(
+        socket_name,
+        "show-options",
+        "-p",
+        "-q",
+        "-v",
+        "-t",
+        pane_id,
+        PANE_ACTIVITY_REPORTER_OPTION,
+    ).stdout.strip()
+    owner = run_tmux(
+        socket_name,
+        "display-message",
+        "-p",
+        "-t",
+        pane_id,
+        "#{pane_current_command}",
+    ).stdout.strip()
+    if not owner:
+        raise ValueError(f"pane {pane_id} has no current command")
+    desired_activity = owner if state == "busy" else ""
+
+    if current_activity == desired_activity and current_reporter == owner:
+        return
+    if current_reporter != owner:
+        run_tmux(
             socket_name,
-            "display-message",
+            "set-option",
             "-p",
             "-t",
             pane_id,
-            "#{pane_current_command}",
-        ).stdout.strip()
-        if not desired:
-            raise ValueError(f"pane {pane_id} has no current command")
-    else:
-        desired = ""
-
-    if current == desired:
+            PANE_ACTIVITY_REPORTER_OPTION,
+            owner,
+        )
+    if current_activity == desired_activity:
         return
-    if desired:
+    if desired_activity:
         run_tmux(
             socket_name,
             "set-option",
@@ -778,7 +799,7 @@ def update_pane_activity(socket_name, pane_id, state):
             "-t",
             pane_id,
             PANE_ACTIVITY_OPTION,
-            desired,
+            desired_activity,
         )
     else:
         run_tmux(

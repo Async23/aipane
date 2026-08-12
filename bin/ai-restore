@@ -13,6 +13,7 @@
 #
 # Trigger: @resurrect-hook-post-restore-all 'ai-restore'  (runs after restore settles).
 # Manual : ai-restore            (act) | ai-restore --dry-run (print plan only)
+# Machine: ai-restore --plan-json (JSON Lines recovery plan; no panes touched)
 #
 # Safety: a pane is only touched if it is currently sitting at an idle shell, so we
 # never clobber a program resurrect already re-ran, and re-running ai-restore is safe.
@@ -27,14 +28,15 @@ TMUX_CMD=("${(@z)${AIPANE_TMUX:-tmux}}")
 run_tmux() { command "${TMUX_CMD[@]}" "$@"; }
 
 # ---- options -------------------------------------------------------------
-typeset DRYRUN=0 DUMP="" DELAY="${AI_RESTORE_SETTLE_DELAY:-0.4}"
+typeset DRYRUN=0 PLAN_JSON=0 DUMP="" DELAY="${AI_RESTORE_SETTLE_DELAY:-0.4}"
 while (( $# > 0 )); do
   case "$1" in
     --dry-run|-n) DRYRUN=1 ;;
+    --plan-json) DRYRUN=1; PLAN_JSON=1 ;;
     --dump) shift; DUMP="$1" ;;
     --delay) shift; DELAY="$1" ;;
     -h|--help)
-      print "usage: ai-restore [--dry-run] [--dump FILE] [--delay SECS]"
+      print "usage: ai-restore [--dry-run|--plan-json] [--dump FILE] [--delay SECS]"
       return 0 2>/dev/null || exit 0 ;;
     *) DUMP="$1" ;;
   esac
@@ -269,10 +271,33 @@ record_restored_binding() {
   fi
 }
 
+# emit_plan_json <target> <tool> <kind> <restorable 0|1> <cwd> <command>
+# JSON Lines keeps the recovery plan machine-readable without exposing the
+# implementation of dump parsing to callers such as ai-restart.
+emit_plan_json() {
+  AIPANE_PLAN_TARGET="$1" \
+  AIPANE_PLAN_TOOL="$2" \
+  AIPANE_PLAN_KIND="$3" \
+  AIPANE_PLAN_RESTORABLE="$4" \
+  AIPANE_PLAN_CWD="$5" \
+  AIPANE_PLAN_COMMAND="$6" \
+    command python3 -c '
+import json, os
+print(json.dumps({
+    "target": os.environ["AIPANE_PLAN_TARGET"],
+    "tool": os.environ["AIPANE_PLAN_TOOL"],
+    "kind": os.environ["AIPANE_PLAN_KIND"],
+    "restorable": os.environ["AIPANE_PLAN_RESTORABLE"] == "1",
+    "cwd": os.environ["AIPANE_PLAN_CWD"],
+    "command": os.environ["AIPANE_PLAN_COMMAND"],
+}, ensure_ascii=False, separators=(",", ":")))
+'
+}
+
 # ---- walk the dump -------------------------------------------------------
 typeset -i n_ai=0 n_sent=0 n_skip=0
 log "=== ai-restore start (dump=$DUMP dryrun=$DRYRUN) ==="
-(( DRYRUN )) && print "ai-restore dry-run  (dump: $DUMP)"
+(( DRYRUN && ! PLAN_JSON )) && print "ai-restore dry-run  (dump: $DUMP)"
 
 local line
 local -a f
@@ -310,7 +335,13 @@ while IFS= read -r line; do
   fi
 
   if (( DRYRUN )); then
-    printf '  %-22s %-6s %-6s %s\n' "$target" "$tool" "$label" "$cmd"
+    if (( PLAN_JSON )); then
+      local restorable=1
+      (( skip_fresh || skip_invalid )) && restorable=0
+      emit_plan_json "$target" "$tool" "$REPLY_KIND" "$restorable" "$cwd" "$cmd"
+    else
+      printf '  %-22s %-6s %-6s %s\n' "$target" "$tool" "$label" "$cmd"
+    fi
     continue
   fi
 
@@ -338,7 +369,9 @@ while IFS= read -r line; do
 done < "$DUMP"
 
 log "=== ai-restore done: ai_panes=$n_ai sent=$n_sent skipped=$n_skip ==="
-if (( DRYRUN )); then
+if (( PLAN_JSON )); then
+  :
+elif (( DRYRUN )); then
   print "\nsummary: ai_panes=$n_ai (dry-run, nothing sent)"
 else
   run_tmux display-message "ai-restore: resumed $n_sent AI pane(s), skipped $n_skip" 2>/dev/null
