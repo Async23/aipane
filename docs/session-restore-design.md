@@ -354,7 +354,7 @@ gold-case 4 家**无需 `aipane-snapshot`、无需注册表**（「铁律二：�
 ### codex 支路（实测已落地）——唯一非 gold-case 核心工具
 codex 无启动期 `--session-id`，其会话 id（`thread-id`）在**运行后**才知道。链路：
 1. **信道 = codex `notify`**（实证其载荷含 `thread-id`，且进程继承 `$TMUX_PANE`；`type=agent-turn-complete`，每回合触发）。
-2. `config.toml` 的 `notify` 改指向 **`bin/aipane-codex-notify`** 包装器：后台 fire-and-forget 调 `aipane-bind` 记 `(%N→thread-id)`，再 `exec` 原 `codex-notify.py`（**用户脚本零改动**）。
+2. `config.toml` 的 `notify` 改指向 **`bin/aipane-codex-notify`** 包装器：后台 fire-and-forget 调 `aipane-bind` 记 `(%N→根 thread-id)`，再 `exec` 原 `codex-notify.py`（**用户脚本零改动**）。subagent 会继承父进程的 `$TMUX_PANE`，所以包装器从 rollout metadata 解析到根 thread：subagent 完成既不清 busy、也不覆盖根会话绑定；根 `agent-turn-complete` 仅在没有 active goal 继续执行时上报 `idle`。`Stop` 可被其他钩子阻止并让回合继续，因此不再用它判定真正完成。`/goal` 又可能绕过普通 `UserPromptSubmit`，所以另以 `PreToolUse → busy` 兜底。
 3. 存盘时 **`bin/aipane-snapshot`**（`post-save-layout` 钩子）把 `%N→sid` 解析成 `坐标→sid` 写 `coords-last.json`（同刻锁定坐标，抗 renumber，理由同 §10）。
 4. `ai-restore` 对 codex 的 id 优先级：**argv > 坐标快照(coords-last.json) > pane 标题 uuid**。
 
@@ -379,7 +379,7 @@ codex 无启动期 `--session-id`，其会话 id（`thread-id`）在**运行后*
 - `--dry-run` 可对任意存档预演；日志在 `~/.local/share/aipane/ai-restore.log`。
 
 ### 已知残留 / 待办
-- **懒惰派空会话**：`ai g` / `ai c` 注入了 id 但重启前**未发消息** → 会话未落盘，`--resume X` 会报「找不到」。属 §1 早已承认的「没发消息＝没东西可恢复」；可后续加 store 存在性探测改判 resume/fresh。
+- **Claude 空会话（已处理）**：`ai c` 会先注入 id，但只运行 `/skills` 等本地 slash command 时，Claude 并未创建可恢复的 model conversation。`ai-restore` 现在会先检查 `~/.claude/projects/*/<session-id>.jsonl` 持久化 transcript；文件不存在的 id 标为 `invalid`，`ai-restart` 不会销毁该 pane 再伪报恢复成功。
 - **cursor 预建 ~3s**：`create-chat` 网络往返约 2.7–3s，每次裸 `ai r` 会等这一下。`AIPANE_CURSOR_PRECREATE=0` 可单独关闭（则 cursor pane 重启后为 fresh）。
 - **codex 首回合前重启**：`thread-id` 经 `notify`（回合完成）才拿到；若一条消息都没发过就重启，无 id 可恢复（同懒惰派空会话，合理）。标题恰为 uuid 时仍可兜底。
 - **codex config 生效范围**：`notify` 改动只对**新启动**的 codex 生效；运行中的旧进程仍用旧 notifier。

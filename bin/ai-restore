@@ -179,6 +179,17 @@ codex_session_exists() {
   (( ${#matches[@]} > 0 ))
 }
 
+# Claude accepts an aipane-assigned --session-id before the first real model
+# turn exists. Local slash commands such as /skills can therefore leave a live
+# Claude process whose id is not resumable. A real local conversation owns a
+# project transcript named <session-id>.jsonl; require that durable record.
+claude_session_exists() {
+  local sid="$1" root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  local -a matches
+  matches=("$root"/projects/*/"$sid".jsonl(N))
+  (( ${#matches[@]} > 0 ))
+}
+
 # build_resume <tool> <full_cmd> <title> <coord_sid> -> REPLY = command to send, or ""
 # id precedence: command-line argv (gold-case) > coords-snapshot (codex/opencode/kimi
 # via their hook, keyed by coordinate) > codex title. opencode/kimi ids are not UUIDs
@@ -201,7 +212,10 @@ build_resume() {
       if [[ -n "$id" ]]; then REPLY="$GROK_BASE --resume $id"; REPLY_KIND=resume
       else REPLY="$GROK_BASE"; REPLY_KIND=fresh; fi ;;
     claude)
-      if [[ -n "$id" ]]; then REPLY="$CLAUDE_BASE --resume $id"; REPLY_KIND=resume
+      if [[ -n "$id" ]]; then
+        REPLY="$CLAUDE_BASE --resume $id"
+        if claude_session_exists "$id"; then REPLY_KIND=resume
+        else REPLY_KIND=invalid; fi
       else REPLY="$CLAUDE_BASE"; REPLY_KIND=fresh; fi ;;
     codex)
       # codex id is not in argv on a bare launch, but its pane title is usually the
@@ -349,7 +363,7 @@ while IFS= read -r line; do
     log "skip $target ($tool): fresh, no recoverable id"; (( n_skip++ )); continue
   fi
   if (( skip_invalid )); then
-    log "skip $target ($tool): session id has no local Codex rollout"; (( n_skip++ )); continue
+    log "skip $target ($tool): session is not resumable"; (( n_skip++ )); continue
   fi
 
   if ! run_tmux has-session -t "$session" 2>/dev/null; then

@@ -180,7 +180,8 @@ ai cc                                     # 重复的键会启动重复的工具
 
 `ai-restart` 会刷新 tmux-resurrect 快照，找出拥有可恢复会话的 AI pane，
 将这些 pane 重生为空闲 shell，再交给 `ai-restore` 续接原会话。pane ID、
-布局和工作目录保持不变。Qoder 和 Droid 因尚未支持会话恢复而直接忽略。
+布局和工作目录保持不变。只有续接后的 Agent 进程在短暂稳定期内
+持续存活，才会报告恢复成功。Qoder 和 Droid 因尚未支持会话恢复而直接忽略。
 
 ```bash
 ai-restart --dry-run  # 刷新快照并预览，不重启 pane
@@ -194,6 +195,11 @@ ai-restart --force    # 允许重启当前标记为 busy 的 pane
 请从 tmux 外的独立终端运行该命令，以便安全替换所有选中的 AI pane。该功能依赖
 tmux-resurrect 以及
 [`docs/session-restore-design.md`](docs/session-restore-design.md) 中的会话恢复 hooks。
+
+Claude 可能已拥有预分配的 `--session-id`，但还没创建真实的 model
+conversation（例如只执行过本地 `/skills` 命令）。这种 ID 会在 pane 被替换前
+判定为不可恢复，不再发送给 `claude --resume` 并误报成功。
+`ai-restart` 会将该 pane 明确列为 `left untouched / no saved conversation`。
 
 ## 进程清理
 
@@ -245,6 +251,7 @@ killrod --dry-run
 ├── cmd/                     # ai/pane 与 kill* 命令
 ├── bin/
 │   ├── aipane-cleanup
+│   ├── aipane-claude-activity
 │   ├── ai-restart
 │   ├── ai-restore
 │   ├── rod-cleanup
@@ -276,6 +283,7 @@ killrod --dry-run
     ├── init-reload.zsh
     ├── test_ai_restart.py
     ├── test_agent_activity_integrations.py
+    ├── test_session_restore.py
     ├── test_tmux_window_jump.py
     ├── test_tmux_window_wrap.py
     └── test_workstation_fragments.py
@@ -285,7 +293,7 @@ killrod --dry-run
 
 ```bash
 zsh -n init.zsh aipane.zsh cmd/*.zsh lib/*.zsh tests/*.zsh
-sh -n bin/aipane-cleanup bin/rod-cleanup bin/tmux-colour-palette bin/tmux-rename-window-popup bin/tmux-window-jump tests/*.sh
+sh -n bin/aipane-cleanup bin/aipane-claude-activity bin/aipane-codex-notify bin/rod-cleanup bin/tmux-colour-palette bin/tmux-rename-window-popup bin/tmux-window-jump tests/*.sh
 
 zsh -fc '
   source ./init.zsh
@@ -305,6 +313,7 @@ zsh -fc '
 # 可选工作台 / window-wrap
 python3 tests/test_ai_restart.py
 python3 tests/test_agent_activity_integrations.py
+python3 tests/test_session_restore.py
 python3 tests/test_tmux_window_jump.py
 python3 tests/test_workstation_fragments.py
 python3 tests/test_tmux_window_wrap.py

@@ -2,6 +2,7 @@
   "hooks": {
     "SessionStart": [
       {
+        "matcher": "^(startup|resume|clear)$",
         "hooks": [
           {
             "type": "command",
@@ -22,23 +23,12 @@
         ]
       }
     ],
-    "Stop": [
+    "PreToolUse": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.local/bin/tmux-window-wrap activity idle",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
-    "StopFailure": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$HOME/.local/bin/tmux-window-wrap activity idle",
+            "command": "$HOME/.local/bin/tmux-window-wrap activity busy",
             "timeout": 5
           }
         ]

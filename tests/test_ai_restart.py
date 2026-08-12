@@ -95,20 +95,32 @@ class AiRestartTests(unittest.TestCase):
                 #!/usr/bin/env python3
                 import json
                 import os
+                import shlex
+                import subprocess
                 import sys
 
                 if "--plan-json" in sys.argv:
                     print(json.dumps({
                         "target": os.environ["TEST_TARGET"],
                         "tool": "claude",
-                        "kind": "resume",
-                        "restorable": True,
+                        "kind": (
+                            "invalid"
+                            if os.environ.get("TEST_PLAN_INVALID") == "1"
+                            else "resume"
+                        ),
+                        "restorable": os.environ.get("TEST_PLAN_INVALID") != "1",
                         "cwd": os.environ["TEST_CWD"],
                         "command": "claude --resume test-session",
                     }))
                 else:
                     with open(os.environ["TEST_RESTORE_LOG"], "a", encoding="utf-8") as log:
                         log.write(" ".join(sys.argv[1:]) + "\\n")
+                    if os.environ.get("TEST_RESTORE_LEAVES_SHELL") != "1":
+                        subprocess.run([
+                            *shlex.split(os.environ["AIPANE_TMUX"]),
+                            "send-keys", "-t", os.environ["TEST_TARGET"],
+                            "sleep 120", "Enter",
+                        ], check=True)
                 """
             ),
             encoding="utf-8",
@@ -129,9 +141,15 @@ class AiRestartTests(unittest.TestCase):
                 "TEST_RESTORE_LOG": str(self.restore_log),
                 "TEST_SAVE_LOG": str(self.save_log),
                 "TEST_SNAPSHOT_LOG": str(self.snapshot_log),
+                "AIPANE_RESTART_VERIFY_TIMEOUT": "0.35",
+                "AIPANE_RESTART_VERIFY_STABILITY": "0.1",
                 "XDG_DATA_HOME": str(self.tmp),
             }
         )
+        if getattr(self, "restore_leaves_shell", False):
+            environment["TEST_RESTORE_LEAVES_SHELL"] = "1"
+        if getattr(self, "plan_invalid", False):
+            environment["TEST_PLAN_INVALID"] = "1"
         return environment
 
     def run_restart(self, *arguments):
@@ -201,8 +219,37 @@ class AiRestartTests(unittest.TestCase):
         result = self.run_restart("--yes")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("restarted and resumed 1 AI pane", result.stdout)
+        self.assertIn("verified 1 AI pane(s) resumed", result.stdout)
         self.assertIn("--dump", self.restore_log.read_text())
+
+    def test_restore_command_that_leaves_a_shell_is_reported_failed(self):
+        self.restore_leaves_shell = True
+        self.tmux(
+            "set-option",
+            "-p",
+            "-t",
+            self.target,
+            "@tmux-window-wrap-activity-reporter",
+            "sleep",
+        )
+
+        result = self.run_restart("--yes")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"failed to resume {self.target} (claude)", result.stderr)
+        self.assertIn("verified 0 resumed; 1 failed", result.stdout)
+
+    def test_invalid_session_is_reported_and_left_untouched(self):
+        self.plan_invalid = True
+
+        result = self.run_restart("--dry-run")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Non-restorable AI panes left untouched", result.stdout)
+        self.assertIn("no saved conversation", result.stdout)
+        self.assertIn("no live, restorable AI panes found", result.stdout)
+        self.assertEqual(self.current_command(), "sleep")
+        self.assertFalse(self.restore_log.exists())
 
     def test_force_respawns_same_pane_then_invokes_ai_restore(self):
         self.tmux(
@@ -217,8 +264,8 @@ class AiRestartTests(unittest.TestCase):
         result = self.run_restart("--yes", "--force")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("restarted and resumed 1 AI pane", result.stdout)
-        self.assertIn(self.current_command(), {"zsh", "bash", "sh", "fish"})
+        self.assertIn("verified 1 AI pane(s) resumed", result.stdout)
+        self.assertEqual(self.current_command(), "sleep")
         current_pane_id = self.tmux(
             "display-message",
             "-p",

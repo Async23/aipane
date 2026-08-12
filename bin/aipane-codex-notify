@@ -3,32 +3,116 @@
 #
 # codex calls its `notify` program after each turn with a JSON payload that carries
 # both the session id (`thread-id`) and, via the inherited environment, $TMUX_PANE.
-# We use that to record the codex pane→session binding (codex is the only core tool
-# with no launch-time --session-id), then delegate unchanged to the real notifier so
-# the user's notifications keep working.
+# We use that to record the codex pane→root-session binding (codex is the only core
+# tool with no launch-time --session-id) and to update activity only from the root
+# agent. Subagents inherit the same TMUX_PANE, so their completion must never clear
+# the parent's busy state or replace its resumable session id. Then we delegate
+# unchanged to the real notifier so the user's notifications keep working.
 #
 # Wiring: config.toml  notify = ["/Users/YOU/.local/bin/aipane-codex-notify"]
 #
-# This must never break codex: the binding runs in the background and all failures
-# are swallowed; the real notifier is always exec'd.
+# This must never break codex: all aipane failures are swallowed; the real notifier
+# is always exec'd.
 
 PAYLOAD="$1"
 REAL_NOTIFY="${AIPANE_CODEX_REAL_NOTIFY:-$HOME/.codex/bin/codex-notify.py}"
 PYTHON="${AIPANE_PYTHON:-/opt/homebrew/bin/python3}"
 BIND="$HOME/.local/bin/aipane-bind"
+ACTIVITY="$HOME/.local/bin/tmux-window-wrap"
+CODEX_STATE_HOME="${CODEX_HOME:-$HOME/.codex}"
 
-# Record the binding (best-effort, backgrounded, never blocks or fails codex).
-if [ -n "$PAYLOAD" ] && [ -x "$BIND" ]; then
-  (
-    tid=$(printf '%s' "$PAYLOAD" | "$PYTHON" -c \
-      'import json,sys
+# Classify the completing thread from its rollout metadata. Legacy notify payloads
+# do not include parent_thread_id, but every persisted subagent transcript does.
+# Resolve nested parents all the way to the root and query its goal state. All
+# failures degrade to the historical main-thread behavior so notifications remain
+# best-effort and never break Codex.
+if [ -n "$PAYLOAD" ]; then
+  fields=$(printf '%s' "$PAYLOAD" | "$PYTHON" -c \
+    'import glob,json,os,sqlite3,sys
 try:
     p=json.load(sys.stdin)
-    print(p.get("thread-id") or p.get("thread_id") or "")
 except Exception:
-    print("")' 2>/dev/null)
-    [ -n "$tid" ] && "$BIND" --tool x --sid "$tid" >/dev/null 2>&1
-  ) &
+    p={}
+
+event=p.get("type") or ""
+tid=p.get("thread-id") or p.get("thread_id") or ""
+codex_home=sys.argv[1]
+root_tid=tid
+is_subagent=False
+seen=set()
+
+while root_tid and root_tid not in seen:
+    seen.add(root_tid)
+    pattern=os.path.join(codex_home,"sessions","*","*","*","*-"+root_tid+".jsonl")
+    metadata={}
+    for path in glob.iglob(pattern):
+        try:
+            with open(path,encoding="utf-8") as handle:
+                record=json.loads(handle.readline())
+            candidate=record.get("payload") or {}
+            if candidate.get("id")==root_tid:
+                metadata=candidate
+                break
+        except (OSError,ValueError):
+            continue
+    source=metadata.get("source") or {}
+    if not isinstance(source,dict):
+        source={}
+    subagent=source.get("subagent") or source.get("sub_agent") or {}
+    spawn=subagent.get("thread_spawn") or subagent.get("threadSpawn") or {}
+    parent=spawn.get("parent_thread_id") or spawn.get("parentThreadId") or ""
+    if not parent:
+        break
+    is_subagent=True
+    root_tid=parent
+
+goal_status=""
+if root_tid:
+    for relative in ("goals_1.sqlite",os.path.join("sqlite","goals_1.sqlite")):
+        path=os.path.join(codex_home,relative)
+        if not os.path.isfile(path):
+            continue
+        try:
+            uri="file:"+os.path.realpath(path)+"?mode=ro"
+            connection=sqlite3.connect(uri,uri=True,timeout=0.25)
+            try:
+                row=connection.execute(
+                    "SELECT status FROM thread_goals WHERE thread_id = ?",
+                    (root_tid,),
+                ).fetchone()
+            finally:
+                connection.close()
+            if row:
+                goal_status=row[0] or ""
+                break
+        except (OSError,sqlite3.Error):
+            continue
+
+for value in (event,root_tid,"subagent" if is_subagent else "main",goal_status):
+    print(value or "")' "$CODEX_STATE_HOME" 2>/dev/null)
+  if [ -z "$fields" ]; then
+    fields=$(printf '\n\n\n\n')
+  fi
+  event=$(printf '%s\n' "$fields" | sed -n '1p')
+  tid=$(printf '%s\n' "$fields" | sed -n '2p')
+  scope=$(printf '%s\n' "$fields" | sed -n '3p')
+  goal_status=$(printf '%s\n' "$fields" | sed -n '4p')
+  if [ "$event" = "agent-turn-complete" ]; then
+    # Only the root agent owns pane activity. An active goal immediately
+    # continues after a root turn, so keep/restore busy instead of going idle.
+    if [ "$scope" = "main" ] && [ -x "$ACTIVITY" ]; then
+      if [ "$goal_status" = "active" ]; then
+        "$ACTIVITY" activity busy >/dev/null 2>&1 || :
+      else
+        # Keeping the final idle update synchronous prevents an old completion
+        # notification from racing a newly submitted prompt.
+        "$ACTIVITY" activity idle >/dev/null 2>&1 || :
+      fi
+    fi
+    if [ -n "$tid" ] && [ -x "$BIND" ]; then
+      "$BIND" --tool x --sid "$tid" >/dev/null 2>&1 &
+    fi
+  fi
 fi
 
 # Delegate to the real notifier (preserve original behavior exactly).

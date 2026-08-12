@@ -1,4 +1,5 @@
 import fcntl
+import io
 import json
 import os
 import pty
@@ -138,6 +139,122 @@ class WindowWrapCliTests(unittest.TestCase):
         self.assertEqual(completed.stdout, "")
         self.assertEqual(completed.stderr, "")
 
+    def test_codex_stop_idle_is_ignored_for_already_running_agents(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        ignore = namespace["ignore_early_codex_idle"]
+        environment = {}
+
+        self.assertTrue(ignore("idle", "Stop", "", "codex", environment))
+        self.assertTrue(
+            ignore("idle", "Stop", "", "codex-aarch64", environment)
+        )
+        self.assertTrue(
+            ignore("idle", "SessionStart", "compact", "codex", environment)
+        )
+        self.assertFalse(
+            ignore("idle", "SessionStart", "startup", "codex", environment)
+        )
+        self.assertFalse(
+            ignore("idle", "SessionEnd", "", "codex", environment)
+        )
+        self.assertFalse(ignore("busy", "Stop", "", "codex", environment))
+        self.assertFalse(ignore("idle", "Stop", "", "claude", environment))
+
+    def test_codex_stop_idle_compatibility_guard_can_be_overridden(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        ignore = namespace["ignore_early_codex_idle"]
+
+        self.assertFalse(
+            ignore(
+                "idle",
+                "Stop",
+                "",
+                "codex",
+                {"TMUX_WINDOW_WRAP_ALLOW_CODEX_STOP_IDLE": "1"},
+            )
+        )
+
+    def test_hook_context_is_read_from_codex_json_stdin(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        read_hook_context = namespace["read_hook_context"]
+
+        self.assertEqual(
+            read_hook_context(
+                io.StringIO(
+                    '{"hook_event_name":"SessionStart","source":"compact"}'
+                )
+            ),
+            ("SessionStart", "compact"),
+        )
+        self.assertEqual(read_hook_context(io.StringIO("not-json")), ("", ""))
+
+    def test_repeated_busy_report_still_invalidates_status_cache(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        update_pane_activity = namespace["update_pane_activity"]
+        script_globals = update_pane_activity.__globals__
+        invalidations = []
+
+        def fake_run_tmux(_socket_name, *arguments):
+            if arguments[0] == "show-options":
+                value = (
+                    "codex"
+                    if arguments[-1]
+                    in {
+                        "@tmux-window-wrap-activity",
+                        "@tmux-window-wrap-activity-reporter",
+                    }
+                    else ""
+                )
+            elif arguments[0] == "display-message":
+                value = "codex"
+            else:
+                raise AssertionError(arguments)
+            return subprocess.CompletedProcess(
+                ["tmux", *arguments],
+                0,
+                stdout=value + "\n",
+                stderr="",
+            )
+
+        script_globals["run_tmux"] = fake_run_tmux
+        script_globals["invalidate_cache"] = invalidations.append
+
+        update_pane_activity("test-socket", "%1", "busy")
+
+        self.assertEqual(invalidations, ["test-socket"])
+
+    def test_repeated_pre_tool_busy_does_not_rerender_status(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        update_pane_activity = namespace["update_pane_activity"]
+        script_globals = update_pane_activity.__globals__
+        invalidations = []
+
+        def fake_run_tmux(_socket_name, *arguments):
+            if arguments[0] == "show-options":
+                value = "codex"
+            elif arguments[0] == "display-message":
+                value = "codex"
+            else:
+                raise AssertionError(arguments)
+            return subprocess.CompletedProcess(
+                ["tmux", *arguments],
+                0,
+                stdout=value + "\n",
+                stderr="",
+            )
+
+        script_globals["run_tmux"] = fake_run_tmux
+        script_globals["invalidate_cache"] = invalidations.append
+
+        update_pane_activity(
+            "test-socket",
+            "%1",
+            "busy",
+            hook_event_name="PreToolUse",
+        )
+
+        self.assertEqual(invalidations, [])
+
     def test_animator_invalidates_cache_when_color_scheme_changes(self):
         namespace = runpy.run_path(str(SCRIPT))
         animate_status = namespace["animate_status"]
@@ -194,6 +311,18 @@ class WindowWrapCliTests(unittest.TestCase):
             events,
         )
         self.assertIn(("invalidate-cache", "test-socket"), events)
+
+    def test_animation_tick_never_skips_breathing_levels(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        next_animation_tick = namespace["next_animation_tick"]
+
+        ticks = []
+        tick = None
+        for _ in range(26):
+            tick = next_animation_tick(tick)
+            ticks.append(tick)
+
+        self.assertEqual(ticks, [*range(24), 0, 1])
 
     def test_animation_probe_reads_owner_without_panes(self):
         namespace = runpy.run_path(str(SCRIPT))
@@ -500,6 +629,33 @@ class WindowWrapCliTests(unittest.TestCase):
         rendered = self.run_render(payload, 0)
 
         self.assertIn("▓#[fg=colour15]2₄:many ", rendered)
+
+    def test_single_busy_activity_breathes_without_dropping_a_frame(self):
+        payload = {
+            "width": 80,
+            "left_width": 4,
+            "right_width": 5,
+            "active": "@1",
+            "activity_palettes": TEST_ACTIVITY_PALETTES,
+            "color_scheme": "light",
+            "windows": [
+                {
+                    "id": "@1",
+                    "index": "1",
+                    "name": "busy",
+                    "label": " 1:busy ",
+                    "busy_activity_count": 1,
+                },
+            ],
+        }
+
+        frames = []
+        for animation_tick in range(24):
+            payload["animation_tick"] = animation_tick
+            frames.append(self.run_render(payload, 0))
+
+        self.assertTrue(all(frame.count("▓") == 1 for frame in frames))
+        self.assertEqual(len(set(frames)), 13)
 
     def test_render_offsets_busy_activity_by_half_a_cycle(self):
         payload = {
