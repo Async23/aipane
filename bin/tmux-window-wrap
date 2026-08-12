@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import select
 import subprocess
 import sys
 import time
@@ -665,6 +666,12 @@ def detect_color_scheme():
     return "dark" if background <= 8 else "light"
 
 
+def next_animation_tick(last_tick):
+    if last_tick is None:
+        return 0
+    return (last_tick + 1) % len(ACTIVITY_LEVEL_SEQUENCE)
+
+
 def animate_status(socket_name, fps):
     owner = uuid.uuid4().hex
     try:
@@ -683,6 +690,7 @@ def animate_status(socket_name, fps):
     color_scheme = None
     next_probe = 0.0
     next_scheme_probe = 0.0
+    next_tick_at = 0.0
     while True:
         now = time.monotonic()
         try:
@@ -693,6 +701,7 @@ def animate_status(socket_name, fps):
                 next_probe = now + (1.0 if busy else 0.25)
                 if not busy:
                     last_tick = None
+                    next_tick_at = 0.0
 
             if now >= next_scheme_probe:
                 detected_scheme = detect_color_scheme()
@@ -709,9 +718,9 @@ def animate_status(socket_name, fps):
                 next_scheme_probe = now + 5.0
 
             if busy:
-                absolute_tick = int(now * fps)
-                tick = absolute_tick % len(ACTIVITY_LEVEL_SEQUENCE)
-                if tick != last_tick:
+                frame_now = time.monotonic()
+                if last_tick is None or frame_now >= next_tick_at:
+                    tick = next_animation_tick(last_tick)
                     run_tmux(
                         socket_name,
                         "set-option",
@@ -720,8 +729,11 @@ def animate_status(socket_name, fps):
                         str(tick),
                     )
                     last_tick = tick
-                next_tick = (absolute_tick + 1) / fps
-                wake_at = min(next_probe, next_tick, next_scheme_probe)
+                    # Schedule from the frame actually rendered. If another
+                    # probe stalls briefly, stretch that frame instead of
+                    # jumping over intermediate breathing levels to catch up.
+                    next_tick_at = time.monotonic() + (1 / fps)
+                wake_at = min(next_probe, next_tick_at, next_scheme_probe)
             else:
                 wake_at = min(next_probe, next_scheme_probe)
         except subprocess.CalledProcessError:
@@ -744,7 +756,16 @@ def invalidate_cache(socket_name):
     refresh_clients(socket_name)
 
 
-def update_pane_activity(socket_name, pane_id, state):
+def update_pane_activity(
+    socket_name,
+    pane_id,
+    state,
+    hook_event_name="",
+    hook_source="",
+    environment=None,
+):
+    if environment is None:
+        environment = os.environ
     current_activity = run_tmux(
         socket_name,
         "show-options",
@@ -775,9 +796,23 @@ def update_pane_activity(socket_name, pane_id, state):
     ).stdout.strip()
     if not owner:
         raise ValueError(f"pane {pane_id} has no current command")
+    if ignore_early_codex_idle(
+        state,
+        hook_event_name,
+        hook_source,
+        owner,
+        environment,
+    ):
+        return
     desired_activity = owner if state == "busy" else ""
 
     if current_activity == desired_activity and current_reporter == owner:
+        # A repeated busy report starts a new turn. Refresh even when the marker
+        # value is unchanged so a cached/stale status job is woken immediately.
+        # PreToolUse is only a fallback for internal Codex work and can fire many
+        # times in one turn, so it must not repeatedly rerender the statusline.
+        if state == "busy" and hook_event_name != "PreToolUse":
+            invalidate_cache(socket_name)
         return
     if current_reporter != owner:
         run_tmux(
@@ -812,6 +847,49 @@ def update_pane_activity(socket_name, pane_id, state):
             PANE_ACTIVITY_OPTION,
         )
     invalidate_cache(socket_name)
+
+
+def ignore_early_codex_idle(
+    state,
+    hook_event_name,
+    hook_source,
+    owner,
+    environment,
+):
+    is_early_event = hook_event_name == "Stop" or (
+        hook_event_name == "SessionStart" and hook_source == "compact"
+    )
+    return (
+        state == "idle"
+        and environment.get("TMUX_WINDOW_WRAP_ALLOW_CODEX_STOP_IDLE") != "1"
+        and is_early_event
+        and (owner == "codex" or owner.startswith("codex-"))
+    )
+
+
+def read_hook_context(input_stream):
+    if input_stream.isatty():
+        return "", ""
+    try:
+        ready, _, _ = select.select([input_stream], [], [], 0)
+    except (OSError, TypeError, ValueError):
+        # In-memory streams used by callers/tests have no file descriptor but
+        # are safe to read immediately.
+        ready = [input_stream]
+    if not ready:
+        return "", ""
+    try:
+        payload = json.load(input_stream)
+    except (OSError, ValueError):
+        return "", ""
+    if not isinstance(payload, dict):
+        return "", ""
+    hook_event_name = payload.get("hook_event_name", "")
+    hook_source = payload.get("source", "")
+    return (
+        hook_event_name if isinstance(hook_event_name, str) else "",
+        hook_source if isinstance(hook_source, str) else "",
+    )
 
 
 def reconcile_status_heights(socket_name):
@@ -1046,7 +1124,6 @@ def main():
         parser.error("--fps must be greater than zero")
     if arguments.command == "activity" and not arguments.pane:
         return
-
     if arguments.command == "plan":
         json.dump(plan(json.load(sys.stdin)), sys.stdout, separators=(",", ":"))
         sys.stdout.write("\n")
@@ -1057,11 +1134,14 @@ def main():
         return
 
     if arguments.command == "activity":
+        hook_event_name, hook_source = read_hook_context(sys.stdin)
         try:
             update_pane_activity(
                 arguments.socket_name,
                 arguments.pane,
                 arguments.state,
+                hook_event_name=hook_event_name,
+                hook_source=hook_source,
             )
         except ValueError as error:
             parser.error(str(error))

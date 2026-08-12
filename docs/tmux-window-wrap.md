@@ -49,6 +49,9 @@ Therefore two running panes start at the widest contrast and follow
 `0/12 → 1/11 → ... → 11/1 → 12/0 → 11/1 → ... → 1/11`.
 This keeps multiple agent panes distinguishable without synchronizing their
 breathing animation.
+The animator advances exactly one adjacent level per rendered frame. If a tmux
+or theme probe is briefly slow, the current frame lasts slightly longer rather
+than skipping levels to catch up, which avoids visible jumps.
 
 AI Tool integrations report state with `tmux-window-wrap activity busy` and
 `tmux-window-wrap activity idle`. The command stores the pane's current command
@@ -66,6 +69,32 @@ ends when the AI Tool completes or fails the turn. New AI Tool integrations
 should report this state explicitly through `tmux-window-wrap activity
 busy|idle`. Hooks and plugins inherit `TMUX_PANE`, so no pane id needs to appear
 in model messages.
+
+Claude Code agent-team teammates do not receive a user-submitted prompt, even
+when each teammate owns a separate tmux pane. The Claude Adapter therefore
+marks a teammate busy from `SessionStart(agent_type=...)`, refreshes busy at
+`PreToolUse` for later delegated turns, and clears it at `TeammateIdle`.
+`SessionStart(source=compact)` is ignored because compaction happens inside an
+already-running turn. This preserves one activity cell per actually busy
+teammate pane without reading terminal titles.
+
+Codex also reports `busy` from `PreToolUse`. This is a deliberate fallback for
+`/goal`: goal work can start as an internal `thread_goal_updated -> task_started`
+sequence without an ordinary user-message event, so `UserPromptSubmit` does not
+cover that entry path.
+
+Codex is a deliberate exception to the usual `Stop -> idle` mapping. A Codex
+`Stop` hook may add feedback and make the same turn continue, so reporting idle
+there would hide an Agent that is still working. Its existing `notify` wrapper
+reports idle only on `agent-turn-complete`; `SessionEnd` remains the cleanup
+fallback. `SessionStart` is restricted to `startup|resume|clear`, because Codex
+also emits it after an in-turn context compaction. The activity command ignores
+both an inherited `Stop` idle report and a `SessionStart(source=compact)` idle
+report, so already-running Codex processes that loaded older hook configuration
+do not regress before their next restart. The notify wrapper resolves each
+completing Codex thread through its rollout metadata: subagent completions keep
+the parent pane busy and bind the root thread id, while a root completion stays
+busy when its goal is still active.
 
 Terminal titles are presentation owned by each AI Tool and are not activity
 inputs. Versioned hook fragments and plugin source live under
@@ -119,7 +148,10 @@ lightweight driver advances a tmux animation option every approximately
 `1.2s`. Window layout stays cached, so each frame is expanded by tmux without
 rerunning the Python layout renderer. The cached 24-frame colour lookup uses a
 balanced format tree, keeping per-frame expansion depth logarithmic without
-changing the frame sequence. Only the current light or dark palette is cached;
+changing the frame sequence. The driver advances exactly one palette level per
+rendered frame; a slow background probe stretches that frame instead of
+skipping a level, which keeps the breathing transition continuous. Only the
+current light or dark palette is cached;
 a system appearance change updates the cache key and reruns the renderer once.
 The fragment does not lower tmux's global `status-interval`.
 

@@ -1,0 +1,50 @@
+#!/bin/sh
+# aipane-claude-activity — translate Claude Code hooks to Agent Activity.
+#
+# A regular Claude turn starts at UserPromptSubmit. Agent-team teammates are
+# different: their initial task starts with SessionStart(agent_type=...), and
+# later delegated work may first become observable at PreToolUse. TeammateIdle
+# is their explicit completion boundary. Keep those Claude-specific lifecycle
+# details out of tmux-window-wrap, whose interface remains activity busy|idle.
+#
+# This adapter must never block or fail Claude Code. Invalid/unknown payloads
+# are ignored and all tmux-window-wrap failures are swallowed.
+
+PAYLOAD=$(cat 2>/dev/null)
+PYTHON="${AIPANE_PYTHON:-/opt/homebrew/bin/python3}"
+ACTIVITY="$HOME/.local/bin/tmux-window-wrap"
+
+if [ -z "$PAYLOAD" ] || [ ! -x "$ACTIVITY" ]; then
+  exit 0
+fi
+
+STATE=$(printf '%s' "$PAYLOAD" | "$PYTHON" -c \
+  'import json,sys
+try:
+    payload=json.load(sys.stdin)
+except Exception:
+    payload={}
+
+event=payload.get("hook_event_name") or ""
+source=payload.get("source") or ""
+agent_type=payload.get("agent_type") or ""
+
+if event=="SessionStart":
+    if agent_type:
+        print("busy")
+    elif source!="compact":
+        print("idle")
+elif event in {"UserPromptSubmit","PreToolUse"}:
+    print("busy")
+elif event in {"Stop","StopFailure","TeammateIdle","SessionEnd"}:
+    print("idle")' 2>/dev/null)
+
+case "$STATE" in
+  busy|idle)
+    # Preserve the hook payload so tmux-window-wrap can identify repeated
+    # PreToolUse fallbacks without needlessly invalidating animation frames.
+    printf '%s' "$PAYLOAD" | "$ACTIVITY" activity "$STATE" >/dev/null 2>&1 || :
+    ;;
+esac
+
+exit 0

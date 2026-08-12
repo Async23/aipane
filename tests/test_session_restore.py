@@ -147,6 +147,53 @@ class SessionRestoreTests(unittest.TestCase):
             )
             self.assertIn("invalid", matching_line)
 
+    def test_restore_marks_claude_id_without_a_conversation_invalid(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            claude_config = self.claude_config(tmp, conversation_exists=False)
+            result = self.run_restore(
+                tmp,
+                coord={"sid": FOREIGN_SID, "tool": "c"},
+                title="custom-title",
+                saved_codex_ids=set(),
+                plan_json=True,
+                current_command="claude",
+                full_command=(
+                    "claude --dangerously-skip-permissions "
+                    f"--session-id {FOREIGN_SID}"
+                ),
+                extra_env={"CLAUDE_CONFIG_DIR": str(claude_config)},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(result.stdout)
+            self.assertEqual(plan["tool"], "claude")
+            self.assertEqual(plan["kind"], "invalid")
+            self.assertFalse(plan["restorable"])
+
+    def test_restore_keeps_claude_id_with_a_project_transcript(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            claude_config = self.claude_config(tmp, conversation_exists=True)
+            result = self.run_restore(
+                tmp,
+                coord={"sid": FOREIGN_SID, "tool": "c"},
+                title="custom-title",
+                saved_codex_ids=set(),
+                plan_json=True,
+                current_command="claude",
+                full_command=(
+                    "claude --dangerously-skip-permissions "
+                    f"--session-id {FOREIGN_SID}"
+                ),
+                extra_env={"CLAUDE_CONFIG_DIR": str(claude_config)},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(result.stdout)
+            self.assertEqual(plan["kind"], "resume")
+            self.assertTrue(plan["restorable"])
+
     def test_restore_exposes_machine_readable_recovery_plan(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
@@ -251,6 +298,8 @@ class SessionRestoreTests(unittest.TestCase):
         dry_run: bool = True,
         plan_json: bool = False,
         extra_env: dict[str, str] | None = None,
+        current_command: str = "codex",
+        full_command: str = "codex --yolo",
     ) -> subprocess.CompletedProcess[str]:
         state_dir = tmp / "state"
         state_dir.mkdir()
@@ -278,8 +327,8 @@ class SessionRestoreTests(unittest.TestCase):
                     title,
                     f":{tmp}",
                     "1",
-                    "codex",
-                    ":codex --yolo",
+                    current_command,
+                    f":{full_command}",
                 ]
             )
             + "\n",
@@ -309,6 +358,14 @@ class SessionRestoreTests(unittest.TestCase):
             text=True,
             env=env,
         )
+
+    def claude_config(self, tmp: Path, *, conversation_exists: bool) -> Path:
+        config = tmp / "claude"
+        project = config / "projects" / "-Users-test-project"
+        project.mkdir(parents=True)
+        if conversation_exists:
+            (project / f"{FOREIGN_SID}.jsonl").touch()
+        return config
 
 
 if __name__ == "__main__":

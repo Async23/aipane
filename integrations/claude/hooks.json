@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.local/bin/tmux-window-wrap activity idle",
+            "command": "$HOME/.local/bin/aipane-claude-activity",
             "timeout": 5
           }
         ]
@@ -16,7 +16,18 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.local/bin/tmux-window-wrap activity busy",
+            "command": "$HOME/.local/bin/aipane-claude-activity",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/aipane-claude-activity",
             "timeout": 5
           }
         ]
@@ -27,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.local/bin/tmux-window-wrap activity idle",
+            "command": "$HOME/.local/bin/aipane-claude-activity",
             "timeout": 5
           }
         ]
@@ -38,7 +49,18 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.local/bin/tmux-window-wrap activity idle",
+            "command": "$HOME/.local/bin/aipane-claude-activity",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "TeammateIdle": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/aipane-claude-activity",
             "timeout": 5
           }
         ]
@@ -49,7 +71,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.local/bin/tmux-window-wrap activity idle",
+            "command": "$HOME/.local/bin/aipane-claude-activity",
             "timeout": 5
           }
         ]

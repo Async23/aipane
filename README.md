@@ -181,8 +181,9 @@ Inside tmux, a pane layout reuses the current window only when it has one pane; 
 `ai-restart` refreshes the tmux-resurrect snapshot, finds AI panes with a
 recoverable session, replaces those panes with an idle shell, and delegates the
 resume commands to `ai-restore`. Pane IDs, layout, and working directories stay
-unchanged. Qoder and Droid are ignored because their session restore is not
-implemented.
+unchanged. A restart is reported successful only after each resumed Agent
+process remains alive for a short stability window. Qoder and Droid are ignored
+because their session restore is not implemented.
 
 ```bash
 ai-restart --dry-run  # refresh snapshot and preview; does not restart panes
@@ -198,6 +199,12 @@ non-interactive override. Run the command from a separate terminal outside
 tmux so it can safely replace every selected AI pane. This requires
 tmux-resurrect and the session-restore hooks described in
 [`docs/session-restore-design.md`](docs/session-restore-design.md).
+
+Claude can own a preassigned `--session-id` without having created a model
+conversation yet (for example, after only a local `/skills` command). Such an
+ID is classified as non-restorable before panes are replaced, rather than being
+sent to `claude --resume` and counted as a success. `ai-restart` lists that pane
+as `left untouched / no saved conversation`.
 
 ## Process Cleanup
 
@@ -249,6 +256,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 ├── cmd/                     # ai/pane and kill* commands
 ├── bin/
 │   ├── aipane-cleanup
+│   ├── aipane-claude-activity
 │   ├── ai-restart
 │   ├── ai-restore
 │   ├── rod-cleanup
@@ -280,6 +288,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
     ├── init-reload.zsh
     ├── test_ai_restart.py
     ├── test_agent_activity_integrations.py
+    ├── test_session_restore.py
     ├── test_tmux_window_jump.py
     ├── test_tmux_window_wrap.py
     └── test_workstation_fragments.py
@@ -289,7 +298,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 
 ```bash
 zsh -n init.zsh aipane.zsh cmd/*.zsh lib/*.zsh tests/*.zsh
-sh -n bin/aipane-cleanup bin/rod-cleanup bin/tmux-colour-palette bin/tmux-rename-window-popup bin/tmux-window-jump tests/*.sh
+sh -n bin/aipane-cleanup bin/aipane-claude-activity bin/aipane-codex-notify bin/rod-cleanup bin/tmux-colour-palette bin/tmux-rename-window-popup bin/tmux-window-jump tests/*.sh
 
 zsh -fc '
   source ./init.zsh
@@ -309,6 +318,7 @@ zsh -fc '
 # optional workstation / window-wrap
 python3 tests/test_ai_restart.py
 python3 tests/test_agent_activity_integrations.py
+python3 tests/test_session_restore.py
 python3 tests/test_tmux_window_jump.py
 python3 tests/test_workstation_fragments.py
 python3 tests/test_tmux_window_wrap.py

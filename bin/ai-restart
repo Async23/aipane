@@ -133,7 +133,7 @@ def recovery_plan(
     restore_command: list[str],
     dump: Path,
     environment: dict[str, str],
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     completed = subprocess.run(
         [*restore_command, "--plan-json", "--dump", str(dump)],
         check=True,
@@ -142,6 +142,7 @@ def recovery_plan(
         env=environment,
     )
     plan: list[dict[str, object]] = []
+    invalid: list[dict[str, object]] = []
     for number, line in enumerate(completed.stdout.splitlines(), start=1):
         if not line.strip():
             continue
@@ -155,7 +156,9 @@ def recovery_plan(
             raise RestartError(f"ai-restore plan line {number} is not an object")
         if item.get("restorable") is True:
             plan.append(item)
-    return plan
+        elif item.get("kind") == "invalid":
+            invalid.append(item)
+    return plan, invalid
 
 
 def pane_state(tmux: Tmux, target: str) -> dict[str, object] | None:
@@ -222,6 +225,17 @@ def print_plan(plan: list[dict[str, object]]) -> None:
         )
 
 
+def print_invalid_plan(plan: list[dict[str, object]]) -> None:
+    print("Non-restorable AI panes left untouched:")
+    for item in plan:
+        print(
+            f"  {str(item['target']):<20} "
+            f"{str(item['tool']):<9} "
+            f"no saved conversation  "
+            f"{item['cwd']}"
+        )
+
+
 def confirm_restart(count: int) -> bool:
     if not sys.stdin.isatty():
         raise RestartError("confirmation needs a terminal; rerun with --yes")
@@ -257,18 +271,91 @@ def wait_for_shells(tmux: Tmux, targets: list[str], timeout: float = 5.0) -> set
     return pending
 
 
+def captured_failure_reason(tmux: Tmux, target: str) -> str:
+    completed = tmux.run(
+        "capture-pane",
+        "-p",
+        "-t",
+        target,
+        "-S",
+        "-40",
+        check=False,
+    )
+    if completed.returncode != 0:
+        return "pane disappeared"
+    candidates = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    for line in reversed(candidates):
+        lowered = line.lower()
+        if any(
+            marker in lowered
+            for marker in ("error", "failed", "not found", "unable", "invalid")
+        ):
+            return line
+    return "pane returned to its shell"
+
+
+def wait_for_resumed_panes(
+    tmux: Tmux,
+    plan: list[dict[str, object]],
+    *,
+    timeout: float,
+    stability: float,
+) -> tuple[list[str], list[str]]:
+    deadline = time.monotonic() + timeout
+    pending = {str(item["target"]): item for item in plan}
+    running_since: dict[str, float] = {}
+    resumed: list[str] = []
+    failures: list[str] = []
+
+    while pending and time.monotonic() < deadline:
+        now = time.monotonic()
+        for target, item in tuple(pending.items()):
+            state = pane_state(tmux, target)
+            if state is None:
+                failures.append(
+                    f"failed to resume {target} ({item['tool']}): pane disappeared"
+                )
+                pending.pop(target)
+                continue
+            command = str(state["current_command"]).lower()
+            if command in SHELL_COMMANDS:
+                if target in running_since:
+                    failures.append(
+                        f"failed to resume {target} ({item['tool']}): "
+                        f"{captured_failure_reason(tmux, target)}"
+                    )
+                    pending.pop(target)
+                continue
+            started = running_since.setdefault(target, now)
+            if now - started >= stability:
+                resumed.append(target)
+                pending.pop(target)
+        if pending:
+            time.sleep(0.05)
+
+    for target, item in pending.items():
+        state = pane_state(tmux, target)
+        if state and str(state["current_command"]).lower() in SHELL_COMMANDS:
+            reason = captured_failure_reason(tmux, target)
+        else:
+            reason = "Agent process did not remain stable before timeout"
+        failures.append(f"failed to resume {target} ({item['tool']}): {reason}")
+    return resumed, failures
+
+
 def restart_panes(
     tmux: Tmux,
     plan: list[dict[str, object]],
     restore_command: list[str],
     dump: Path,
     environment: dict[str, str],
-) -> None:
+) -> tuple[list[str], list[str]]:
     default_shell = tmux.value("show-option", "-gv", "default-shell")
     if not default_shell:
         default_shell = os.environ.get("SHELL", "/bin/zsh")
 
     targets: list[str] = []
+    items_by_target: dict[str, dict[str, object]] = {}
     failures: list[str] = []
     for item in plan:
         target = str(item["target"])
@@ -287,20 +374,31 @@ def restart_panes(
             failures.append(f"failed to respawn {target}: {completed.stderr.strip()}")
             continue
         targets.append(target)
+        items_by_target[target] = item
 
     pending = wait_for_shells(tmux, targets)
-    if targets:
+    ready = [target for target in targets if target not in pending]
+    if ready:
         subprocess.run(
             [*restore_command, "--dump", str(dump)],
             check=True,
             env=environment,
         )
     if pending:
-        failures.append(
-            "pane shell did not become ready: " + ", ".join(sorted(pending))
-        )
-    if failures:
-        raise RestartError("; ".join(failures))
+        for target in sorted(pending):
+            failures.append(f"failed to respawn {target}: shell did not become ready")
+
+    verify_timeout = float(os.environ.get("AIPANE_RESTART_VERIFY_TIMEOUT", "8"))
+    verify_stability = float(os.environ.get("AIPANE_RESTART_VERIFY_STABILITY", "1"))
+    if verify_timeout <= 0 or verify_stability <= 0:
+        raise RestartError("restart verification timing must be greater than zero")
+    resumed, resume_failures = wait_for_resumed_panes(
+        tmux,
+        [items_by_target[target] for target in ready],
+        timeout=verify_timeout,
+        stability=verify_stability,
+    )
+    return resumed, [*failures, *resume_failures]
 
 
 def main() -> int:
@@ -338,7 +436,12 @@ def main() -> int:
 
     dump = save_snapshot(tmux, script_dir)
     environment = state_environment(tmux)
-    plan = live_plan(tmux, recovery_plan(restore_command, dump, environment))
+    restorable, invalid = recovery_plan(restore_command, dump, environment)
+    plan = live_plan(tmux, restorable)
+    invalid = live_plan(tmux, invalid)
+    if invalid:
+        print_invalid_plan(invalid)
+        print()
     if not plan:
         print("ai-restart: no live, restorable AI panes found")
         return 0
@@ -397,8 +500,20 @@ def main() -> int:
             "new unknown Agent Activity appeared after confirmation; retry"
         )
 
-    restart_panes(tmux, refreshed_plan, restore_command, dump, environment)
-    print(f"ai-restart: restarted and resumed {len(refreshed_plan)} AI pane(s)")
+    resumed, failures = restart_panes(
+        tmux,
+        refreshed_plan,
+        restore_command,
+        dump,
+        environment,
+    )
+    if failures:
+        print(
+            f"ai-restart: verified {len(resumed)} resumed; "
+            f"{len(failures)} failed"
+        )
+        raise RestartError("; ".join(failures))
+    print(f"ai-restart: verified {len(resumed)} AI pane(s) resumed")
     return 0
 
 
