@@ -1,0 +1,29 @@
+[[hooks]]
+event = "SessionStart"
+command = "$HOME/.local/bin/tmux-window-wrap activity idle"
+timeout = 5
+
+[[hooks]]
+event = "UserPromptSubmit"
+command = "$HOME/.local/bin/tmux-window-wrap activity busy"
+timeout = 5
+
+[[hooks]]
+event = "Stop"
+command = "$HOME/.local/bin/tmux-window-wrap activity idle"
+timeout = 5
+
+[[hooks]]
+event = "StopFailure"
+command = "$HOME/.local/bin/tmux-window-wrap activity idle"
+timeout = 5
+
+[[hooks]]
+event = "Interrupt"
+command = "$HOME/.local/bin/tmux-window-wrap activity idle"
+timeout = 5
+
+[[hooks]]
+event = "SessionEnd"
+command = "$HOME/.local/bin/tmux-window-wrap activity idle"
+timeout = 5

@@ -93,16 +93,19 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `bin/tmux-colour-palette` | indexed terminal colour palette (`0–255`) |
 | `bin/tmux-window-jump` | repeated-digit exact-index window selector |
 | `bin/tmux-window-wrap` | renderer CLI |
+| [`integrations/`](integrations/README.md) | Agent lifecycle hook fragments and OpenCode Adapter |
+| `tests/test_agent_activity_integrations.py` | Agent Activity contract tests |
 | `tests/test_tmux_window_jump.py` | window-jump behavior + live tmux tests |
 | `tests/test_tmux_window_wrap.py` | window-wrap unit + live tmux tests |
 | `tests/test_workstation_fragments.py` | structural tests for conf fragments |
 | [`docs/ghostty-tmux-workstation.md`](docs/ghostty-tmux-workstation.md) | install + ownership |
 | [`docs/cheatsheet.md`](docs/cheatsheet.md) | key map |
-| [`docs/tmux-window-wrap.md`](docs/tmux-window-wrap.md) | wrap-only notes |
+| [`docs/tmux-window-wrap.md`](docs/tmux-window-wrap.md) | wrapping and Agent Activity notes |
 
 After editing workstation conf or the wrap renderer:
 
 ```bash
+python3 "$AIPANE_ROOT/tests/test_agent_activity_integrations.py"
 python3 "$AIPANE_ROOT/tests/test_tmux_window_jump.py"
 python3 "$AIPANE_ROOT/tests/test_workstation_fragments.py"
 python3 "$AIPANE_ROOT/tests/test_tmux_window_wrap.py"
@@ -230,6 +233,14 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 │   ├── ghostty-tmux.conf
 │   ├── tmux-workstation.conf
 │   └── tmux-window-wrap.conf
+├── integrations/            # AI Tool Agent Activity Adapters
+│   ├── claude/
+│   ├── codex/
+│   ├── cursor/
+│   ├── grok/
+│   ├── kimi/
+│   ├── opencode/
+│   └── qoder/
 ├── docs/
 │   ├── cheatsheet.md
 │   ├── ghostty-tmux-workstation.md
@@ -240,6 +251,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
     ├── aipane-cleanup-ai-protection.sh
     ├── aipane-cleanup-contracts.sh
     ├── init-reload.zsh
+    ├── test_agent_activity_integrations.py
     ├── test_tmux_window_jump.py
     ├── test_tmux_window_wrap.py
     └── test_workstation_fragments.py
@@ -267,6 +279,7 @@ zsh -fc '
 ./tests/aipane-cleanup-contracts.sh
 
 # optional workstation / window-wrap
+python3 tests/test_agent_activity_integrations.py
 python3 tests/test_tmux_window_jump.py
 python3 tests/test_workstation_fragments.py
 python3 tests/test_tmux_window_wrap.py

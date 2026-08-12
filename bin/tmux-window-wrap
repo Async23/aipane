@@ -13,10 +13,6 @@ WINDOW_SEPARATOR = "\x1f"
 MAX_STATUS_LINES = 3
 PANE_ACTIVITY_OPTION = "@tmux-window-wrap-activity"
 PANE_ACTIVITY_REFERENCE = "#{" + PANE_ACTIVITY_OPTION + "}"
-CODEX_WORKING_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-CODEX_BUSY_PANE_FORMAT = (
-    f"#{{m/r:^[{CODEX_WORKING_SPINNER}]( |$),#{{pane_title}}}}"
-)
 MARKED_BUSY_PANE_FORMAT = (
     "#{&&:#{m/r:^.+$,"
     + PANE_ACTIVITY_REFERENCE
@@ -24,13 +20,7 @@ MARKED_BUSY_PANE_FORMAT = (
     + PANE_ACTIVITY_REFERENCE
     + ",#{pane_current_command}}}"
 )
-BUSY_PANES_FORMAT = (
-    "#{P:#{||:"
-    + CODEX_BUSY_PANE_FORMAT
-    + ","
-    + MARKED_BUSY_PANE_FORMAT
-    + "}}"
-)
+BUSY_PANES_FORMAT = "#{P:" + MARKED_BUSY_PANE_FORMAT + "}"
 ACTIVITY_GLYPH = "▓"
 ACTIVITY_LEVEL_COUNT = 13
 ACTIVITY_LEVEL_SEQUENCE = (
@@ -611,7 +601,6 @@ def animation_probe(socket_name):
                 (
                     f"#{{{ANIMATOR_OWNER_ENVIRONMENT}}}",
                     "#{session_attached}",
-                    "#{pane_title}",
                     PANE_ACTIVITY_REFERENCE,
                     "#{pane_current_command}",
                 )
@@ -640,21 +629,16 @@ def animation_probe(socket_name):
     owner = None
     busy = False
     for record in records:
-        record_owner, attached, title, activity_source, current_command = (
-            record.split(WINDOW_SEPARATOR, 4)
+        record_owner, attached, activity_source, current_command = (
+            record.split(WINDOW_SEPARATOR, 3)
         )
         if owner is None:
             owner = record_owner
-        codex_busy = (
-            bool(title)
-            and title[0] in CODEX_WORKING_SPINNER
-            and (len(title) == 1 or title[1] == " ")
-        )
         marked_busy = (
             bool(activity_source)
             and activity_source == current_command
         )
-        if attached != "0" and (codex_busy or marked_busy):
+        if attached != "0" and marked_busy:
             busy = True
     return owner, busy
 

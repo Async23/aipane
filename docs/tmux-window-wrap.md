@@ -50,61 +50,30 @@ Therefore two running panes start at the widest contrast and follow
 This keeps multiple agent panes distinguishable without synchronizing their
 breathing animation.
 
-Busy state has two inputs:
+AI Tool integrations report state with `tmux-window-wrap activity busy` and
+`tmux-window-wrap activity idle`. The command stores the pane's current command
+in `@tmux-window-wrap-activity`; a marker is honored only while that command
+still owns the pane, so a marker left by an abnormal exit is ignored.
 
-- Codex is detected automatically when a pane title starts with its working
-  spinner. Idle panes and panes showing `[ ! ] Action Required` are not counted.
-- Other agents can call `tmux-window-wrap activity busy` and
-  `tmux-window-wrap activity idle`. The command stores the pane's current
-  command in `@tmux-window-wrap-activity`; a marker is honored only while that
-  command still owns the pane, so a marker left by an abnormal exit is ignored.
+### Agent Activity Interface
+
+Agent Activity is turn-level: `busy` starts when the user submits a prompt and
+ends when the AI Tool completes or fails the turn. New AI Tool integrations
+should report this state explicitly through `tmux-window-wrap activity
+busy|idle`. Hooks and plugins inherit `TMUX_PANE`, so no pane id needs to appear
+in model messages.
+
+Terminal titles are presentation owned by each AI Tool and are not activity
+inputs. Versioned hook fragments and plugin source live under
+`integrations/`; user-owned Agent configuration only registers those Adapters.
 
 ### Kimi Code hooks
 
 Kimi Code can drive the pane-local marker through lifecycle hooks in
-`~/.kimi-code/config.toml`:
-
-```toml
-[[hooks]]
-event = "SessionStart"
-command = "$HOME/.local/bin/tmux-window-wrap activity idle"
-timeout = 5
-
-[[hooks]]
-event = "UserPromptSubmit"
-command = "$HOME/.local/bin/tmux-window-wrap activity busy"
-timeout = 5
-
-[[hooks]]
-event = "PermissionRequest"
-command = "$HOME/.local/bin/tmux-window-wrap activity idle"
-timeout = 5
-
-[[hooks]]
-event = "PermissionResult"
-command = "$HOME/.local/bin/tmux-window-wrap activity busy"
-timeout = 5
-
-[[hooks]]
-event = "Stop"
-command = "$HOME/.local/bin/tmux-window-wrap activity idle"
-timeout = 5
-
-[[hooks]]
-event = "StopFailure"
-command = "$HOME/.local/bin/tmux-window-wrap activity idle"
-timeout = 5
-
-[[hooks]]
-event = "Interrupt"
-command = "$HOME/.local/bin/tmux-window-wrap activity idle"
-timeout = 5
-
-[[hooks]]
-event = "SessionEnd"
-command = "$HOME/.local/bin/tmux-window-wrap activity idle"
-timeout = 5
-```
+`~/.kimi-code/config.toml`. Merge
+[`integrations/kimi/hooks.toml`](../integrations/kimi/hooks.toml) into that
+file. The turn stays busy while Kimi waits for permission; permission events do
+not create a tool-specific interpretation of Agent Activity.
 
 The helper uses `TMUX_PANE`, which Kimi inherits from tmux. Run `/reload` in an
 idle Kimi session or start a new Kimi process after changing the hook
@@ -139,9 +108,8 @@ so the indicator begins flush with the preceding window label and index. The
 first indicator replaces that omitted padding; additional indicators add one
 column each.
 
-Automatic Codex detection depends on the terminal-title `activity` item and
-animations being enabled. External-agent detection depends on its lifecycle
-hooks. The indicator width is included in wrapping calculations, and a
+Agent Activity depends on each AI Tool's lifecycle hooks or plugin Adapter. The
+indicator width is included in wrapping calculations, and a
 lightweight driver advances a tmux animation option every approximately
 `50ms` (`20 FPS`) while any busy agent pane exists. One full loop takes
 `1.2s`. Window layout stays cached, so each frame is expanded by tmux without
