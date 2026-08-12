@@ -27,3 +27,7 @@ _Avoid_: Kimi CLI (legacy product line naming), Moonshot, kimi-code home directo
 **Permission Mode**:
 Kimi Code's session approval policy: `manual` (prompt), `yolo` (auto-approve regular tools, may still ask), or `auto` (fully unattended).
 _Avoid_: AFK (legacy/alternate naming), approval flag as a synonym for the whole mode set
+
+**Agent Activity**:
+The pane-local state of an AI Tool turn. `busy` means a submitted turn is still in flight; `idle` means no turn is in flight.
+_Avoid_: process activity, terminal-title activity, spinner state

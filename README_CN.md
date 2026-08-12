@@ -93,16 +93,19 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `bin/tmux-colour-palette` | 终端索引色表（`0–255`） |
 | `bin/tmux-window-jump` | 同数字连按、精确 index 的窗口选择器 |
 | `bin/tmux-window-wrap` | 渲染 CLI |
+| [`integrations/`](integrations/README.md) | Agent 生命周期 hook 片段与 OpenCode Adapter |
+| `tests/test_agent_activity_integrations.py` | Agent Activity 契约测试 |
 | `tests/test_tmux_window_jump.py` | window-jump 行为 + 真 tmux 测试 |
 | `tests/test_tmux_window_wrap.py` | window-wrap 单元 + 真 tmux 测试 |
 | `tests/test_workstation_fragments.py` | conf 片段结构测试 |
 | [`docs/ghostty-tmux-workstation.md`](docs/ghostty-tmux-workstation.md) | 安装与所有权 |
 | [`docs/cheatsheet.md`](docs/cheatsheet.md) | 键位速查 |
-| [`docs/tmux-window-wrap.md`](docs/tmux-window-wrap.md) | 仅换行说明 |
+| [`docs/tmux-window-wrap.md`](docs/tmux-window-wrap.md) | 换行与 Agent Activity 说明 |
 
 改 workstation conf 或 wrap 渲染器后：
 
 ```bash
+python3 "$AIPANE_ROOT/tests/test_agent_activity_integrations.py"
 python3 "$AIPANE_ROOT/tests/test_tmux_window_jump.py"
 python3 "$AIPANE_ROOT/tests/test_workstation_fragments.py"
 python3 "$AIPANE_ROOT/tests/test_tmux_window_wrap.py"
@@ -230,6 +233,14 @@ killrod --dry-run
 │   ├── ghostty-tmux.conf
 │   ├── tmux-workstation.conf
 │   └── tmux-window-wrap.conf
+├── integrations/            # AI Tool Agent Activity Adapter
+│   ├── claude/
+│   ├── codex/
+│   ├── cursor/
+│   ├── grok/
+│   ├── kimi/
+│   ├── opencode/
+│   └── qoder/
 ├── docs/
 │   ├── cheatsheet.md
 │   ├── ghostty-tmux-workstation.md
@@ -240,6 +251,7 @@ killrod --dry-run
     ├── aipane-cleanup-ai-protection.sh
     ├── aipane-cleanup-contracts.sh
     ├── init-reload.zsh
+    ├── test_agent_activity_integrations.py
     ├── test_tmux_window_jump.py
     ├── test_tmux_window_wrap.py
     └── test_workstation_fragments.py
@@ -267,6 +279,7 @@ zsh -fc '
 ./tests/aipane-cleanup-contracts.sh
 
 # 可选工作台 / window-wrap
+python3 tests/test_agent_activity_integrations.py
 python3 tests/test_tmux_window_jump.py
 python3 tests/test_workstation_fragments.py
 python3 tests/test_tmux_window_wrap.py
