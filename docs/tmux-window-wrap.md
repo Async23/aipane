@@ -61,6 +61,9 @@ Every call also records the current command in
 `@tmux-window-wrap-activity-reporter`. This lets destructive maintenance tools
 distinguish a reported `idle` state from an older Agent process whose state is
 unknown; the reporter option does not affect statusline rendering.
+Busy reports also store their wall-clock time in
+`@tmux-window-wrap-activity-updated-at`. The timestamp prevents an older idle
+record from clearing a newly submitted turn.
 
 ### Agent Activity Interface
 
@@ -99,6 +102,16 @@ busy when its goal is still active.
 Terminal titles are presentation owned by each AI Tool and are not activity
 inputs. Versioned hook fragments and plugin source live under
 `integrations/`; user-owned Agent configuration only registers those Adapters.
+
+Claude Code also maintains a live session record under
+`${CLAUDE_CONFIG_DIR:-~/.claude}/sessions/` with its exact tmux target and
+`busy` / `idle` status. The animation probe reconciles a matching Claude
+marker against that record. This is a narrow fallback for hard failure paths
+such as a context-limit rejection that can return Claude to its prompt without
+delivering the expected completion hook. A live record must match the pane's
+tmux target, TTY, and Claude version, and its idle timestamp must be at least as
+new as the busy marker; stale records therefore cannot clear a later turn.
+Other AI Tools remain hook/plugin-driven.
 
 ### Kimi Code hooks
 

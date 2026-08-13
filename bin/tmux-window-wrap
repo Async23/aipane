@@ -15,6 +15,7 @@ MAX_STATUS_LINES = 3
 PANE_ACTIVITY_OPTION = "@tmux-window-wrap-activity"
 PANE_ACTIVITY_REFERENCE = "#{" + PANE_ACTIVITY_OPTION + "}"
 PANE_ACTIVITY_REPORTER_OPTION = "@tmux-window-wrap-activity-reporter"
+PANE_ACTIVITY_UPDATED_AT_OPTION = "@tmux-window-wrap-activity-updated-at"
 MARKED_BUSY_PANE_FORMAT = (
     "#{&&:#{m/r:^.+$,"
     + PANE_ACTIVITY_REFERENCE
@@ -592,6 +593,121 @@ def tmux_has_sessions(socket_name):
     return bool(completed.stdout.splitlines())
 
 
+def process_is_running(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def process_tty(pid):
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "tty="],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return ""
+    tty = completed.stdout.strip()
+    if completed.returncode != 0 or tty in {"", "?", "??", "-"}:
+        return ""
+    return tty.removeprefix("/dev/")
+
+
+def load_claude_session_states(
+    targets=None,
+    environment=None,
+    process_exists=None,
+    process_tty_lookup=None,
+):
+    # Claude writes this registry independently of lifecycle hooks, so it stays
+    # usable when a hard API failure returns to the prompt without an idle hook.
+    if environment is None:
+        environment = os.environ
+    if process_exists is None:
+        process_exists = process_is_running
+    if process_tty_lookup is None:
+        process_tty_lookup = process_tty
+    config_dir = environment.get("CLAUDE_CONFIG_DIR")
+    if not config_dir:
+        home = environment.get("HOME") or os.path.expanduser("~")
+        config_dir = os.path.join(home, ".claude")
+    sessions_dir = os.path.join(config_dir, "sessions")
+
+    try:
+        entries = os.scandir(sessions_dir)
+    except OSError:
+        return {}
+
+    states = {}
+    with entries:
+        for entry in entries:
+            try:
+                if not entry.name.endswith(".json") or not entry.is_file():
+                    continue
+                with open(entry.path, encoding="utf-8") as handle:
+                    record = json.load(handle)
+                pid = record.get("pid")
+                target = record.get("tmux")
+                status = record.get("status")
+                updated_at = record.get("statusUpdatedAt")
+                version = record.get("version")
+                if (
+                    not isinstance(pid, int)
+                    or pid <= 0
+                    or not isinstance(target, str)
+                    or not target
+                    or not isinstance(status, str)
+                    or not isinstance(updated_at, (int, float))
+                    or isinstance(updated_at, bool)
+                    or not isinstance(version, str)
+                    or (targets is not None and target not in targets)
+                    or not process_exists(pid)
+                ):
+                    continue
+                tty = process_tty_lookup(pid)
+                if not tty:
+                    continue
+            except (AttributeError, OSError, TypeError, ValueError):
+                continue
+
+            state = {
+                "pid": pid,
+                "status": status,
+                "updated_at": int(updated_at),
+                "version": version,
+                "tty": tty,
+            }
+            previous = states.get(target)
+            if previous is None or state["updated_at"] > previous["updated_at"]:
+                states[target] = state
+    return states
+
+
+def claude_idle_supersedes_marker(
+    state,
+    current_command,
+    pane_tty,
+    marker_updated_at,
+):
+    if not state or state["status"] != "idle":
+        return False
+    if current_command != state["version"] and current_command != "claude":
+        return False
+    if pane_tty.removeprefix("/dev/") != state["tty"]:
+        return False
+    try:
+        marker_timestamp = int(marker_updated_at)
+    except (TypeError, ValueError):
+        marker_timestamp = 0
+    return state["updated_at"] >= marker_timestamp
+
+
 def animation_probe(socket_name):
     try:
         completed = run_tmux(
@@ -603,8 +719,12 @@ def animation_probe(socket_name):
                 (
                     f"#{{{ANIMATOR_OWNER_ENVIRONMENT}}}",
                     "#{session_attached}",
+                    "#{session_name}:#{window_id}.#{pane_id}",
+                    "#{pane_id}",
+                    "#{pane_tty}",
                     PANE_ACTIVITY_REFERENCE,
                     "#{pane_current_command}",
+                    "#{" + PANE_ACTIVITY_UPDATED_AT_OPTION + "}",
                 )
             ),
         )
@@ -629,19 +749,96 @@ def animation_probe(socket_name):
         )
 
     owner = None
-    busy = False
+    panes = []
     for record in records:
-        record_owner, attached, activity_source, current_command = (
-            record.split(WINDOW_SEPARATOR, 3)
+        (
+            record_owner,
+            attached,
+            target,
+            pane_id,
+            pane_tty,
+            activity_source,
+            current_command,
+            marker_updated_at,
+        ) = record.split(WINDOW_SEPARATOR, 7)
+        panes.append(
+            (
+                attached,
+                target,
+                pane_id,
+                pane_tty,
+                activity_source,
+                current_command,
+                marker_updated_at,
+            )
         )
         if owner is None:
             owner = record_owner
+
+    busy = False
+    cleared = False
+    marked_panes = [
+        pane
+        for pane in panes
+        if pane[0] != "0" and pane[4] and pane[4] == pane[5]
+    ]
+    claude_states = (
+        load_claude_session_states({pane[1] for pane in marked_panes})
+        if marked_panes
+        else {}
+    )
+    for (
+        attached,
+        target,
+        pane_id,
+        pane_tty,
+        activity_source,
+        current_command,
+        marker_updated_at,
+    ) in panes:
         marked_busy = (
             bool(activity_source)
             and activity_source == current_command
         )
         if attached != "0" and marked_busy:
-            busy = True
+            if claude_idle_supersedes_marker(
+                claude_states.get(target),
+                current_command,
+                pane_tty,
+                marker_updated_at,
+            ):
+                try:
+                    run_tmux(
+                        socket_name,
+                        "set-option",
+                        "-p",
+                        "-u",
+                        "-t",
+                        pane_id,
+                        PANE_ACTIVITY_OPTION,
+                    )
+                except subprocess.CalledProcessError:
+                    # The pane may disappear between list-panes and cleanup.
+                    # Keep the animator alive; the next probe sees fresh state.
+                    continue
+                cleared = True
+                if marker_updated_at:
+                    try:
+                        run_tmux(
+                            socket_name,
+                            "set-option",
+                            "-p",
+                            "-u",
+                            "-t",
+                            pane_id,
+                            PANE_ACTIVITY_UPDATED_AT_OPTION,
+                        )
+                    except subprocess.CalledProcessError:
+                        pass
+            else:
+                busy = True
+    if cleared:
+        invalidate_cache(socket_name)
     return owner, busy
 
 
@@ -786,6 +983,16 @@ def update_pane_activity(
         pane_id,
         PANE_ACTIVITY_REPORTER_OPTION,
     ).stdout.strip()
+    current_updated_at = run_tmux(
+        socket_name,
+        "show-options",
+        "-p",
+        "-q",
+        "-v",
+        "-t",
+        pane_id,
+        PANE_ACTIVITY_UPDATED_AT_OPTION,
+    ).stdout.strip()
     owner = run_tmux(
         socket_name,
         "display-message",
@@ -805,6 +1012,27 @@ def update_pane_activity(
     ):
         return
     desired_activity = owner if state == "busy" else ""
+
+    if state == "busy":
+        run_tmux(
+            socket_name,
+            "set-option",
+            "-p",
+            "-t",
+            pane_id,
+            PANE_ACTIVITY_UPDATED_AT_OPTION,
+            str(time.time_ns() // 1_000_000),
+        )
+    elif current_updated_at:
+        run_tmux(
+            socket_name,
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            pane_id,
+            PANE_ACTIVITY_UPDATED_AT_OPTION,
+        )
 
     if current_activity == desired_activity and current_reporter == owner:
         # A repeated busy report starts a new turn. Refresh even when the marker

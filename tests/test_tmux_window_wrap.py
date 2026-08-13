@@ -14,6 +14,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -207,6 +208,8 @@ class WindowWrapCliTests(unittest.TestCase):
                 )
             elif arguments[0] == "display-message":
                 value = "codex"
+            elif arguments[0] == "set-option":
+                value = ""
             else:
                 raise AssertionError(arguments)
             return subprocess.CompletedProcess(
@@ -234,6 +237,8 @@ class WindowWrapCliTests(unittest.TestCase):
                 value = "codex"
             elif arguments[0] == "display-message":
                 value = "codex"
+            elif arguments[0] == "set-option":
+                value = ""
             else:
                 raise AssertionError(arguments)
             return subprocess.CompletedProcess(
@@ -382,7 +387,16 @@ class WindowWrapCliTests(unittest.TestCase):
         def fake_run_tmux(_socket_name, *arguments):
             pane_format["value"] = arguments[-1]
             record = namespace["WINDOW_SEPARATOR"].join(
-                ("owner", "1", activity_source["value"], "codex")
+                (
+                    "owner",
+                    "1",
+                    "work:@1.%1",
+                    "%1",
+                    "/dev/ttys001",
+                    activity_source["value"],
+                    "codex",
+                    "1000",
+                )
             )
             return subprocess.CompletedProcess(
                 ["tmux", *arguments],
@@ -398,6 +412,106 @@ class WindowWrapCliTests(unittest.TestCase):
 
         activity_source["value"] = "zsh"
         self.assertEqual(animation_probe("test-socket"), ("owner", False))
+
+    def test_animation_probe_clears_marker_from_newer_claude_idle_state(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        animation_probe = namespace["animation_probe"]
+        script_globals = animation_probe.__globals__
+        separator = namespace["WINDOW_SEPARATOR"]
+        events = []
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            claude_config = Path(raw_tmp) / ".claude"
+            sessions = claude_config / "sessions"
+            sessions.mkdir(parents=True)
+            (sessions / f"{os.getpid()}.json").write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "status": "idle",
+                        "statusUpdatedAt": 2_000,
+                        "tmux": "work:@8.%7",
+                        "version": "2.1.229",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_run_tmux(_socket_name, *arguments):
+                events.append(arguments)
+                if arguments[0] == "list-panes":
+                    record = separator.join(
+                        (
+                            "owner",
+                            "1",
+                            "work:@8.%7",
+                            "%7",
+                            "/dev/ttys007",
+                            "2.1.229",
+                            "2.1.229",
+                            "1000",
+                        )
+                    )
+                    stdout = record + "\n"
+                else:
+                    stdout = ""
+                return subprocess.CompletedProcess(
+                    ["tmux", *arguments],
+                    0,
+                    stdout=stdout,
+                    stderr="",
+                )
+
+            script_globals["run_tmux"] = fake_run_tmux
+            script_globals["process_tty"] = lambda _pid: "ttys007"
+            script_globals["invalidate_cache"] = lambda socket: events.append(
+                ("invalidate-cache", socket)
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"CLAUDE_CONFIG_DIR": str(claude_config)},
+            ):
+                self.assertEqual(
+                    animation_probe("test-socket"),
+                    ("owner", False),
+                )
+
+        self.assertIn(
+            (
+                "set-option",
+                "-p",
+                "-u",
+                "-t",
+                "%7",
+                "@tmux-window-wrap-activity",
+            ),
+            events,
+        )
+        self.assertIn(("invalidate-cache", "test-socket"), events)
+
+    def test_claude_idle_state_cannot_clear_a_newer_busy_marker(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        supersedes = namespace["claude_idle_supersedes_marker"]
+        idle = {
+            "status": "idle",
+            "updated_at": 1_000,
+            "version": "2.1.229",
+            "tty": "ttys007",
+        }
+
+        self.assertFalse(supersedes(idle, "2.1.229", "/dev/ttys007", "1001"))
+        self.assertTrue(supersedes(idle, "2.1.229", "/dev/ttys007", "1000"))
+        self.assertTrue(supersedes(idle, "2.1.229", "/dev/ttys007", ""))
+        self.assertFalse(
+            supersedes(
+                {**idle, "status": "busy", "updated_at": 2_000},
+                "2.1.229",
+                "/dev/ttys007",
+                "1000",
+            )
+        )
+        self.assertFalse(supersedes(idle, "grok", "/dev/ttys007", "1000"))
+        self.assertFalse(supersedes(idle, "2.1.229", "/dev/ttys008", "1000"))
 
     def test_windows_stay_on_one_line_when_they_fit(self):
         result = self.run_plan(
@@ -1411,6 +1525,16 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "@tmux-window-wrap-activity",
         ).stdout.strip()
         self.assertEqual(marker, "sleep")
+        marker_updated_at = self.tmux(
+            "show-options",
+            "-p",
+            "-q",
+            "-v",
+            "-t",
+            pane_id,
+            "@tmux-window-wrap-activity-updated-at",
+        ).stdout.strip()
+        self.assertTrue(marker_updated_at.isdecimal())
         rendered = self.render_runtime(line=0, width=80, animation_tick=0)
         self.assertEqual(rendered.count("▓"), 1)
 
@@ -1446,6 +1570,16 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "@tmux-window-wrap-activity-reporter",
         ).stdout.strip()
         self.assertEqual(reporter, "sleep")
+        marker_updated_at = self.tmux(
+            "show-options",
+            "-p",
+            "-q",
+            "-v",
+            "-t",
+            pane_id,
+            "@tmux-window-wrap-activity-updated-at",
+        ).stdout.strip()
+        self.assertEqual(marker_updated_at, "")
 
     def test_deferred_activity_matches_every_direct_frame_and_scheme(self):
         animation_option = "@tmux-window-wrap-test-animation-tick"
