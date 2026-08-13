@@ -15,6 +15,12 @@ become observable at `PreToolUse`. `TeammateIdle` clears their pane when the
 delegated turn finishes. An in-turn `SessionStart(source=compact)` preserves
 the existing marker.
 
+If a hard Claude failure returns to the prompt without delivering its terminal
+hook, `tmux-window-wrap` reconciles the marker with Claude Code's live session
+registry. The registry target, process, version, status, and status timestamp
+must all agree, so this fallback does not infer activity from terminal titles
+or process CPU usage.
+
 Codex completion is handled by `bin/aipane-codex-notify`, not its `Stop` hook.
 Another Codex `Stop` hook can ask the current turn to continue, so `Stop` is not
 a reliable completion boundary. `UserPromptSubmit` starts normal turns;
