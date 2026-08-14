@@ -18,9 +18,18 @@ import time
 from pathlib import Path
 
 
+LIB_DIR = Path(__file__).resolve().parents[1] / "lib"
+if str(LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(LIB_DIR))
+
+from agent_activity import AgentActivity, PaneActivity
+
+
 FIELD_SEPARATOR = "\x1f"
 ACTIVITY_OPTION = "@tmux-window-wrap-activity"
 ACTIVITY_REPORTER_OPTION = "@tmux-window-wrap-activity-reporter"
+ACTIVITY_UPDATED_AT_OPTION = "@tmux-window-wrap-activity-updated-at"
+ACTIVITY_RECORD_OPTION = "@tmux-window-wrap-activity-record"
 SHELL_COMMANDS = {"zsh", "-zsh", "bash", "-bash", "sh", "-sh", "fish", "-fish"}
 
 
@@ -161,13 +170,23 @@ def recovery_plan(
     return plan, invalid
 
 
-def pane_state(tmux: Tmux, target: str) -> dict[str, object] | None:
+def pane_state(
+    tmux: Tmux,
+    target: str,
+    resolver: AgentActivity | None = None,
+) -> dict[str, object] | None:
     pane_format = FIELD_SEPARATOR.join(
         (
             "#{pane_id}",
             "#{pane_current_command}",
+            "#{session_name}:#{window_id}.#{pane_id}",
+            "#{pane_tty}",
+            "#{socket_path}",
+            "#{pid}",
             f"#{{{ACTIVITY_OPTION}}}",
             f"#{{{ACTIVITY_REPORTER_OPTION}}}",
+            f"#{{{ACTIVITY_UPDATED_AT_OPTION}}}",
+            f"#{{{ACTIVITY_RECORD_OPTION}}}",
         )
     )
     completed = tmux.run(
@@ -180,27 +199,56 @@ def pane_state(tmux: Tmux, target: str) -> dict[str, object] | None:
     )
     if completed.returncode != 0:
         return None
-    fields = completed.stdout.rstrip("\n").split(FIELD_SEPARATOR, 3)
-    if len(fields) != 4:
+    fields = completed.stdout.rstrip("\n").split(FIELD_SEPARATOR, 9)
+    if len(fields) != 10:
         return None
-    pane_id, current_command, activity_source, activity_reporter = fields
-    busy = bool(activity_source) and activity_source == current_command
+    (
+        pane_id,
+        current_command,
+        canonical_target,
+        pane_tty,
+        socket_path,
+        server_pid,
+        activity_source,
+        activity_reporter,
+        activity_updated_at,
+        activity_record,
+    ) = fields
+    resolver = resolver or AgentActivity()
+    view = resolver.resolve(
+        PaneActivity(
+            pane_id=pane_id,
+            current_command=current_command,
+            target=canonical_target,
+            pane_tty=pane_tty,
+            socket_path=socket_path,
+            server_pid=server_pid,
+            marker=activity_source,
+            reporter=activity_reporter,
+            marker_updated_at=activity_updated_at,
+            record=activity_record,
+        )
+    )
     return {
         "pane_id": pane_id,
         "current_command": current_command,
-        "busy": busy,
-        "reported": busy or activity_reporter == current_command,
+        "busy": view.state == "busy",
+        "reported": view.reported,
+        "activity_state": view.state,
+        "activity_reason": view.reason,
+        "activity_evidence": view.evidence_turn_id,
     }
 
 
 def live_plan(tmux: Tmux, plan: list[dict[str, object]]) -> list[dict[str, object]]:
     result: list[dict[str, object]] = []
     seen: set[str] = set()
+    resolver = AgentActivity()
     for item in plan:
         target = str(item.get("target", ""))
         if not target or target in seen:
             continue
-        state = pane_state(tmux, target)
+        state = pane_state(tmux, target, resolver)
         if state is None:
             continue
         seen.add(target)
@@ -211,9 +259,9 @@ def live_plan(tmux: Tmux, plan: list[dict[str, object]]) -> list[dict[str, objec
 def print_plan(plan: list[dict[str, object]]) -> None:
     print("AI panes to restart:")
     for item in plan:
-        if item["busy"]:
+        if item.get("activity_state") == "busy":
             status = "BUSY"
-        elif item["reported"]:
+        elif item.get("activity_state") == "idle":
             status = "idle"
         else:
             status = "unknown"
@@ -249,7 +297,7 @@ def confirm_unknown(count: int, targets: list[str]) -> bool:
             "unknown Agent Activity needs interactive confirmation or --force"
         )
     print(
-        "\nThese pane(s) have not loaded the new activity hooks: "
+        "\nAgent Activity could not be verified for these pane(s): "
         + ", ".join(targets)
     )
     answer = input(
@@ -448,7 +496,11 @@ def main() -> int:
 
     print_plan(plan)
     busy = [str(item["target"]) for item in plan if item["busy"]]
-    unknown = [str(item["target"]) for item in plan if not item["reported"]]
+    unknown = [
+        str(item["target"])
+        for item in plan
+        if item.get("activity_state") == "unknown"
+    ]
     if arguments.dry_run:
         print("\nDry run: snapshot refreshed; no panes were restarted.")
         return 0
@@ -480,7 +532,9 @@ def main() -> int:
         raise RestartError("the live pane set changed after confirmation; retry")
     newly_busy = [str(item["target"]) for item in refreshed_plan if item["busy"]]
     newly_unknown = [
-        str(item["target"]) for item in refreshed_plan if not item["reported"]
+        str(item["target"])
+        for item in refreshed_plan
+        if item.get("activity_state") == "unknown"
     ]
     if newly_busy and not arguments.force:
         raise RestartError(

@@ -1,124 +1,121 @@
-#!/bin/sh
-# aipane-codex-notify — thin wrapper around the user's codex `notify` program.
-#
-# codex calls its `notify` program after each turn with a JSON payload that carries
-# both the session id (`thread-id`) and, via the inherited environment, $TMUX_PANE.
-# We use that to record the codex pane→root-session binding (codex is the only core
-# tool with no launch-time --session-id) and to update activity only from the root
-# agent. Subagents inherit the same TMUX_PANE, so their completion must never clear
-# the parent's busy state or replace its resumable session id. Then we delegate
-# unchanged to the real notifier so the user's notifications keep working.
-#
-# Wiring: config.toml  notify = ["/Users/YOU/.local/bin/aipane-codex-notify"]
-#
-# This must never break codex: all aipane failures are swallowed; the real notifier
-# is always exec'd.
+#!/usr/bin/env python3
+"""Translate Codex legacy notify events without breaking the real notifier."""
 
-PAYLOAD="$1"
-REAL_NOTIFY="${AIPANE_CODEX_REAL_NOTIFY:-$HOME/.codex/bin/codex-notify.py}"
-PYTHON="${AIPANE_PYTHON:-/opt/homebrew/bin/python3}"
-BIND="$HOME/.local/bin/aipane-bind"
-ACTIVITY="$HOME/.local/bin/tmux-window-wrap"
-CODEX_STATE_HOME="${CODEX_HOME:-$HOME/.codex}"
+from __future__ import annotations
 
-# Classify the completing thread from its rollout metadata. Legacy notify payloads
-# do not include parent_thread_id, but every persisted subagent transcript does.
-# Resolve nested parents all the way to the root and query its goal state. All
-# failures degrade to the historical main-thread behavior so notifications remain
-# best-effort and never break Codex.
-if [ -n "$PAYLOAD" ]; then
-  fields=$(printf '%s' "$PAYLOAD" | "$PYTHON" -c \
-    'import glob,json,os,sqlite3,sys
+import json
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+
+LIB_DIR = Path(__file__).resolve().parents[1] / "lib"
+if str(LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(LIB_DIR))
+
 try:
-    p=json.load(sys.stdin)
-except Exception:
-    p={}
+    from agent_activity import codex_goal_state, codex_thread_identity
+except ImportError:
+    codex_goal_state = None
+    codex_thread_identity = None
 
-event=p.get("type") or ""
-tid=p.get("thread-id") or p.get("thread_id") or ""
-codex_home=sys.argv[1]
-root_tid=tid
-is_subagent=False
-seen=set()
 
-while root_tid and root_tid not in seen:
-    seen.add(root_tid)
-    pattern=os.path.join(codex_home,"sessions","*","*","*","*-"+root_tid+".jsonl")
-    metadata={}
-    for path in glob.iglob(pattern):
-        try:
-            with open(path,encoding="utf-8") as handle:
-                record=json.loads(handle.readline())
-            candidate=record.get("payload") or {}
-            if candidate.get("id")==root_tid:
-                metadata=candidate
-                break
-        except (OSError,ValueError):
-            continue
-    source=metadata.get("source") or {}
-    if not isinstance(source,dict):
-        source={}
-    subagent=source.get("subagent") or source.get("sub_agent") or {}
-    spawn=subagent.get("thread_spawn") or subagent.get("threadSpawn") or {}
-    parent=spawn.get("parent_thread_id") or spawn.get("parentThreadId") or ""
-    if not parent:
-        break
-    is_subagent=True
-    root_tid=parent
+def report_activity(home: Path, state: str, payload: str) -> None:
+    command = home / ".local" / "bin" / "tmux-window-wrap"
+    if not os.access(command, os.X_OK):
+        return
+    try:
+        subprocess.run(
+            [str(command), "activity", state],
+            input=payload,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
 
-goal_status=""
-if root_tid:
-    for relative in ("goals_1.sqlite",os.path.join("sqlite","goals_1.sqlite")):
-        path=os.path.join(codex_home,relative)
-        if not os.path.isfile(path):
-            continue
-        try:
-            uri="file:"+os.path.realpath(path)+"?mode=ro"
-            connection=sqlite3.connect(uri,uri=True,timeout=0.25)
-            try:
-                row=connection.execute(
-                    "SELECT status FROM thread_goals WHERE thread_id = ?",
-                    (root_tid,),
-                ).fetchone()
-            finally:
-                connection.close()
-            if row:
-                goal_status=row[0] or ""
-                break
-        except (OSError,sqlite3.Error):
-            continue
 
-for value in (event,root_tid,"subagent" if is_subagent else "main",goal_status):
-    print(value or "")' "$CODEX_STATE_HOME" 2>/dev/null)
-  if [ -z "$fields" ]; then
-    fields=$(printf '\n\n\n\n')
-  fi
-  event=$(printf '%s\n' "$fields" | sed -n '1p')
-  tid=$(printf '%s\n' "$fields" | sed -n '2p')
-  scope=$(printf '%s\n' "$fields" | sed -n '3p')
-  goal_status=$(printf '%s\n' "$fields" | sed -n '4p')
-  if [ "$event" = "agent-turn-complete" ]; then
-    # Only the root agent owns pane activity. An active goal immediately
-    # continues after a root turn, so keep/restore busy instead of going idle.
-    if [ "$scope" = "main" ] && [ -x "$ACTIVITY" ]; then
-      if [ "$goal_status" = "active" ]; then
-        "$ACTIVITY" activity busy >/dev/null 2>&1 || :
-      else
-        # Keeping the final idle update synchronous prevents an old completion
-        # notification from racing a newly submitted prompt.
-        "$ACTIVITY" activity idle >/dev/null 2>&1 || :
-      fi
-    fi
-    if [ -n "$tid" ] && [ -x "$BIND" ]; then
-      "$BIND" --tool x --sid "$tid" >/dev/null 2>&1 &
-    fi
-  fi
-fi
+def bind_session(home: Path, session_id: str) -> None:
+    command = home / ".local" / "bin" / "aipane-bind"
+    if not session_id or not os.access(command, os.X_OK):
+        return
+    try:
+        subprocess.Popen(
+            [str(command), "--tool", "x", "--sid", session_id],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
 
-# Delegate to the real notifier (preserve original behavior exactly).
-if [ -x "$REAL_NOTIFY" ]; then
-  exec "$REAL_NOTIFY" "$@"
-elif [ -f "$REAL_NOTIFY" ]; then
-  exec "$PYTHON" "$REAL_NOTIFY" "$@"
-fi
-exit 0
+
+def translate(payload_text: str, home: Path, codex_home: Path) -> None:
+    if codex_thread_identity is None or codex_goal_state is None:
+        return
+    try:
+        payload = json.loads(payload_text)
+    except (TypeError, ValueError):
+        return
+    if not isinstance(payload, dict) or payload.get("type") != "agent-turn-complete":
+        return
+    session_id = payload.get("thread-id") or payload.get("thread_id")
+    turn_id = payload.get("turn-id") or payload.get("turn_id")
+    if not isinstance(session_id, str) or not session_id:
+        return
+
+    identity = codex_thread_identity(codex_home, session_id)
+    if identity.scope == "unknown":
+        return
+    if identity.scope == "main" and isinstance(turn_id, str) and turn_id:
+        goal = codex_goal_state(codex_home, identity.root_session_id)
+        report_activity(
+            home,
+            "busy" if goal in {"active", "unknown"} else "idle",
+            payload_text,
+        )
+    bind_session(home, identity.root_session_id)
+
+
+def delegate(real_notify: Path) -> int:
+    arguments = sys.argv[1:]
+    if os.access(real_notify, os.X_OK):
+        os.execv(str(real_notify), [str(real_notify), *arguments])
+    if real_notify.is_file():
+        python = shlex.split(os.environ.get("AIPANE_PYTHON", sys.executable))
+        if python:
+            os.execvp(
+                python[0],
+                [*python, str(real_notify), *arguments],
+            )
+    return 0
+
+
+def main() -> int:
+    home = Path(os.environ.get("HOME", str(Path.home()))).expanduser()
+    codex_home = Path(
+        os.environ.get("CODEX_HOME", str(home / ".codex"))
+    ).expanduser()
+    payload_text = sys.argv[1] if len(sys.argv) > 1 else ""
+    try:
+        translate(payload_text, home, codex_home)
+    except Exception:
+        # Activity is safety metadata; it must never suppress user notifications.
+        pass
+    real_notify = Path(
+        os.environ.get(
+            "AIPANE_CODEX_REAL_NOTIFY",
+            str(home / ".codex" / "bin" / "codex-notify.py"),
+        )
+    ).expanduser()
+    return delegate(real_notify)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

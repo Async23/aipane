@@ -21,6 +21,132 @@ FOREIGN_SID = "1fa8ab6a-cba1-4189-abcd-64a29ffb2fc3"
 
 
 class SessionRestoreTests(unittest.TestCase):
+    def test_snapshot_uses_codex_activity_record_before_first_notify(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            state_dir = tmp / "state"
+            state_dir.mkdir()
+            record = json.dumps(
+                {
+                    "version": 1,
+                    "owner": "codex",
+                    "pane": {
+                        "id": "%3",
+                        "socket": "/private/tmp/tmux-main",
+                        "server_pid": "999",
+                    },
+                    "root": {
+                        "session_id": VALID_CODEX_SID,
+                        "turn_id": "",
+                    },
+                },
+                separators=(",", ":"),
+            )
+            fake_tmux = tmp / "tmux"
+            fake_tmux.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/bin/sh
+                    case "$1" in
+                      display-message)
+                        printf '/private/tmp/tmux-main\\t999\\n'
+                        ;;
+                      list-panes)
+                        printf '%%3\\t0:4.1\\t/Users/test\\tcodex\\t%s\\n' '{record}'
+                        ;;
+                      *)
+                        exit 99
+                        ;;
+                    esac
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_tmux.chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "AIPANE_STATE_DIR": str(state_dir),
+                    "AIPANE_REGISTRY": str(state_dir / "missing.jsonl"),
+                    "AIPANE_TMUX": str(fake_tmux),
+                }
+            )
+
+            subprocess.run(
+                [sys.executable, str(SNAPSHOT)],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            coords = json.loads((state_dir / "coords-last.json").read_text())
+            self.assertEqual(
+                coords["0:4.1"],
+                {"sid": VALID_CODEX_SID, "tool": "x", "cwd": "/Users/test"},
+            )
+
+    def test_snapshot_rejects_activity_record_from_another_tmux_server(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            state_dir = tmp / "state"
+            state_dir.mkdir()
+            record = json.dumps(
+                {
+                    "version": 1,
+                    "owner": "codex",
+                    "pane": {
+                        "id": "%3",
+                        "socket": "/private/tmp/tmux-old",
+                        "server_pid": "111",
+                    },
+                    "root": {"session_id": FOREIGN_SID, "turn_id": ""},
+                },
+                separators=(",", ":"),
+            )
+            fake_tmux = tmp / "tmux"
+            fake_tmux.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/bin/sh
+                    case "$1" in
+                      display-message)
+                        printf '/private/tmp/tmux-main\\t999\\n'
+                        ;;
+                      list-panes)
+                        printf '%%3\\t0:4.1\\t/Users/test\\tcodex\\t%s\\n' '{record}'
+                        ;;
+                      *)
+                        exit 99
+                        ;;
+                    esac
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_tmux.chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "AIPANE_STATE_DIR": str(state_dir),
+                    "AIPANE_REGISTRY": str(state_dir / "missing.jsonl"),
+                    "AIPANE_TMUX": str(fake_tmux),
+                }
+            )
+
+            subprocess.run(
+                [sys.executable, str(SNAPSHOT)],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            self.assertEqual(
+                json.loads((state_dir / "coords-last.json").read_text()),
+                {},
+            )
+
     def test_snapshot_ignores_newer_binding_from_another_tmux_server(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)

@@ -30,4 +30,5 @@ _Avoid_: AFK (legacy/alternate naming), approval flag as a synonym for the whole
 
 **Agent Activity**:
 The pane-local state of an AI Tool turn. `busy` means a submitted turn is still in flight; `idle` means no turn is in flight.
+`unknown` is a safety-resolution result when the report or authoritative evidence cannot be trusted; it is not a third lifecycle state and must never be treated as `idle` automatically.
 _Avoid_: process activity, terminal-title activity, spinner state
