@@ -168,6 +168,12 @@ current light or dark palette is cached;
 a system appearance change updates the cache key and reruns the renderer once.
 The fragment does not lower tmux's global `status-interval`.
 
+The animator records uncaught exceptions in
+`~/.local/state/aipane/tmux-window-wrap-animate.log`. A logged crash ends the
+animator cleanly so tmux does not replace the active pane with its background
+job error view. Normal ownership handoff between animator processes is not
+logged.
+
 Four thirteen-colour palettes cover active/inactive windows in light/dark
 terminal themes:
 

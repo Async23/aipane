@@ -6,6 +6,7 @@ import select
 import subprocess
 import sys
 import time
+import traceback
 import unicodedata
 import uuid
 
@@ -939,6 +940,37 @@ def animate_status(socket_name, fps):
         time.sleep(max(0.01, wake_at - time.monotonic()))
 
 
+def run_animation_with_error_log(
+    socket_name,
+    fps,
+    error_log,
+    animator=None,
+):
+    if animator is None:
+        animator = animate_status
+    try:
+        animator(socket_name, fps)
+    except Exception:
+        crash_text = traceback.format_exc()
+        expanded_log = os.path.abspath(os.path.expanduser(error_log))
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        try:
+            os.makedirs(os.path.dirname(expanded_log), exist_ok=True)
+            with open(expanded_log, "a", encoding="utf-8") as handle:
+                handle.write(
+                    f"[{timestamp}] tmux-window-wrap animator crashed\n"
+                )
+                handle.write(crash_text)
+                if not crash_text.endswith("\n"):
+                    handle.write("\n")
+        except OSError as log_error:
+            sys.stderr.write(
+                "tmux-window-wrap could not write animator crash log "
+                f"{expanded_log}: {log_error}\n"
+            )
+            sys.stderr.write(crash_text)
+
+
 def invalidate_cache(socket_name):
     run_tmux(
         socket_name,
@@ -1291,6 +1323,7 @@ def main():
         type=float,
         default=DEFAULT_ACTIVITY_FPS,
     )
+    animate_parser.add_argument("--error-log")
     animate_parser.add_argument("--socket-name")
     render_parser = commands.add_parser("render")
     render_parser.add_argument(
@@ -1376,7 +1409,14 @@ def main():
         return
 
     if arguments.command == "animate":
-        animate_status(arguments.socket_name, arguments.fps)
+        if arguments.error_log:
+            run_animation_with_error_log(
+                arguments.socket_name,
+                arguments.fps,
+                arguments.error_log,
+            )
+        else:
+            animate_status(arguments.socket_name, arguments.fps)
         return
 
     if arguments.session_id:
