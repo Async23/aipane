@@ -317,6 +317,27 @@ class WindowWrapCliTests(unittest.TestCase):
         )
         self.assertIn(("invalidate-cache", "test-socket"), events)
 
+    def test_animator_logs_unhandled_exception_without_propagating(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        run_with_error_log = namespace["run_animation_with_error_log"]
+
+        def failing_animator(_socket_name, _fps):
+            raise RuntimeError("animation probe failed")
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            log_path = Path(raw_tmp) / "nested" / "animate.log"
+            run_with_error_log(
+                "test-socket",
+                20,
+                str(log_path),
+                animator=failing_animator,
+            )
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertIn("tmux-window-wrap animator crashed", log_text)
+        self.assertIn("Traceback (most recent call last)", log_text)
+        self.assertIn("RuntimeError: animation probe failed", log_text)
+
     def test_animation_tick_never_skips_breathing_levels(self):
         namespace = runpy.run_path(str(SCRIPT))
         next_animation_tick = namespace["next_animation_tick"]
@@ -2363,6 +2384,11 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         self.assertIn(
             "tmux-window-wrap animate "
             "--fps #{@tmux-window-wrap-animation-fps}",
+            conf_text,
+        )
+        self.assertIn(
+            '--error-log "$HOME/.local/state/aipane/'
+            'tmux-window-wrap-animate.log"',
             conf_text,
         )
         self.assertNotIn("set -g prefix", conf_text)
