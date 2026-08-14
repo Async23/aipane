@@ -57,6 +57,11 @@ AI Tool integrations report state with `tmux-window-wrap activity busy` and
 `tmux-window-wrap activity idle`. The command stores the pane's current command
 in `@tmux-window-wrap-activity`; a marker is honored only while that command
 still owns the pane, so a marker left by an abnormal exit is ignored.
+The safety source is a versioned JSON record in
+`@tmux-window-wrap-activity-record`. It binds the report to the tmux pane,
+server, TTY, and exact Agent process; Codex records also carry the root session,
+turn, transcript, and per-pane `CODEX_HOME`. The older scalar options remain
+display/compatibility projections and are written only after the record.
 Every call also records the current command in
 `@tmux-window-wrap-activity-reporter`. This lets destructive maintenance tools
 distinguish a reported `idle` state from an older Agent process whose state is
@@ -89,8 +94,10 @@ cover that entry path.
 Codex is a deliberate exception to the usual `Stop -> idle` mapping. A Codex
 `Stop` hook may add feedback and make the same turn continue, so reporting idle
 there would hide an Agent that is still working. Its existing `notify` wrapper
-reports idle only on `agent-turn-complete`; `SessionEnd` remains the cleanup
-fallback. `SessionStart` is restricted to `startup|resume|clear`, because Codex
+reports idle only when `agent-turn-complete` matches the record's exact root
+session and turn; a late completion from an older turn cannot clear newer work.
+`SessionEnd` remains the cleanup fallback. `SessionStart` is restricted to
+`startup|resume|clear`, because Codex
 also emits it after an in-turn context compaction. The activity command ignores
 both an inherited `Stop` idle report and a `SessionStart(source=compact)` idle
 report, so already-running Codex processes that loaded older hook configuration
@@ -98,6 +105,23 @@ do not regress before their next restart. The notify wrapper resolves each
 completing Codex thread through its rollout metadata: subagent completions keep
 the parent pane busy and bind the root thread id, while a root completion stays
 busy when its goal is still active.
+
+Codex can terminate a failed turn before its legacy notifier runs (for example,
+a remote-compaction stream failure). Once per activity probe—not in the 20 FPS
+render path—the shared resolver checks the exact turn in Codex's read-only
+thread-history projection. It uses that projection only when its byte offset has
+caught up with the canonical rollout; otherwise it reads a bounded rollout tail.
+`completed`, `failed`, and `interrupted` are terminal, while a newer
+`inProgress` turn or active goal remains busy. A repair is materialized only
+after two identical observations and an identity/revision recheck under the
+pane lock. Missing, malformed, locked, mismatched, or unfamiliar evidence is
+`unknown` and never clears a busy marker.
+
+`ai-restart` calls the same resolver before showing its plan and again after
+confirmation. Resolution is read-only, so `--dry-run` does not repair tmux
+options; `unknown` continues to require interactive acknowledgement or
+`--force`. This also protects detached panes that have no attached statusline
+animator.
 
 Terminal titles are presentation owned by each AI Tool and are not activity
 inputs. Versioned hook fragments and plugin source live under
@@ -111,7 +135,14 @@ such as a context-limit rejection that can return Claude to its prompt without
 delivering the expected completion hook. A live record must match the pane's
 tmux target, TTY, and Claude version, and its idle timestamp must be at least as
 new as the busy marker; stale records therefore cannot clear a later turn.
-Other AI Tools remain hook/plugin-driven.
+
+Grok skips both `Stop` and `StopFailure` when a turn is interrupted, refused,
+or stopped by its turn limit. The animation probe therefore reconciles a
+marked Grok pane with `${GROK_HOME:-~/.grok}/active_sessions.json` and the
+session's authoritative `updates.jsonl` stream. The live process, TTY, session
+id, and Grok command must agree, and only a `turn_completed` timestamp at least
+as new as the busy marker clears it. A previous turn's completion therefore
+cannot clear a newly submitted turn. Other AI Tools remain hook/plugin-driven.
 
 ### Kimi Code hooks
 
@@ -195,6 +226,7 @@ colour.
 | Path | Role |
 |------|------|
 | `bin/tmux-window-wrap` | `plan` / `render` / `animate` / `invalidate` CLI |
+| `lib/agent_activity.py` | shared report/resolution policy and AI Tool evidence adapters |
 | `conf/tmux-window-wrap.conf` | Public fragment: `status-format` + lifecycle hooks |
 | `tests/test_tmux_window_wrap.py` | Unit + live tmux tests |
 

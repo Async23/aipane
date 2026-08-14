@@ -2,13 +2,28 @@
 import argparse
 import json
 import os
-import select
 import subprocess
 import sys
 import time
 import traceback
 import unicodedata
 import uuid
+from pathlib import Path
+
+
+LIB_DIR = Path(__file__).resolve().parents[1] / "lib"
+if str(LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(LIB_DIR))
+
+import agent_activity as activity_domain
+from agent_activity import (
+    AgentActivity,
+    PaneActivity,
+    claude_idle_supersedes_marker,
+    grok_idle_supersedes_marker,
+    is_grok_command,
+    pane_activity_lock,
+)
 
 
 WINDOW_SEPARATOR = "\x1f"
@@ -17,6 +32,7 @@ PANE_ACTIVITY_OPTION = "@tmux-window-wrap-activity"
 PANE_ACTIVITY_REFERENCE = "#{" + PANE_ACTIVITY_OPTION + "}"
 PANE_ACTIVITY_REPORTER_OPTION = "@tmux-window-wrap-activity-reporter"
 PANE_ACTIVITY_UPDATED_AT_OPTION = "@tmux-window-wrap-activity-updated-at"
+PANE_ACTIVITY_RECORD_OPTION = "@tmux-window-wrap-activity-record"
 MARKED_BUSY_PANE_FORMAT = (
     "#{&&:#{m/r:^.+$,"
     + PANE_ACTIVITY_REFERENCE
@@ -32,6 +48,7 @@ ACTIVITY_LEVEL_SEQUENCE = (
     *range(ACTIVITY_LEVEL_COUNT - 2, 0, -1),
 )
 DEFAULT_ACTIVITY_FPS = 20
+ACTIVITY_REPAIR_CANDIDATES = {}
 ANIMATION_TICK_OPTION = "@tmux-window-wrap-animation-tick"
 COLOR_SCHEME_OPTION = "@tmux-window-wrap-color-scheme"
 DEFAULT_PANE_COUNT_STYLE = "subscript"
@@ -594,30 +611,12 @@ def tmux_has_sessions(socket_name):
     return bool(completed.stdout.splitlines())
 
 
-def process_is_running(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+def is_codex_command(current_command):
+    return current_command == "codex" or current_command.startswith("codex-")
 
 
-def process_tty(pid):
-    try:
-        completed = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "tty="],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-    except OSError:
-        return ""
-    tty = completed.stdout.strip()
-    if completed.returncode != 0 or tty in {"", "?", "??", "-"}:
-        return ""
-    return tty.removeprefix("/dev/")
+process_is_running = activity_domain.process_is_running
+process_tty = activity_domain.process_tty
 
 
 def load_claude_session_states(
@@ -626,87 +625,176 @@ def load_claude_session_states(
     process_exists=None,
     process_tty_lookup=None,
 ):
-    # Claude writes this registry independently of lifecycle hooks, so it stays
-    # usable when a hard API failure returns to the prompt without an idle hook.
+    return activity_domain.load_claude_session_states(
+        targets,
+        environment,
+        process_exists or process_is_running,
+        process_tty_lookup or process_tty,
+    )
+
+
+def load_grok_session_states(
+    ttys=None,
+    environment=None,
+    process_exists=None,
+    process_tty_lookup=None,
+):
+    return activity_domain.load_grok_session_states(
+        ttys,
+        environment,
+        process_exists or process_is_running,
+        process_tty_lookup or process_tty,
+    )
+
+
+def _repair_pane_activity_unlocked(socket_name, pane, view):
+    (
+        _attached,
+        _target,
+        pane_id,
+        _pane_tty,
+        marker,
+        owner,
+        marker_updated_at,
+        _reporter,
+        record,
+        _socket_path,
+        _server_pid,
+    ) = pane
+    current_record = run_tmux(
+        socket_name,
+        "show-options",
+        "-p",
+        "-q",
+        "-v",
+        "-t",
+        pane_id,
+        PANE_ACTIVITY_RECORD_OPTION,
+    ).stdout.strip()
+    current_marker = run_tmux(
+        socket_name,
+        "show-options",
+        "-p",
+        "-q",
+        "-v",
+        "-t",
+        pane_id,
+        PANE_ACTIVITY_OPTION,
+    ).stdout.strip()
+    current_updated_at = run_tmux(
+        socket_name,
+        "show-options",
+        "-p",
+        "-q",
+        "-v",
+        "-t",
+        pane_id,
+        PANE_ACTIVITY_UPDATED_AT_OPTION,
+    ).stdout.strip()
+    current_identity = run_tmux(
+        socket_name,
+        "display-message",
+        "-p",
+        "-t",
+        pane_id,
+        WINDOW_SEPARATOR.join(
+            (
+                "#{pane_current_command}",
+                "#{pane_tty}",
+                "#{socket_path}",
+                "#{pid}",
+            )
+        ),
+    ).stdout.strip()
+    expected_identity = WINDOW_SEPARATOR.join(
+        (owner, _pane_tty, _socket_path, _server_pid)
+    )
+    if (
+        current_record != record
+        or current_marker != marker
+        or current_updated_at != marker_updated_at
+        or current_identity != expected_identity
+    ):
+        return False
+
+    fresh = AgentActivity().resolve(
+        PaneActivity(
+            pane_id=pane_id,
+            current_command=owner,
+            target=_target,
+            pane_tty=_pane_tty,
+            socket_path=_socket_path,
+            server_pid=_server_pid,
+            marker=current_marker,
+            reporter=_reporter,
+            marker_updated_at=current_updated_at,
+            record=current_record,
+        )
+    )
+    if (
+        fresh.state != view.state
+        or fresh.evidence_turn_id != getattr(view, "evidence_turn_id", "")
+        or not fresh.repairable
+    ):
+        return False
+
+    run_tmux(
+        socket_name,
+        "set-option",
+        "-p",
+        "-t",
+        pane_id,
+        PANE_ACTIVITY_RECORD_OPTION,
+        fresh.repair_record,
+    )
+    if view.state == "idle":
+        if current_marker:
+            run_tmux(
+                socket_name,
+                "set-option",
+                "-p",
+                "-u",
+                "-t",
+                pane_id,
+                PANE_ACTIVITY_OPTION,
+            )
+        if current_updated_at:
+            run_tmux(
+                socket_name,
+                "set-option",
+                "-p",
+                "-u",
+                "-t",
+                pane_id,
+                PANE_ACTIVITY_UPDATED_AT_OPTION,
+            )
+    elif view.state == "busy" and current_marker != owner:
+        run_tmux(
+            socket_name,
+            "set-option",
+            "-p",
+            "-t",
+            pane_id,
+            PANE_ACTIVITY_UPDATED_AT_OPTION,
+            str(time.time_ns() // 1_000_000),
+        )
+        run_tmux(
+            socket_name,
+            "set-option",
+            "-p",
+            "-t",
+            pane_id,
+            PANE_ACTIVITY_OPTION,
+            owner,
+        )
+    return True
+
+
+def repair_pane_activity(socket_name, pane, view, environment=None):
     if environment is None:
         environment = os.environ
-    if process_exists is None:
-        process_exists = process_is_running
-    if process_tty_lookup is None:
-        process_tty_lookup = process_tty
-    config_dir = environment.get("CLAUDE_CONFIG_DIR")
-    if not config_dir:
-        home = environment.get("HOME") or os.path.expanduser("~")
-        config_dir = os.path.join(home, ".claude")
-    sessions_dir = os.path.join(config_dir, "sessions")
-
-    try:
-        entries = os.scandir(sessions_dir)
-    except OSError:
-        return {}
-
-    states = {}
-    with entries:
-        for entry in entries:
-            try:
-                if not entry.name.endswith(".json") or not entry.is_file():
-                    continue
-                with open(entry.path, encoding="utf-8") as handle:
-                    record = json.load(handle)
-                pid = record.get("pid")
-                target = record.get("tmux")
-                status = record.get("status")
-                updated_at = record.get("statusUpdatedAt")
-                version = record.get("version")
-                if (
-                    not isinstance(pid, int)
-                    or pid <= 0
-                    or not isinstance(target, str)
-                    or not target
-                    or not isinstance(status, str)
-                    or not isinstance(updated_at, (int, float))
-                    or isinstance(updated_at, bool)
-                    or not isinstance(version, str)
-                    or (targets is not None and target not in targets)
-                    or not process_exists(pid)
-                ):
-                    continue
-                tty = process_tty_lookup(pid)
-                if not tty:
-                    continue
-            except (AttributeError, OSError, TypeError, ValueError):
-                continue
-
-            state = {
-                "pid": pid,
-                "status": status,
-                "updated_at": int(updated_at),
-                "version": version,
-                "tty": tty,
-            }
-            previous = states.get(target)
-            if previous is None or state["updated_at"] > previous["updated_at"]:
-                states[target] = state
-    return states
-
-
-def claude_idle_supersedes_marker(
-    state,
-    current_command,
-    pane_tty,
-    marker_updated_at,
-):
-    if not state or state["status"] != "idle":
-        return False
-    if current_command != state["version"] and current_command != "claude":
-        return False
-    if pane_tty.removeprefix("/dev/") != state["tty"]:
-        return False
-    try:
-        marker_timestamp = int(marker_updated_at)
-    except (TypeError, ValueError):
-        marker_timestamp = 0
-    return state["updated_at"] >= marker_timestamp
+    with pane_activity_lock(socket_name, pane[2], environment):
+        return _repair_pane_activity_unlocked(socket_name, pane, view)
 
 
 def animation_probe(socket_name):
@@ -726,6 +814,10 @@ def animation_probe(socket_name):
                     PANE_ACTIVITY_REFERENCE,
                     "#{pane_current_command}",
                     "#{" + PANE_ACTIVITY_UPDATED_AT_OPTION + "}",
+                    "#{" + PANE_ACTIVITY_REPORTER_OPTION + "}",
+                    "#{" + PANE_ACTIVITY_RECORD_OPTION + "}",
+                    "#{socket_path}",
+                    "#{pid}",
                 )
             ),
         )
@@ -752,6 +844,11 @@ def animation_probe(socket_name):
     owner = None
     panes = []
     for record in records:
+        fields = record.split(WINDOW_SEPARATOR)
+        if len(fields) == 8:
+            fields.extend(("", "", "", ""))
+        if len(fields) != 12:
+            continue
         (
             record_owner,
             attached,
@@ -761,7 +858,11 @@ def animation_probe(socket_name):
             activity_source,
             current_command,
             marker_updated_at,
-        ) = record.split(WINDOW_SEPARATOR, 7)
+            activity_reporter,
+            activity_record,
+            socket_path,
+            server_pid,
+        ) = fields
         panes.append(
             (
                 attached,
@@ -771,6 +872,10 @@ def animation_probe(socket_name):
                 activity_source,
                 current_command,
                 marker_updated_at,
+                activity_reporter,
+                activity_record,
+                socket_path,
+                server_pid,
             )
         )
         if owner is None:
@@ -788,22 +893,101 @@ def animation_probe(socket_name):
         if marked_panes
         else {}
     )
-    for (
-        attached,
-        target,
-        pane_id,
-        pane_tty,
-        activity_source,
-        current_command,
-        marker_updated_at,
-    ) in panes:
+    marked_grok_ttys = {
+        pane[3].removeprefix("/dev/")
+        for pane in marked_panes
+        if is_grok_command(pane[5])
+    }
+    grok_states = (
+        load_grok_session_states(marked_grok_ttys)
+        if marked_grok_ttys
+        else {}
+    )
+    activity_resolver = AgentActivity()
+    for pane in panes:
+        (
+            attached,
+            target,
+            pane_id,
+            pane_tty,
+            activity_source,
+            current_command,
+            marker_updated_at,
+            activity_reporter,
+            activity_record,
+            socket_path,
+            server_pid,
+        ) = pane
         marked_busy = (
             bool(activity_source)
             and activity_source == current_command
         )
+        codex_candidate = (
+            attached != "0"
+            and is_codex_command(current_command)
+            and (
+                marked_busy
+                or bool(activity_record)
+                or activity_reporter == current_command
+            )
+        )
+        if codex_candidate:
+            view = activity_resolver.resolve(
+                PaneActivity(
+                        pane_id=pane_id,
+                        current_command=current_command,
+                        target=target,
+                    pane_tty=pane_tty,
+                    socket_path=socket_path,
+                    server_pid=server_pid,
+                    marker=activity_source,
+                    reporter=activity_reporter,
+                    marker_updated_at=marker_updated_at,
+                    record=activity_record,
+                )
+            )
+            if view.repairable:
+                candidate = (
+                    view.state,
+                    activity_record,
+                    marker_updated_at,
+                    view.evidence_turn_id,
+                    view.reason,
+                )
+                if ACTIVITY_REPAIR_CANDIDATES.get(pane_id) == candidate:
+                    try:
+                        repaired = repair_pane_activity(
+                            socket_name,
+                            pane,
+                            view,
+                        )
+                    except subprocess.CalledProcessError:
+                        repaired = False
+                    if repaired:
+                        ACTIVITY_REPAIR_CANDIDATES.pop(pane_id, None)
+                        cleared = True
+                        if view.state == "busy":
+                            busy = True
+                        continue
+                else:
+                    ACTIVITY_REPAIR_CANDIDATES[pane_id] = candidate
+                if view.state == "busy" or marked_busy:
+                    busy = True
+                continue
+            ACTIVITY_REPAIR_CANDIDATES.pop(pane_id, None)
+            if view.state == "busy" or (
+                view.state == "unknown" and marked_busy
+            ):
+                busy = True
+            continue
         if attached != "0" and marked_busy:
             if claude_idle_supersedes_marker(
                 claude_states.get(target),
+                current_command,
+                pane_tty,
+                marker_updated_at,
+            ) or grok_idle_supersedes_marker(
+                grok_states.get(pane_tty.removeprefix("/dev/")),
                 current_command,
                 pane_tty,
                 marker_updated_at,
@@ -985,12 +1169,13 @@ def invalidate_cache(socket_name):
     refresh_clients(socket_name)
 
 
-def update_pane_activity(
+def _update_pane_activity_unlocked(
     socket_name,
     pane_id,
     state,
     hook_event_name="",
     hook_source="",
+    hook_payload=None,
     environment=None,
 ):
     if environment is None:
@@ -1025,16 +1210,46 @@ def update_pane_activity(
         pane_id,
         PANE_ACTIVITY_UPDATED_AT_OPTION,
     ).stdout.strip()
-    owner = run_tmux(
+    current_record = run_tmux(
+        socket_name,
+        "show-options",
+        "-p",
+        "-q",
+        "-v",
+        "-t",
+        pane_id,
+        PANE_ACTIVITY_RECORD_OPTION,
+    ).stdout.strip()
+    pane_identity = run_tmux(
         socket_name,
         "display-message",
         "-p",
         "-t",
         pane_id,
-        "#{pane_current_command}",
+        WINDOW_SEPARATOR.join(
+            (
+                "#{pane_current_command}",
+                "#{pane_tty}",
+                "#{socket_path}",
+                "#{pid}",
+            )
+        ),
     ).stdout.strip()
+    identity_fields = pane_identity.split(WINDOW_SEPARATOR, 3)
+    owner = identity_fields[0] if identity_fields else ""
+    pane_tty = identity_fields[1] if len(identity_fields) > 1 else ""
+    socket_path = identity_fields[2] if len(identity_fields) > 2 else ""
+    server_pid = identity_fields[3] if len(identity_fields) > 3 else ""
     if not owner:
         raise ValueError(f"pane {pane_id} has no current command")
+    if not isinstance(hook_payload, dict):
+        hook_payload = {}
+    if not hook_event_name:
+        value = hook_payload.get("hook_event_name", "")
+        hook_event_name = value if isinstance(value, str) else ""
+    if not hook_source:
+        value = hook_payload.get("source", "")
+        hook_source = value if isinstance(value, str) else ""
     if ignore_early_codex_idle(
         state,
         hook_event_name,
@@ -1043,7 +1258,39 @@ def update_pane_activity(
         environment,
     ):
         return
+    pane = PaneActivity(
+        pane_id=pane_id,
+        current_command=owner,
+        pane_tty=pane_tty,
+        socket_path=socket_path,
+        server_pid=server_pid,
+        marker=current_activity,
+        reporter=current_reporter,
+        marker_updated_at=current_updated_at,
+        record=current_record,
+    )
+    report = AgentActivity(environment=environment).report(
+        pane,
+        state,
+        hook_payload,
+    )
+    if not report.accepted:
+        return
+    state = report.state
     desired_activity = owner if state == "busy" else ""
+
+    if report.record != current_record:
+        # The versioned record is the safety truth. Compatibility/display
+        # options are projected only after this write succeeds.
+        run_tmux(
+            socket_name,
+            "set-option",
+            "-p",
+            "-t",
+            pane_id,
+            PANE_ACTIVITY_RECORD_OPTION,
+            report.record,
+        )
 
     if state == "busy":
         run_tmux(
@@ -1109,6 +1356,29 @@ def update_pane_activity(
     invalidate_cache(socket_name)
 
 
+def update_pane_activity(
+    socket_name,
+    pane_id,
+    state,
+    hook_event_name="",
+    hook_source="",
+    hook_payload=None,
+    environment=None,
+):
+    if environment is None:
+        environment = os.environ
+    with pane_activity_lock(socket_name, pane_id, environment):
+        return _update_pane_activity_unlocked(
+            socket_name,
+            pane_id,
+            state,
+            hook_event_name=hook_event_name,
+            hook_source=hook_source,
+            hook_payload=hook_payload,
+            environment=environment,
+        )
+
+
 def ignore_early_codex_idle(
     state,
     hook_event_name,
@@ -1127,23 +1397,18 @@ def ignore_early_codex_idle(
     )
 
 
-def read_hook_context(input_stream):
+def read_hook_payload(input_stream):
     if input_stream.isatty():
-        return "", ""
-    try:
-        ready, _, _ = select.select([input_stream], [], [], 0)
-    except (OSError, TypeError, ValueError):
-        # In-memory streams used by callers/tests have no file descriptor but
-        # are safe to read immediately.
-        ready = [input_stream]
-    if not ready:
-        return "", ""
+        return {}
     try:
         payload = json.load(input_stream)
     except (OSError, ValueError):
-        return "", ""
-    if not isinstance(payload, dict):
-        return "", ""
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def read_hook_context(input_stream):
+    payload = read_hook_payload(input_stream)
     hook_event_name = payload.get("hook_event_name", "")
     hook_source = payload.get("source", "")
     return (
@@ -1395,7 +1660,9 @@ def main():
         return
 
     if arguments.command == "activity":
-        hook_event_name, hook_source = read_hook_context(sys.stdin)
+        hook_payload = read_hook_payload(sys.stdin)
+        hook_event_name = hook_payload.get("hook_event_name", "")
+        hook_source = hook_payload.get("source", "")
         try:
             update_pane_activity(
                 arguments.socket_name,
@@ -1403,6 +1670,7 @@ def main():
                 arguments.state,
                 hook_event_name=hook_event_name,
                 hook_source=hook_source,
+                hook_payload=hook_payload,
             )
         except ValueError as error:
             parser.error(str(error))

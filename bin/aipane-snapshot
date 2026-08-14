@@ -29,6 +29,7 @@ STATE_DIR = Path(
 REGISTRY = Path(os.environ.get("AIPANE_REGISTRY") or (STATE_DIR / "registry.jsonl"))
 OUT = STATE_DIR / "coords-last.json"
 TMUX = shlex.split(os.environ.get("AIPANE_TMUX", "tmux"))
+ACTIVITY_RECORD_OPTION = "@tmux-window-wrap-activity-record"
 
 
 def current_server_identity() -> tuple[str, str] | None:
@@ -78,9 +79,13 @@ def latest_by_pane(socket_path: str, server_pid: str) -> dict:
     return result
 
 
-def live_panes() -> list[tuple[str, str, str]]:
-    """[(pane_id %N, 'session:win.pane', cwd), ...] for every current pane."""
-    fmt = "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_path}"
+def live_panes() -> list[tuple[str, str, str, str, str]]:
+    """Return live pane coordinates plus their activity/session projection."""
+    fmt = (
+        "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}"
+        "\t#{pane_current_path}\t#{pane_current_command}"
+        f"\t#{{{ACTIVITY_RECORD_OPTION}}}"
+    )
     try:
         out = subprocess.run(
             [*TMUX, "list-panes", "-a", "-F", fmt],
@@ -93,16 +98,63 @@ def live_panes() -> list[tuple[str, str, str]]:
     for line in out.splitlines():
         parts = line.split("\t")
         if len(parts) == 3:
-            rows.append((parts[0], parts[1], parts[2]))
+            parts.extend(("", ""))
+        elif len(parts) == 4:
+            # Compatibility for fixture/older wrapper output without command.
+            parts.insert(3, "")
+        if len(parts) == 5:
+            rows.append(tuple(parts))
     return rows
+
+
+def activity_binding(
+    pane_id: str,
+    current_command: str,
+    raw: str,
+    server: tuple[str, str] | None,
+) -> dict | None:
+    if not raw:
+        return None
+    try:
+        record = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    root = record.get("root")
+    pane = record.get("pane")
+    owner = record.get("owner")
+    session_id = root.get("session_id") if isinstance(root, dict) else None
+    if (
+        record.get("version") != 1
+        or not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(owner, str)
+        or not (owner == "codex" or owner.startswith("codex-"))
+        or owner != current_command
+        or server is None
+        or not isinstance(pane, dict)
+        or pane.get("id") != pane_id
+        or pane.get("socket") != server[0]
+        or str(pane.get("server_pid", "")) != server[1]
+    ):
+        return None
+    return {"sid": session_id, "tool": "x"}
 
 
 def main() -> int:
     server = current_server_identity()
     by_pane = latest_by_pane(*server) if server else {}
     coords: dict[str, dict] = {}
-    for pane_id, coord, cwd in live_panes():
-        rec = by_pane.get(pane_id)
+    for pane_id, coord, cwd, current_command, activity_record in live_panes():
+        rec = activity_binding(
+            pane_id,
+            current_command,
+            activity_record,
+            server,
+        )
+        if rec is None:
+            rec = by_pane.get(pane_id)
         if not rec or not rec.get("sid"):
             continue  # only useful when we actually have an id (mainly codex)
         coords[coord] = {"sid": rec["sid"], "tool": rec.get("tool", ""), "cwd": cwd}

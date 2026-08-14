@@ -6,12 +6,15 @@ import pty
 import runpy
 import select
 import signal
+import sqlite3
 import struct
 import subprocess
 import termios
 import tempfile
 import time
+import types
 import unittest
+import urllib.parse
 import uuid
 from pathlib import Path
 from unittest import mock
@@ -259,6 +262,87 @@ class WindowWrapCliTests(unittest.TestCase):
         )
 
         self.assertEqual(invalidations, [])
+
+    def test_codex_busy_report_writes_exact_activity_record_first(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        update_pane_activity = namespace["update_pane_activity"]
+        script_globals = update_pane_activity.__globals__
+        activity_class = namespace.get("AgentActivity")
+        events = []
+
+        def fake_run_tmux(_socket_name, *arguments):
+            events.append(arguments)
+            if arguments[0] == "show-options":
+                value = ""
+            elif arguments[0] == "display-message":
+                value = namespace["WINDOW_SEPARATOR"].join(
+                    (
+                        "codex",
+                        "/dev/ttys031",
+                        "/private/tmp/tmux/default",
+                        "30402",
+                    )
+                )
+            elif arguments[0] == "set-option":
+                value = ""
+            else:
+                raise AssertionError(arguments)
+            return subprocess.CompletedProcess(
+                ["tmux", *arguments],
+                0,
+                stdout=value + "\n",
+                stderr="",
+            )
+
+        script_globals["run_tmux"] = fake_run_tmux
+        script_globals["invalidate_cache"] = lambda socket: events.append(
+            ("invalidate-cache", socket)
+        )
+        script_globals["AgentActivity"] = lambda **_kwargs: activity_class(
+            environment={"CODEX_HOME": "/tmp/codex"},
+            process_identity=lambda _pane: {
+                "pid": 6322,
+                "started_at": "Fri Aug 14 19:00:41 2026",
+            },
+        )
+
+        update_pane_activity(
+            "test-socket",
+            "%12",
+            "busy",
+            hook_payload={
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+                "transcript_path": "/tmp/codex/sessions/turn-1.jsonl",
+            },
+        )
+
+        record_write = next(
+            event
+            for event in events
+            if event[:5]
+            == (
+                "set-option",
+                "-p",
+                "-t",
+                "%12",
+                "@tmux-window-wrap-activity-record",
+            )
+        )
+        marker_write = events.index(
+            (
+                "set-option",
+                "-p",
+                "-t",
+                "%12",
+                "@tmux-window-wrap-activity",
+                "codex",
+            )
+        )
+        self.assertLess(events.index(record_write), marker_write)
+        record = json.loads(record_write[-1])
+        self.assertEqual(record["root"]["turn_id"], "turn-1")
 
     def test_animator_invalidates_cache_when_color_scheme_changes(self):
         namespace = runpy.run_path(str(SCRIPT))
@@ -533,6 +617,608 @@ class WindowWrapCliTests(unittest.TestCase):
         )
         self.assertFalse(supersedes(idle, "grok", "/dev/ttys007", "1000"))
         self.assertFalse(supersedes(idle, "2.1.229", "/dev/ttys008", "1000"))
+
+    def test_animation_probe_clears_marker_after_grok_cancelled_turn(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        animation_probe = namespace["animation_probe"]
+        script_globals = animation_probe.__globals__
+        separator = namespace["WINDOW_SEPARATOR"]
+        events = []
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            grok_home = Path(raw_tmp) / ".grok"
+            workspace = Path(raw_tmp) / "workspace"
+            session_id = "e841e6b4-e97e-4ef1-b0b8-a321c7e9f7ce"
+            session_dir = (
+                grok_home
+                / "sessions"
+                / urllib.parse.quote(str(workspace), safe="")
+                / session_id
+            )
+            session_dir.mkdir(parents=True)
+            (grok_home / "active_sessions.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "session_id": session_id,
+                            "pid": os.getpid(),
+                            "cwd": str(workspace),
+                            "opened_at": "2026-08-14T02:59:46.917119Z",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (session_dir / "updates.jsonl").write_text(
+                "\n".join(
+                    (
+                        json.dumps(
+                            {
+                                "timestamp": 1_786_700_390,
+                                "params": {
+                                    "update": {
+                                        "sessionUpdate": "hook_execution",
+                                        "event_name": "user_prompt_submit",
+                                    },
+                                    "_meta": {
+                                        "agentTimestampMs": 1_786_700_390_013,
+                                    },
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": 1_786_700_391,
+                                "params": {
+                                    "update": {
+                                        "sessionUpdate": "turn_completed",
+                                        "stop_reason": "cancelled",
+                                    },
+                                    "_meta": {
+                                        "agentTimestampMs": 1_786_700_391_390,
+                                        "cancelTrigger": "esc",
+                                    },
+                                },
+                            }
+                        ),
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            def fake_run_tmux(_socket_name, *arguments):
+                events.append(arguments)
+                if arguments[0] == "list-panes":
+                    record = separator.join(
+                        (
+                            "owner",
+                            "1",
+                            "work:@8.%7",
+                            "%7",
+                            "/dev/ttys023",
+                            "grok-1.0.3-maco",
+                            "grok-1.0.3-maco",
+                            "1786700389907",
+                        )
+                    )
+                    stdout = record + "\n"
+                else:
+                    stdout = ""
+                return subprocess.CompletedProcess(
+                    ["tmux", *arguments],
+                    0,
+                    stdout=stdout,
+                    stderr="",
+                )
+
+            script_globals["run_tmux"] = fake_run_tmux
+            script_globals["process_tty"] = lambda _pid: "ttys023"
+            script_globals["invalidate_cache"] = lambda socket: events.append(
+                ("invalidate-cache", socket)
+            )
+            with mock.patch.dict(os.environ, {"GROK_HOME": str(grok_home)}):
+                self.assertEqual(
+                    animation_probe("test-socket"),
+                    ("owner", False),
+                )
+
+        self.assertIn(
+            (
+                "set-option",
+                "-p",
+                "-u",
+                "-t",
+                "%7",
+                "@tmux-window-wrap-activity",
+            ),
+            events,
+        )
+        self.assertIn(("invalidate-cache", "test-socket"), events)
+
+    def test_animation_probe_repairs_stale_codex_busy_after_stable_evidence(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        animation_probe = namespace["animation_probe"]
+        script_globals = animation_probe.__globals__
+        activity_class = namespace["AgentActivity"]
+        separator = namespace["WINDOW_SEPARATOR"]
+        events = []
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            codex_home = Path(raw_tmp) / ".codex"
+            transcript = (
+                codex_home
+                / "sessions"
+                / "2026"
+                / "08"
+                / "14"
+                / "rollout-2026-08-14T19-00-41-thread-1.jsonl"
+            )
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_complete",
+                            "turn_id": "turn-1",
+                            "error": {"message": "remote compact failed"},
+                            "completed_at": 1_786_707_036,
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            history = sqlite3.connect(codex_home / "thread_history_1.sqlite")
+            try:
+                history.executescript(
+                    """
+                    CREATE TABLE thread_turns (
+                        thread_id TEXT NOT NULL,
+                        turn_id TEXT NOT NULL,
+                        rollout_ordinal INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        completed_at INTEGER,
+                        PRIMARY KEY (thread_id, turn_id)
+                    );
+                    CREATE TABLE thread_history_projection_state (
+                        thread_id TEXT PRIMARY KEY,
+                        next_rollout_byte_offset INTEGER NOT NULL,
+                        next_rollout_ordinal INTEGER NOT NULL
+                    );
+                    """
+                )
+                history.execute(
+                    "INSERT INTO thread_turns VALUES (?, ?, ?, ?, ?)",
+                    ("thread-1", "turn-1", 1, "failed", 1_786_707_036),
+                )
+                history.execute(
+                    "INSERT INTO thread_history_projection_state VALUES (?, ?, ?)",
+                    ("thread-1", transcript.stat().st_size, 2),
+                )
+                history.commit()
+            finally:
+                history.close()
+
+            record = json.dumps(
+                {
+                    "version": 1,
+                    "revision": "revision-1",
+                    "generation": "generation-1",
+                    "owner": "codex",
+                    "reported": "busy",
+                    "updated_at": 1_786_706_587_976,
+                    "pane": {
+                        "id": "%7",
+                        "tty": "/dev/ttys031",
+                        "socket": "/private/tmp/tmux/default",
+                        "server_pid": "30402",
+                    },
+                    "process": {"pid": 6322, "started_at": "process-1"},
+                    "root": {
+                        "session_id": "thread-1",
+                        "turn_id": "turn-1",
+                        "transcript_path": str(transcript),
+                        "codex_home": str(codex_home),
+                    },
+                },
+                separators=(",", ":"),
+            )
+
+            def fake_run_tmux(_socket_name, *arguments):
+                events.append(arguments)
+                if arguments[0] == "list-panes":
+                    value = separator.join(
+                        (
+                            "owner",
+                            "1",
+                            "work:@8.%7",
+                            "%7",
+                            "/dev/ttys031",
+                            "codex",
+                            "codex",
+                            "1786706587976",
+                            "codex",
+                            record,
+                            "/private/tmp/tmux/default",
+                            "30402",
+                        )
+                    )
+                elif arguments[0] == "show-options":
+                    option = arguments[-1]
+                    value = {
+                        "@tmux-window-wrap-activity": "codex",
+                        "@tmux-window-wrap-activity-updated-at": "1786706587976",
+                        "@tmux-window-wrap-activity-record": record,
+                    }.get(option, "codex")
+                elif arguments[0] == "display-message":
+                    value = separator.join(
+                        (
+                            "codex",
+                            "/dev/ttys031",
+                            "/private/tmp/tmux/default",
+                            "30402",
+                        )
+                    )
+                else:
+                    value = ""
+                return subprocess.CompletedProcess(
+                    ["tmux", *arguments],
+                    0,
+                    stdout=value + "\n",
+                    stderr="",
+                )
+
+            script_globals["run_tmux"] = fake_run_tmux
+            script_globals["AgentActivity"] = lambda **_kwargs: activity_class(
+                process_matches=lambda _process, _pane: True,
+            )
+            script_globals["invalidate_cache"] = lambda socket: events.append(
+                ("invalidate-cache", socket)
+            )
+
+            self.assertEqual(animation_probe("test-socket"), ("owner", True))
+            self.assertEqual(animation_probe("test-socket"), ("owner", False))
+
+        self.assertIn(
+            (
+                "set-option",
+                "-p",
+                "-u",
+                "-t",
+                "%7",
+                "@tmux-window-wrap-activity",
+            ),
+            events,
+        )
+
+    def test_animation_probe_promotes_missed_codex_busy_hook(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        animation_probe = namespace["animation_probe"]
+        script_globals = animation_probe.__globals__
+        activity_class = namespace["AgentActivity"]
+        separator = namespace["WINDOW_SEPARATOR"]
+        events = []
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            codex_home = Path(raw_tmp) / ".codex"
+            transcript = (
+                codex_home
+                / "sessions"
+                / "2026"
+                / "08"
+                / "14"
+                / "rollout-2026-08-14T19-00-41-thread-running.jsonl"
+            )
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_started",
+                            "turn_id": "turn-running",
+                            "started_at": 1_786_707_100,
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            history = sqlite3.connect(codex_home / "thread_history_1.sqlite")
+            try:
+                history.executescript(
+                    """
+                    CREATE TABLE thread_turns (
+                        thread_id TEXT NOT NULL,
+                        turn_id TEXT NOT NULL,
+                        rollout_ordinal INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        completed_at INTEGER,
+                        PRIMARY KEY (thread_id, turn_id)
+                    );
+                    CREATE TABLE thread_history_projection_state (
+                        thread_id TEXT PRIMARY KEY,
+                        next_rollout_byte_offset INTEGER NOT NULL,
+                        next_rollout_ordinal INTEGER NOT NULL
+                    );
+                    """
+                )
+                history.execute(
+                    "INSERT INTO thread_turns VALUES (?, ?, ?, ?, ?)",
+                    ("thread-running", "turn-running", 1, "inProgress", None),
+                )
+                history.execute(
+                    "INSERT INTO thread_history_projection_state VALUES (?, ?, ?)",
+                    ("thread-running", transcript.stat().st_size, 2),
+                )
+                history.commit()
+            finally:
+                history.close()
+            record = json.dumps(
+                {
+                    "version": 1,
+                    "revision": "revision-idle",
+                    "generation": "generation-session",
+                    "owner": "codex",
+                    "reported": "idle",
+                    "updated_at": 1_786_707_000_000,
+                    "pane": {
+                        "id": "%7",
+                        "tty": "/dev/ttys031",
+                        "socket": "/private/tmp/tmux/default",
+                        "server_pid": "30402",
+                    },
+                    "process": {"pid": 6322, "started_at": "process-1"},
+                    "root": {
+                        "session_id": "thread-running",
+                        "turn_id": "",
+                        "transcript_path": str(transcript),
+                        "codex_home": str(codex_home),
+                    },
+                },
+                separators=(",", ":"),
+            )
+
+            def fake_run_tmux(_socket_name, *arguments):
+                events.append(arguments)
+                if arguments[0] == "list-panes":
+                    value = separator.join(
+                        (
+                            "owner",
+                            "1",
+                            "work:@8.%7",
+                            "%7",
+                            "/dev/ttys031",
+                            "",
+                            "codex",
+                            "",
+                            "codex",
+                            record,
+                            "/private/tmp/tmux/default",
+                            "30402",
+                        )
+                    )
+                elif arguments[0] == "show-options":
+                    value = {
+                        "@tmux-window-wrap-activity-record": record,
+                        "@tmux-window-wrap-activity-reporter": "codex",
+                    }.get(arguments[-1], "")
+                elif arguments[0] == "display-message":
+                    value = separator.join(
+                        (
+                            "codex",
+                            "/dev/ttys031",
+                            "/private/tmp/tmux/default",
+                            "30402",
+                        )
+                    )
+                else:
+                    value = ""
+                return subprocess.CompletedProcess(
+                    ["tmux", *arguments],
+                    0,
+                    stdout=value + "\n",
+                    stderr="",
+                )
+
+            script_globals["run_tmux"] = fake_run_tmux
+            script_globals["AgentActivity"] = lambda **_kwargs: activity_class(
+                process_matches=lambda _process, _pane: True,
+            )
+            script_globals["invalidate_cache"] = lambda socket: events.append(
+                ("invalidate-cache", socket)
+            )
+
+            self.assertEqual(animation_probe("test-socket"), ("owner", True))
+            self.assertEqual(animation_probe("test-socket"), ("owner", True))
+
+        self.assertIn(
+            (
+                "set-option",
+                "-p",
+                "-t",
+                "%7",
+                "@tmux-window-wrap-activity",
+                "codex",
+            ),
+            events,
+        )
+
+    def test_activity_repair_rejects_reused_pane_identity(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        repair = namespace["repair_pane_activity"]
+        script_globals = repair.__globals__
+        events = []
+        pane = (
+            "1",
+            "work:@8.%7",
+            "%7",
+            "/dev/ttys031",
+            "codex",
+            "codex",
+            "1000",
+            "codex",
+            "old-record",
+            "/private/tmp/tmux/default",
+            "30402",
+        )
+        view = types.SimpleNamespace(
+            state="idle",
+            repair_record="new-record",
+        )
+
+        def fake_run_tmux(_socket_name, *arguments):
+            events.append(arguments)
+            if arguments[0] == "show-options":
+                value = {
+                    "@tmux-window-wrap-activity-record": "old-record",
+                    "@tmux-window-wrap-activity": "codex",
+                    "@tmux-window-wrap-activity-updated-at": "1000",
+                }[arguments[-1]]
+            elif arguments[0] == "display-message":
+                value = namespace["WINDOW_SEPARATOR"].join(
+                    (
+                        "codex",
+                        "/dev/ttys099",
+                        "/private/tmp/tmux/default",
+                        "30402",
+                    )
+                )
+            else:
+                value = ""
+            return subprocess.CompletedProcess(
+                ["tmux", *arguments],
+                0,
+                stdout=value + "\n",
+                stderr="",
+            )
+
+        script_globals["run_tmux"] = fake_run_tmux
+
+        self.assertFalse(repair("test-socket", pane, view))
+        self.assertFalse(any(event[0] == "set-option" for event in events))
+
+    def test_activity_repair_revalidates_agent_process_inside_lock(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        repair = namespace["repair_pane_activity"]
+        script_globals = repair.__globals__
+        events = []
+        old_record = json.dumps(
+            {
+                "version": 1,
+                "revision": "revision-old-process",
+                "generation": "generation-old-process",
+                "owner": "python3",
+                "reported": "busy",
+                "updated_at": 1_000,
+                "pane": {
+                    "id": "%7",
+                    "tty": "",
+                    "socket": "/private/tmp/tmux/default",
+                    "server_pid": "30402",
+                },
+                "process": {
+                    "pid": os.getpid(),
+                    "started_at": "Mon Jan 01 00:00:00 2001",
+                },
+            },
+            separators=(",", ":"),
+        )
+        pane = (
+            "1",
+            "work:@8.%7",
+            "%7",
+            "",
+            "python3",
+            "python3",
+            "1000",
+            "python3",
+            old_record,
+            "/private/tmp/tmux/default",
+            "30402",
+        )
+        view = types.SimpleNamespace(
+            state="idle",
+            reason="terminal",
+            evidence_turn_id="turn-1",
+            repair_record="new-record",
+        )
+
+        def fake_run_tmux(_socket_name, *arguments):
+            events.append(arguments)
+            if arguments[0] == "show-options":
+                value = {
+                    "@tmux-window-wrap-activity-record": old_record,
+                    "@tmux-window-wrap-activity": "python3",
+                    "@tmux-window-wrap-activity-updated-at": "1000",
+                }[arguments[-1]]
+            elif arguments[0] == "display-message":
+                value = namespace["WINDOW_SEPARATOR"].join(
+                    (
+                        "python3",
+                        "",
+                        "/private/tmp/tmux/default",
+                        "30402",
+                    )
+                )
+            else:
+                value = ""
+            return subprocess.CompletedProcess(
+                ["tmux", *arguments],
+                0,
+                stdout=value + "\n",
+                stderr="",
+            )
+
+        script_globals["run_tmux"] = fake_run_tmux
+
+        self.assertFalse(repair("test-socket", pane, view))
+        self.assertFalse(any(event[0] == "set-option" for event in events))
+
+    def test_grok_completion_cannot_clear_a_newer_busy_marker(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        supersedes = namespace["grok_idle_supersedes_marker"]
+        idle = {
+            "status": "idle",
+            "updated_at": 1_786_700_391_390,
+            "stop_reason": "cancelled",
+            "pid": os.getpid(),
+            "session_id": "e841e6b4-e97e-4ef1-b0b8-a321c7e9f7ce",
+            "tty": "ttys023",
+        }
+
+        self.assertTrue(
+            supersedes(
+                idle,
+                "grok-1.0.3-maco",
+                "/dev/ttys023",
+                "1786700391390",
+            )
+        )
+        self.assertFalse(
+            supersedes(
+                idle,
+                "grok-1.0.3-maco",
+                "/dev/ttys023",
+                "1786700391391",
+            )
+        )
+        self.assertFalse(
+            supersedes(idle, "grok-1.0.3-maco", "/dev/ttys023", "")
+        )
+        self.assertFalse(
+            supersedes(idle, "codex", "/dev/ttys023", "1786700390000")
+        )
+        self.assertFalse(
+            supersedes(
+                idle,
+                "grok-1.0.3-maco",
+                "/dev/ttys024",
+                "1786700390000",
+            )
+        )
 
     def test_windows_stay_on_one_line_when_they_fit(self):
         result = self.run_plan(

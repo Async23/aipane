@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
 import textwrap
@@ -150,6 +151,7 @@ class AiRestartTests(unittest.TestCase):
             environment["TEST_RESTORE_LEAVES_SHELL"] = "1"
         if getattr(self, "plan_invalid", False):
             environment["TEST_PLAN_INVALID"] = "1"
+        environment.update(getattr(self, "extra_environment", {}))
         return environment
 
     def run_restart(self, *arguments):
@@ -283,6 +285,154 @@ class AiRestartTests(unittest.TestCase):
         ).stdout.strip()
         self.assertEqual(Path(restored_cwd).resolve(), self.tmp.resolve())
         self.assertIn("--dump", self.restore_log.read_text())
+
+    def test_dry_run_resolves_terminal_codex_without_repairing_marker(self):
+        fake_codex = self.tmp / "codex"
+        fake_codex_source = self.tmp / "codex.c"
+        fake_codex_source.write_text(
+            "#include <unistd.h>\nint main(void) { sleep(120); return 0; }\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            ["cc", str(fake_codex_source), "-o", str(fake_codex)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.tmux(
+            "respawn-pane",
+            "-k",
+            "-t",
+            self.target,
+            str(fake_codex),
+            "120",
+        )
+        self.assertEqual(self.current_command(), "codex")
+
+        codex_home = self.tmp / ".codex"
+        transcript = (
+            codex_home
+            / "sessions"
+            / "2026"
+            / "08"
+            / "14"
+            / "rollout-2026-08-14T19-00-41-thread-restart.jsonl"
+        )
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "turn_id": "turn-restart",
+                        "error": {"message": "remote compact failed"},
+                        "completed_at": 1_786_707_036,
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        history = sqlite3.connect(codex_home / "thread_history_1.sqlite")
+        try:
+            history.executescript(
+                """
+                CREATE TABLE thread_turns (
+                    thread_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    rollout_ordinal INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    completed_at INTEGER,
+                    PRIMARY KEY (thread_id, turn_id)
+                );
+                CREATE TABLE thread_history_projection_state (
+                    thread_id TEXT PRIMARY KEY,
+                    next_rollout_byte_offset INTEGER NOT NULL,
+                    next_rollout_ordinal INTEGER NOT NULL
+                );
+                """
+            )
+            history.execute(
+                "INSERT INTO thread_turns VALUES (?, ?, ?, ?, ?)",
+                (
+                    "thread-restart",
+                    "turn-restart",
+                    1,
+                    "failed",
+                    1_786_707_036,
+                ),
+            )
+            history.execute(
+                "INSERT INTO thread_history_projection_state VALUES (?, ?, ?)",
+                ("thread-restart", transcript.stat().st_size, 2),
+            )
+            history.commit()
+        finally:
+            history.close()
+        identity = self.tmux(
+            "display-message",
+            "-p",
+            "-t",
+            self.target,
+            "#{pane_id}\t#{pane_tty}\t#{socket_path}\t#{pid}\t#{pane_pid}",
+        ).stdout.strip().split("\t")
+        pane_id, pane_tty, socket_path, server_pid, process_pid = identity
+        process_started_at = subprocess.run(
+            ["ps", "-p", process_pid, "-o", "lstart="],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        record = json.dumps(
+            {
+                "version": 1,
+                "revision": "revision-restart",
+                "generation": "generation-restart",
+                "owner": "codex",
+                "reported": "busy",
+                "updated_at": 1_786_706_587_976,
+                "pane": {
+                    "id": pane_id,
+                    "tty": pane_tty,
+                    "socket": socket_path,
+                    "server_pid": server_pid,
+                },
+                "process": {
+                    "pid": int(process_pid),
+                    "started_at": process_started_at,
+                },
+                "root": {
+                    "session_id": "thread-restart",
+                    "turn_id": "turn-restart",
+                    "transcript_path": str(transcript),
+                    "codex_home": str(codex_home),
+                },
+            },
+            separators=(",", ":"),
+        )
+        for option, value in (
+            ("@tmux-window-wrap-activity", "codex"),
+            ("@tmux-window-wrap-activity-reporter", "codex"),
+            ("@tmux-window-wrap-activity-updated-at", "1786706587976"),
+            ("@tmux-window-wrap-activity-record", record),
+        ):
+            self.tmux("set-option", "-p", "-t", self.target, option, value)
+        self.extra_environment = {"CODEX_HOME": str(codex_home)}
+
+        result = self.run_restart("--dry-run")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("idle", result.stdout)
+        self.assertNotIn("BUSY", result.stdout)
+        marker = self.tmux(
+            "show-options",
+            "-pqv",
+            "-t",
+            self.target,
+            "@tmux-window-wrap-activity",
+        ).stdout.strip()
+        self.assertEqual(marker, "codex")
 
 
 if __name__ == "__main__":

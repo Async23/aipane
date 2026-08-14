@@ -192,11 +192,13 @@ ai-restart --force    # allow panes currently marked busy
 ```
 
 The default command aborts the whole operation if any selected Agent Activity
-marker is busy. For an older Agent process that has not reported its state, the
-interactive command shows `unknown` and requires an explicit confirmation that
-all tasks are idle. `--yes` alone never accepts `unknown`; `--force` is the
-non-interactive override. Run the command from a separate terminal outside
-tmux so it can safely replace every selected AI pane. This requires
+is effectively busy. It resolves Codex turns from exact lifecycle evidence
+before the plan and again after confirmation; `--dry-run` remains read-only.
+Missing, stale, or inconsistent evidence is shown as `unknown` and requires an
+explicit interactive confirmation that all tasks are idle. `--yes` alone never
+accepts `unknown`; `--force` is the non-interactive override. Run the command
+from a separate terminal outside tmux so it can safely replace every selected
+AI pane. This requires
 tmux-resurrect and the session-restore hooks described in
 [`docs/session-restore-design.md`](docs/session-restore-design.md).
 
@@ -253,6 +255,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 ├── init.zsh                 # zsh entrypoint
 ├── aipane.zsh               # compatibility entrypoint
 ├── lib/core.zsh
+├── lib/agent_activity.py    # shared Agent Activity policy + evidence adapters
 ├── cmd/                     # ai/pane and kill* commands
 ├── bin/
 │   ├── aipane-cleanup

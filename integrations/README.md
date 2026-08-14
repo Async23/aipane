@@ -21,16 +21,33 @@ registry. The registry target, process, version, status, and status timestamp
 must all agree, so this fallback does not infer activity from terminal titles
 or process CPU usage.
 
+Grok does not emit `Stop` or `StopFailure` for interrupted, refused, or
+turn-limit outcomes. Its Adapter still reports ordinary hook transitions, and
+`tmux-window-wrap` reconciles a missing terminal transition from Grok's active
+session registry and authoritative `turn_completed` update. The live process,
+TTY, session id, command, and timestamp must agree before a marker is cleared;
+an older completion cannot override a newer prompt.
+
 Codex completion is handled by `bin/aipane-codex-notify`, not its `Stop` hook.
 Another Codex `Stop` hook can ask the current turn to continue, so `Stop` is not
 a reliable completion boundary. `UserPromptSubmit` starts normal turns;
 `PreToolUse` is a fallback for internal `/goal` turns that do not pass through a
-normal user-message event. The wrapper changes pane activity only for the root
-agent: subagent completions inherit the same `TMUX_PANE`, but they neither clear
-the parent's busy state nor replace its root session binding. A root completion
-clears activity only when no active goal will continue the work. `SessionStart`
-only clears on `startup|resume|clear`; the `compact` source occurs inside an
-already-running turn and must preserve busy.
+normal user-message event. Both hooks persist Codex's exact root session, turn,
+transcript, and `CODEX_HOME` in the pane's versioned activity record. The notify
+wrapper forwards its original `turn-id`; only a completion matching that exact
+root turn may clear the report. Subagent completions inherit the same
+`TMUX_PANE`, but they neither clear the parent's busy state nor replace its root
+binding. A root completion clears activity only when no active goal will
+continue the work. `SessionStart` only clears on `startup|resume|clear`; the
+`compact` source occurs inside an already-running turn and must preserve busy.
+
+If Codex exits a failed turn before legacy notify runs, the shared Agent
+Activity resolver reconciles the record against the caught-up read-only thread
+history, falling back to the canonical rollout tail when that projection lags.
+Terminal evidence must be newer than the busy report, the Agent/pane identity
+must still match, and two stable status probes are required before the display
+projection is repaired. Any missing or inconsistent evidence remains
+`unknown`; it is never guessed idle.
 
 The JSON and TOML files are mergeable configuration fragments; do not replace
 an existing user configuration wholesale. The OpenCode Adapter is executable

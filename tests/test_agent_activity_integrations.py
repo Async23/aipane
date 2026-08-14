@@ -179,7 +179,9 @@ class AgentActivityIntegrationTests(unittest.TestCase):
             )
 
             (local_bin / "tmux-window-wrap").write_text(
-                f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {activity_log}\n",
+                "#!/bin/sh\n"
+                f"printf '%s|' \"$*\" >> {activity_log}\n"
+                f"cat >> {activity_log}\n",
                 encoding="utf-8",
             )
             (local_bin / "aipane-bind").write_text(
@@ -195,7 +197,11 @@ class AgentActivityIntegrationTests(unittest.TestCase):
                 command.chmod(0o755)
 
             payload = json.dumps(
-                {"type": "agent-turn-complete", "thread-id": thread_id}
+                {
+                    "type": "agent-turn-complete",
+                    "thread-id": thread_id,
+                    "turn-id": "turn-root",
+                }
             )
             environment = os.environ.copy()
             environment.update(
@@ -218,7 +224,10 @@ class AgentActivityIntegrationTests(unittest.TestCase):
                 time.sleep(0.01)
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(activity_log.read_text(), "activity idle\n")
+            self.assertEqual(
+                activity_log.read_text(),
+                f"activity idle|{payload}",
+            )
             self.assertIn(f"--tool x --sid {thread_id}", bind_log.read_text())
             self.assertEqual(notify_log.read_text(), payload + "\n")
 
@@ -251,7 +260,9 @@ class AgentActivityIntegrationTests(unittest.TestCase):
             )
 
             (local_bin / "tmux-window-wrap").write_text(
-                f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {activity_log}\n",
+                "#!/bin/sh\n"
+                f"printf '%s|' \"$*\" >> {activity_log}\n"
+                f"cat >> {activity_log}\n",
                 encoding="utf-8",
             )
             (local_bin / "aipane-bind").write_text(
@@ -306,6 +317,18 @@ class AgentActivityIntegrationTests(unittest.TestCase):
             bind_log = home / "bind.log"
             notify_log = home / "notify.log"
             thread_id = "019ff626-3d48-7be3-9106-ed7cd1f2b1f8"
+            sessions = codex_home / "sessions" / "2026" / "08" / "12"
+            sessions.mkdir(parents=True)
+            (sessions / f"rollout-2026-08-12T21-27-31-{thread_id}.jsonl").write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {"id": thread_id, "source": "cli"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             connection = sqlite3.connect(codex_home / "goals_1.sqlite")
             try:
                 connection.execute(
@@ -320,7 +343,9 @@ class AgentActivityIntegrationTests(unittest.TestCase):
                 connection.close()
 
             (local_bin / "tmux-window-wrap").write_text(
-                f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {activity_log}\n",
+                "#!/bin/sh\n"
+                f"printf '%s|' \"$*\" >> {activity_log}\n"
+                f"cat >> {activity_log}\n",
                 encoding="utf-8",
             )
             (local_bin / "aipane-bind").write_text(
@@ -336,7 +361,11 @@ class AgentActivityIntegrationTests(unittest.TestCase):
                 command.chmod(0o755)
 
             payload = json.dumps(
-                {"type": "agent-turn-complete", "thread-id": thread_id}
+                {
+                    "type": "agent-turn-complete",
+                    "thread-id": thread_id,
+                    "turn-id": "turn-goal",
+                }
             )
             environment = os.environ.copy()
             environment.update(
@@ -359,8 +388,140 @@ class AgentActivityIntegrationTests(unittest.TestCase):
                 time.sleep(0.01)
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(activity_log.read_text(), "activity busy\n")
+            self.assertEqual(
+                activity_log.read_text(),
+                f"activity busy|{payload}",
+            )
             self.assertIn(f"--tool x --sid {thread_id}", bind_log.read_text())
+            self.assertEqual(notify_log.read_text(), payload + "\n")
+
+    def test_codex_goal_store_failure_keeps_parent_busy(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            home = Path(raw_tmp)
+            local_bin = home / ".local" / "bin"
+            codex_home = home / ".codex"
+            sessions = codex_home / "sessions" / "2026" / "08" / "12"
+            local_bin.mkdir(parents=True)
+            sessions.mkdir(parents=True)
+            activity_log = home / "activity.log"
+            bind_log = home / "bind.log"
+            notify_log = home / "notify.log"
+            thread_id = "019ff626-3d48-7be3-9106-ed7cd1f2b1f8"
+            (sessions / f"rollout-2026-08-12T21-27-31-{thread_id}.jsonl").write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {"id": thread_id, "source": "cli"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (codex_home / "goals_1.sqlite").write_text(
+                "not a sqlite database",
+                encoding="utf-8",
+            )
+            (local_bin / "tmux-window-wrap").write_text(
+                "#!/bin/sh\n"
+                f"printf '%s|' \"$*\" >> {activity_log}\n"
+                f"cat >> {activity_log}\n",
+                encoding="utf-8",
+            )
+            (local_bin / "aipane-bind").write_text(
+                f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {bind_log}\n",
+                encoding="utf-8",
+            )
+            notifier = home / "notify"
+            notifier.write_text(
+                f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> {notify_log}\n",
+                encoding="utf-8",
+            )
+            for command in (*local_bin.iterdir(), notifier):
+                command.chmod(0o755)
+            payload = json.dumps(
+                {
+                    "type": "agent-turn-complete",
+                    "thread-id": thread_id,
+                    "turn-id": "turn-goal-unknown",
+                }
+            )
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HOME": str(home),
+                    "AIPANE_PYTHON": sys.executable,
+                    "AIPANE_CODEX_REAL_NOTIFY": str(notifier),
+                    "TMUX_PANE": "%7",
+                }
+            )
+
+            result = subprocess.run(
+                [str(CODEX_NOTIFY), payload],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                activity_log.read_text(),
+                f"activity busy|{payload}",
+            )
+
+    def test_codex_unknown_completion_cannot_clear_or_rebind_pane(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            home = Path(raw_tmp)
+            local_bin = home / ".local" / "bin"
+            local_bin.mkdir(parents=True)
+            activity_log = home / "activity.log"
+            bind_log = home / "bind.log"
+            notify_log = home / "notify.log"
+            (local_bin / "tmux-window-wrap").write_text(
+                "#!/bin/sh\n"
+                f"printf '%s|' \"$*\" >> {activity_log}\n"
+                f"cat >> {activity_log}\n",
+                encoding="utf-8",
+            )
+            (local_bin / "aipane-bind").write_text(
+                f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {bind_log}\n",
+                encoding="utf-8",
+            )
+            notifier = home / "notify"
+            notifier.write_text(
+                f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> {notify_log}\n",
+                encoding="utf-8",
+            )
+            for command in (*local_bin.iterdir(), notifier):
+                command.chmod(0o755)
+            payload = json.dumps(
+                {
+                    "type": "agent-turn-complete",
+                    "thread-id": "thread-without-rollout",
+                    "turn-id": "turn-unknown",
+                }
+            )
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HOME": str(home),
+                    "AIPANE_PYTHON": sys.executable,
+                    "AIPANE_CODEX_REAL_NOTIFY": str(notifier),
+                    "TMUX_PANE": "%7",
+                }
+            )
+
+            result = subprocess.run(
+                [str(CODEX_NOTIFY), payload],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(activity_log.exists())
+            self.assertFalse(bind_log.exists())
             self.assertEqual(notify_log.read_text(), payload + "\n")
 
     def test_codex_session_end_respects_three_second_timeout_limit(self):
