@@ -356,7 +356,7 @@ codex 无启动期 `--session-id`，其会话 id（`thread-id`）在**运行后*
 1. **信道 = codex `notify`**（实证其载荷含 `thread-id`，且进程继承 `$TMUX_PANE`；`type=agent-turn-complete`，每回合触发）。
 2. `config.toml` 的 `notify` 改指向 **`bin/aipane-codex-notify`** 包装器：后台 fire-and-forget 调 `aipane-bind` 记 `(%N→根 thread-id)`，再 `exec` 原 `codex-notify.py`（**用户脚本零改动**）。subagent 会继承父进程的 `$TMUX_PANE`，所以包装器从 rollout metadata 解析到根 thread：subagent 完成既不清 busy、也不覆盖根会话绑定；根 `agent-turn-complete` 仅在没有 active goal 继续执行时上报 `idle`。`Stop` 可被其他钩子阻止并让回合继续，因此不再用它判定真正完成。`/goal` 又可能绕过普通 `UserPromptSubmit`，所以另以 `PreToolUse → busy` 兜底。
 3. 存盘时 **`bin/aipane-snapshot`**（`post-save-layout` 钩子）把 `%N→sid` 解析成 `坐标→sid` 写 `coords-last.json`（同刻锁定坐标，抗 renumber，理由同 §10）。
-4. `ai-restore` 对 codex 的 id 优先级：**argv > 坐标快照(coords-last.json) > pane 标题 uuid**。
+4. `ai-restore` 对 codex 的 id 优先级：**有效坐标快照(coords-last.json) > argv > pane 标题 uuid**。Codex 可在同一进程内 fork 到新 thread，此时启动 argv 仍指向父 thread；只有动态绑定代表当前会话。坐标 id 必须已有本地 rollout，否则回退 argv。
 
 ### 已落地清单
 | 序号 | 位置 | 内容 |
@@ -375,7 +375,8 @@ codex 无启动期 `--session-id`，其会话 id（`thread-id`）在**运行后*
 ### ai-restore 的关键策略（实测已验证）
 - **仅恢复有确切 id 的 pane（resume）**；无可恢复 id 的（fresh）**默认跳过**，不空起新 AI（省 token、避免惊吓）。`AI_RESTORE_FRESH=1` 可开启空起。
 - **幂等 & 安全**：只对「当前停在 idle shell」的 pane 下手 → 不覆盖 resurrect 已重开的白名单进程；重复运行无害。
-- **per-tool resume 重建**：pi `--session-id X`（幂等）；grok/claude `--resume X`（其 `--session-id` 仅新建）；cursor `--resume X`；codex `resume X`（argv→坐标快照→标题）。
+- **per-tool resume 重建**：pi `--session-id X`（幂等）；grok/claude `--resume X`（其 `--session-id` 仅新建）；cursor `--resume X`；codex `resume X`（有效坐标快照→argv→标题）。
+- `ai-restart` 替换 pane 进程后会清除旧进程的 activity marker/reporter/timestamp/record；恢复命令重新绑定 session，新的生命周期 hook 再建立 activity record，避免 stale process identity 污染后续快照和安全判断。
 - `--dry-run` 可对任意存档预演；日志在 `~/.local/share/aipane/ai-restore.log`。
 
 ### 已知残留 / 待办

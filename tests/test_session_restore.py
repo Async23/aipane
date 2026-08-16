@@ -320,6 +320,47 @@ class SessionRestoreTests(unittest.TestCase):
             self.assertEqual(plan["kind"], "resume")
             self.assertTrue(plan["restorable"])
 
+    def test_restore_prefers_current_codex_binding_over_stale_resume_argv(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            result = self.run_restore(
+                tmp,
+                coord={"sid": VALID_CODEX_SID, "tool": "x"},
+                title=VALID_CODEX_SID,
+                saved_codex_ids={VALID_CODEX_SID, FOREIGN_SID},
+                plan_json=True,
+                full_command=(
+                    "codex --yolo --disable plugins "
+                    f"resume {FOREIGN_SID}"
+                ),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(result.stdout)
+            self.assertEqual(
+                plan["command"],
+                f"codex --yolo --disable plugins resume {VALID_CODEX_SID}",
+            )
+
+    def test_restore_falls_back_to_codex_argv_when_binding_is_not_durable(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            result = self.run_restore(
+                tmp,
+                coord={"sid": FOREIGN_SID, "tool": "x"},
+                title="custom-title",
+                saved_codex_ids={VALID_CODEX_SID},
+                plan_json=True,
+                full_command=f"codex --yolo resume {VALID_CODEX_SID}",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(result.stdout)
+            self.assertEqual(
+                plan["command"],
+                f"codex --yolo --disable plugins resume {VALID_CODEX_SID}",
+            )
+
     def test_restore_exposes_machine_readable_recovery_plan(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)

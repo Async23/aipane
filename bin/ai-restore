@@ -191,15 +191,20 @@ claude_session_exists() {
 }
 
 # build_resume <tool> <full_cmd> <title> <coord_sid> -> REPLY = command to send, or ""
-# id precedence: command-line argv (gold-case) > coords-snapshot (codex/opencode/kimi
-# via their hook, keyed by coordinate) > codex title. opencode/kimi ids are not UUIDs
-# and never appear in argv, so for them the coords-snapshot is the only id source.
+# Gold-case tools keep their session id in argv. Codex is different: an in-process
+# fork changes the current thread without changing the original `codex resume ...`
+# argv, so a durable current coordinate binding must supersede that stale id.
+# opencode/kimi ids are not UUIDs and only come from the coordinate snapshot.
 # Sets REPLY_KIND = resume|fresh|invalid for logging.
 build_resume() {
   local tool="$1" full="$2" title="$3" coord_sid="$4" id
   REPLY=""; REPLY_KIND=""; REPLY_SID=""
   extract_uuid "$full"; id="$REPLY"
-  [[ -z "$id" && -n "$coord_sid" ]] && id="$coord_sid"
+  if [[ "$tool" == codex && -n "$coord_sid" ]] && codex_session_exists "$coord_sid"; then
+    id="$coord_sid"
+  elif [[ -z "$id" && -n "$coord_sid" ]]; then
+    id="$coord_sid"
+  fi
   case "$tool" in
     pi)
       # --session-id is idempotent on pi: resumes if present, creates if not.

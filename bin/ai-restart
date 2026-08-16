@@ -30,6 +30,12 @@ ACTIVITY_OPTION = "@tmux-window-wrap-activity"
 ACTIVITY_REPORTER_OPTION = "@tmux-window-wrap-activity-reporter"
 ACTIVITY_UPDATED_AT_OPTION = "@tmux-window-wrap-activity-updated-at"
 ACTIVITY_RECORD_OPTION = "@tmux-window-wrap-activity-record"
+ACTIVITY_OPTIONS = (
+    ACTIVITY_OPTION,
+    ACTIVITY_REPORTER_OPTION,
+    ACTIVITY_UPDATED_AT_OPTION,
+    ACTIVITY_RECORD_OPTION,
+)
 SHELL_COMMANDS = {"zsh", "-zsh", "bash", "-bash", "sh", "-sh", "fish", "-fish"}
 
 
@@ -425,7 +431,30 @@ def restart_panes(
         items_by_target[target] = item
 
     pending = wait_for_shells(tmux, targets)
-    ready = [target for target in targets if target not in pending]
+    ready: list[str] = []
+    for target in targets:
+        if target in pending:
+            continue
+        activity_error = ""
+        for option in ACTIVITY_OPTIONS:
+            cleared = tmux.run(
+                "set-option",
+                "-p",
+                "-u",
+                "-t",
+                target,
+                option,
+                check=False,
+            )
+            if cleared.returncode != 0:
+                activity_error = cleared.stderr.strip() or f"could not unset {option}"
+                break
+        if activity_error:
+            failures.append(
+                f"failed to clear replaced activity for {target}: {activity_error}"
+            )
+        else:
+            ready.append(target)
     if ready:
         subprocess.run(
             [*restore_command, "--dump", str(dump)],

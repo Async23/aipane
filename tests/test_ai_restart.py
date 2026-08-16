@@ -286,6 +286,33 @@ class AiRestartTests(unittest.TestCase):
         self.assertEqual(Path(restored_cwd).resolve(), self.tmp.resolve())
         self.assertIn("--dump", self.restore_log.read_text())
 
+    def test_restart_clears_activity_metadata_from_replaced_process(self):
+        for option, value in (
+            ("@tmux-window-wrap-activity", "sleep"),
+            ("@tmux-window-wrap-activity-reporter", "sleep"),
+            ("@tmux-window-wrap-activity-updated-at", "1234"),
+            ("@tmux-window-wrap-activity-record", '{"version":1}'),
+        ):
+            self.tmux("set-option", "-p", "-t", self.target, option, value)
+
+        result = self.run_restart("--yes", "--force")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for option in (
+            "@tmux-window-wrap-activity",
+            "@tmux-window-wrap-activity-reporter",
+            "@tmux-window-wrap-activity-updated-at",
+            "@tmux-window-wrap-activity-record",
+        ):
+            value = self.tmux(
+                "show-options",
+                "-pqv",
+                "-t",
+                self.target,
+                option,
+            ).stdout.strip()
+            self.assertEqual(value, "", option)
+
     def test_dry_run_resolves_terminal_codex_without_repairing_marker(self):
         fake_codex = self.tmp / "codex"
         fake_codex_source = self.tmp / "codex.c"
