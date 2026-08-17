@@ -95,8 +95,10 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `bin/tmux-window-jump` | 同数字连按、精确 index 的窗口选择器 |
 | `bin/tmux-window-wrap` | 渲染 CLI |
 | `bin/ai-restart` | 原地安全重启并续接可恢复的 AI pane |
+| `bin/aipane-restore-executor` | 带验证、重试和持久 pending 意图的恢复执行器 |
 | [`integrations/`](integrations/README.md) | Agent 生命周期 hook 片段与 OpenCode Adapter |
 | `tests/test_agent_activity_integrations.py` | Agent Activity 契约测试 |
+| `tests/test_restore_executor.py` | 恢复验证、重试与 pending 意图测试 |
 | `tests/test_tmux_window_jump.py` | window-jump 行为 + 真 tmux 测试 |
 | `tests/test_tmux_window_wrap.py` | window-wrap 单元 + 真 tmux 测试 |
 | `tests/test_workstation_fragments.py` | conf 片段结构测试 |
@@ -180,8 +182,11 @@ ai cc                                     # 重复的键会启动重复的工具
 
 `ai-restart` 会刷新 tmux-resurrect 快照，找出拥有可恢复会话的 AI pane，
 将这些 pane 重生为空闲 shell，再交给 `ai-restore` 续接原会话。pane ID、
-布局和工作目录保持不变。只有续接后的 Agent 进程在短暂稳定期内
-持续存活，才会报告恢复成功。Qoder 和 Droid 因尚未支持会话恢复而直接忽略。
+布局和工作目录保持不变。恢复前会清理残留终端输入，瞬时失败会延迟重试，
+并且只有验证成功后才重新绑定 pane。Grok 必须明确上报目标会话
+`session loaded`，其他 Agent 则必须通过进程稳定期。未完成的恢复意图保存在
+`~/.local/share/aipane/restore-pending.json`，不会再被后续 continuum 快照抹掉。
+Qoder 和 Droid 因尚未支持会话恢复而直接忽略。
 
 ```bash
 ai-restart --dry-run  # 刷新快照并预览，不重启 pane
@@ -210,9 +215,9 @@ tmux-resurrect 以及
 [`docs/session-restore-design.md`](docs/session-restore-design.md) 中的会话恢复 hooks。
 
 Pi 与 Claude 都可能已拥有预分配的 `--session-id`，但还没创建可持久恢复的
-conversation。这种 ID 会在 pane 被替换前判定为不可恢复，不再创建空白替代会话并
-误报成功。
-`ai-restart` 会将该 pane 明确列为 `left untouched / no saved conversation`。
+conversation。空 Pi 会话会重新打开空 TUI，并明确标为 `recreated`，绝不冒充已续接
+的历史对话；若同一 Pi ID 实际属于其他项目或记录已损坏，仍标为 `invalid`。
+Claude 仍要求存在持久 transcript，否则保持原 pane 不动。
 
 ## 进程清理
 
@@ -267,6 +272,7 @@ killrod --dry-run
 │   ├── aipane-claude-activity
 │   ├── ai-restart
 │   ├── ai-restore
+│   ├── aipane-restore-executor
 │   ├── rod-cleanup
 │   ├── tmux-rename-window-popup
 │   ├── tmux-colour-palette
@@ -328,6 +334,7 @@ zsh -fc '
 python3 tests/test_ai_restart.py
 python3 tests/test_agent_activity_integrations.py
 python3 tests/test_session_restore.py
+python3 tests/test_restore_executor.py
 node --experimental-strip-types --test tests/pi-session-binding.test.mjs
 python3 tests/test_tmux_window_jump.py
 python3 tests/test_workstation_fragments.py
