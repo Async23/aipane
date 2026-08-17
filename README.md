@@ -95,8 +95,10 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `bin/tmux-window-jump` | repeated-digit exact-index window selector |
 | `bin/tmux-window-wrap` | renderer CLI |
 | `bin/ai-restart` | safely restart and resume restorable AI panes in place |
+| `bin/aipane-restore-executor` | verified recovery, retry, and durable pending intent |
 | [`integrations/`](integrations/README.md) | Agent lifecycle hook fragments and OpenCode Adapter |
 | `tests/test_agent_activity_integrations.py` | Agent Activity contract tests |
+| `tests/test_restore_executor.py` | verified recovery, retry, and pending-intent tests |
 | `tests/test_tmux_window_jump.py` | window-jump behavior + live tmux tests |
 | `tests/test_tmux_window_wrap.py` | window-wrap unit + live tmux tests |
 | `tests/test_workstation_fragments.py` | structural tests for conf fragments |
@@ -181,9 +183,13 @@ Inside tmux, a pane layout reuses the current window only when it has one pane; 
 `ai-restart` refreshes the tmux-resurrect snapshot, finds AI panes with a
 recoverable session, replaces those panes with an idle shell, and delegates the
 resume commands to `ai-restore`. Pane IDs, layout, and working directories stay
-unchanged. A restart is reported successful only after each resumed Agent
-process remains alive for a short stability window. Qoder and Droid are ignored
-because their session restore is not implemented.
+unchanged. Recovery commands are cleared of stale terminal input before launch,
+transient failures are retried, and a pane is rebound only after verification.
+Grok must report the requested `session loaded`; other Agents must remain alive
+for a stability window. Unfinished intent is kept in
+`~/.local/share/aipane/restore-pending.json`, so a later continuum save cannot
+erase a failed recovery. Qoder and Droid are ignored because their session
+restore is not implemented.
 
 ```bash
 ai-restart --dry-run  # refresh snapshot and preview; does not restart panes
@@ -216,10 +222,10 @@ tmux-resurrect and the session-restore hooks described in
 [`docs/session-restore-design.md`](docs/session-restore-design.md).
 
 Pi and Claude can own a preassigned `--session-id` without having created a
-durable conversation yet. Such an ID is classified as non-restorable before
-panes are replaced, rather than being used to create an empty replacement and
-counted as a success. `ai-restart` lists that pane as
-`left untouched / no saved conversation`.
+durable conversation yet. An empty Pi session is reopened as an empty TUI and
+reported as `recreated`, never as a resumed conversation. A Pi ID that exists
+under another project (or has a damaged record) remains `invalid`. Claude still
+requires a durable transcript and is left untouched when none exists.
 
 ## Process Cleanup
 
@@ -275,6 +281,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 │   ├── aipane-claude-activity
 │   ├── ai-restart
 │   ├── ai-restore
+│   ├── aipane-restore-executor
 │   ├── rod-cleanup
 │   ├── tmux-rename-window-popup
 │   ├── tmux-colour-palette
@@ -336,6 +343,7 @@ zsh -fc '
 python3 tests/test_ai_restart.py
 python3 tests/test_agent_activity_integrations.py
 python3 tests/test_session_restore.py
+python3 tests/test_restore_executor.py
 node --experimental-strip-types --test tests/pi-session-binding.test.mjs
 python3 tests/test_tmux_window_jump.py
 python3 tests/test_workstation_fragments.py

@@ -287,8 +287,9 @@ pi 会话相关 flag（实测 `pi --help`）：
 ### 决策
 - aipane 启动 pi 改为注入 **`pi --session-id <aipane 生成的 uuid>`**（可选 `--name`）。
 - 初始 id 由 aipane 掌控并写入 argv；new/resume/fork 后以动态坐标绑定为准（§15）。
-- 恢复：仅当同 cwd 的 JSONL header 确认该 id 存在时执行 `pi --session-id <同一 uuid>`；
-  不存在时标为 `invalid` 并保留原 pane，绝不把“创建空会话”当作恢复降级。
+- 恢复（经 §15–§16 修订）：同 cwd 的 JSONL header 匹配时标为 `resume`；全局完全
+  不存在该 id 时以同一 id 重开空 TUI 并标为 `recreated`；记录损坏或属于其他项目时
+  才标为 `invalid`。`recreated` 绝不冒充历史对话续接成功。
 - **坑**：aipane 现有 `ai p resume …` 会把 `resume` 当参数传给 pi（`pi resume` 不合法）；pi 续接用 `--continue`/`--resume`/`--session`/`--session-id`，与 codex/grok 的 `resume` 子命令不同 → aipane 需为 pi 单独映射。
 - **已确认（2026-08-08，用户同意）**：`ai p` 默认启动改为注入 `--session-id`。
 
@@ -382,10 +383,13 @@ codex 无启动期 `--session-id`，其会话 id（`thread-id`）在**运行后*
 | 10 | `~/.local/bin` | symlink：ai-restore / aipane-bind / aipane-codex-notify / aipane-snapshot |
 
 ### ai-restore 的关键策略（实测已验证）
-- **仅恢复有确切 id 的 pane（resume）**；无可恢复 id 的（fresh）**默认跳过**，不空起新 AI（省 token、避免惊吓）。`AI_RESTORE_FRESH=1` 可开启空起。
+- **仅执行有确切恢复意图的 pane**：持久对话标为 `resume`；已分配 id 但从未落盘的空 Pi
+  标为 `recreated` 并只重开空 TUI；完全没有 id 的 `fresh` 默认仍跳过。
+  `AI_RESTORE_FRESH=1` 可开启一般 fresh 启动。
 - **幂等 & 安全**：只对「当前停在 idle shell」的 pane 下手 → 不覆盖 resurrect 已重开的白名单进程；重复运行无害。
-- **per-tool resume 重建**：pi 仅在同 cwd durable JSONL 已验证后用 `--session-id X`
-  （动态坐标→argv）；grok/claude `--resume X`；cursor `--resume X`；codex
+- **per-tool resume 重建**：pi 在同 cwd durable JSONL 已验证后用 `--session-id X`
+  续接；若该 id 在所有 Pi store 中都不存在，则以同一 id 重建空 TUI，并明确标为
+  `recreated`（动态坐标→argv）；grok/claude `--resume X`；cursor `--resume X`；codex
   `resume X`（有效坐标快照→argv→标题）。
 - `ai-restart` 替换 pane 进程后会清除旧进程的 activity marker/reporter/timestamp/record；恢复命令重新绑定 session，新的生命周期 hook 再建立 activity record，避免 stale process identity 污染后续快照和安全判断。
 - `--dry-run` 可对任意存档预演；日志在 `~/.local/share/aipane/ai-restore.log`。
@@ -458,7 +462,34 @@ session；启动 argv 不变，但 `session_start(reason=new|resume|fork)` 会�
 2. `aipane-snapshot` 将该动态 `%N → sid` 绑定投影到存盘坐标；Pi 与 Codex 一样，
    当前坐标绑定优先于可能过期的启动 argv。
 3. 恢复计划只有在 Pi JSONL header 的 `id` 与 pane `cwd` 同时匹配时才标为
-   `resume`；缺失、损坏或属于其他项目的记录标为 `invalid`，原 pane 不被销毁。
+   `resume`；全局完全不存在该 id 时标为 `recreated`，只重开空 TUI；id 已存在但记录
+   损坏或属于其他项目时仍标为 `invalid`，原 pane 不被销毁。
 
-这取代了 §11 中“Pi 无需 hook/动态绑定”和“id 不存在时天然降级”的旧结论；
-不存在时创建新会话适合首次启动，不适合作为恢复成功的判据。
+这取代了 §11 中“Pi 无需 hook/动态绑定”和“id 不存在时天然降级”的旧结论。
+不存在时创建新会话不能冒充历史恢复成功，但可作为显式的 `recreated` UI 恢复。
+
+## 16. 真实重启事故修正：验证、重试与持久恢复意图（2026-08-17）
+
+一次整机重启暴露了三个会串联放大的缺口：
+
+1. `ai-restore` 把 `tmux send-keys` 成功直接记作恢复成功；当 Grok 在加载账号设置时
+   35–45 秒后超时，日志仍写成 `sent/rebound`。
+2. Grok 异常退出后残留 SGR 鼠标输入；下一次恢复命令被拼到脏输入后面，zsh 将
+   `35;22;40M...` 等片段当作命令执行。
+3. continuum 随后把这些失败 pane 以 zsh 写入新的 `last`，默认快照不再包含原恢复命令，
+   因而简单重跑 `ai-restore` 已无法重试。
+
+修正后的执行不变量：
+
+- `ai-restore` 只负责从 resurrect dump 与坐标绑定构造声明式 JSONL 计划；
+  `aipane-restore-executor` 统一负责副作用，形成一个深模块接口。
+- 所有可执行意图在发送命令**之前**原子写入
+  `~/.local/share/aipane/restore-pending.json`；新 dump 未再包含该 pane 时，pending 意图仍
+  会参与下一次执行。成功项才删除，默认保留 6 小时；pending 同时守卫创建时的
+  pane id / tmux server identity，坐标被其他 pane 复用时绝不发送命令。
+- 每次启动前先 `C-c` 清空输入，再用 `tmux send-keys -R` 重置终端状态，并以 literal
+  send-keys 提交命令，避免鼠标控制序列污染。
+- 普通工具通过进程稳定窗口后才算成功；新启动的 Grok 还必须在
+  `~/.grok/logs/unified.jsonl` 中出现目标 sid 的 `session loaded`。默认失败后延迟重试
+  一次；仍失败则保留 pending 并返回非零。
+- 只有验证成功后才调用 `aipane-bind`。因此 `sent`、`resumed`、`verified` 不再混为一谈。

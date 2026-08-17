@@ -1,0 +1,879 @@
+#!/usr/bin/env python3
+"""Execute an ai-restore plan with verification, retry, and durable intent.
+
+The zsh ai-restore command owns snapshot parsing and tool-specific resume command
+construction.  This module owns the stateful half of recovery behind one CLI
+interface: merge the new plan with unfinished work, launch panes cleanly, verify
+that the requested tool is actually ready, retry transient failures, and only
+then publish the new pane binding.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+
+SHELL_COMMANDS = {
+    "zsh",
+    "-zsh",
+    "bash",
+    "-bash",
+    "sh",
+    "-sh",
+    "fish",
+    "-fish",
+    "",
+}
+TOOL_TAGS = {
+    "pi": "p",
+    "grok": "g",
+    "claude": "c",
+    "cursor": "r",
+    "codex": "x",
+    "opencode": "o",
+    "kimi": "k",
+}
+PENDING_VERSION = 1
+
+
+class RestoreExecutionError(RuntimeError):
+    pass
+
+
+def positive_float(environment: dict[str, str], name: str, default: float) -> float:
+    try:
+        value = float(environment.get(name, str(default)))
+    except ValueError as error:
+        raise RestoreExecutionError(f"{name} must be a number") from error
+    if value <= 0:
+        raise RestoreExecutionError(f"{name} must be greater than zero")
+    return value
+
+
+def nonnegative_float(
+    environment: dict[str, str], name: str, default: float
+) -> float:
+    try:
+        value = float(environment.get(name, str(default)))
+    except ValueError as error:
+        raise RestoreExecutionError(f"{name} must be a number") from error
+    if value < 0:
+        raise RestoreExecutionError(f"{name} must not be negative")
+    return value
+
+
+def positive_int(environment: dict[str, str], name: str, default: int) -> int:
+    try:
+        value = int(environment.get(name, str(default)))
+    except ValueError as error:
+        raise RestoreExecutionError(f"{name} must be an integer") from error
+    if value <= 0:
+        raise RestoreExecutionError(f"{name} must be greater than zero")
+    return value
+
+
+def read_plan(path: Path) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise RestoreExecutionError(f"cannot read recovery plan {path}: {error}") from error
+    for number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise RestoreExecutionError(
+                f"invalid recovery plan JSON on line {number}: {error}"
+            ) from error
+        if not isinstance(raw, dict):
+            raise RestoreExecutionError(
+                f"recovery plan line {number} must be a JSON object"
+            )
+        required = ("target", "tool", "kind", "cwd", "command", "restorable")
+        if any(key not in raw for key in required):
+            raise RestoreExecutionError(
+                f"recovery plan line {number} is missing required fields"
+            )
+        item = {
+            "target": str(raw["target"]),
+            "tool": str(raw["tool"]),
+            "kind": str(raw["kind"]),
+            "restorable": raw["restorable"] is True,
+            "cwd": str(raw["cwd"]),
+            "command": str(raw["command"]),
+            "sid": str(raw.get("sid", "")),
+        }
+        if (
+            not item["target"]
+            or not item["tool"]
+            or not item["cwd"]
+            or not item["command"]
+        ):
+            raise RestoreExecutionError(
+                f"recovery plan line {number} contains an empty identity field"
+            )
+        if item["tool"] not in TOOL_TAGS:
+            raise RestoreExecutionError(
+                f"recovery plan line {number} has unknown tool {item['tool']!r}"
+            )
+        result.append(item)
+    return result
+
+
+def command_matches(
+    tool: str,
+    current_command: str,
+    *,
+    allow_ambiguous_node: bool = True,
+) -> bool:
+    command = current_command.lower()
+    if tool == "pi":
+        return (
+            (allow_ambiguous_node and command == "node")
+            or command == "pi"
+            or command.startswith("pi-")
+        )
+    if tool == "grok":
+        return command == "grok" or command.startswith("grok-")
+    if tool == "claude":
+        return command in {"claude", "claude-guard"}
+    if tool == "cursor":
+        return command == "cursor-agent" or (
+            allow_ambiguous_node and command == "node"
+        )
+    if tool == "codex":
+        return command in {"codex", "codexx"} or command.startswith("codex-")
+    if tool == "opencode":
+        return command == "opencode" or command.startswith("opencode-")
+    if tool == "kimi":
+        return command == "kimi" or command.startswith("kimi-")
+    return False
+
+
+class Tmux:
+    def __init__(self, environment: dict[str, str]) -> None:
+        self.command = shlex.split(environment.get("AIPANE_TMUX", "tmux"))
+        if not self.command:
+            raise RestoreExecutionError("AIPANE_TMUX resolved to an empty command")
+
+    def run(
+        self,
+        *arguments: str,
+        check: bool = False,
+        capture_output: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [*self.command, *arguments],
+            check=check,
+            capture_output=capture_output,
+            text=True,
+        )
+
+    def current_command(self, target: str) -> str | None:
+        completed = self.run(
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "#{pane_current_command}",
+        )
+        if completed.returncode != 0:
+            return None
+        return completed.stdout.strip()
+
+    def send(self, *arguments: str) -> bool:
+        return self.run("send-keys", *arguments).returncode == 0
+
+    def pane_identity(self, target: str) -> tuple[str, str, str] | None:
+        completed = self.run(
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "#{pane_id}\t#{socket_path}\t#{pid}",
+        )
+        if completed.returncode != 0:
+            return None
+        fields = completed.stdout.rstrip("\n").split("\t")
+        if len(fields) != 3 or not all(fields):
+            return None
+        return fields[0], fields[1], fields[2]
+
+    def foreground_command(self, target: str) -> str:
+        completed = self.run(
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "#{pane_tty}",
+        )
+        if completed.returncode != 0:
+            return ""
+        tty = completed.stdout.strip().removeprefix("/dev/")
+        if not tty:
+            return ""
+        try:
+            processes = subprocess.run(
+                ["ps", "-t", tty, "-o", "stat=", "-o", "command="],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            return ""
+        if processes.returncode != 0:
+            return ""
+        for line in processes.stdout.splitlines():
+            fields = line.strip().split(maxsplit=1)
+            if len(fields) == 2 and "+" in fields[0]:
+                return fields[1]
+        return ""
+
+    def capture_failure(self, target: str) -> str:
+        completed = self.run("capture-pane", "-p", "-t", target, "-S", "-40")
+        if completed.returncode != 0:
+            return "pane disappeared"
+        candidates = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+        for line in reversed(candidates):
+            lowered = line.lower()
+            if any(
+                marker in lowered
+                for marker in ("error", "failed", "not found", "unable", "invalid", "timed out")
+            ):
+                return line
+        return "pane returned to its shell"
+
+    def notify(self, message: str) -> None:
+        self.run("display-message", message)
+
+
+class PendingStore:
+    def __init__(self, path: Path, max_age: float) -> None:
+        self.path = path
+        self.max_age = max_age
+
+    def load(self, now: float) -> list[dict[str, Any]]:
+        if not self.path.is_file():
+            return []
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if not isinstance(payload, dict) or payload.get("version") != PENDING_VERSION:
+            return []
+        raw_items = payload.get("items")
+        if not isinstance(raw_items, list):
+            return []
+        result: list[dict[str, Any]] = []
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                created_at = float(raw.get("created_at", 0))
+            except (TypeError, ValueError):
+                continue
+            if created_at <= 0 or now - created_at > self.max_age:
+                continue
+            if raw.get("restorable") is not True:
+                continue
+            if not all(raw.get(field) for field in ("target", "tool", "command")):
+                continue
+            if raw.get("tool") not in TOOL_TAGS:
+                continue
+            result.append(dict(raw))
+        return result
+
+    def merge(
+        self,
+        current: list[dict[str, Any]],
+        *,
+        dump: str,
+        now: float,
+    ) -> list[dict[str, Any]]:
+        previous = {item["target"]: item for item in self.load(now)}
+        merged = dict(previous)
+        for item in current:
+            target = item["target"]
+            if item["restorable"] is not True:
+                prior = previous.get(target)
+                if (
+                    item["kind"] == "fresh"
+                    and prior
+                    and prior.get("tool") == item["tool"]
+                ):
+                    # A later snapshot can retain the tool name while losing its
+                    # identity. The older exact pending intent is stronger evidence.
+                    continue
+                merged.pop(target, None)
+                continue
+            prior = previous.get(target)
+            same_intent = bool(
+                prior
+                and prior.get("tool") == item["tool"]
+                and prior.get("command") == item["command"]
+            )
+            merged_item = dict(item)
+            merged_item.update(
+                {
+                    "created_at": prior.get("created_at", now) if same_intent else now,
+                    "updated_at": now,
+                    "attempts": int(prior.get("attempts", 0)) if same_intent else 0,
+                    "last_error": prior.get("last_error", "") if same_intent else "",
+                    "source_dump": dump,
+                }
+            )
+            if same_intent:
+                for field in ("pane_id", "socket_path", "server_pid"):
+                    if prior.get(field):
+                        merged_item[field] = prior[field]
+            merged[target] = merged_item
+        return sorted(merged.values(), key=lambda item: item["target"])
+
+    def display_plan(
+        self,
+        current: list[dict[str, Any]],
+        *,
+        now: float,
+    ) -> list[dict[str, Any]]:
+        pending_by_target = {item["target"]: item for item in self.load(now)}
+        current_targets = {item["target"] for item in current}
+        result = []
+        for item in current:
+            pending = pending_by_target.get(item["target"])
+            if (
+                item["restorable"] is not True
+                and item["kind"] == "fresh"
+                and pending
+                and pending.get("tool") == item["tool"]
+            ):
+                result.append({**pending, "pending": True})
+                continue
+            same_intent = bool(
+                item["restorable"] is True
+                and pending
+                and pending.get("tool") == item["tool"]
+                and pending.get("command") == item["command"]
+            )
+            result.append({**item, "pending": same_intent})
+        result.extend(
+            {**item, "pending": True}
+            for item in pending_by_target.values()
+            if item["target"] not in current_targets
+        )
+        return result
+
+    def save(self, items: list[dict[str, Any]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": PENDING_VERSION,
+            "updated_at": time.time(),
+            "items": items,
+        }
+        temporary = self.path.with_name(f"{self.path.name}.tmp.{os.getpid()}")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.chmod(0o600)
+        temporary.replace(self.path)
+
+
+@dataclass
+class Attempt:
+    item: dict[str, Any]
+    started_at: float
+    deadline: float
+    grok_offset: int | None
+    existing_process: bool
+    sent: bool
+    seen_running: bool = False
+    running_since: float | None = None
+
+
+@dataclass
+class ExecutionReport:
+    verified: int
+    pending: int
+    skipped: int
+    deferred: int
+
+    def render(self) -> str:
+        return (
+            f"ai-restore: verified={self.verified} pending={self.pending} "
+            f"skipped={self.skipped} deferred={self.deferred}"
+        )
+
+
+class RestoreExecutor:
+    def __init__(self, environment: dict[str, str]) -> None:
+        self.environment = environment
+        self.state_dir = Path(
+            environment.get("AIPANE_STATE_DIR")
+            or Path(environment.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+            / "aipane"
+        )
+        pending_path = Path(
+            environment.get(
+                "AIPANE_RESTORE_PENDING",
+                str(self.state_dir / "restore-pending.json"),
+            )
+        )
+        pending_max_age = positive_float(
+            environment, "AI_RESTORE_PENDING_MAX_AGE", 21_600
+        )
+        self.store = PendingStore(pending_path, pending_max_age)
+        self.log_path = Path(
+            environment.get("AIPANE_RESTORE_LOG", str(self.state_dir / "ai-restore.log"))
+        )
+        self.lock_path = self.state_dir / "restore-executor.lock"
+        self.registry_path = Path(
+            environment.get(
+                "AIPANE_REGISTRY",
+                str(self.state_dir / "registry.jsonl"),
+            )
+        )
+        self.tmux = Tmux(environment)
+        self.bind_command = shlex.split(
+            environment.get("AIPANE_BIND_COMMAND", "aipane-bind")
+        )
+        self.grok_log = Path(
+            environment.get("AIPANE_GROK_LOG", str(Path.home() / ".grok/logs/unified.jsonl"))
+        )
+        self.max_attempts = positive_int(environment, "AI_RESTORE_MAX_ATTEMPTS", 2)
+        self.verify_timeout = positive_float(
+            environment, "AI_RESTORE_VERIFY_TIMEOUT", 10
+        )
+        self.grok_verify_timeout = positive_float(
+            environment, "AI_RESTORE_GROK_VERIFY_TIMEOUT", 60
+        )
+        self.verify_stability = positive_float(
+            environment, "AI_RESTORE_VERIFY_STABILITY", 1
+        )
+        self.grok_fallback_stability = positive_float(
+            environment, "AI_RESTORE_GROK_FALLBACK_STABILITY", 50
+        )
+        self.retry_delay = nonnegative_float(
+            environment, "AI_RESTORE_RETRY_DELAY", 5
+        )
+        self.launch_delay = nonnegative_float(
+            environment, "AI_RESTORE_LAUNCH_DELAY", 0.4
+        )
+        self.interrupt_timeout = positive_float(
+            environment, "AI_RESTORE_INTERRUPT_TIMEOUT", 3
+        )
+        self.poll_interval = min(
+            positive_float(environment, "AI_RESTORE_POLL_INTERVAL", 0.1),
+            self.verify_stability,
+        )
+
+    def log(self, message: str) -> None:
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.log_path.open("a", encoding="utf-8") as log:
+            log.write(f"{datetime.now().astimezone():%F %T} {message}\n")
+
+    def grok_offset(self) -> int | None:
+        try:
+            return self.grok_log.stat().st_size
+        except OSError:
+            return None
+
+    def grok_ready(self, sid: str, offset: int) -> bool:
+        try:
+            with self.grok_log.open("rb") as log:
+                size = log.seek(0, os.SEEK_END)
+                log.seek(offset if offset <= size else 0)
+                for raw_line in log:
+                    try:
+                        event = json.loads(raw_line)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if event.get("msg") == "session loaded" and event.get("sid") == sid:
+                        return True
+        except OSError:
+            return False
+        return False
+
+    def wait_for_shell(self, target: str) -> bool:
+        deadline = time.monotonic() + self.interrupt_timeout
+        while time.monotonic() < deadline:
+            command = self.tmux.current_command(target)
+            if command is not None and command.lower() in SHELL_COMMANDS:
+                return True
+            time.sleep(self.poll_interval)
+        return False
+
+    def existing_tool_matches(
+        self,
+        item: dict[str, Any],
+        current_command: str,
+    ) -> bool:
+        if not command_matches(item["tool"], current_command):
+            return False
+        foreground = self.tmux.foreground_command(item["target"])
+        sid = item.get("sid", "")
+        if sid and sid in foreground:
+            return True
+        identity = self.tmux.pane_identity(item["target"])
+        if not sid or identity is None or not self.registry_path.is_file():
+            return False
+        pane_id, socket_path, server_pid = identity
+        latest: dict[str, Any] | None = None
+        try:
+            with self.registry_path.open(encoding="utf-8") as registry:
+                for line in registry:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if (
+                        record.get("pane") == pane_id
+                        and record.get("sock") == socket_path
+                        and str(record.get("srv", "")) == server_pid
+                    ):
+                        latest = record
+        except OSError:
+            return False
+        tag = TOOL_TAGS.get(item["tool"])
+        if latest and latest.get("sid") == sid and latest.get("tool") in {
+            tag,
+            item["tool"],
+        }:
+            return True
+        return False
+
+    def pane_guard_matches(self, item: dict[str, Any]) -> bool:
+        expected = (
+            item.get("pane_id"),
+            item.get("socket_path"),
+            item.get("server_pid"),
+        )
+        if not all(expected):
+            return True
+        return self.tmux.pane_identity(item["target"]) == expected
+
+    def launch(self, item: dict[str, Any], *, interrupt_running: bool) -> tuple[Attempt | None, str]:
+        target = item["target"]
+        if not self.pane_guard_matches(item):
+            return None, "pane identity changed since recovery was planned"
+        current = self.tmux.current_command(target)
+        if current is None:
+            return None, "pane disappeared"
+        matches_existing = self.existing_tool_matches(item, current)
+        if interrupt_running and command_matches(item["tool"], current):
+            matches_existing = True
+        if matches_existing:
+            if not interrupt_running:
+                now = time.monotonic()
+                return (
+                    Attempt(
+                        item=item,
+                        started_at=now,
+                        deadline=now + self.verify_timeout,
+                        grok_offset=None,
+                        existing_process=True,
+                        sent=False,
+                    ),
+                    "",
+                )
+            if not self.tmux.send("-t", target, "C-c") or not self.wait_for_shell(target):
+                return None, "running Agent did not stop for retry"
+            current = self.tmux.current_command(target) or ""
+        if current.lower() not in SHELL_COMMANDS:
+            return None, f"pane is running {current}"
+
+        # C-c clears typed text and stale SGR mouse reports. -R resets tmux's
+        # terminal state before the literal command is queued.
+        if not self.tmux.send("-t", target, "C-c"):
+            return None, "could not clear pane input"
+        if not self.tmux.send("-R", "-t", target):
+            return None, "could not reset pane terminal state"
+        offset = self.grok_offset() if item["tool"] == "grok" else None
+        if not self.tmux.send("-l", "-t", target, item["command"]):
+            return None, "could not send recovery command"
+        if not self.tmux.send("-t", target, "Enter"):
+            return None, "could not submit recovery command"
+
+        now = time.monotonic()
+        timeout = self.grok_verify_timeout if item["tool"] == "grok" else self.verify_timeout
+        return (
+            Attempt(
+                item=item,
+                started_at=now,
+                deadline=now + timeout,
+                grok_offset=offset,
+                existing_process=False,
+                sent=True,
+            ),
+            "",
+        )
+
+    def verify_round(
+        self, attempts: list[Attempt]
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        active = {attempt.item["target"]: attempt for attempt in attempts}
+        verified: list[dict[str, Any]] = []
+        failures: dict[str, str] = {}
+
+        while active:
+            now = time.monotonic()
+            for target, attempt in tuple(active.items()):
+                item = attempt.item
+                current = self.tmux.current_command(target)
+                if current is None:
+                    failures[target] = "pane disappeared"
+                    active.pop(target)
+                    continue
+                if command_matches(item["tool"], current):
+                    attempt.seen_running = True
+                    if attempt.running_since is None:
+                        attempt.running_since = now
+                    stable_for = now - attempt.running_since
+                    ready = False
+                    if attempt.existing_process:
+                        ready = stable_for >= self.verify_stability
+                    elif item["tool"] == "grok" and item.get("sid") and attempt.grok_offset is not None:
+                        ready = stable_for >= self.verify_stability and (
+                            self.grok_ready(item["sid"], attempt.grok_offset)
+                            or stable_for >= self.grok_fallback_stability
+                        )
+                    elif item["tool"] == "grok":
+                        ready = stable_for >= self.grok_fallback_stability
+                    else:
+                        ready = stable_for >= self.verify_stability
+                    if ready:
+                        verified.append(item)
+                        active.pop(target)
+                        continue
+                elif current.lower() in SHELL_COMMANDS:
+                    if attempt.seen_running:
+                        failures[target] = self.tmux.capture_failure(target)
+                        active.pop(target)
+                        continue
+                else:
+                    failures[target] = f"pane switched to unexpected process {current}"
+                    active.pop(target)
+                    continue
+
+                if now >= attempt.deadline:
+                    if item["tool"] == "grok" and attempt.seen_running:
+                        failures[target] = "Grok did not report session loaded before timeout"
+                    elif current.lower() in SHELL_COMMANDS:
+                        failures[target] = self.tmux.capture_failure(target)
+                    else:
+                        failures[target] = "Agent process did not become ready before timeout"
+                    active.pop(target)
+            if active:
+                time.sleep(self.poll_interval)
+        return verified, failures
+
+    def bind(self, item: dict[str, Any]) -> bool:
+        sid = item.get("sid", "")
+        if not sid:
+            return True
+        tag = TOOL_TAGS.get(item["tool"])
+        identity = self.tmux.pane_identity(item["target"])
+        if not tag or identity is None or not self.bind_command:
+            return False
+        pane_id, socket_path, server_pid = identity
+        environment = self.environment.copy()
+        environment["TMUX"] = f"{socket_path},{server_pid},0"
+        try:
+            completed = subprocess.run(
+                [
+                    *self.bind_command,
+                    "--tool",
+                    tag,
+                    "--sid",
+                    sid,
+                    "--pane",
+                    pane_id,
+                    "--cmd",
+                    item["command"],
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                cwd=item["cwd"],
+            )
+        except OSError:
+            return False
+        return completed.returncode == 0
+
+    def execute(self, current: list[dict[str, Any]], dump: str) -> ExecutionReport:
+        now = time.time()
+        pending = self.store.merge(current, dump=dump, now=now)
+        pending_by_target = {item["target"]: item for item in pending}
+        current_targets = {
+            item["target"] for item in current if item["restorable"] is True
+        }
+        for target in current_targets:
+            item = pending_by_target.get(target)
+            identity = self.tmux.pane_identity(target)
+            guarded = item is not None and all(
+                item.get(field)
+                for field in ("pane_id", "socket_path", "server_pid")
+            )
+            new_server = bool(
+                guarded
+                and identity is not None
+                and (item.get("socket_path"), item.get("server_pid"))
+                != (identity[1], identity[2])
+            )
+            if item is not None and identity is not None and (not guarded or new_server):
+                item["pane_id"], item["socket_path"], item["server_pid"] = identity
+        self.store.save(list(pending_by_target.values()))
+        skipped = sum(item["restorable"] is not True for item in current)
+        verified_count = 0
+        deferred = 0
+        candidates = list(pending_by_target.values())
+
+        for round_index in range(self.max_attempts):
+            if not candidates:
+                break
+            attempts: list[Attempt] = []
+            immediate_failures: dict[str, str] = {}
+            for item in candidates:
+                attempt, error = self.launch(
+                    item,
+                    interrupt_running=round_index > 0,
+                )
+                if attempt is None:
+                    immediate_failures[item["target"]] = error
+                    continue
+                if attempt.sent:
+                    item["attempts"] = int(item.get("attempts", 0)) + 1
+                    item["updated_at"] = time.time()
+                    self.log(
+                        f"attempt {round_index + 1} sent {item['target']} "
+                        f"({item['tool']}/{item['kind']}): {item['command']}"
+                    )
+                attempts.append(attempt)
+                if self.launch_delay and item is not candidates[-1]:
+                    time.sleep(self.launch_delay)
+
+            self.store.save(list(pending_by_target.values()))
+            ready, failures = self.verify_round(attempts)
+            failures.update(immediate_failures)
+            retry: list[dict[str, Any]] = []
+
+            for item in ready:
+                target = item["target"]
+                if self.bind(item):
+                    pending_by_target.pop(target, None)
+                    verified_count += 1
+                    self.log(
+                        f"verified {target} ({item['tool']}/{item['kind']}): {item['command']}"
+                    )
+                else:
+                    item["last_error"] = "session resumed but pane binding failed"
+                    item["updated_at"] = time.time()
+                    self.log(f"pending {target}: {item['last_error']}")
+
+            for item in candidates:
+                target = item["target"]
+                error = failures.get(target)
+                if not error:
+                    continue
+                item["last_error"] = error
+                item["updated_at"] = time.time()
+                self.log(f"attempt {round_index + 1} failed {target} ({item['tool']}): {error}")
+                current_command = self.tmux.current_command(target)
+                retryable = target not in immediate_failures and current_command is not None and (
+                    current_command.lower() in SHELL_COMMANDS
+                    or command_matches(item["tool"], current_command)
+                )
+                if round_index + 1 < self.max_attempts and retryable:
+                    retry.append(item)
+                elif not retryable:
+                    deferred += 1
+
+            self.store.save(list(pending_by_target.values()))
+            candidates = retry
+            if candidates and self.retry_delay:
+                delay = self.retry_delay * (round_index + 1)
+                self.log(f"retrying {len(candidates)} pane(s) after {delay:g}s")
+                time.sleep(delay)
+
+        remaining = list(pending_by_target.values())
+        self.store.save(remaining)
+        report = ExecutionReport(
+            verified=verified_count,
+            pending=len(remaining),
+            skipped=skipped,
+            deferred=deferred,
+        )
+        self.log(report.render())
+        self.tmux.notify(report.render())
+        return report
+
+
+def print_plan(items: list[dict[str, Any]], dump: str) -> None:
+    print(f"ai-restore dry-run  (dump: {dump})")
+    for item in items:
+        if item["restorable"] is True:
+            label = item["kind"]
+        elif item["kind"] == "fresh":
+            label = "skip"
+        else:
+            label = item["kind"]
+        if item.get("pending"):
+            label = f"pending/{label}"
+        print(
+            f"  {item['target']:<22} {item['tool']:<6} {label:<14} {item['command']}"
+        )
+    print(f"\nsummary: ai_panes={len(items)} (dry-run, nothing sent)")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="aipane-restore-executor")
+    parser.add_argument("--plan", required=True, type=Path)
+    parser.add_argument("--dump", required=True)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--plan-json", action="store_true")
+    mode.add_argument("--dry-run", action="store_true")
+    arguments = parser.parse_args()
+
+    environment = os.environ.copy()
+    executor = RestoreExecutor(environment)
+    current = read_plan(arguments.plan)
+    display_items = executor.store.display_plan(current, now=time.time())
+    if arguments.plan_json:
+        for item in display_items:
+            print(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
+        return 0
+    if arguments.dry_run:
+        print_plan(display_items, arguments.dump)
+        return 0
+
+    executor.state_dir.mkdir(parents=True, exist_ok=True)
+    with executor.lock_path.open("a", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("ai-restore: another recovery executor is already running")
+            return 0
+        report = executor.execute(current, arguments.dump)
+    print(report.render())
+    return 0 if report.pending == 0 else 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (RestoreExecutionError, OSError, subprocess.SubprocessError) as error:
+        print(f"aipane-restore-executor: {error}", file=sys.stderr)
+        raise SystemExit(2)
