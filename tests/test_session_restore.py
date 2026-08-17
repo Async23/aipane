@@ -321,7 +321,7 @@ class SessionRestoreTests(unittest.TestCase):
             self.assertEqual(plan["kind"], "resume")
             self.assertTrue(plan["restorable"])
 
-    def test_restore_marks_missing_pi_session_invalid(self):
+    def test_restore_recreates_empty_pi_session_without_claiming_resume(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
             pi_agent_dir = tmp / "pi-agent"
@@ -340,8 +340,9 @@ class SessionRestoreTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             plan = json.loads(result.stdout)
             self.assertEqual(plan["tool"], "pi")
-            self.assertEqual(plan["kind"], "invalid")
-            self.assertFalse(plan["restorable"])
+            self.assertEqual(plan["kind"], "recreated")
+            self.assertTrue(plan["restorable"])
+            self.assertEqual(plan["command"], f"pi --session-id {VALID_PI_SID}")
 
     def test_restore_prefers_current_pi_binding_over_stale_launch_id(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -363,6 +364,28 @@ class SessionRestoreTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             plan = json.loads(result.stdout)
             self.assertEqual(plan["kind"], "resume")
+            self.assertTrue(plan["restorable"])
+            self.assertEqual(plan["command"], f"pi --session-id {VALID_PI_SID}")
+
+    def test_restore_recreates_current_empty_pi_binding_instead_of_stale_argv(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            pi_agent_dir = tmp / "pi-agent"
+            self.write_pi_session(pi_agent_dir, FOREIGN_SID, tmp)
+            result = self.run_restore(
+                tmp,
+                coord={"sid": VALID_PI_SID, "tool": "p"},
+                title="pi",
+                saved_codex_ids=set(),
+                plan_json=True,
+                current_command="node",
+                full_command=f"pi --session-id {FOREIGN_SID}",
+                extra_env={"PI_CODING_AGENT_DIR": str(pi_agent_dir)},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(result.stdout)
+            self.assertEqual(plan["kind"], "recreated")
             self.assertTrue(plan["restorable"])
             self.assertEqual(plan["command"], f"pi --session-id {VALID_PI_SID}")
 
@@ -459,6 +482,8 @@ class SessionRestoreTests(unittest.TestCase):
             local_bin.mkdir(parents=True)
             tmux_log = tmp / "tmux.log"
             bind_log = tmp / "bind.log"
+            pane_command = tmp / "pane-command"
+            pane_command.write_text("zsh\n", encoding="utf-8")
 
             fake_tmux = local_bin / "tmux"
             fake_tmux.write_text(
@@ -471,7 +496,8 @@ class SessionRestoreTests(unittest.TestCase):
                         ;;
                       display-message)
                         case "$*" in
-                          *pane_current_command*) printf 'zsh\\n' ;;
+                          *pane_current_command*) cat "$PANE_COMMAND" ;;
+                          *pane_id*socket_path*pid*) printf '%%42\\t/private/tmp/tmux-test\\t4242\\n' ;;
                           *pane_id*) printf '%%42\\n' ;;
                           *socket_path*) printf '/private/tmp/tmux-test\\n' ;;
                           *"#{pid}"*) printf '4242\\n' ;;
@@ -479,6 +505,9 @@ class SessionRestoreTests(unittest.TestCase):
                         ;;
                       send-keys)
                         printf '%s\\n' "$*" >> "$TMUX_LOG"
+                        case "$*" in
+                          *Enter*) printf 'codex\\n' > "$PANE_COMMAND" ;;
+                        esac
                         ;;
                       *)
                         exit 99
@@ -508,14 +537,20 @@ class SessionRestoreTests(unittest.TestCase):
                     "AIPANE_TMUX": str(fake_tmux),
                     "TMUX_LOG": str(tmux_log),
                     "BIND_LOG": str(bind_log),
+                    "PANE_COMMAND": str(pane_command),
+                    "AIPANE_BIND_COMMAND": str(fake_bind),
                     "AI_RESTORE_SETTLE_DELAY": "0",
+                    "AI_RESTORE_MAX_ATTEMPTS": "1",
+                    "AI_RESTORE_VERIFY_TIMEOUT": "0.3",
+                    "AI_RESTORE_VERIFY_STABILITY": "0.03",
+                    "AI_RESTORE_POLL_INTERVAL": "0.01",
                 },
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(
-                "send-keys -t 0:4.1 "
-                f"codex --yolo --disable plugins resume {VALID_CODEX_SID} Enter",
+                "send-keys -l -t 0:4.1 "
+                f"codex --yolo --disable plugins resume {VALID_CODEX_SID}",
                 tmux_log.read_text(),
             )
             binding = bind_log.read_text()
