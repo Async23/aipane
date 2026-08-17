@@ -53,6 +53,13 @@ The JSON and TOML files are mergeable configuration fragments; do not replace
 an existing user configuration wholesale. The OpenCode Adapter is executable
 plugin source and may be symlinked into OpenCode's plugin directory.
 
+Pi's Agent Activity remains owned by the separately versioned
+`@async23/pi-tmux-window-wrap` package. `pi/aipane-bind.ts` has a different job:
+Pi can replace its active session during `/new`, `/resume`, or `/fork` without
+changing the process argv, so this Adapter records the new session id on every
+`session_start` event. Symlink it into Pi's global extension directory and use
+`/reload` to activate it in an existing Pi process.
+
 | AI Tool | Integration source | User-owned registration point |
 |---|---|---|
 | Claude Code | `claude/hooks.json` | `~/.claude/settings.json` |
@@ -61,7 +68,7 @@ plugin source and may be symlinked into OpenCode's plugin directory.
 | Grok | `grok/hooks.json` | `~/.grok/hooks/*.json` |
 | Kimi Code | `kimi/hooks.toml` | `~/.kimi-code/config.toml` |
 | OpenCode | `opencode/aipane-bind.js` | `~/.config/opencode/plugins/` |
+| Pi | `pi/aipane-bind.ts` | `~/.pi/agent/extensions/` |
 | Qoder | `qoder/hooks.json` | `~/.qoder/settings.json` |
 
-Pi uses the separately versioned `@async23/pi-tmux-window-wrap` package, so it
-does not need another Adapter here.
+Pi uses `@async23/pi-tmux-window-wrap` separately for Agent Activity.

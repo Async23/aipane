@@ -4,7 +4,8 @@
 # Two jobs:
 #   1. gold-case launch: give aipane-controlled tools a session id AT LAUNCH
 #      (pi/grok/claude via --session-id; cursor via pre-created chat id) so the
-#      pane→session binding is deterministic — no hooks, no store races.
+#      initial pane→session binding is deterministic. Pi may replace its session
+#      in-process; integrations/pi/aipane-bind.ts updates that binding afterward.
 #   2. registry: append (pane %N → tool, session id) bindings to a JSONL log,
 #      last-writer-wins, so ai-restore / aipane-snapshot can resume the right
 #      session into the right pane after a tmux server restart.
