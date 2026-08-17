@@ -189,6 +189,19 @@ ai-restart            # 预览、确认，然后重启并恢复
 ai-restart --force    # 允许重启当前标记为 busy 的 pane
 ```
 
+Pi 可以在不重启进程的情况下切换会话。安装 aipane 的 Pi 会话绑定 Adapter，
+确保 `/new`、`/resume`、`/fork` 之后仍能恢复当前会话：
+
+```bash
+AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
+mkdir -p ~/.pi/agent/extensions ~/.local/bin
+ln -sf "$AIPANE_ROOT/integrations/pi/aipane-bind.ts" \
+  ~/.pi/agent/extensions/aipane-bind.ts
+ln -sf "$AIPANE_ROOT/bin/aipane-bind" ~/.local/bin/aipane-bind
+```
+
+已经运行的 Pi 进程执行一次 `/reload` 即可加载。
+
 默认情况下，只要选中的 Agent Activity 中有一个为 `busy`，整次操作就会中止。
 旧 Agent 进程尚未上报状态时会显示 `unknown`，交互命令要求你明确确认所有任务均已
 空闲。单独使用 `--yes` 不会接受 `unknown`；非交互场景必须显式使用 `--force`。
@@ -196,9 +209,9 @@ ai-restart --force    # 允许重启当前标记为 busy 的 pane
 tmux-resurrect 以及
 [`docs/session-restore-design.md`](docs/session-restore-design.md) 中的会话恢复 hooks。
 
-Claude 可能已拥有预分配的 `--session-id`，但还没创建真实的 model
-conversation（例如只执行过本地 `/skills` 命令）。这种 ID 会在 pane 被替换前
-判定为不可恢复，不再发送给 `claude --resume` 并误报成功。
+Pi 与 Claude 都可能已拥有预分配的 `--session-id`，但还没创建可持久恢复的
+conversation。这种 ID 会在 pane 被替换前判定为不可恢复，不再创建空白替代会话并
+误报成功。
 `ai-restart` 会将该 pane 明确列为 `left untouched / no saved conversation`。
 
 ## 进程清理
@@ -270,6 +283,7 @@ killrod --dry-run
 │   ├── grok/
 │   ├── kimi/
 │   ├── opencode/
+│   ├── pi/
 │   └── qoder/
 ├── docs/
 │   ├── cheatsheet.md
@@ -314,6 +328,7 @@ zsh -fc '
 python3 tests/test_ai_restart.py
 python3 tests/test_agent_activity_integrations.py
 python3 tests/test_session_restore.py
+node --experimental-strip-types --test tests/pi-session-binding.test.mjs
 python3 tests/test_tmux_window_jump.py
 python3 tests/test_workstation_fragments.py
 python3 tests/test_tmux_window_wrap.py

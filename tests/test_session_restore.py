@@ -18,6 +18,7 @@ RESTORE = ROOT / "bin" / "ai-restore"
 
 VALID_CODEX_SID = "019fdad7-16c3-7a13-89cf-ec8c2184e5f7"
 FOREIGN_SID = "1fa8ab6a-cba1-4189-abcd-64a29ffb2fc3"
+VALID_PI_SID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 
 
 class SessionRestoreTests(unittest.TestCase):
@@ -320,6 +321,72 @@ class SessionRestoreTests(unittest.TestCase):
             self.assertEqual(plan["kind"], "resume")
             self.assertTrue(plan["restorable"])
 
+    def test_restore_marks_missing_pi_session_invalid(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            pi_agent_dir = tmp / "pi-agent"
+            pi_agent_dir.mkdir()
+            result = self.run_restore(
+                tmp,
+                coord={"sid": VALID_PI_SID, "tool": "p"},
+                title="pi",
+                saved_codex_ids=set(),
+                plan_json=True,
+                current_command="node",
+                full_command="pi",
+                extra_env={"PI_CODING_AGENT_DIR": str(pi_agent_dir)},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(result.stdout)
+            self.assertEqual(plan["tool"], "pi")
+            self.assertEqual(plan["kind"], "invalid")
+            self.assertFalse(plan["restorable"])
+
+    def test_restore_prefers_current_pi_binding_over_stale_launch_id(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            pi_agent_dir = tmp / "pi-agent"
+            self.write_pi_session(pi_agent_dir, FOREIGN_SID, tmp)
+            self.write_pi_session(pi_agent_dir, VALID_PI_SID, tmp)
+            result = self.run_restore(
+                tmp,
+                coord={"sid": VALID_PI_SID, "tool": "p"},
+                title="pi",
+                saved_codex_ids=set(),
+                plan_json=True,
+                current_command="node",
+                full_command=f"pi --session-id {FOREIGN_SID}",
+                extra_env={"PI_CODING_AGENT_DIR": str(pi_agent_dir)},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(result.stdout)
+            self.assertEqual(plan["kind"], "resume")
+            self.assertTrue(plan["restorable"])
+            self.assertEqual(plan["command"], f"pi --session-id {VALID_PI_SID}")
+
+    def test_restore_rejects_pi_session_from_a_different_project(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            pi_agent_dir = tmp / "pi-agent"
+            self.write_pi_session(pi_agent_dir, VALID_PI_SID, tmp / "other-project")
+            result = self.run_restore(
+                tmp,
+                coord={"sid": VALID_PI_SID, "tool": "p"},
+                title="pi",
+                saved_codex_ids=set(),
+                plan_json=True,
+                current_command="node",
+                full_command="pi",
+                extra_env={"PI_CODING_AGENT_DIR": str(pi_agent_dir)},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(result.stdout)
+            self.assertEqual(plan["kind"], "invalid")
+            self.assertFalse(plan["restorable"])
+
     def test_restore_prefers_current_codex_binding_over_stale_resume_argv(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
@@ -533,6 +600,25 @@ class SessionRestoreTests(unittest.TestCase):
         if conversation_exists:
             (project / f"{FOREIGN_SID}.jsonl").touch()
         return config
+
+    def write_pi_session(self, agent_dir: Path, sid: str, cwd: Path) -> Path:
+        project = agent_dir / "sessions" / "--fixture-project--"
+        project.mkdir(parents=True, exist_ok=True)
+        session = project / f"2026-08-16T09-01-27-117Z_{sid}.jsonl"
+        session.write_text(
+            json.dumps(
+                {
+                    "type": "session",
+                    "version": 3,
+                    "id": sid,
+                    "timestamp": "2026-08-16T09:01:27.117Z",
+                    "cwd": str(cwd),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return session
 
 
 if __name__ == "__main__":
