@@ -191,6 +191,19 @@ ai-restart            # preview, confirm, then restart and resume
 ai-restart --force    # allow panes currently marked busy
 ```
 
+Pi can change sessions without restarting its process. Install aipane's Pi
+session-binding Adapter so `/new`, `/resume`, and `/fork` remain restorable:
+
+```bash
+AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
+mkdir -p ~/.pi/agent/extensions ~/.local/bin
+ln -sf "$AIPANE_ROOT/integrations/pi/aipane-bind.ts" \
+  ~/.pi/agent/extensions/aipane-bind.ts
+ln -sf "$AIPANE_ROOT/bin/aipane-bind" ~/.local/bin/aipane-bind
+```
+
+Run `/reload` in Pi processes that were already open.
+
 The default command aborts the whole operation if any selected Agent Activity
 is effectively busy. It resolves Codex turns from exact lifecycle evidence
 before the plan and again after confirmation; `--dry-run` remains read-only.
@@ -202,11 +215,11 @@ AI pane. This requires
 tmux-resurrect and the session-restore hooks described in
 [`docs/session-restore-design.md`](docs/session-restore-design.md).
 
-Claude can own a preassigned `--session-id` without having created a model
-conversation yet (for example, after only a local `/skills` command). Such an
-ID is classified as non-restorable before panes are replaced, rather than being
-sent to `claude --resume` and counted as a success. `ai-restart` lists that pane
-as `left untouched / no saved conversation`.
+Pi and Claude can own a preassigned `--session-id` without having created a
+durable conversation yet. Such an ID is classified as non-restorable before
+panes are replaced, rather than being used to create an empty replacement and
+counted as a success. `ai-restart` lists that pane as
+`left untouched / no saved conversation`.
 
 ## Process Cleanup
 
@@ -278,6 +291,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 │   ├── grok/
 │   ├── kimi/
 │   ├── opencode/
+│   ├── pi/
 │   └── qoder/
 ├── docs/
 │   ├── cheatsheet.md
@@ -322,6 +336,7 @@ zsh -fc '
 python3 tests/test_ai_restart.py
 python3 tests/test_agent_activity_integrations.py
 python3 tests/test_session_restore.py
+node --experimental-strip-types --test tests/pi-session-binding.test.mjs
 python3 tests/test_tmux_window_jump.py
 python3 tests/test_workstation_fragments.py
 python3 tests/test_tmux_window_wrap.py

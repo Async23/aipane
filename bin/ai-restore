@@ -7,9 +7,11 @@
 #   - aipane's gold-case launch puts the session id straight into that command line
 #     (pi/grok/claude via --session-id, cursor via a pre-created chat id), and any
 #     `resume`-style launch already carries its id too.
-#   - So the last resurrect dump already pairs each pane's coordinate with a command
-#     line that contains the session id. We parse it and re-issue the right resume
-#     command into the matching restored pane.
+#   - For tools whose active session still matches their launch argv, the resurrect
+#     dump contains the id directly. Pi/Codex can replace sessions in-process, so
+#     their current coordinate binding takes precedence over stale launch argv.
+#   - We parse that durable identity and re-issue the right resume command into the
+#     matching restored pane.
 #
 # Trigger: @resurrect-hook-post-restore-all 'ai-restore'  (runs after restore settles).
 # Manual : ai-restore            (act) | ai-restore --dry-run (print plan only)
@@ -46,13 +48,14 @@ done
 typeset STATE_DIR="${AIPANE_STATE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/aipane}"
 typeset LOG="$STATE_DIR/ai-restore.log"
 typeset COORDS="$STATE_DIR/coords-last.json"
+typeset PI_SESSION_ROOT="${PI_CODING_AGENT_SESSION_DIR:-${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/sessions}"
 mkdir -p "$STATE_DIR" 2>/dev/null
 
 log() { print -r -- "$(date '+%F %T') $*" >>"$LOG" 2>/dev/null; }
 
-# Coordinate -> session id/tool map produced by aipane-snapshot at save time. The
-# tool tag is part of the identity: a stale binding from another tool must never be
-# interpreted as the detected pane's session id.
+# Coordinate -> current session id/tool map produced by aipane-snapshot at save
+# time. The tool tag is part of the identity: a stale binding from another tool
+# must never be interpreted as the detected pane's session id.
 typeset -A COORDS_SID COORDS_TOOL
 if [[ -r "$COORDS" ]] && command -v python3 &>/dev/null; then
   local _cl
@@ -190,25 +193,65 @@ claude_session_exists() {
   (( ${#matches[@]} > 0 ))
 }
 
-# build_resume <tool> <full_cmd> <title> <coord_sid> -> REPLY = command to send, or ""
-# Gold-case tools keep their session id in argv. Codex is different: an in-process
-# fork changes the current thread without changing the original `codex resume ...`
+# pi_session_exists <uuid> <cwd> — `pi --session-id` creates a new session when
+# the id is absent. Treating any UUID as resumable therefore turns stale bindings
+# into convincing empty sessions. Require a durable JSONL whose header identifies
+# both the requested id and the pane's project cwd.
+pi_session_exists() {
+  local sid="$1" cwd="$2"
+  local -a matches
+  matches=("$PI_SESSION_ROOT"/**/*_"$sid".jsonl(N))
+  (( ${#matches[@]} > 0 )) || return 1
+  command -v python3 &>/dev/null || return 1
+  python3 - "$sid" "$cwd" "${matches[@]}" <<'PY'
+import json
+import os
+import sys
+
+sid, cwd, *paths = sys.argv[1:]
+expected_cwd = os.path.normcase(os.path.realpath(cwd))
+for path in paths:
+    try:
+        with open(path, encoding="utf-8") as session:
+            header = json.loads(session.readline())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        continue
+    if (
+        isinstance(header, dict)
+        and header.get("type") == "session"
+        and header.get("id") == sid
+        and isinstance(header.get("cwd"), str)
+        and os.path.normcase(os.path.realpath(header["cwd"])) == expected_cwd
+    ):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+# build_resume <tool> <full_cmd> <title> <coord_sid> <cwd>
+# -> REPLY = command to send, or ""
+# Gold-case tools begin with their session id in argv. Codex and Pi are different:
+# an in-process resume/fork changes the current session without changing the launch
 # argv, so a durable current coordinate binding must supersede that stale id.
 # opencode/kimi ids are not UUIDs and only come from the coordinate snapshot.
 # Sets REPLY_KIND = resume|fresh|invalid for logging.
 build_resume() {
-  local tool="$1" full="$2" title="$3" coord_sid="$4" id
+  local tool="$1" full="$2" title="$3" coord_sid="$4" cwd="$5" id
   REPLY=""; REPLY_KIND=""; REPLY_SID=""
   extract_uuid "$full"; id="$REPLY"
   if [[ "$tool" == codex && -n "$coord_sid" ]] && codex_session_exists "$coord_sid"; then
+    id="$coord_sid"
+  elif [[ "$tool" == pi && -n "$coord_sid" ]] && pi_session_exists "$coord_sid" "$cwd"; then
     id="$coord_sid"
   elif [[ -z "$id" && -n "$coord_sid" ]]; then
     id="$coord_sid"
   fi
   case "$tool" in
     pi)
-      # --session-id is idempotent on pi: resumes if present, creates if not.
-      if [[ -n "$id" ]]; then REPLY="$PI_BASE --session-id $id"; REPLY_KIND=resume
+      if [[ -n "$id" ]]; then
+        REPLY="$PI_BASE --session-id $id"
+        if pi_session_exists "$id" "$cwd"; then REPLY_KIND=resume
+        else REPLY_KIND=invalid; fi
       else REPLY="$PI_BASE"; REPLY_KIND=fresh; fi ;;
     cursor)
       if [[ -n "$id" ]]; then REPLY="$CURSOR_BASE --resume $id"; REPLY_KIND=resume
@@ -342,7 +385,7 @@ while IFS= read -r line; do
     coord_sid=""
   fi
 
-  build_resume "$tool" "$full" "$title" "$coord_sid"; cmd="$REPLY"; resume_sid="$REPLY_SID"
+  build_resume "$tool" "$full" "$title" "$coord_sid" "$cwd"; cmd="$REPLY"; resume_sid="$REPLY_SID"
   [[ -n "$cmd" ]] || { (( n_skip++ )); continue; }
 
   # Invalid ids are always skipped. Fresh panes are skipped unless opted in.
