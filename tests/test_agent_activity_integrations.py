@@ -538,12 +538,13 @@ class AgentActivityIntegrationTests(unittest.TestCase):
         self.assertEqual(hooks["stop"][0]["command"], IDLE_COMMAND)
         self.assertEqual(hooks["sessionEnd"][0]["command"], IDLE_COMMAND)
 
-    def test_kimi_hook_fragment_has_no_permission_state_override(self):
+    def test_kimi_turn_started_hook_covers_non_user_turn_origins(self):
         path = INTEGRATIONS / "kimi" / "hooks.toml"
         hooks = tomllib.loads(path.read_text(encoding="utf-8"))["hooks"]
         commands = {hook["event"]: hook["command"] for hook in hooks}
 
-        self.assertEqual(commands["UserPromptSubmit"], BUSY_COMMAND)
+        self.assertEqual(commands["TurnStarted"], BUSY_COMMAND)
+        self.assertNotIn("UserPromptSubmit", commands)
         for event in ("SessionStart", "Stop", "StopFailure", "Interrupt", "SessionEnd"):
             self.assertEqual(commands[event], IDLE_COMMAND)
         self.assertNotIn("PermissionRequest", commands)

@@ -49,6 +49,11 @@ must still match, and two stable status probes are required before the display
 projection is repaired. Any missing or inconsistent evidence remains
 `unknown`; it is never guessed idle.
 
+Kimi Code starts activity from `TurnStarted`, available since Kimi Code 0.32.0.
+`UserPromptSubmit` only covers turns whose origin is `user`; slash skills,
+plugin commands, goal continuations, and other non-user origins bypass it even
+though the Agent is running. Terminal lifecycle events clear the marker.
+
 The JSON and TOML files are mergeable configuration fragments; do not replace
 an existing user configuration wholesale. The OpenCode Adapter is executable
 plugin source and may be symlinked into OpenCode's plugin directory.
