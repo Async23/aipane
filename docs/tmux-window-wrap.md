@@ -149,8 +149,12 @@ cannot clear a newly submitted turn. Other AI Tools remain hook/plugin-driven.
 Kimi Code can drive the pane-local marker through lifecycle hooks in
 `~/.kimi-code/config.toml`. Merge
 [`integrations/kimi/hooks.toml`](../integrations/kimi/hooks.toml) into that
-file. The turn stays busy while Kimi waits for permission; permission events do
-not create a tool-specific interpretation of Agent Activity.
+file. The fragment uses `TurnStarted`, available since Kimi Code 0.32.0, so
+slash skills, plugin commands, goal continuations, and other non-user turn
+origins are covered. `UserPromptSubmit` is not a complete activity boundary
+because Kimi only emits it for turns whose origin is `user`. The turn stays
+busy while Kimi waits for permission; permission events do not create a
+tool-specific interpretation of Agent Activity.
 
 The helper uses `TMUX_PANE`, which Kimi inherits from tmux. Run `/reload` in an
 idle Kimi session or start a new Kimi process after changing the hook

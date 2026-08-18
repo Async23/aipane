@@ -4,7 +4,7 @@ command = "$HOME/.local/bin/tmux-window-wrap activity idle"
 timeout = 5
 
 [[hooks]]
-event = "UserPromptSubmit"
+event = "TurnStarted"
 command = "$HOME/.local/bin/tmux-window-wrap activity busy"
 timeout = 5
 
