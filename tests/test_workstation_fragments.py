@@ -198,6 +198,91 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 capture_output=True,
             )
 
+    def test_pane_border_marks_input_off_independently_of_broadcast(self):
+        socket = f"ws-input-off-{os.getpid()}-{id(self)}"
+
+        def tmux(*args: str):
+            return subprocess.run(
+                ["tmux", "-L", socket, *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        def border(target: str) -> str:
+            return tmux(
+                "display-message",
+                "-p",
+                "-t",
+                target,
+                "#{E:pane-border-format}",
+            ).stdout.strip()
+
+        off_badge = "#[bg=red]#[fg=colour231]#[bold] OFF #[default]"
+        try:
+            tmux(
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "input-off",
+                "sleep 30",
+            )
+            tmux("source-file", str(TMUX_WS))
+            first = tmux(
+                "display-message",
+                "-p",
+                "-t",
+                "input-off:0.0",
+                "#{pane_id}",
+            ).stdout.strip()
+            second = tmux(
+                "split-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                "input-off:0",
+                "sleep 30",
+            ).stdout.strip()
+
+            plain = border(first)
+            self.assertNotIn(off_badge, plain)
+            self.assertNotIn("▶ ▶ ▶", plain)
+
+            tmux("set-option", "-w", "-t", first, "synchronize-panes", "on")
+            synchronized = border(first)
+            self.assertNotIn(off_badge, synchronized)
+            self.assertIn("#[fg=red] ▶ ▶ ▶#[default]", synchronized)
+
+            tmux("select-pane", "-d", "-t", first)
+            active_off = border(first)
+            self.assertIn(off_badge, active_off)
+            self.assertNotIn("▶ ▶ ▶", active_off)
+
+            tmux("select-pane", "-t", second)
+            inactive_off = border(first)
+            self.assertIn(off_badge, inactive_off)
+            self.assertNotIn("▶ ▶ ▶", inactive_off)
+
+            tmux("set-option", "-w", "-t", first, "synchronize-panes", "off")
+            broadcast_off = border(first)
+            self.assertIn(off_badge, broadcast_off)
+            self.assertNotIn("▶ ▶ ▶", broadcast_off)
+
+            tmux("select-pane", "-e", "-t", first)
+            restored = border(first)
+            self.assertNotIn(off_badge, restored)
+            self.assertNotIn("▶ ▶ ▶", restored)
+        finally:
+            subprocess.run(
+                ["tmux", "-L", socket, "kill-server"],
+                check=False,
+                capture_output=True,
+            )
+
     def test_digit_binding_passes_literal_session_id_to_window_jump(self):
         socket = f"ws-jump-binding-{os.getpid()}-{id(self)}"
         child_pid = None
@@ -618,6 +703,7 @@ class DocsPointerTests(unittest.TestCase):
         self.assertIn("| `Cmd+S` | prefix only |", cheatsheet)
         self.assertIn("| `Cmd+Opt+P` | popup pane ID list |", cheatsheet)
         self.assertIn("| `Cmd+I` | centered popup rename window |", cheatsheet)
+        self.assertIn("red-background `OFF` badge", cheatsheet)
         self.assertIn(
             "| `prefix P` | indexed colour palette "
             "(`0–255`; `q`/`Esc` closes) |",
