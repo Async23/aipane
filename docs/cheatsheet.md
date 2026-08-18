@@ -105,7 +105,9 @@ Requires Ghostty `macos-option-as-alt = true` (in `ghostty-tmux.conf`).
 | `prefix B` / `Cmd+Opt+I` | sync input to all panes in window |
 | `prefix e` / `Cmd+Opt+Shift+I` | mute / unmute this pane only |
 
-Status: yellow `SYNC`; pane bar / window label show `▶` when synced.
+Status: yellow `SYNC`; pane bar / window label show `▶` when synced. A pane
+with input disabled shows a red-background `OFF` badge in its pane bar even
+when `SYNC` is off.
 
 ## Copy mode
 
