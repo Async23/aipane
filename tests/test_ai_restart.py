@@ -100,28 +100,36 @@ class AiRestartTests(unittest.TestCase):
                 import subprocess
                 import sys
 
+                targets = [
+                    (os.environ["TEST_TARGET"], "sleep 120"),
+                ]
+                if second_target := os.environ.get("TEST_SECOND_TARGET"):
+                    targets.append((second_target, "tail -f /dev/null"))
+
                 if "--plan-json" in sys.argv:
-                    print(json.dumps({
-                        "target": os.environ["TEST_TARGET"],
-                        "tool": "claude",
-                        "kind": (
-                            "invalid"
-                            if os.environ.get("TEST_PLAN_INVALID") == "1"
-                            else "resume"
-                        ),
-                        "restorable": os.environ.get("TEST_PLAN_INVALID") != "1",
-                        "cwd": os.environ["TEST_CWD"],
-                        "command": "claude --resume test-session",
-                    }))
+                    for target, command in targets:
+                        print(json.dumps({
+                            "target": target,
+                            "tool": "claude",
+                            "kind": (
+                                "invalid"
+                                if os.environ.get("TEST_PLAN_INVALID") == "1"
+                                else "resume"
+                            ),
+                            "restorable": os.environ.get("TEST_PLAN_INVALID") != "1",
+                            "cwd": os.environ["TEST_CWD"],
+                            "command": command,
+                        }))
                 else:
                     with open(os.environ["TEST_RESTORE_LOG"], "a", encoding="utf-8") as log:
                         log.write(" ".join(sys.argv[1:]) + "\\n")
                     if os.environ.get("TEST_RESTORE_LEAVES_SHELL") != "1":
-                        subprocess.run([
-                            *shlex.split(os.environ["AIPANE_TMUX"]),
-                            "send-keys", "-t", os.environ["TEST_TARGET"],
-                            "sleep 120", "Enter",
-                        ], check=True)
+                        for target, command in targets:
+                            subprocess.run([
+                                *shlex.split(os.environ["AIPANE_TMUX"]),
+                                "send-keys", "-t", target,
+                                command, "Enter",
+                            ], check=True)
                 """
             ),
             encoding="utf-8",
@@ -182,6 +190,27 @@ class AiRestartTests(unittest.TestCase):
         self.assertEqual(self.save_log.read_text(), "saved\n")
         self.assertEqual(self.snapshot_log.read_text(), "snapshot\n")
         self.assertFalse(self.restore_log.exists())
+
+    def test_dry_run_preserves_sync(self):
+        self.tmux(
+            "set-window-option",
+            "-t",
+            self.target,
+            "synchronize-panes",
+            "on",
+        )
+
+        result = self.run_restart("--dry-run")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        synchronized = self.tmux(
+            "display-message",
+            "-p",
+            "-t",
+            self.target,
+            "#{synchronize-panes}",
+        ).stdout.strip()
+        self.assertEqual(synchronized, "1")
 
     def test_busy_pane_aborts_the_whole_restart(self):
         self.tmux(
@@ -285,6 +314,50 @@ class AiRestartTests(unittest.TestCase):
         ).stdout.strip()
         self.assertEqual(Path(restored_cwd).resolve(), self.tmp.resolve())
         self.assertIn("--dump", self.restore_log.read_text())
+
+    def test_restart_disables_sync_before_restoring_distinct_panes(self):
+        second_target = self.tmux(
+            "split-window",
+            "-h",
+            "-P",
+            "-F",
+            "#{session_name}:#{window_index}.#{pane_index}",
+            "-t",
+            self.target,
+            "-c",
+            str(self.tmp),
+            "sleep 120",
+        ).stdout.strip()
+        self.extra_environment = {"TEST_SECOND_TARGET": second_target}
+        self.tmux(
+            "set-window-option",
+            "-t",
+            self.target,
+            "synchronize-panes",
+            "on",
+        )
+
+        result = self.run_restart("--yes", "--force")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("disabled SYNC for", result.stdout)
+        synchronized = self.tmux(
+            "display-message",
+            "-p",
+            "-t",
+            self.target,
+            "#{synchronize-panes}",
+        ).stdout.strip()
+        self.assertEqual(synchronized, "0")
+        self.assertEqual(self.current_command(), "sleep")
+        second_command = self.tmux(
+            "display-message",
+            "-p",
+            "-t",
+            second_target,
+            "#{pane_current_command}",
+        ).stdout.strip()
+        self.assertEqual(second_command, "tail")
 
     def test_restart_clears_activity_metadata_from_replaced_process(self):
         for option, value in (

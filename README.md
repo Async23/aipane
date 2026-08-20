@@ -184,7 +184,9 @@ Inside tmux, a pane layout reuses the current window only when it has one pane; 
 recoverable session, replaces those panes with an idle shell, and delegates the
 resume commands to `ai-restore`. Pane IDs, layout, and working directories stay
 unchanged. Recovery commands are cleared of stale terminal input before launch,
-transient failures are retried, and a pane is rebound only after verification.
+and SYNC is disabled on affected tmux windows so distinct pane commands cannot
+be broadcast across the window. Transient failures are retried, and a pane is
+rebound only after verification.
 Grok must report the requested `session loaded`; other Agents must remain alive
 for a stability window. Unfinished intent is kept in
 `~/.local/share/aipane/restore-pending.json`, so a later continuum save cannot
