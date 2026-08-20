@@ -262,6 +262,67 @@ def live_plan(tmux: Tmux, plan: list[dict[str, object]]) -> list[dict[str, objec
     return result
 
 
+def disable_synchronized_windows(
+    tmux: Tmux,
+    plan: list[dict[str, object]],
+) -> list[str]:
+    window_states: dict[str, str] = {}
+    for item in plan:
+        target = str(item.get("target", ""))
+        completed = tmux.run(
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            f"#{{window_id}}{FIELD_SEPARATOR}#{{synchronize-panes}}",
+            check=False,
+        )
+        if completed.returncode != 0:
+            reason = completed.stderr.strip() or "pane disappeared"
+            raise RestartError(
+                f"could not inspect synchronized input for {target}: {reason}"
+            )
+        fields = completed.stdout.rstrip("\n").split(FIELD_SEPARATOR, 1)
+        if len(fields) != 2 or not fields[0]:
+            raise RestartError(
+                f"could not resolve the window containing {target}"
+            )
+        window_id, synchronized = fields
+        window_states[window_id] = synchronized
+
+    disabled = [
+        window_id
+        for window_id, synchronized in window_states.items()
+        if synchronized in {"1", "on"}
+    ]
+    for window_id in window_states:
+        completed = tmux.run(
+            "set-window-option",
+            "-t",
+            window_id,
+            "synchronize-panes",
+            "off",
+            check=False,
+        )
+        if completed.returncode != 0:
+            reason = completed.stderr.strip() or "tmux rejected the option change"
+            raise RestartError(
+                f"could not disable synchronized input for {window_id}: {reason}"
+            )
+        synchronized = tmux.value(
+            "display-message",
+            "-p",
+            "-t",
+            window_id,
+            "#{synchronize-panes}",
+        )
+        if synchronized not in {"0", "off"}:
+            raise RestartError(
+                f"synchronized input is still enabled for {window_id}"
+            )
+    return disabled
+
+
 def print_plan(plan: list[dict[str, object]]) -> None:
     print("AI panes to restart:")
     for item in plan:
@@ -581,6 +642,13 @@ def main() -> int:
     ):
         raise RestartError(
             "new unknown Agent Activity appeared after confirmation; retry"
+        )
+
+    disabled_windows = disable_synchronized_windows(tmux, refreshed_plan)
+    if disabled_windows:
+        print(
+            "ai-restart: disabled SYNC for "
+            + ", ".join(sorted(disabled_windows))
         )
 
     resumed, failures = restart_panes(

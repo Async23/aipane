@@ -182,8 +182,9 @@ ai cc                                     # 重复的键会启动重复的工具
 
 `ai-restart` 会刷新 tmux-resurrect 快照，找出拥有可恢复会话的 AI pane，
 将这些 pane 重生为空闲 shell，再交给 `ai-restore` 续接原会话。pane ID、
-布局和工作目录保持不变。恢复前会清理残留终端输入，瞬时失败会延迟重试，
-并且只有验证成功后才重新绑定 pane。Grok 必须明确上报目标会话
+布局和工作目录保持不变。恢复前会清理残留终端输入，并关闭受影响 tmux window
+的 SYNC，避免不同 pane 的恢复命令被广播。瞬时失败会延迟重试，并且只有验证
+成功后才重新绑定 pane。Grok 必须明确上报目标会话
 `session loaded`，其他 Agent 则必须通过进程稳定期。未完成的恢复意图保存在
 `~/.local/share/aipane/restore-pending.json`，不会再被后续 continuum 快照抹掉。
 Qoder 和 Droid 因尚未支持会话恢复而直接忽略。
