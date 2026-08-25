@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Restart restorable AI Tools in place and resume their saved sessions.
-
-The command refreshes the tmux-resurrect snapshot, asks ai-restore for its
-machine-readable plan, replaces only those AI panes with an idle shell, and
-then lets ai-restore resume the same sessions in the same panes.
-"""
+"""Confirm and seal an exact in-place restart plan for restorable AI Tools."""
 
 from __future__ import annotations
 
@@ -12,9 +7,10 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
-import time
+import tempfile
 from pathlib import Path
 
 
@@ -23,6 +19,7 @@ if str(LIB_DIR) not in sys.path:
     sys.path.insert(0, str(LIB_DIR))
 
 from agent_activity import AgentActivity, PaneActivity
+from recovery_plan import GUARD_FIELDS, RecoveryPlanError, seal_plan
 
 
 FIELD_SEPARATOR = "\x1f"
@@ -30,13 +27,6 @@ ACTIVITY_OPTION = "@tmux-window-wrap-activity"
 ACTIVITY_REPORTER_OPTION = "@tmux-window-wrap-activity-reporter"
 ACTIVITY_UPDATED_AT_OPTION = "@tmux-window-wrap-activity-updated-at"
 ACTIVITY_RECORD_OPTION = "@tmux-window-wrap-activity-record"
-ACTIVITY_OPTIONS = (
-    ACTIVITY_OPTION,
-    ACTIVITY_REPORTER_OPTION,
-    ACTIVITY_UPDATED_AT_OPTION,
-    ACTIVITY_RECORD_OPTION,
-)
-SHELL_COMMANDS = {"zsh", "-zsh", "bash", "-bash", "sh", "-sh", "fish", "-fish"}
 
 
 class RestartError(RuntimeError):
@@ -64,9 +54,6 @@ class Tmux:
             capture_output=capture_output,
             text=True,
         )
-
-    def value(self, *arguments: str) -> str:
-        return self.run(*arguments).stdout.strip()
 
 
 def configured_command(name: str, fallback: Path) -> list[str]:
@@ -141,7 +128,10 @@ def save_snapshot(tmux: Tmux, script_dir: Path) -> Path:
     dump = resurrect_dump_path(tmux)
     if not dump.exists():
         raise RestartError(f"tmux-resurrect did not produce a snapshot at {dump}")
-    return dump
+    try:
+        return dump.resolve(strict=True)
+    except OSError as error:
+        raise RestartError(f"could not pin the saved snapshot {dump}: {error}") from error
 
 
 def recovery_plan(
@@ -189,6 +179,7 @@ def pane_state(
             "#{pane_tty}",
             "#{socket_path}",
             "#{pid}",
+            "#{pane_pid}",
             f"#{{{ACTIVITY_OPTION}}}",
             f"#{{{ACTIVITY_REPORTER_OPTION}}}",
             f"#{{{ACTIVITY_UPDATED_AT_OPTION}}}",
@@ -205,8 +196,8 @@ def pane_state(
     )
     if completed.returncode != 0:
         return None
-    fields = completed.stdout.rstrip("\n").split(FIELD_SEPARATOR, 9)
-    if len(fields) != 10:
+    fields = completed.stdout.rstrip("\n").split(FIELD_SEPARATOR, 10)
+    if len(fields) != 11:
         return None
     (
         pane_id,
@@ -215,7 +206,8 @@ def pane_state(
         pane_tty,
         socket_path,
         server_pid,
-        activity_source,
+        pane_pid,
+        activity_marker,
         activity_reporter,
         activity_updated_at,
         activity_record,
@@ -229,7 +221,7 @@ def pane_state(
             pane_tty=pane_tty,
             socket_path=socket_path,
             server_pid=server_pid,
-            marker=activity_source,
+            marker=activity_marker,
             reporter=activity_reporter,
             marker_updated_at=activity_updated_at,
             record=activity_record,
@@ -243,6 +235,17 @@ def pane_state(
         "activity_state": view.state,
         "activity_reason": view.reason,
         "activity_evidence": view.evidence_turn_id,
+        "guard": {
+            "pane_id": pane_id,
+            "socket_path": socket_path,
+            "server_pid": server_pid,
+            "pane_pid": pane_pid,
+            "current_command": current_command,
+            "activity_marker": activity_marker,
+            "activity_reporter": activity_reporter,
+            "activity_updated_at": activity_updated_at,
+            "activity_record": activity_record,
+        },
     }
 
 
@@ -257,70 +260,36 @@ def live_plan(tmux: Tmux, plan: list[dict[str, object]]) -> list[dict[str, objec
         state = pane_state(tmux, target, resolver)
         if state is None:
             continue
+        live_guard = state.get("guard")
+        expected_guard = item.get("guard")
+        if isinstance(expected_guard, dict):
+            normalized = {
+                field_name: str(expected_guard.get(field_name, ""))
+                for field_name in GUARD_FIELDS
+            }
+            if live_guard != normalized:
+                raise RestartError(
+                    f"pane guard changed for {target} after confirmation; retry"
+                )
+        else:
+            legacy_expected = (
+                str(item.get("pane_id", "")),
+                str(item.get("socket_path", "")),
+                str(item.get("server_pid", "")),
+            )
+            if all(legacy_expected) and isinstance(live_guard, dict):
+                legacy_live = (
+                    live_guard["pane_id"],
+                    live_guard["socket_path"],
+                    live_guard["server_pid"],
+                )
+                if legacy_expected != legacy_live:
+                    raise RestartError(
+                        f"stored pane identity no longer matches {target}; retry"
+                    )
         seen.add(target)
         result.append({**item, **state})
     return result
-
-
-def disable_synchronized_windows(
-    tmux: Tmux,
-    plan: list[dict[str, object]],
-) -> list[str]:
-    window_states: dict[str, str] = {}
-    for item in plan:
-        target = str(item.get("target", ""))
-        completed = tmux.run(
-            "display-message",
-            "-p",
-            "-t",
-            target,
-            f"#{{window_id}}{FIELD_SEPARATOR}#{{synchronize-panes}}",
-            check=False,
-        )
-        if completed.returncode != 0:
-            reason = completed.stderr.strip() or "pane disappeared"
-            raise RestartError(
-                f"could not inspect synchronized input for {target}: {reason}"
-            )
-        fields = completed.stdout.rstrip("\n").split(FIELD_SEPARATOR, 1)
-        if len(fields) != 2 or not fields[0]:
-            raise RestartError(
-                f"could not resolve the window containing {target}"
-            )
-        window_id, synchronized = fields
-        window_states[window_id] = synchronized
-
-    disabled = [
-        window_id
-        for window_id, synchronized in window_states.items()
-        if synchronized in {"1", "on"}
-    ]
-    for window_id in window_states:
-        completed = tmux.run(
-            "set-window-option",
-            "-t",
-            window_id,
-            "synchronize-panes",
-            "off",
-            check=False,
-        )
-        if completed.returncode != 0:
-            reason = completed.stderr.strip() or "tmux rejected the option change"
-            raise RestartError(
-                f"could not disable synchronized input for {window_id}: {reason}"
-            )
-        synchronized = tmux.value(
-            "display-message",
-            "-p",
-            "-t",
-            window_id,
-            "#{synchronize-panes}",
-        )
-        if synchronized not in {"0", "off"}:
-            raise RestartError(
-                f"synchronized input is still enabled for {window_id}"
-            )
-    return disabled
 
 
 def print_plan(plan: list[dict[str, object]]) -> None:
@@ -373,170 +342,106 @@ def confirm_unknown(count: int, targets: list[str]) -> bool:
     return answer in {"y", "yes"}
 
 
-def wait_for_shells(tmux: Tmux, targets: list[str], timeout: float = 5.0) -> set[str]:
-    deadline = time.monotonic() + timeout
-    pending = set(targets)
-    while pending and time.monotonic() < deadline:
-        for target in tuple(pending):
-            state = pane_state(tmux, target)
-            if state and str(state["current_command"]).lower() in SHELL_COMMANDS:
-                pending.remove(target)
-        if pending:
-            time.sleep(0.05)
-    return pending
+def exact_plan_items(plan: list[dict[str, object]]) -> list[dict[str, object]]:
+    fields = ("target", "tool", "kind", "restorable", "cwd", "command", "sid")
+    exact: list[dict[str, object]] = []
+    for item in plan:
+        guard = item.get("guard")
+        if not isinstance(guard, dict):
+            raise RestartError(f"missing pane guard for {item.get('target', 'unknown')}")
+        exact.append(
+            {
+                **{field_name: item.get(field_name, "") for field_name in fields},
+                "guard": {
+                    field_name: str(guard.get(field_name, ""))
+                    for field_name in GUARD_FIELDS
+                },
+            }
+        )
+    return exact
 
 
-def captured_failure_reason(tmux: Tmux, target: str) -> str:
-    completed = tmux.run(
-        "capture-pane",
-        "-p",
-        "-t",
-        target,
-        "-S",
-        "-40",
-        check=False,
+def recovery_executor_command(script_dir: Path) -> list[str]:
+    configured = os.environ.get("AIPANE_RESTART_EXECUTOR_COMMAND")
+    if configured is None:
+        configured = os.environ.get("AIPANE_RESTORE_EXECUTOR")
+    command = (
+        shlex.split(configured)
+        if configured
+        else [str(script_dir / "aipane-restore-executor")]
     )
-    if completed.returncode != 0:
-        return "pane disappeared"
-    candidates = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
-    for line in reversed(candidates):
-        lowered = line.lower()
-        if any(
-            marker in lowered
-            for marker in ("error", "failed", "not found", "unable", "invalid")
-        ):
-            return line
-    return "pane returned to its shell"
+    if not command or not (Path(command[0]).is_file() or shutil.which(command[0])):
+        raise RestartError("aipane-restore-executor was not found next to ai-restart")
+    return command
 
 
-def wait_for_resumed_panes(
-    tmux: Tmux,
+def execute_sealed_plan(
     plan: list[dict[str, object]],
-    *,
-    timeout: float,
-    stability: float,
-) -> tuple[list[str], list[str]]:
-    deadline = time.monotonic() + timeout
-    pending = {str(item["target"]): item for item in plan}
-    running_since: dict[str, float] = {}
-    resumed: list[str] = []
-    failures: list[str] = []
-
-    while pending and time.monotonic() < deadline:
-        now = time.monotonic()
-        for target, item in tuple(pending.items()):
-            state = pane_state(tmux, target)
-            if state is None:
-                failures.append(
-                    f"failed to resume {target} ({item['tool']}): pane disappeared"
-                )
-                pending.pop(target)
-                continue
-            command = str(state["current_command"]).lower()
-            if command in SHELL_COMMANDS:
-                if target in running_since:
-                    failures.append(
-                        f"failed to resume {target} ({item['tool']}): "
-                        f"{captured_failure_reason(tmux, target)}"
-                    )
-                    pending.pop(target)
-                continue
-            started = running_since.setdefault(target, now)
-            if now - started >= stability:
-                resumed.append(target)
-                pending.pop(target)
-        if pending:
-            time.sleep(0.05)
-
-    for target, item in pending.items():
-        state = pane_state(tmux, target)
-        if state and str(state["current_command"]).lower() in SHELL_COMMANDS:
-            reason = captured_failure_reason(tmux, target)
-        else:
-            reason = "Agent process did not remain stable before timeout"
-        failures.append(f"failed to resume {target} ({item['tool']}): {reason}")
-    return resumed, failures
-
-
-def restart_panes(
-    tmux: Tmux,
-    plan: list[dict[str, object]],
-    restore_command: list[str],
     dump: Path,
     environment: dict[str, str],
-) -> tuple[list[str], list[str]]:
-    default_shell = tmux.value("show-option", "-gv", "default-shell")
-    if not default_shell:
-        default_shell = os.environ.get("SHELL", "/bin/zsh")
-
-    targets: list[str] = []
-    items_by_target: dict[str, dict[str, object]] = {}
-    failures: list[str] = []
-    for item in plan:
-        target = str(item["target"])
-        cwd = str(item["cwd"])
-        completed = tmux.run(
-            "respawn-pane",
-            "-k",
-            "-t",
-            target,
-            "-c",
-            cwd,
-            default_shell,
+    script_dir: Path,
+) -> None:
+    state_dir = Path(
+        environment.get("AIPANE_STATE_DIR")
+        or Path(environment.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+        / "aipane"
+    )
+    state_dir.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_path = tempfile.mkstemp(
+        prefix="restart-plan.",
+        suffix=".json",
+        dir=state_dir,
+    )
+    os.close(descriptor)
+    plan_path = Path(raw_path)
+    try:
+        exact = exact_plan_items(plan)
+        seal_plan(plan_path, dump, exact)
+        completed = subprocess.run(
+            [
+                *recovery_executor_command(script_dir),
+                "--sealed-plan",
+                str(plan_path),
+                "--report-json",
+            ],
             check=False,
-        )
-        if completed.returncode != 0:
-            failures.append(f"failed to respawn {target}: {completed.stderr.strip()}")
-            continue
-        targets.append(target)
-        items_by_target[target] = item
-
-    pending = wait_for_shells(tmux, targets)
-    ready: list[str] = []
-    for target in targets:
-        if target in pending:
-            continue
-        activity_error = ""
-        for option in ACTIVITY_OPTIONS:
-            cleared = tmux.run(
-                "set-option",
-                "-p",
-                "-u",
-                "-t",
-                target,
-                option,
-                check=False,
-            )
-            if cleared.returncode != 0:
-                activity_error = cleared.stderr.strip() or f"could not unset {option}"
-                break
-        if activity_error:
-            failures.append(
-                f"failed to clear replaced activity for {target}: {activity_error}"
-            )
-        else:
-            ready.append(target)
-    if ready:
-        subprocess.run(
-            [*restore_command, "--dump", str(dump)],
-            check=True,
+            capture_output=True,
+            text=True,
             env=environment,
         )
-    if pending:
-        for target in sorted(pending):
-            failures.append(f"failed to respawn {target}: shell did not become ready")
-
-    verify_timeout = float(os.environ.get("AIPANE_RESTART_VERIFY_TIMEOUT", "8"))
-    verify_stability = float(os.environ.get("AIPANE_RESTART_VERIFY_STABILITY", "1"))
-    if verify_timeout <= 0 or verify_stability <= 0:
-        raise RestartError("restart verification timing must be greater than zero")
-    resumed, resume_failures = wait_for_resumed_panes(
-        tmux,
-        [items_by_target[target] for target in ready],
-        timeout=verify_timeout,
-        stability=verify_stability,
-    )
-    return resumed, [*failures, *resume_failures]
+        lines = [line for line in completed.stdout.splitlines() if line.strip()]
+        if not lines:
+            reason = completed.stderr.strip() or "recovery executor returned no report"
+            raise RestartError(reason)
+        try:
+            report = json.loads(lines[-1])
+        except json.JSONDecodeError as error:
+            raise RestartError(f"recovery executor returned an invalid report: {error}") from error
+        if not isinstance(report, dict):
+            raise RestartError("recovery executor report is not an object")
+        try:
+            verified = int(report["verified"])
+            pending = int(report["pending"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise RestartError("recovery executor report is incomplete") from error
+        if verified < 0 or pending < 0 or verified + pending != len(exact):
+            raise RestartError("recovery executor report does not cover the confirmed target set")
+        disabled = report.get("disabled_windows", [])
+        if isinstance(disabled, list) and disabled:
+            print("ai-restart: disabled SYNC for " + ", ".join(sorted(map(str, disabled))))
+        if completed.returncode != 0 or pending:
+            print(f"ai-restart: verified {verified} resumed; {pending} pending")
+            errors = report.get("errors", [])
+            reasons = [str(error) for error in errors] if isinstance(errors, list) else []
+            if not reasons:
+                reasons.append(completed.stderr.strip() or "recovery remains pending")
+            raise RestartError("; ".join(reasons))
+        print(f"ai-restart: verified {verified} AI pane(s) resumed")
+    finally:
+        try:
+            plan_path.unlink()
+        except OSError:
+            pass
 
 
 def main() -> int:
@@ -618,7 +523,9 @@ def main() -> int:
     # A different pane could submit a prompt while this popup waits for
     # confirmation. Re-check every marker immediately before the destructive step.
     refreshed_plan = live_plan(tmux, plan)
-    if len(refreshed_plan) != len(plan):
+    if [item["target"] for item in refreshed_plan] != [
+        item["target"] for item in plan
+    ]:
         raise RestartError("the live pane set changed after confirmation; retry")
     newly_busy = [str(item["target"]) for item in refreshed_plan if item["busy"]]
     newly_unknown = [
@@ -644,33 +551,18 @@ def main() -> int:
             "new unknown Agent Activity appeared after confirmation; retry"
         )
 
-    disabled_windows = disable_synchronized_windows(tmux, refreshed_plan)
-    if disabled_windows:
-        print(
-            "ai-restart: disabled SYNC for "
-            + ", ".join(sorted(disabled_windows))
-        )
-
-    resumed, failures = restart_panes(
-        tmux,
-        refreshed_plan,
-        restore_command,
-        dump,
-        environment,
-    )
-    if failures:
-        print(
-            f"ai-restart: verified {len(resumed)} resumed; "
-            f"{len(failures)} failed"
-        )
-        raise RestartError("; ".join(failures))
-    print(f"ai-restart: verified {len(resumed)} AI pane(s) resumed")
+    execute_sealed_plan(refreshed_plan, dump, environment, script_dir)
     return 0
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (RestartError, subprocess.CalledProcessError, OSError) as error:
+    except (
+        RecoveryPlanError,
+        RestartError,
+        subprocess.CalledProcessError,
+        OSError,
+    ) as error:
         print(f"ai-restart: {error}", file=sys.stderr)
         raise SystemExit(1)

@@ -131,6 +131,7 @@ typeset KIMI_BASE="${AIPANE_KIMI_LAUNCH_CMD:-kimi --yolo}"
   CLAUDE_BASE="claude --dangerously-skip-permissions"
 [[ "$CODEX_BASE" == "codexx" ]] &&
   CODEX_BASE="codex --yolo --disable plugins"
+typeset CODEX_RESTORE_BASE="$CODEX_BASE -c check_for_update_on_startup=false"
 
 # detect_tool <full_cmd> <cur_cmd> -> REPLY in {pi,grok,claude,cursor,codex,opencode,kimi} or ""
 detect_tool() {
@@ -299,10 +300,10 @@ build_resume() {
       # session uuid — use that as a fallback.
       if [[ -z "$id" ]]; then extract_uuid "$title"; id="$REPLY"; fi
       if [[ -n "$id" ]]; then
-        REPLY="$CODEX_BASE resume $id"
+        REPLY="$CODEX_RESTORE_BASE resume $id"
         if codex_session_exists "$id"; then REPLY_KIND=resume
         else REPLY_KIND=invalid; fi
-      else REPLY="$CODEX_BASE"; REPLY_KIND=fresh; fi ;;
+      else REPLY="$CODEX_RESTORE_BASE"; REPLY_KIND=fresh; fi ;;
     opencode)
       # id (ses_...) comes only from the coords-snapshot (recorded by the opencode
       # plugin on the first message). opencode --continue is global "last session",

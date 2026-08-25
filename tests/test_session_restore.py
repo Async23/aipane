@@ -235,7 +235,8 @@ class SessionRestoreTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(
-                f"codex --yolo --disable plugins resume {VALID_CODEX_SID}",
+                "codex --yolo --disable plugins "
+                f"-c check_for_update_on_startup=false resume {VALID_CODEX_SID}",
                 result.stdout,
             )
             self.assertNotIn(FOREIGN_SID, result.stdout)
@@ -253,7 +254,8 @@ class SessionRestoreTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(
-                f"codex --yolo --disable plugins resume {VALID_CODEX_SID}",
+                "codex --yolo --disable plugins "
+                f"-c check_for_update_on_startup=false resume {VALID_CODEX_SID}",
                 result.stdout,
             )
             self.assertNotIn("codexx resume", result.stdout)
@@ -429,7 +431,8 @@ class SessionRestoreTests(unittest.TestCase):
             plan = json.loads(result.stdout)
             self.assertEqual(
                 plan["command"],
-                f"codex --yolo --disable plugins resume {VALID_CODEX_SID}",
+                "codex --yolo --disable plugins "
+                f"-c check_for_update_on_startup=false resume {VALID_CODEX_SID}",
             )
 
     def test_restore_falls_back_to_codex_argv_when_binding_is_not_durable(self):
@@ -448,7 +451,8 @@ class SessionRestoreTests(unittest.TestCase):
             plan = json.loads(result.stdout)
             self.assertEqual(
                 plan["command"],
-                f"codex --yolo --disable plugins resume {VALID_CODEX_SID}",
+                "codex --yolo --disable plugins "
+                f"-c check_for_update_on_startup=false resume {VALID_CODEX_SID}",
             )
 
     def test_restore_exposes_machine_readable_recovery_plan(self):
@@ -471,7 +475,8 @@ class SessionRestoreTests(unittest.TestCase):
             self.assertEqual(plan["cwd"], str(tmp))
             self.assertEqual(
                 plan["command"],
-                f"codex --yolo --disable plugins resume {VALID_CODEX_SID}",
+                "codex --yolo --disable plugins "
+                f"-c check_for_update_on_startup=false resume {VALID_CODEX_SID}",
             )
 
     def test_successful_restore_rebinds_session_to_the_new_pane_id(self):
@@ -549,8 +554,8 @@ class SessionRestoreTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(
-                "send-keys -l -t 0:4.1 "
-                f"codex --yolo --disable plugins resume {VALID_CODEX_SID}",
+                "send-keys -l -t 0:4.1 codex --yolo --disable plugins "
+                f"-c check_for_update_on_startup=false resume {VALID_CODEX_SID}",
                 tmux_log.read_text(),
             )
             binding = bind_log.read_text()

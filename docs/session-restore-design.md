@@ -10,7 +10,8 @@
 
 - tmux-resurrect 保存结构后，`ai-restore` 负责在原 pane 续接 AI 会话。
 - `ai-restart --dry-run` 刷新快照并预览本次可恢复的 pane。
-- 从 tmux 外的独立终端执行 `ai-restart`，确认后批量重生这些 pane，再调用 `ai-restore`。
+- 从 tmux 外的独立终端执行 `ai-restart`；确认后由恢复执行器按 sealed plan 批量重生并
+  续接这些 pane。
 - 默认检测到任一 `busy` Agent Activity 就整体中止；旧进程显示 `unknown` 时，命令
   要求明确确认所有任务已空闲。非交互覆盖必须使用 `--force`。
 - Qoder 与 Droid 暂不在恢复范围内。
@@ -390,8 +391,10 @@ codex 无启动期 `--session-id`，其会话 id（`thread-id`）在**运行后*
 - **per-tool resume 重建**：pi 在同 cwd durable JSONL 已验证后用 `--session-id X`
   续接；若该 id 在所有 Pi store 中都不存在，则以同一 id 重建空 TUI，并明确标为
   `recreated`（动态坐标→argv）；grok/claude `--resume X`；cursor `--resume X`；codex
-  `resume X`（有效坐标快照→argv→标题）。
-- `ai-restart` 替换 pane 进程后会清除旧进程的 activity marker/reporter/timestamp/record；恢复命令重新绑定 session，新的生命周期 hook 再建立 activity record，避免 stale process identity 污染后续快照和安全判断。
+  `-c check_for_update_on_startup=false resume X`（有效坐标快照→argv→标题）。
+- 恢复执行器替换 pane 进程后会清除旧进程的 activity
+  marker/reporter/timestamp/record；恢复命令重新绑定 session，新的生命周期 hook 再建立
+  activity record，避免 stale process identity 污染后续快照和安全判断。
 - `--dry-run` 可对任意存档预演；日志在 `~/.local/share/aipane/ai-restore.log`。
 
 ### 已知残留 / 待办
@@ -493,3 +496,28 @@ session；启动 argv 不变，但 `session_start(reason=new|resume|fork)` 会�
   `~/.grok/logs/unified.jsonl` 中出现目标 sid 的 `session loaded`。默认失败后延迟重试
   一次；仍失败则保留 pending 并返回非零。
 - 只有验证成功后才调用 `aipane-bind`。因此 `sent`、`resumed`、`verified` 不再混为一谈。
+
+## 17. 确认计划与恢复执行器边界（2026-08-25）
+
+一次 `ai-restart` 批量恢复中，多个 Codex pane 停在启动期升级选择页；旧验证只看到
+`codex` 进程持续存活，因而把“等待人工选择”误报为 `verified`。同时，旧流程在用户
+确认后先由 `ai-restart` 直接 respawn pane，再重新调用 `ai-restore` 解析 dump；确认的
+目标集与最终执行的目标集之间没有不可变契约。
+
+修正后的模块边界和顺序如下：
+
+1. `ai-restart` 只负责刷新并固定实际 dump、获取声明式计划、解析 Agent Activity、展示
+   和确认目标。确认后再次读取 pane guard；任一 guard 变化都整体中止，`--force` 只能
+   接受 `busy` / `unknown`，不能绕过身份变化。
+2. 确认结果写成 version 1 的 sealed plan。计划固定真实 dump 路径、精确目标及 Launch
+   Command，并记录 pane id、tmux socket/server pid、pane pid、当前进程和四个 activity
+   字段；canonical JSON 的 SHA-256 digest 在执行前重新校验。
+3. `aipane-restore-executor` 是唯一恢复副作用入口。它取得单实例锁后，按“全量 guard
+   复核 → pending 原子落盘 → 关闭相关窗口 SYNC → respawn → 清 activity → launch →
+   verify → bind”执行；锁竞争返回非零。每个 pane 在 respawn 前还会立即复核一次。
+4. sealed plan 只执行本次确认的目标。pending store 中其他未完成意图继续保留，但不会
+   被这次 restart 顺带启动；执行器不会再次解析 resurrect dump 或扩大目标集。
+5. Codex 恢复专用 Launch Command 强制追加
+   `-c check_for_update_on_startup=false`，不改变日常 Codex 启动配置。验证阶段仍把可见的
+   `Update available!` / `Skip until next version` 选择页标为 `blocked`，保留 pending、
+   不绑定 session，并返回非零，作为配置失效或未来行为变化时的第二道防线。
