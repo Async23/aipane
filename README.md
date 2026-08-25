@@ -94,11 +94,13 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `bin/tmux-colour-palette` | indexed terminal colour palette (`0–255`) |
 | `bin/tmux-window-jump` | repeated-digit exact-index window selector |
 | `bin/tmux-window-wrap` | renderer CLI |
-| `bin/ai-restart` | safely restart and resume restorable AI panes in place |
-| `bin/aipane-restore-executor` | verified recovery, retry, and durable pending intent |
+| `bin/ai-restart` | confirm and seal an exact in-place AI pane restart plan |
+| `bin/aipane-restore-executor` | exclusively execute, verify, retry, and persist recovery |
+| `lib/recovery_plan.py` | versioned, digest-protected restart plan contract |
 | [`integrations/`](integrations/README.md) | Agent lifecycle hook fragments and OpenCode Adapter |
 | `tests/test_agent_activity_integrations.py` | Agent Activity contract tests |
 | `tests/test_restore_executor.py` | verified recovery, retry, and pending-intent tests |
+| `tests/test_recovery_plan.py` | sealed recovery plan contract tests |
 | `tests/test_tmux_window_jump.py` | window-jump behavior + live tmux tests |
 | `tests/test_tmux_window_wrap.py` | window-wrap unit + live tmux tests |
 | `tests/test_workstation_fragments.py` | structural tests for conf fragments |
@@ -181,17 +183,22 @@ Inside tmux, a pane layout reuses the current window only when it has one pane; 
 ## Restart AI Panes
 
 `ai-restart` refreshes the tmux-resurrect snapshot, finds AI panes with a
-recoverable session, replaces those panes with an idle shell, and delegates the
-resume commands to `ai-restore`. Pane IDs, layout, and working directories stay
-unchanged. Recovery commands are cleared of stale terminal input before launch,
-and SYNC is disabled on affected tmux windows so distinct pane commands cannot
-be broadcast across the window. Transient failures are retried, and a pane is
-rebound only after verification.
+recoverable session, checks Agent Activity, and confirms one exact target set.
+After confirmation it rechecks the pane/process/activity guard and seals a
+versioned, digest-protected execution plan. `aipane-restore-executor` is the
+single owner of pane replacement and recovery side effects under one lock.
+Pane IDs, layout, and working directories stay unchanged. Recovery commands are
+cleared of stale terminal input before launch, and SYNC is disabled on affected
+tmux windows so distinct pane commands cannot be broadcast across the window.
+Transient failures are retried, and a pane is rebound only after verification.
 Grok must report the requested `session loaded`; other Agents must remain alive
 for a stability window. Unfinished intent is kept in
 `~/.local/share/aipane/restore-pending.json`, so a later continuum save cannot
 erase a failed recovery. Qoder and Droid are ignored because their session
 restore is not implemented.
+
+The full recovery invariants and failure model live in
+[`docs/session-restore-design.md`](docs/session-restore-design.md).
 
 ```bash
 ai-restart --dry-run  # refresh snapshot and preview; does not restart panes
@@ -277,6 +284,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 ├── aipane.zsh               # compatibility entrypoint
 ├── lib/core.zsh
 ├── lib/agent_activity.py    # shared Agent Activity policy + evidence adapters
+├── lib/recovery_plan.py     # immutable restart plan contract
 ├── cmd/                     # ai/pane and kill* commands
 ├── bin/
 │   ├── aipane-cleanup
@@ -314,6 +322,8 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
     ├── init-reload.zsh
     ├── test_ai_restart.py
     ├── test_agent_activity_integrations.py
+    ├── test_recovery_plan.py
+    ├── test_restore_executor.py
     ├── test_session_restore.py
     ├── test_tmux_window_jump.py
     ├── test_tmux_window_wrap.py
@@ -344,6 +354,7 @@ zsh -fc '
 # optional workstation / window-wrap
 python3 tests/test_ai_restart.py
 python3 tests/test_agent_activity_integrations.py
+python3 tests/test_recovery_plan.py
 python3 tests/test_session_restore.py
 python3 tests/test_restore_executor.py
 node --experimental-strip-types --test tests/pi-session-binding.test.mjs

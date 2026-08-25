@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Execute an ai-restore plan with verification, retry, and durable intent.
+"""Own recovery side effects, verification, retry, and durable intent.
 
 The zsh ai-restore command owns snapshot parsing and tool-specific resume command
-construction.  This module owns the stateful half of recovery behind one CLI
-interface: merge the new plan with unfinished work, launch panes cleanly, verify
-that the requested tool is actually ready, retry transient failures, and only
-then publish the new pane binding.
+construction; ai-restart can additionally provide a sealed exact restart plan.
+This module is the single stateful recovery interface: it persists intent,
+replaces panes when explicitly authorized, launches cleanly, verifies readiness,
+retries transient failures, and only then publishes the new pane binding.
 """
 
 from __future__ import annotations
@@ -18,10 +18,17 @@ import shlex
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+
+LIB_DIR = Path(__file__).resolve().parents[1] / "lib"
+if str(LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(LIB_DIR))
+
+from recovery_plan import GUARD_FIELDS, RecoveryPlanError, load_sealed_plan
 
 
 SHELL_COMMANDS = {
@@ -45,6 +52,13 @@ TOOL_TAGS = {
     "kimi": "k",
 }
 PENDING_VERSION = 1
+FIELD_SEPARATOR = "\x1f"
+ACTIVITY_OPTIONS = (
+    "@tmux-window-wrap-activity",
+    "@tmux-window-wrap-activity-reporter",
+    "@tmux-window-wrap-activity-updated-at",
+    "@tmux-window-wrap-activity-record",
+)
 
 
 class RestoreExecutionError(RuntimeError):
@@ -83,29 +97,19 @@ def positive_int(environment: dict[str, str], name: str, default: int) -> int:
     return value
 
 
-def read_plan(path: Path) -> list[dict[str, Any]]:
+def normalize_plan(
+    raw_items: list[dict[str, Any]],
+    *,
+    source: str,
+    require_guard: bool = False,
+) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as error:
-        raise RestoreExecutionError(f"cannot read recovery plan {path}: {error}") from error
-    for number, line in enumerate(lines, start=1):
-        if not line.strip():
-            continue
-        try:
-            raw = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise RestoreExecutionError(
-                f"invalid recovery plan JSON on line {number}: {error}"
-            ) from error
-        if not isinstance(raw, dict):
-            raise RestoreExecutionError(
-                f"recovery plan line {number} must be a JSON object"
-            )
+    targets: set[str] = set()
+    for number, raw in enumerate(raw_items, start=1):
         required = ("target", "tool", "kind", "cwd", "command", "restorable")
         if any(key not in raw for key in required):
             raise RestoreExecutionError(
-                f"recovery plan line {number} is missing required fields"
+                f"{source} item {number} is missing required fields"
             )
         item = {
             "target": str(raw["target"]),
@@ -123,14 +127,51 @@ def read_plan(path: Path) -> list[dict[str, Any]]:
             or not item["command"]
         ):
             raise RestoreExecutionError(
-                f"recovery plan line {number} contains an empty identity field"
+                f"{source} item {number} contains an empty identity field"
             )
         if item["tool"] not in TOOL_TAGS:
             raise RestoreExecutionError(
-                f"recovery plan line {number} has unknown tool {item['tool']!r}"
+                f"{source} item {number} has unknown tool {item['tool']!r}"
             )
+        if item["target"] in targets:
+            raise RestoreExecutionError(
+                f"{source} contains duplicate target {item['target']}"
+            )
+        targets.add(item["target"])
+        if require_guard:
+            guard = raw.get("guard")
+            if not isinstance(guard, dict) or any(
+                field_name not in guard for field_name in GUARD_FIELDS
+            ):
+                raise RestoreExecutionError(
+                    f"{source} item {number} has an incomplete pane guard"
+                )
+            item["guard"] = {field_name: str(guard[field_name]) for field_name in GUARD_FIELDS}
         result.append(item)
     return result
+
+
+def read_plan(path: Path) -> list[dict[str, Any]]:
+    raw_items: list[dict[str, Any]] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise RestoreExecutionError(f"cannot read recovery plan {path}: {error}") from error
+    for number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise RestoreExecutionError(
+                f"invalid recovery plan JSON on line {number}: {error}"
+            ) from error
+        if not isinstance(raw, dict):
+            raise RestoreExecutionError(
+                f"recovery plan line {number} must be a JSON object"
+            )
+        raw_items.append(raw)
+    return normalize_plan(raw_items, source="recovery plan")
 
 
 def command_matches(
@@ -165,6 +206,7 @@ def command_matches(
 
 class Tmux:
     def __init__(self, environment: dict[str, str]) -> None:
+        self.environment = environment
         self.command = shlex.split(environment.get("AIPANE_TMUX", "tmux"))
         if not self.command:
             raise RestoreExecutionError("AIPANE_TMUX resolved to an empty command")
@@ -212,6 +254,37 @@ class Tmux:
             return None
         return fields[0], fields[1], fields[2]
 
+    def recovery_guard(self, target: str) -> dict[str, str] | None:
+        pane_format = FIELD_SEPARATOR.join(
+            (
+                "#{pane_id}",
+                "#{socket_path}",
+                "#{pid}",
+                "#{pane_pid}",
+                "#{pane_current_command}",
+                "#{@tmux-window-wrap-activity}",
+                "#{@tmux-window-wrap-activity-reporter}",
+                "#{@tmux-window-wrap-activity-updated-at}",
+                "#{@tmux-window-wrap-activity-record}",
+            )
+        )
+        completed = self.run("display-message", "-p", "-t", target, pane_format)
+        if completed.returncode != 0:
+            return None
+        fields = completed.stdout.rstrip("\n").split(FIELD_SEPARATOR, len(GUARD_FIELDS) - 1)
+        if len(fields) != len(GUARD_FIELDS):
+            return None
+        guard = dict(zip(GUARD_FIELDS, fields, strict=True))
+        if any(not guard[field_name] for field_name in GUARD_FIELDS[:5]):
+            return None
+        return guard
+
+    def guard_matches(self, target: str, expected: dict[str, Any]) -> bool:
+        return self.recovery_guard(target) == {
+            field_name: str(expected.get(field_name, ""))
+            for field_name in GUARD_FIELDS
+        }
+
     def foreground_command(self, target: str) -> str:
         completed = self.run(
             "display-message",
@@ -255,6 +328,93 @@ class Tmux:
             ):
                 return line
         return "pane returned to its shell"
+
+    def capture_visible(self, target: str) -> str:
+        completed = self.run("capture-pane", "-p", "-t", target)
+        return completed.stdout if completed.returncode == 0 else ""
+
+    def default_shell(self) -> str:
+        completed = self.run("show-option", "-gv", "default-shell")
+        configured = completed.stdout.strip() if completed.returncode == 0 else ""
+        return configured or self.environment.get("SHELL", "/bin/zsh")
+
+    def synchronized_windows(
+        self, items: list[dict[str, Any]]
+    ) -> dict[str, str]:
+        result: dict[str, str] = {}
+        pane_format = f"#{{window_id}}{FIELD_SEPARATOR}#{{synchronize-panes}}"
+        for item in items:
+            target = item["target"]
+            completed = self.run("display-message", "-p", "-t", target, pane_format)
+            if completed.returncode != 0:
+                reason = completed.stderr.strip() or "pane disappeared"
+                raise RestoreExecutionError(
+                    f"could not inspect synchronized input for {target}: {reason}"
+                )
+            fields = completed.stdout.rstrip("\n").split(FIELD_SEPARATOR, 1)
+            if len(fields) != 2 or not fields[0]:
+                raise RestoreExecutionError(
+                    f"could not resolve the window containing {target}"
+                )
+            result[fields[0]] = fields[1]
+        return result
+
+    def disable_synchronized_windows(self, items: list[dict[str, Any]]) -> list[str]:
+        states = self.synchronized_windows(items)
+        disabled = [
+            window_id
+            for window_id, synchronized in states.items()
+            if synchronized in {"1", "on"}
+        ]
+        for window_id in states:
+            completed = self.run(
+                "set-window-option",
+                "-t",
+                window_id,
+                "synchronize-panes",
+                "off",
+            )
+            if completed.returncode != 0:
+                reason = completed.stderr.strip() or "tmux rejected the option change"
+                raise RestoreExecutionError(
+                    f"could not disable synchronized input for {window_id}: {reason}"
+                )
+            verification = self.run(
+                "display-message",
+                "-p",
+                "-t",
+                window_id,
+                "#{synchronize-panes}",
+            )
+            if verification.returncode != 0 or verification.stdout.strip() not in {
+                "0",
+                "off",
+            }:
+                raise RestoreExecutionError(
+                    f"synchronized input is still enabled for {window_id}"
+                )
+        return disabled
+
+    def respawn(self, target: str, cwd: str, shell: str) -> str:
+        completed = self.run(
+            "respawn-pane",
+            "-k",
+            "-t",
+            target,
+            "-c",
+            cwd,
+            shell,
+        )
+        if completed.returncode == 0:
+            return ""
+        return completed.stderr.strip() or "tmux rejected respawn-pane"
+
+    def clear_activity(self, target: str) -> str:
+        for option in ACTIVITY_OPTIONS:
+            completed = self.run("set-option", "-p", "-u", "-t", target, option)
+            if completed.returncode != 0:
+                return completed.stderr.strip() or f"could not unset {option}"
+        return ""
 
     def notify(self, message: str) -> None:
         self.run("display-message", message)
@@ -302,6 +462,7 @@ class PendingStore:
         *,
         dump: str,
         now: float,
+        preserve_identity: bool = True,
     ) -> list[dict[str, Any]]:
         previous = {item["target"]: item for item in self.load(now)}
         merged = dict(previous)
@@ -326,6 +487,10 @@ class PendingStore:
                 and prior.get("command") == item["command"]
             )
             merged_item = dict(item)
+            # A sealed plan's full process/activity guard authorizes only that
+            # one destructive execution. Pending intent retains the durable
+            # pane/server identity, never the now-stale confirmation snapshot.
+            merged_item.pop("guard", None)
             merged_item.update(
                 {
                     "created_at": prior.get("created_at", now) if same_intent else now,
@@ -335,7 +500,7 @@ class PendingStore:
                     "source_dump": dump,
                 }
             )
-            if same_intent:
+            if same_intent and preserve_identity:
                 for field in ("pane_id", "socket_path", "server_pid"):
                     if prior.get(field):
                         merged_item[field] = prior[field]
@@ -409,12 +574,27 @@ class ExecutionReport:
     pending: int
     skipped: int
     deferred: int
+    blocked: int = 0
+    disabled_windows: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
     def render(self) -> str:
         return (
             f"ai-restore: verified={self.verified} pending={self.pending} "
-            f"skipped={self.skipped} deferred={self.deferred}"
+            f"skipped={self.skipped} deferred={self.deferred} "
+            f"blocked={self.blocked}"
         )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "verified": self.verified,
+            "pending": self.pending,
+            "skipped": self.skipped,
+            "deferred": self.deferred,
+            "blocked": self.blocked,
+            "disabled_windows": self.disabled_windows,
+            "errors": self.errors,
+        }
 
 
 class RestoreExecutor:
@@ -622,10 +802,11 @@ class RestoreExecutor:
 
     def verify_round(
         self, attempts: list[Attempt]
-    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    ) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, str]]:
         active = {attempt.item["target"]: attempt for attempt in attempts}
         verified: list[dict[str, Any]] = []
         failures: dict[str, str] = {}
+        blocked: dict[str, str] = {}
 
         while active:
             now = time.monotonic()
@@ -637,6 +818,17 @@ class RestoreExecutor:
                     active.pop(target)
                     continue
                 if command_matches(item["tool"], current):
+                    if item["tool"] == "codex":
+                        visible = self.tmux.capture_visible(target).lower()
+                        if (
+                            "update available!" in visible
+                            and "skip until next version" in visible
+                        ):
+                            blocked[target] = (
+                                "Codex startup is blocked at its update prompt"
+                            )
+                            active.pop(target)
+                            continue
                     attempt.seen_running = True
                     if attempt.running_since is None:
                         attempt.running_since = now
@@ -677,7 +869,7 @@ class RestoreExecutor:
                     active.pop(target)
             if active:
                 time.sleep(self.poll_interval)
-        return verified, failures
+        return verified, failures, blocked
 
     def bind(self, item: dict[str, Any]) -> bool:
         sid = item.get("sid", "")
@@ -713,33 +905,15 @@ class RestoreExecutor:
             return False
         return completed.returncode == 0
 
-    def execute(self, current: list[dict[str, Any]], dump: str) -> ExecutionReport:
-        now = time.time()
-        pending = self.store.merge(current, dump=dump, now=now)
-        pending_by_target = {item["target"]: item for item in pending}
-        current_targets = {
-            item["target"] for item in current if item["restorable"] is True
-        }
-        for target in current_targets:
-            item = pending_by_target.get(target)
-            identity = self.tmux.pane_identity(target)
-            guarded = item is not None and all(
-                item.get(field)
-                for field in ("pane_id", "socket_path", "server_pid")
-            )
-            new_server = bool(
-                guarded
-                and identity is not None
-                and (item.get("socket_path"), item.get("server_pid"))
-                != (identity[1], identity[2])
-            )
-            if item is not None and identity is not None and (not guarded or new_server):
-                item["pane_id"], item["socket_path"], item["server_pid"] = identity
-        self.store.save(list(pending_by_target.values()))
-        skipped = sum(item["restorable"] is not True for item in current)
+    def execute_candidates(
+        self,
+        pending_by_target: dict[str, dict[str, Any]],
+        candidates: list[dict[str, Any]],
+    ) -> tuple[int, int, int, list[str]]:
         verified_count = 0
         deferred = 0
-        candidates = list(pending_by_target.values())
+        blocked_count = 0
+        final_errors: dict[str, str] = {}
 
         for round_index in range(self.max_attempts):
             if not candidates:
@@ -766,7 +940,7 @@ class RestoreExecutor:
                     time.sleep(self.launch_delay)
 
             self.store.save(list(pending_by_target.values()))
-            ready, failures = self.verify_round(attempts)
+            ready, failures, blocked = self.verify_round(attempts)
             failures.update(immediate_failures)
             retry: list[dict[str, Any]] = []
 
@@ -781,10 +955,21 @@ class RestoreExecutor:
                 else:
                     item["last_error"] = "session resumed but pane binding failed"
                     item["updated_at"] = time.time()
+                    final_errors[target] = item["last_error"]
                     self.log(f"pending {target}: {item['last_error']}")
+
+            for target, error in blocked.items():
+                item = pending_by_target[target]
+                item["last_error"] = error
+                item["updated_at"] = time.time()
+                blocked_count += 1
+                final_errors[target] = error
+                self.log(f"blocked {target} ({item['tool']}): {error}")
 
             for item in candidates:
                 target = item["target"]
+                if target in blocked:
+                    continue
                 error = failures.get(target)
                 if not error:
                     continue
@@ -798,8 +983,10 @@ class RestoreExecutor:
                 )
                 if round_index + 1 < self.max_attempts and retryable:
                     retry.append(item)
-                elif not retryable:
-                    deferred += 1
+                else:
+                    final_errors[target] = error
+                    if not retryable:
+                        deferred += 1
 
             self.store.save(list(pending_by_target.values()))
             candidates = retry
@@ -808,17 +995,148 @@ class RestoreExecutor:
                 self.log(f"retrying {len(candidates)} pane(s) after {delay:g}s")
                 time.sleep(delay)
 
-        remaining = list(pending_by_target.values())
-        self.store.save(remaining)
-        report = ExecutionReport(
-            verified=verified_count,
-            pending=len(remaining),
-            skipped=skipped,
-            deferred=deferred,
+        return (
+            verified_count,
+            deferred,
+            blocked_count,
+            [f"{target}: {error}" for target, error in sorted(final_errors.items())],
         )
+
+    def finish_report(self, report: ExecutionReport) -> ExecutionReport:
         self.log(report.render())
         self.tmux.notify(report.render())
         return report
+
+    def execute(self, current: list[dict[str, Any]], dump: str) -> ExecutionReport:
+        now = time.time()
+        pending = self.store.merge(current, dump=dump, now=now)
+        pending_by_target = {item["target"]: item for item in pending}
+        current_targets = {
+            item["target"] for item in current if item["restorable"] is True
+        }
+        for target in current_targets:
+            item = pending_by_target.get(target)
+            identity = self.tmux.pane_identity(target)
+            guarded = item is not None and all(
+                item.get(field_name)
+                for field_name in ("pane_id", "socket_path", "server_pid")
+            )
+            new_server = bool(
+                guarded
+                and identity is not None
+                and (item.get("socket_path"), item.get("server_pid"))
+                != (identity[1], identity[2])
+            )
+            if item is not None and identity is not None and (not guarded or new_server):
+                item["pane_id"], item["socket_path"], item["server_pid"] = identity
+        self.store.save(list(pending_by_target.values()))
+        skipped = sum(item["restorable"] is not True for item in current)
+        verified, deferred, blocked, errors = self.execute_candidates(
+            pending_by_target,
+            list(pending_by_target.values()),
+        )
+
+        remaining = list(pending_by_target.values())
+        self.store.save(remaining)
+        report = ExecutionReport(
+            verified=verified,
+            pending=len(remaining),
+            skipped=skipped,
+            deferred=deferred,
+            blocked=blocked,
+            errors=errors,
+        )
+        return self.finish_report(report)
+
+    def assert_exact_guards(self, items: list[dict[str, Any]]) -> None:
+        for item in items:
+            if not self.tmux.guard_matches(item["target"], item["guard"]):
+                raise RestoreExecutionError(
+                    f"pane guard changed for {item['target']} after confirmation"
+                )
+
+    def execute_restart(
+        self,
+        exact_items: list[dict[str, Any]],
+        dump: str,
+    ) -> ExecutionReport:
+        # The executor lock is already held by main. Validate the complete set
+        # before persisting intent or touching any tmux process.
+        self.assert_exact_guards(exact_items)
+        now = time.time()
+        pending = self.store.merge(
+            exact_items,
+            dump=dump,
+            now=now,
+            preserve_identity=False,
+        )
+        pending_by_target = {item["target"]: item for item in pending}
+        exact_targets = {item["target"] for item in exact_items}
+        for planned in exact_items:
+            item = pending_by_target[planned["target"]]
+            guard = planned["guard"]
+            item["pane_id"] = guard["pane_id"]
+            item["socket_path"] = guard["socket_path"]
+            item["server_pid"] = guard["server_pid"]
+
+        # Durable intent must exist before the first destructive tmux operation.
+        self.store.save(list(pending_by_target.values()))
+        disabled_windows = self.tmux.disable_synchronized_windows(exact_items)
+        self.assert_exact_guards(exact_items)
+
+        shell = self.tmux.default_shell()
+        ready: list[dict[str, Any]] = []
+        prelaunch_errors: list[str] = []
+        for planned in exact_items:
+            target = planned["target"]
+            item = pending_by_target[target]
+            if not self.tmux.guard_matches(target, planned["guard"]):
+                error = "pane guard changed immediately before respawn"
+            else:
+                error = self.tmux.respawn(target, item["cwd"], shell)
+                if error:
+                    error = f"failed to respawn pane: {error}"
+                elif not self.wait_for_shell(target):
+                    error = "respawned shell did not become ready"
+                else:
+                    error = self.tmux.clear_activity(target)
+                    if error:
+                        error = f"failed to clear replaced Agent Activity: {error}"
+            if error:
+                item["last_error"] = error
+                item["updated_at"] = time.time()
+                prelaunch_errors.append(f"{target}: {error}")
+                self.log(f"pending {target}: {error}")
+                self.store.save(list(pending_by_target.values()))
+                continue
+            identity = self.tmux.pane_identity(target)
+            if identity is None:
+                error = "pane disappeared after respawn"
+                item["last_error"] = error
+                item["updated_at"] = time.time()
+                prelaunch_errors.append(f"{target}: {error}")
+                self.store.save(list(pending_by_target.values()))
+                continue
+            item["pane_id"], item["socket_path"], item["server_pid"] = identity
+            ready.append(item)
+
+        self.store.save(list(pending_by_target.values()))
+        verified, deferred, blocked, launch_errors = self.execute_candidates(
+            pending_by_target,
+            ready,
+        )
+        remaining = list(pending_by_target.values())
+        self.store.save(remaining)
+        report = ExecutionReport(
+            verified=verified,
+            pending=sum(target in pending_by_target for target in exact_targets),
+            skipped=0,
+            deferred=deferred,
+            blocked=blocked,
+            disabled_windows=disabled_windows,
+            errors=[*prelaunch_errors, *launch_errors],
+        )
+        return self.finish_report(report)
 
 
 def print_plan(items: list[dict[str, Any]], dump: str) -> None:
@@ -840,23 +1158,43 @@ def print_plan(items: list[dict[str, Any]], dump: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="aipane-restore-executor")
-    parser.add_argument("--plan", required=True, type=Path)
-    parser.add_argument("--dump", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--plan", type=Path)
+    source.add_argument("--sealed-plan", type=Path)
+    parser.add_argument("--dump")
+    parser.add_argument("--report-json", action="store_true")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--plan-json", action="store_true")
     mode.add_argument("--dry-run", action="store_true")
     arguments = parser.parse_args()
 
+    if arguments.sealed_plan and (arguments.dump or arguments.plan_json or arguments.dry_run):
+        parser.error("--sealed-plan cannot be combined with --dump or preview modes")
+    if arguments.plan and not arguments.dump:
+        parser.error("--dump is required with --plan")
+
     environment = os.environ.copy()
     executor = RestoreExecutor(environment)
-    current = read_plan(arguments.plan)
-    display_items = executor.store.display_plan(current, now=time.time())
+    if arguments.sealed_plan:
+        sealed = load_sealed_plan(arguments.sealed_plan)
+        current = normalize_plan(
+            sealed["items"],
+            source="sealed recovery plan",
+            require_guard=True,
+        )
+        dump = sealed["dump"]
+    else:
+        current = read_plan(arguments.plan)
+        dump = arguments.dump
+
     if arguments.plan_json:
+        display_items = executor.store.display_plan(current, now=time.time())
         for item in display_items:
             print(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
         return 0
     if arguments.dry_run:
-        print_plan(display_items, arguments.dump)
+        display_items = executor.store.display_plan(current, now=time.time())
+        print_plan(display_items, dump)
         return 0
 
     executor.state_dir.mkdir(parents=True, exist_ok=True)
@@ -864,16 +1202,30 @@ def main() -> int:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            print("ai-restore: another recovery executor is already running")
-            return 0
-        report = executor.execute(current, arguments.dump)
-    print(report.render())
+            print(
+                "aipane-restore-executor: another recovery executor is already running",
+                file=sys.stderr,
+            )
+            return 3
+        if arguments.sealed_plan:
+            report = executor.execute_restart(current, dump)
+        else:
+            report = executor.execute(current, dump)
+    if arguments.report_json:
+        print(json.dumps(report.as_dict(), ensure_ascii=False, separators=(",", ":")))
+    else:
+        print(report.render())
     return 0 if report.pending == 0 else 1
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (RestoreExecutionError, OSError, subprocess.SubprocessError) as error:
+    except (
+        RecoveryPlanError,
+        RestoreExecutionError,
+        OSError,
+        subprocess.SubprocessError,
+    ) as error:
         print(f"aipane-restore-executor: {error}", file=sys.stderr)
         raise SystemExit(2)

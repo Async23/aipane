@@ -49,6 +49,7 @@ class AiRestartTests(unittest.TestCase):
             "#{pane_id}",
         ).stdout.strip()
         self.restore_log = self.tmp / "restore.log"
+        self.plan_log = self.tmp / "plan.log"
         self.save_log = self.tmp / "save.log"
         self.snapshot_log = self.tmp / "snapshot.log"
         self.resurrect_dir = self.tmp / "tmux" / "resurrect"
@@ -67,6 +68,19 @@ class AiRestartTests(unittest.TestCase):
         )
 
     def make_fixtures(self):
+        fake_agent_source = self.tmp / "claude.c"
+        fake_agent_source.write_text(
+            "#include <unistd.h>\nint main(void) { sleep(120); return 0; }\n",
+            encoding="utf-8",
+        )
+        self.fake_agent = self.tmp / "claude"
+        subprocess.run(
+            ["cc", str(fake_agent_source), "-o", str(self.fake_agent)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
         self.fake_save = self.tmp / "save.sh"
         self.fake_save.write_text(
             textwrap.dedent(
@@ -96,17 +110,17 @@ class AiRestartTests(unittest.TestCase):
                 #!/usr/bin/env python3
                 import json
                 import os
-                import shlex
-                import subprocess
                 import sys
 
                 targets = [
-                    (os.environ["TEST_TARGET"], "sleep 120"),
+                    (os.environ["TEST_TARGET"], os.environ["TEST_AGENT_COMMAND"]),
                 ]
                 if second_target := os.environ.get("TEST_SECOND_TARGET"):
-                    targets.append((second_target, "tail -f /dev/null"))
+                    targets.append((second_target, os.environ["TEST_AGENT_COMMAND"]))
 
                 if "--plan-json" in sys.argv:
+                    with open(os.environ["TEST_PLAN_LOG"], "a", encoding="utf-8") as log:
+                        log.write("plan\\n")
                     for target, command in targets:
                         print(json.dumps({
                             "target": target,
@@ -118,18 +132,17 @@ class AiRestartTests(unittest.TestCase):
                             ),
                             "restorable": os.environ.get("TEST_PLAN_INVALID") != "1",
                             "cwd": os.environ["TEST_CWD"],
-                            "command": command,
+                            "command": (
+                                "/usr/bin/true"
+                                if os.environ.get("TEST_RESTORE_LEAVES_SHELL") == "1"
+                                else command
+                            ),
+                            "sid": "",
                         }))
                 else:
                     with open(os.environ["TEST_RESTORE_LOG"], "a", encoding="utf-8") as log:
-                        log.write(" ".join(sys.argv[1:]) + "\\n")
-                    if os.environ.get("TEST_RESTORE_LEAVES_SHELL") != "1":
-                        for target, command in targets:
-                            subprocess.run([
-                                *shlex.split(os.environ["AIPANE_TMUX"]),
-                                "send-keys", "-t", target,
-                                command, "Enter",
-                            ], check=True)
+                        log.write("unexpected action invocation\\n")
+                    raise SystemExit(9)
                 """
             ),
             encoding="utf-8",
@@ -146,12 +159,18 @@ class AiRestartTests(unittest.TestCase):
                 "AIPANE_AI_RESTORE_COMMAND": str(self.fake_restore),
                 "TEST_TARGET": self.target,
                 "TEST_CWD": str(self.tmp),
+                "TEST_AGENT_COMMAND": str(self.fake_agent),
                 "TEST_RESURRECT_DIR": str(self.resurrect_dir),
                 "TEST_RESTORE_LOG": str(self.restore_log),
+                "TEST_PLAN_LOG": str(self.plan_log),
                 "TEST_SAVE_LOG": str(self.save_log),
                 "TEST_SNAPSHOT_LOG": str(self.snapshot_log),
-                "AIPANE_RESTART_VERIFY_TIMEOUT": "0.35",
-                "AIPANE_RESTART_VERIFY_STABILITY": "0.1",
+                "AIPANE_STATE_DIR": str(self.tmp / "aipane-state"),
+                "AI_RESTORE_MAX_ATTEMPTS": "1",
+                "AI_RESTORE_VERIFY_TIMEOUT": "0.35",
+                "AI_RESTORE_VERIFY_STABILITY": "0.1",
+                "AI_RESTORE_LAUNCH_DELAY": "0",
+                "AI_RESTORE_POLL_INTERVAL": "0.01",
                 "XDG_DATA_HOME": str(self.tmp),
             }
         )
@@ -251,7 +270,9 @@ class AiRestartTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("verified 1 AI pane(s) resumed", result.stdout)
-        self.assertIn("--dump", self.restore_log.read_text())
+        self.assertEqual(self.current_command(), "claude")
+        self.assertEqual(self.plan_log.read_text(), "plan\n")
+        self.assertFalse(self.restore_log.exists())
 
     def test_restore_command_that_leaves_a_shell_is_reported_failed(self):
         self.restore_leaves_shell = True
@@ -267,8 +288,9 @@ class AiRestartTests(unittest.TestCase):
         result = self.run_restart("--yes")
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(f"failed to resume {self.target} (claude)", result.stderr)
-        self.assertIn("verified 0 resumed; 1 failed", result.stdout)
+        self.assertIn(self.target, result.stderr)
+        self.assertIn("verified 0 resumed; 1 pending", result.stdout)
+        self.assertFalse(self.restore_log.exists())
 
     def test_invalid_session_is_reported_and_left_untouched(self):
         self.plan_invalid = True
@@ -282,7 +304,7 @@ class AiRestartTests(unittest.TestCase):
         self.assertEqual(self.current_command(), "sleep")
         self.assertFalse(self.restore_log.exists())
 
-    def test_force_respawns_same_pane_then_invokes_ai_restore(self):
+    def test_force_respawns_same_pane_via_the_recovery_executor(self):
         self.tmux(
             "set-option",
             "-p",
@@ -296,7 +318,7 @@ class AiRestartTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("verified 1 AI pane(s) resumed", result.stdout)
-        self.assertEqual(self.current_command(), "sleep")
+        self.assertEqual(self.current_command(), "claude")
         current_pane_id = self.tmux(
             "display-message",
             "-p",
@@ -313,7 +335,8 @@ class AiRestartTests(unittest.TestCase):
             "#{pane_current_path}",
         ).stdout.strip()
         self.assertEqual(Path(restored_cwd).resolve(), self.tmp.resolve())
-        self.assertIn("--dump", self.restore_log.read_text())
+        self.assertEqual(self.plan_log.read_text(), "plan\n")
+        self.assertFalse(self.restore_log.exists())
 
     def test_restart_disables_sync_before_restoring_distinct_panes(self):
         second_target = self.tmux(
@@ -349,7 +372,7 @@ class AiRestartTests(unittest.TestCase):
             "#{synchronize-panes}",
         ).stdout.strip()
         self.assertEqual(synchronized, "0")
-        self.assertEqual(self.current_command(), "sleep")
+        self.assertEqual(self.current_command(), "claude")
         second_command = self.tmux(
             "display-message",
             "-p",
@@ -357,7 +380,9 @@ class AiRestartTests(unittest.TestCase):
             second_target,
             "#{pane_current_command}",
         ).stdout.strip()
-        self.assertEqual(second_command, "tail")
+        self.assertEqual(second_command, "claude")
+        self.assertEqual(self.plan_log.read_text(), "plan\n")
+        self.assertFalse(self.restore_log.exists())
 
     def test_restart_clears_activity_metadata_from_replaced_process(self):
         for option, value in (
@@ -385,6 +410,42 @@ class AiRestartTests(unittest.TestCase):
                 option,
             ).stdout.strip()
             self.assertEqual(value, "", option)
+
+    def test_force_cannot_bypass_a_post_confirmation_guard_change(self):
+        wrapper = self.tmp / "change-guard-then-execute.py"
+        wrapper.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env python3
+                import os
+                import shlex
+                import subprocess
+                import sys
+
+                subprocess.run([
+                    *shlex.split(os.environ["AIPANE_TMUX"]),
+                    "set-option", "-p", "-t", os.environ["TEST_TARGET"],
+                    "@tmux-window-wrap-activity", "changed-after-confirmation",
+                ], check=True)
+                os.execv({str((ROOT / 'bin' / 'aipane-restore-executor'))!r}, [
+                    {str((ROOT / 'bin' / 'aipane-restore-executor'))!r},
+                    *sys.argv[1:],
+                ])
+                """
+            ),
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        self.extra_environment = {
+            "AIPANE_RESTART_EXECUTOR_COMMAND": str(wrapper),
+        }
+
+        result = self.run_restart("--yes", "--force")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("pane guard changed", result.stderr)
+        self.assertEqual(self.current_command(), "sleep")
+        self.assertFalse(self.restore_log.exists())
 
     def test_dry_run_resolves_terminal_codex_without_repairing_marker(self):
         fake_codex = self.tmp / "codex"

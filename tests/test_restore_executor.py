@@ -2,17 +2,27 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 EXECUTOR = ROOT / "bin" / "aipane-restore-executor"
+LIB = ROOT / "lib"
+if str(LIB) not in sys.path:
+    sys.path.insert(0, str(LIB))
+
+from recovery_plan import seal_plan
+
+
 GROK_SID = "94ea9701-d5e6-4c1f-a4ce-f876266e4629"
 
 
@@ -63,7 +73,10 @@ class RestoreExecutorTests(unittest.TestCase):
                 if command == "has-session":
                     raise SystemExit(0)
                 if command == "capture-pane":
-                    print("Couldn't start Grok: startup timed out after 43s.")
+                    print(os.environ.get(
+                        "FAKE_CAPTURE_TEXT",
+                        "Couldn't start Grok: startup timed out after 43s.",
+                    ))
                     raise SystemExit(0)
                 if command == "display-message":
                     if args[-1].startswith("#{"):
@@ -72,12 +85,40 @@ class RestoreExecutorTests(unittest.TestCase):
                         replacements = {
                             "#{pane_current_command}": state,
                             "#{pane_id}": os.environ["FAKE_PANE_ID"],
+                            "#{pane_pid}": "8484",
+                            "#{pane_tty}": "/dev/ttys042",
                             "#{socket_path}": "/private/tmp/tmux-test",
                             "#{pid}": "4242",
+                            "#{window_id}": "@1",
+                            "#{synchronize-panes}": "0",
+                            "#{@tmux-window-wrap-activity}": "",
+                            "#{@tmux-window-wrap-activity-reporter}": "",
+                            "#{@tmux-window-wrap-activity-updated-at}": "",
+                            "#{@tmux-window-wrap-activity-record}": "",
                         }
                         for marker, replacement in replacements.items():
                             value = value.replace(marker, replacement)
                         print(value)
+                    raise SystemExit(0)
+                if command == "show-option":
+                    print("/bin/sh")
+                    raise SystemExit(0)
+                if command in {"set-window-option", "set-option"}:
+                    raise SystemExit(0)
+                if command == "respawn-pane":
+                    pending = Path(os.environ["AIPANE_STATE_DIR"]) / "restore-pending.json"
+                    target = args[args.index("-t") + 1]
+                    persisted_targets = {
+                        item["target"]
+                        for item in json.loads(pending.read_text(encoding="utf-8"))["items"]
+                    } if pending.exists() else set()
+                    if target not in persisted_targets:
+                        print("pending intent was not persisted", file=sys.stderr)
+                        raise SystemExit(7)
+                    if os.environ.get("FAKE_RESPAWN_FAIL") == "1":
+                        print("synthetic respawn failure", file=sys.stderr)
+                        raise SystemExit(8)
+                    state_path.write_text("zsh\\n", encoding="utf-8")
                     raise SystemExit(0)
                 if command == "send-keys":
                     if "Enter" in args:
@@ -88,7 +129,10 @@ class RestoreExecutorTests(unittest.TestCase):
                         if mode == "fail" or (mode == "fail-once" and count == 1):
                             state_path.write_text("zsh\\n", encoding="utf-8")
                         else:
-                            state_path.write_text("grok-1.0.4-maco\\n", encoding="utf-8")
+                            state_path.write_text(
+                                os.environ["FAKE_RUNNING_COMMAND"] + "\\n",
+                                encoding="utf-8",
+                            )
                             if mode != "running":
                                 with Path(os.environ["GROK_LOG"]).open(
                                     "a", encoding="utf-8"
@@ -127,11 +171,45 @@ class RestoreExecutorTests(unittest.TestCase):
         max_attempts: int = 1,
         plan_json: bool = False,
         pane_id: str = "%42",
+        guard_pane_id: str | None = None,
+        sealed: bool = False,
+        capture_text: str | None = None,
+        running_command: str = "grok-1.0.4-maco",
+        respawn_fail: bool = False,
+        lock_held: bool = False,
+        guard_overrides: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        self.plan_file.write_text(
-            "".join(json.dumps(item) + "\n" for item in plan),
-            encoding="utf-8",
-        )
+        dump = self.tmp / "resurrect.txt"
+        dump.touch()
+        if sealed:
+            guarded_plan = []
+            for item in plan:
+                guard = {
+                    "pane_id": guard_pane_id or pane_id,
+                    "socket_path": "/private/tmp/tmux-test",
+                    "server_pid": "4242",
+                    "pane_pid": "8484",
+                    "current_command": self.runtime_state.read_text(
+                        encoding="utf-8"
+                    ).strip(),
+                    "activity_marker": "",
+                    "activity_reporter": "",
+                    "activity_updated_at": "",
+                    "activity_record": "",
+                }
+                guard.update(guard_overrides or {})
+                guarded_plan.append(
+                    {
+                        **item,
+                        "guard": guard,
+                    }
+                )
+            seal_plan(self.plan_file, dump, guarded_plan)
+        else:
+            self.plan_file.write_text(
+                "".join(json.dumps(item) + "\n" for item in plan),
+                encoding="utf-8",
+            )
         env = os.environ.copy()
         env.update(
             {
@@ -150,21 +228,43 @@ class RestoreExecutorTests(unittest.TestCase):
                 "FAKE_PANE_ID": pane_id,
                 "FAKE_LAUNCH_COUNT": str(self.launch_count),
                 "FAKE_LAUNCH_MODE": launch_mode,
+                "FAKE_RUNNING_COMMAND": running_command,
+                "FAKE_RESPAWN_FAIL": "1" if respawn_fail else "0",
                 "TMUX_LOG": str(self.tmux_log),
                 "BIND_LOG": str(self.bind_log),
                 "GROK_LOG": str(self.grok_log),
                 "GROK_SID": GROK_SID,
             }
         )
-        arguments = [
-            str(EXECUTOR),
-            "--plan",
-            str(self.plan_file),
-            "--dump",
-            str(self.tmp / "resurrect.txt"),
-        ]
+        if capture_text is not None:
+            env["FAKE_CAPTURE_TEXT"] = capture_text
+        if sealed:
+            arguments = [
+                str(EXECUTOR),
+                "--sealed-plan",
+                str(self.plan_file),
+            ]
+        else:
+            arguments = [
+                str(EXECUTOR),
+                "--plan",
+                str(self.plan_file),
+                "--dump",
+                str(dump),
+            ]
         if plan_json:
             arguments.append("--plan-json")
+        if lock_held:
+            lock_path = self.state_dir / "restore-executor.lock"
+            with lock_path.open("a", encoding="utf-8") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return subprocess.run(
+                    arguments,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
         return subprocess.run(
             arguments,
             check=False,
@@ -300,6 +400,135 @@ class RestoreExecutorTests(unittest.TestCase):
             and self.grok_plan()["command"] in call
         ]
         self.assertEqual(len(literal_launches), 2)
+
+    def test_codex_update_prompt_is_blocked_instead_of_verified(self):
+        plan = {
+            "target": "0:4.1",
+            "tool": "codex",
+            "kind": "resume",
+            "restorable": True,
+            "cwd": str(self.tmp),
+            "command": "codex resume thread-1",
+            "sid": "",
+        }
+
+        result = self.run_executor(
+            [plan],
+            launch_mode="ready",
+            sealed=True,
+            running_command="codex",
+            capture_text=(
+                "Update available! 0.148.0 -> 0.149.0\n"
+                "1. Update now\n2. Skip until next version"
+            ),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("blocked=1", result.stdout)
+        self.assertNotIn("verified=1", result.stdout)
+        self.assertEqual([item["target"] for item in self.pending_items()], ["0:4.1"])
+        self.assertFalse(self.bind_log.exists())
+
+    def test_sealed_restart_persists_intent_before_respawn(self):
+        result = self.run_executor(
+            [self.grok_plan()],
+            launch_mode="ready",
+            sealed=True,
+            respawn_fail=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        pending = self.pending_items()
+        self.assertEqual([item["target"] for item in pending], ["0:4.1"])
+        self.assertIn("synthetic respawn failure", pending[0]["last_error"])
+
+    def test_sealed_restart_refuses_reused_pane_identity_before_respawn(self):
+        result = self.run_executor(
+            [self.grok_plan()],
+            launch_mode="ready",
+            sealed=True,
+            pane_id="%99",
+            guard_pane_id="%42",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        calls = [
+            json.loads(line)
+            for line in self.tmux_log.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertFalse(any(call[0] == "respawn-pane" for call in calls))
+        self.assertFalse((self.state_dir / "restore-pending.json").exists())
+
+    def test_sealed_restart_guards_process_and_activity_before_respawn(self):
+        for changed_guard in (
+            {"pane_pid": "9999"},
+            {"activity_marker": "busy-after-confirmation"},
+        ):
+            with self.subTest(changed_guard=changed_guard):
+                self.tmux_log.unlink(missing_ok=True)
+                result = self.run_executor(
+                    [self.grok_plan()],
+                    launch_mode="ready",
+                    sealed=True,
+                    guard_overrides=changed_guard,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                calls = [
+                    json.loads(line)
+                    for line in self.tmux_log.read_text(encoding="utf-8").splitlines()
+                ]
+                self.assertFalse(any(call[0] == "respawn-pane" for call in calls))
+
+    def test_sealed_restart_executes_only_its_confirmed_targets(self):
+        unrelated = {
+            **self.grok_plan(),
+            "target": "0:9.1",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "attempts": 1,
+            "last_error": "older failure",
+            "source_dump": "older-dump",
+            "pane_id": "%90",
+            "socket_path": "/private/tmp/tmux-test",
+            "server_pid": "4242",
+        }
+        (self.state_dir / "restore-pending.json").write_text(
+            json.dumps({"version": 1, "updated_at": time.time(), "items": [unrelated]}),
+            encoding="utf-8",
+        )
+
+        result = self.run_executor(
+            [self.grok_plan()],
+            launch_mode="ready",
+            sealed=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [
+            json.loads(line)
+            for line in self.tmux_log.read_text(encoding="utf-8").splitlines()
+        ]
+        literal_targets = [
+            call[call.index("-t") + 1]
+            for call in calls
+            if call[0] == "send-keys" and "-l" in call
+        ]
+        self.assertEqual(literal_targets, ["0:4.1"])
+        self.assertEqual([item["target"] for item in self.pending_items()], ["0:9.1"])
+
+    def test_executor_lock_contention_is_nonzero_and_non_destructive(self):
+        result = self.run_executor(
+            [self.grok_plan()],
+            launch_mode="ready",
+            sealed=True,
+            lock_held=True,
+        )
+
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("already running", result.stderr)
+        self.assertFalse(self.tmux_log.exists())
+        self.assertFalse((self.state_dir / "restore-pending.json").exists())
 
 
 if __name__ == "__main__":
