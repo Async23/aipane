@@ -1,0 +1,491 @@
+#!/opt/homebrew/bin/python3
+"""Send Kimi Code hook events through the dedicated macOS notifier app."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+HOME = Path(os.environ.get("HOME", str(Path.home()))).expanduser()
+KIMI_HOME = Path(
+    os.environ.get("KIMI_CODE_HOME", str(HOME / ".kimi-code"))
+).expanduser()
+NOTIFIER_APP = Path(
+    os.environ.get(
+        "AIPANE_KIMI_NOTIFIER_APP",
+        str(HOME / "Applications" / "Kimi Code Notifier.app"),
+    )
+).expanduser()
+NOTIFIER = NOTIFIER_APP / "Contents" / "MacOS" / "kimi-notifier"
+FOCUS_SCRIPT = Path(
+    os.environ.get(
+        "AIPANE_KIMI_FOCUS",
+        str(HOME / ".local" / "bin" / "aipane-kimi-focus"),
+    )
+).expanduser()
+STATE_DIR = Path(
+    os.environ.get(
+        "AIPANE_KIMI_NOTIFY_STATE_DIR",
+        str(KIMI_HOME / "notifications"),
+    )
+).expanduser()
+DEDUP_DIR = STATE_DIR / "dedupe"
+LOG_PATH = KIMI_HOME / "logs" / "kimi-notify.log"
+DEDUP_TTL_SECONDS = 3.0
+NOTIFIER_TIMEOUT_SECONDS = 6.0
+SUBTITLE_LIMIT = 80
+BODY_LIMIT = 140
+THREAD_TITLE_LIMIT = 48
+WIRE_TAIL_BYTES = 1024 * 1024
+SAFE_SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,159}")
+
+
+def compact(value: object, limit: int = BODY_LIMIT) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def first_non_empty_line(value: object, limit: int) -> str:
+    for line in str(value or "").splitlines():
+        text = line.strip()
+        text = re.sub(r"^#{1,6}\s+", "", text)
+        text = re.sub(r"^[-*•]\s+", "", text)
+        text = re.sub(r"\[([^]]+)]\([^)]+\)", r"\1", text)
+        text = compact(text, limit)
+        if text:
+            return text
+    return ""
+
+
+def read_json_stream() -> dict[str, object]:
+    raw = sys.stdin.read().strip()
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def project_name(cwd: object) -> str:
+    value = compact(cwd, 240)
+    if not value:
+        return "Kimi Code"
+    return Path(value).name or "Kimi Code"
+
+
+def session_directory(session_id: object) -> Path | None:
+    value = compact(session_id, 160)
+    if not SAFE_SESSION_ID_RE.fullmatch(value):
+        return None
+    sessions_root = KIMI_HOME / "sessions"
+    try:
+        resolved_root = sessions_root.resolve(strict=True)
+        workspace_dirs = [sessions_root, *sessions_root.iterdir()]
+    except OSError:
+        return None
+    for workspace_dir in workspace_dirs:
+        candidate = workspace_dir / value
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved.is_dir() and resolved.is_relative_to(resolved_root):
+            return resolved
+    return None
+
+
+def session_state(session_dir: Path | None) -> dict[str, object]:
+    if session_dir is None:
+        return {}
+    try:
+        value = json.loads((session_dir / "state.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def tail_lines(path: Path, byte_limit: int = WIRE_TAIL_BYTES) -> list[str]:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            start = max(0, size - byte_limit)
+            handle.seek(start)
+            data = handle.read()
+    except OSError:
+        return []
+    if start > 0:
+        newline = data.find(b"\n")
+        if newline < 0:
+            return []
+        data = data[newline + 1 :]
+    return data.decode("utf-8", errors="replace").splitlines()
+
+
+def message_text(message: object) -> str:
+    if isinstance(message, str):
+        return message
+    if isinstance(message, list):
+        parts: list[str] = []
+        for item in message:
+            if not isinstance(item, dict) or item.get("type") != "text":
+                continue
+            text = item.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+        return "\n".join(parts)
+    if not isinstance(message, dict):
+        return ""
+    if message.get("type") == "text" and isinstance(message.get("text"), str):
+        return str(message["text"])
+    return message_text(message.get("content"))
+
+
+def session_wire_path(session_dir: Path | None) -> Path | None:
+    if session_dir is None:
+        return None
+    wire_paths = (
+        session_dir / "agents" / "main" / "wire.jsonl",
+        session_dir / "wire.jsonl",
+    )
+    return next((path for path in wire_paths if path.is_file()), None)
+
+
+def latest_turn_content(session_dir: Path | None) -> tuple[str, str]:
+    wire_path = session_wire_path(session_dir)
+    if wire_path is None:
+        return "", ""
+
+    prompt = ""
+    answer = ""
+    message_fallback = ""
+    for raw_line in reversed(tail_lines(wire_path)):
+        try:
+            record = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+
+        record_type = record.get("type")
+        if not prompt and record_type == "turn.prompt":
+            prompt = first_non_empty_line(
+                message_text(record.get("input")),
+                SUBTITLE_LIMIT,
+            )
+
+        if not answer and record_type == "context.append_loop_event":
+            event = record.get("event")
+            if isinstance(event, dict) and event.get("type") == "content.part":
+                part = event.get("part")
+                if isinstance(part, dict) and part.get("type") == "text":
+                    answer = first_non_empty_line(part.get("text"), BODY_LIMIT)
+
+        message = record.get("message") if record_type == "context.append_message" else record
+        if isinstance(message, dict) and message.get("role") == "assistant" and not answer:
+            answer = first_non_empty_line(message_text(message), BODY_LIMIT)
+        if isinstance(message, dict) and message.get("role") == "user" and not message_fallback:
+            fallback = first_non_empty_line(message_text(message), SUBTITLE_LIMIT)
+            if not fallback.startswith(("<system-reminder>", "<hook_result")):
+                message_fallback = fallback
+
+        if prompt and answer:
+            break
+    return prompt or message_fallback, answer
+
+
+def session_content(payload: dict[str, object]) -> tuple[str, str, str]:
+    directory = session_directory(payload.get("session_id"))
+    state = session_state(directory)
+    title = compact(
+        payload.get("session_title") or state.get("title"),
+        THREAD_TITLE_LIMIT,
+    )
+    wire_prompt, answer = latest_turn_content(directory)
+    prompt = first_non_empty_line(state.get("lastPrompt"), SUBTITLE_LIMIT)
+    if not prompt:
+        prompt = wire_prompt
+    return title, prompt, answer
+
+
+def tmux_target() -> dict[str, str]:
+    pane = os.environ.get("TMUX_PANE", "")
+    if not pane:
+        return {}
+    tmux = shlex.split(os.environ.get("AIPANE_TMUX", "tmux"))
+    if not tmux:
+        return {}
+    try:
+        result = subprocess.run(
+            [
+                *tmux,
+                "display-message",
+                "-p",
+                "-t",
+                pane,
+                "#{session_id}\t#{session_name}\t#{window_id}\t#{pane_id}\t"
+                "#{window_index}\t#{pane_index}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {"pane_id": pane}
+    parts = result.stdout.strip().split("\t")
+    if len(parts) != 6:
+        return {"pane_id": pane}
+    return dict(
+        zip(
+            (
+                "session_id",
+                "session",
+                "window_id",
+                "pane_id",
+                "window_index",
+                "pane_index",
+            ),
+            parts,
+            strict=True,
+        )
+    )
+
+
+def first_question(tool_input: object) -> str:
+    if not isinstance(tool_input, dict):
+        return "Kimi Code 正在等待你的回答。"
+    questions = tool_input.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return "Kimi Code 正在等待你的回答。"
+    first = questions[0]
+    if not isinstance(first, dict):
+        return "Kimi Code 正在等待你的回答。"
+    return compact(first.get("question")) or "Kimi Code 正在等待你的回答。"
+
+
+def notification_for(payload: dict[str, object]) -> dict[str, object] | None:
+    event = compact(payload.get("hook_event_name") or payload.get("event"), 64)
+    tool_name = compact(payload.get("tool_name"), 80)
+    if event == "PermissionRequest" and tool_name == "AskUserQuestion":
+        return None
+
+    thread_title, prompt, answer = session_content(payload)
+    target = tmux_target()
+    project = project_name(payload.get("cwd"))
+    coordinate = ""
+    numeric_session_id = target.get("session_id", "").removeprefix("$")
+    if (
+        numeric_session_id.isdigit()
+        and target.get("window_index", "").isdigit()
+        and target.get("pane_index", "").isdigit()
+    ):
+        coordinate = (
+            f"{numeric_session_id}:{target['window_index']}:{target['pane_index']}"
+        )
+    base_title = thread_title or project
+    if coordinate:
+        base_title = f"{coordinate} · {base_title}"
+
+    if event == "Stop":
+        title = base_title
+        body = answer or "当前任务已执行完成。"
+        sound = ""
+        event_key = "complete"
+    elif event == "StopFailure":
+        title = f"{base_title} · 任务失败"
+        error_type = compact(payload.get("error_type"), 80)
+        error_message = compact(payload.get("error_message"))
+        body = compact(": ".join(part for part in (error_type, error_message) if part))
+        body = body or "任务执行失败。"
+        sound = "default"
+        event_key = "failure"
+    elif event == "PermissionRequest":
+        title = f"{base_title} · 等待确认"
+        body = compact(payload.get("action")) or tool_name or "Kimi Code 需要你的确认。"
+        sound = "default"
+        event_key = f"approval:{compact(payload.get('tool_call_id'), 120) or tool_name}"
+    elif event == "PreToolUse" and tool_name == "AskUserQuestion":
+        title = f"{base_title} · 等待输入"
+        body = first_question(payload.get("tool_input"))
+        sound = "default"
+        event_key = f"question:{compact(payload.get('tool_call_id'), 120) or 'pending'}"
+    else:
+        return None
+
+    session_id = compact(payload.get("session_id"), 160) or "unknown"
+    group_seed = f"{session_id}:{event_key}"
+    group = "kimi-" + hashlib.sha256(group_seed.encode()).hexdigest()[:24]
+    subtitle = prompt or ("任务完成" if event == "Stop" else project)
+
+    action = ""
+    if FOCUS_SCRIPT.is_file() and target:
+        action = shlex.join(
+            [
+                str(FOCUS_SCRIPT),
+                target.get("session", ""),
+                target.get("window_id", ""),
+                target.get("pane_id", ""),
+                target.get("window_index", ""),
+            ]
+        )
+
+    return {
+        "event": event,
+        "title": title,
+        "subtitle": subtitle,
+        "body": body,
+        "sound": sound,
+        "group": group,
+        "action": action,
+        "pane_id": target.get("pane_id", ""),
+    }
+
+
+def ensure_private_dir(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        directory.chmod(0o700)
+    except OSError:
+        pass
+
+
+def claim_dedup(group: str) -> bool:
+    ensure_private_dir(DEDUP_DIR)
+    marker = DEDUP_DIR / group
+    now = time.time()
+    try:
+        descriptor = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        try:
+            if now - marker.stat().st_mtime < DEDUP_TTL_SECONDS:
+                return False
+            os.utime(marker, (now, now))
+            return True
+        except OSError:
+            return True
+    else:
+        os.close(descriptor)
+        return True
+
+
+def log_result(event: str, group: str, pane_id: str, status: str) -> None:
+    ensure_private_dir(LOG_PATH.parent)
+    line = json.dumps(
+        {
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "event": event,
+            "group": group,
+            "pane": pane_id,
+            "status": status,
+        },
+        separators=(",", ":"),
+    )
+    descriptor = os.open(LOG_PATH, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+    with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+
+
+def deliver(notification: dict[str, object]) -> None:
+    event = str(notification.get("event", ""))
+    group = str(notification.get("group", ""))
+    pane_id = str(notification.get("pane_id", ""))
+    if not NOTIFIER.is_file() or not os.access(NOTIFIER, os.X_OK):
+        log_result(event, group, pane_id, "sender-missing")
+        return
+
+    arguments = [
+        str(NOTIFIER),
+        "-title",
+        str(notification["title"]),
+        "-subtitle",
+        str(notification["subtitle"]),
+        "-message",
+        str(notification["body"]),
+        "-group",
+        group,
+    ]
+    sound = str(notification.get("sound", ""))
+    if sound:
+        arguments.extend(["-sound", sound])
+    action = str(notification.get("action", ""))
+    if action:
+        arguments.extend(["-execute", action])
+
+    try:
+        result = subprocess.run(
+            arguments,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=NOTIFIER_TIMEOUT_SECONDS,
+        )
+        status = "sent" if result.returncode == 0 else f"sender-exit-{result.returncode}"
+    except subprocess.TimeoutExpired:
+        status = "sender-timeout"
+    except OSError:
+        status = "sender-error"
+    log_result(event, group, pane_id, status)
+
+
+def spawn_delivery(notification: dict[str, object]) -> None:
+    try:
+        process = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--deliver"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            text=True,
+        )
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(notification, separators=(",", ":")))
+        process.stdin.close()
+    except (OSError, BrokenPipeError):
+        log_result(
+            str(notification.get("event", "")),
+            str(notification.get("group", "")),
+            str(notification.get("pane_id", "")),
+            "worker-error",
+        )
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--deliver":
+        deliver(read_json_stream())
+        return 0
+
+    notification = notification_for(read_json_stream())
+    if notification is None:
+        return 0
+    if os.environ.get("KIMI_NOTIFY_DRY_RUN") == "1":
+        print(json.dumps(notification, ensure_ascii=False, sort_keys=True))
+        return 0
+    group = str(notification["group"])
+    if not claim_dedup(group):
+        log_result(
+            str(notification["event"]),
+            group,
+            str(notification.get("pane_id", "")),
+            "deduplicated",
+        )
+        return 0
+    spawn_delivery(notification)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
