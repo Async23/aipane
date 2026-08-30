@@ -12,6 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTIFY = ROOT / "bin" / "aipane-kimi-notify"
+COMPLETION_SOUNDS = {"Glass", "Ping", "Pop", "Purr", "Submarine", "Tink"}
 
 
 class KimiNotifyTests(unittest.TestCase):
@@ -140,7 +141,7 @@ class KimiNotifyTests(unittest.TestCase):
         self.assertEqual(notification["title"], "Refactor notifications")
         self.assertEqual(notification["subtitle"], "Update the notifier")
         self.assertEqual(notification["body"], "Implemented the notification changes.")
-        self.assertEqual(notification["sound"], "")
+        self.assertIn(notification["sound"], COMPLETION_SOUNDS)
 
     def test_tmux_title_matches_shared_coordinate_format(self):
         self.write_session()
