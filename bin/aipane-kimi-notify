@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -43,6 +44,14 @@ DEDUP_TTL_SECONDS = 3.0
 NOTIFIER_TIMEOUT_SECONDS = 6.0
 SUBTITLE_LIMIT = 80
 BODY_LIMIT = 140
+COMPLETION_SOUNDS = (
+    "Glass",
+    "Ping",
+    "Pop",
+    "Purr",
+    "Submarine",
+    "Tink",
+)
 THREAD_TITLE_LIMIT = 48
 WIRE_TAIL_BYTES = 1024 * 1024
 SAFE_SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,159}")
@@ -302,7 +311,7 @@ def notification_for(payload: dict[str, object]) -> dict[str, object] | None:
     if event == "Stop":
         title = base_title
         body = answer or "当前任务已执行完成。"
-        sound = ""
+        sound = secrets.choice(COMPLETION_SOUNDS)
         event_key = "complete"
     elif event == "StopFailure":
         title = f"{base_title} · 任务失败"
