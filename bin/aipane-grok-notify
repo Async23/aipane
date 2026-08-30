@@ -1,0 +1,776 @@
+#!/opt/homebrew/bin/python3
+"""Grok Build desktop notifications (Codex-style content, independent channel)."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import secrets
+import shlex
+import subprocess
+import sys
+import time
+import unicodedata
+from pathlib import Path
+
+
+HOME = Path.home()
+LOG_PATH = HOME / ".grok" / "logs" / "grok-notify.log"
+STATE_DIR = HOME / ".grok" / "hooks" / "state"
+DEDUP_DIR = HOME / ".grok" / "logs" / "notify-dedup"
+SESSIONS_DIR = HOME / ".grok" / "sessions"
+GROK_NOTIFIER_APP = HOME / "Applications" / "Grok Notifier.app"
+GROK_NOTIFIER = GROK_NOTIFIER_APP / "Contents" / "MacOS" / "terminal-notifier"
+FOCUS_TMUX_SCRIPT = HOME / ".grok" / "bin" / "grok-focus-tmux.sh"
+GHOSTTY_BUNDLE_ID = "com.mitchellh.ghostty"
+NOTIFICATION_GROUP = "grok-agent-turn-complete"
+NOTIFICATION_SOUNDS = ("Glass", "Ping", "Pop", "Purr", "Submarine", "Tink")
+NOTIFIER_TIMEOUT_SECONDS = 7
+DEDUP_TTL_SECONDS = 8
+TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024
+DEFERRED_FLAG = "--deferred"
+TRANSCRIPT_WAIT_SECONDS = 2.0
+TRANSCRIPT_POLL_SECONDS = 0.05
+SUBTITLE_MAX_DISPLAY_WIDTH = 48
+IMAGE_MARKER_RE = re.compile(r"\[\s*Image\s+#\d+\s*\]", re.IGNORECASE)
+
+
+def notification_sound() -> str:
+    override = os.environ.get("GROK_NOTIFY_SOUND", "").strip()
+    return override or secrets.choice(NOTIFICATION_SOUNDS)
+
+
+def is_deferred_worker() -> bool:
+    return len(sys.argv) > 1 and sys.argv[1] == DEFERRED_FLAG
+
+
+def read_payload() -> dict:
+    raw = ""
+    if is_deferred_worker() and len(sys.argv) > 2:
+        raw = sys.argv[2]
+    elif len(sys.argv) > 1 and sys.argv[1]:
+        raw = sys.argv[1]
+    elif not sys.stdin.isatty():
+        raw = sys.stdin.read().strip()
+
+    env_payload = {
+        "event": os.environ.get("GROK_EVENT") or os.environ.get("GROK_HOOK_EVENT") or "",
+        "message": os.environ.get("GROK_MESSAGE") or "",
+        "session_id": os.environ.get("GROK_SESSION_ID") or "",
+        "cwd": os.environ.get("GROK_WORKSPACE_ROOT") or os.environ.get("CLAUDE_PROJECT_DIR") or "",
+    }
+
+    if not raw:
+        data = {k: v for k, v in env_payload.items() if v}
+        data["source"] = "env"
+        return data
+
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            # Merge env fallbacks without overwriting non-empty JSON fields.
+            for key, value in env_payload.items():
+                if value and not data.get(key):
+                    data[key] = value
+            if not data.get("source"):
+                data["source"] = "stdin"
+            return data
+    except json.JSONDecodeError:
+        data = {"raw": raw, **{k: v for k, v in env_payload.items() if v}}
+        data["source"] = "raw"
+        return data
+
+    data = {k: v for k, v in env_payload.items() if v}
+    data["source"] = "env"
+    return data
+
+
+def compact_text(value: str) -> str:
+    return " ".join(str(value).split())
+
+
+def first_non_empty_line(value: str) -> str:
+    for line in str(value).splitlines():
+        text = compact_text(line)
+        if text:
+            return text
+    return ""
+
+
+def short_text(value: str, limit: int) -> str:
+    text = compact_text(value)
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "..."
+
+
+def display_width(value: str) -> int:
+    width = 0
+    for char in str(value):
+        if unicodedata.combining(char) or unicodedata.category(char) in {
+            "Mn",
+            "Me",
+            "Cf",
+        }:
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+    return width
+
+
+def short_display_text(value: str, limit: int) -> str:
+    text = compact_text(value)
+    if not text or limit <= 0:
+        return ""
+    if display_width(text) <= limit:
+        return text
+
+    suffix = "..."
+    budget = max(0, limit - display_width(suffix))
+    result = []
+    width = 0
+    for char in text:
+        char_width = display_width(char)
+        if width + char_width > budget:
+            break
+        result.append(char)
+        width += char_width
+    return "".join(result) + suffix
+
+
+def notification_subtitle(value: str) -> str:
+    text = compact_text(value)
+    had_image_marker = bool(IMAGE_MARKER_RE.search(text))
+    text = compact_text(IMAGE_MARKER_RE.sub("", text))
+    if not text and had_image_marker:
+        text = "图片请求"
+    return short_display_text(text, SUBTITLE_MAX_DISPLAY_WIDTH)
+
+
+def pick(payload: dict, *keys: str):
+    for key in keys:
+        if key in payload and payload[key] not in (None, ""):
+            return payload[key]
+    return None
+
+
+def project_title(cwd: str) -> str:
+    if not cwd:
+        return "Grok"
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+        repo_root = result.stdout.strip()
+        if repo_root:
+            return Path(repo_root).name
+    except Exception:
+        pass
+
+    name = Path(cwd).name
+    return name or "Grok"
+
+
+def tmux_notification_title() -> str:
+    pane_id = os.environ.get("TMUX_PANE", "")
+    if not pane_id:
+        return ""
+
+    try:
+        result = subprocess.run(
+            [
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                pane_id,
+                "#{session_id}\t#{window_index}\t#{pane_index}",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return ""
+
+    parts = result.stdout.strip().split("\t")
+    if len(parts) != 3:
+        return ""
+
+    session_index = parts[0].removeprefix("$")
+    window_index, pane_index = parts[1:]
+    if not all(part.isdecimal() for part in (session_index, window_index, pane_index)):
+        return ""
+    return f"{session_index}:{window_index}:{pane_index}"
+
+
+def safe_id(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", value) or "unknown"
+
+
+def load_recorded_prompt(session_id: str) -> dict:
+    if not session_id:
+        return {}
+    path = STATE_DIR / f"{safe_id(session_id)}.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def clean_user_prompt(value: str) -> str:
+    text = str(value or "").strip()
+    matches = re.findall(
+        r"<user_query(?:\s[^>]*)?>\s*(.*?)\s*</user_query>",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if matches:
+        text = matches[-1]
+    return text.strip()
+
+
+def content_text(value) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("text", "content", "message"):
+            nested = value.get(key)
+            if isinstance(nested, str):
+                return nested
+            if isinstance(nested, (dict, list)):
+                text = content_text(nested)
+                if text:
+                    return text
+        return ""
+    if isinstance(value, list):
+        parts = [content_text(part) for part in value]
+        return "\n".join(part for part in parts if part)
+    return ""
+
+
+def recent_jsonl(path: Path):
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            end = handle.tell()
+            start = max(0, end - TRANSCRIPT_TAIL_BYTES)
+            handle.seek(start)
+            data = handle.read()
+    except Exception:
+        return
+
+    if start:
+        newline = data.find(b"\n")
+        if newline < 0:
+            return
+        data = data[newline + 1 :]
+
+    for raw_line in reversed(data.splitlines()):
+        try:
+            item = json.loads(raw_line.decode("utf-8"))
+        except Exception:
+            continue
+        if isinstance(item, dict):
+            yield item
+
+
+def latest_transcript_messages(payload: dict) -> tuple[str, str]:
+    value = pick(
+        payload,
+        "transcriptPath",
+        "transcript_path",
+        "transcript",
+    )
+    transcripts = []
+    if isinstance(value, str) and value.strip():
+        transcripts.append(Path(value).expanduser())
+    else:
+        session_id = str(pick(payload, "sessionId", "session_id") or "").strip()
+        if session_id and SESSIONS_DIR.is_dir():
+            try:
+                transcripts.extend(
+                    sorted(
+                        SESSIONS_DIR.glob(f"*/{safe_id(session_id)}/updates.jsonl"),
+                        key=lambda path: path.stat().st_mtime,
+                        reverse=True,
+                    )
+                )
+            except Exception:
+                pass
+
+    candidates = []
+    for transcript in transcripts:
+        if transcript not in candidates:
+            candidates.append(transcript)
+        chat_history = transcript.with_name("chat_history.jsonl")
+        if chat_history not in candidates:
+            candidates.append(chat_history)
+
+    best_assistant = ""
+    for path in candidates:
+        if not path.is_file():
+            continue
+
+        assistant = ""
+        for item in recent_jsonl(path):
+            update = item.get("params", {}).get("update", {})
+            if isinstance(update, dict) and update:
+                kind = str(update.get("sessionUpdate") or "")
+                if kind == "agent_message_chunk" and not assistant:
+                    assistant = content_text(update.get("content")).strip()
+                elif kind == "user_message_chunk":
+                    user = clean_user_prompt(content_text(update.get("content")))
+                    if user:
+                        return user, assistant or best_assistant
+                    break
+
+            role = str(item.get("role") or item.get("type") or "").lower()
+            if role in {"assistant", "agent"} and not assistant:
+                assistant = content_text(item.get("content")).strip()
+            elif role in {"user", "human"}:
+                user = clean_user_prompt(content_text(item.get("content")))
+                if user:
+                    return user, assistant or best_assistant
+                break
+
+        if assistant and not best_assistant:
+            best_assistant = assistant
+
+    return "", best_assistant
+
+
+def wait_for_transcript_message(payload: dict) -> None:
+    if last_agent_message(payload):
+        return
+
+    deadline = time.monotonic() + TRANSCRIPT_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        _, assistant = latest_transcript_messages(payload)
+        if assistant:
+            return
+        time.sleep(TRANSCRIPT_POLL_SECONDS)
+
+
+def start_deferred_worker(payload: dict) -> bool:
+    try:
+        subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                DEFERRED_FLAG,
+                json.dumps(payload, ensure_ascii=False),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def latest_user_prompt(payload: dict, recorded: dict) -> str:
+    direct = pick(
+        payload,
+        "prompt",
+        "userPrompt",
+        "user_prompt",
+        "last_user_message",
+        "lastUserMessage",
+    )
+    if isinstance(direct, str) and direct.strip():
+        return clean_user_prompt(direct)
+
+    messages = (
+        pick(payload, "input-messages", "input_messages", "userMessages", "messages")
+        or []
+    )
+    if isinstance(messages, list):
+        for message in reversed(messages):
+            if isinstance(message, str) and message.strip():
+                    return clean_user_prompt(message)
+            if isinstance(message, dict):
+                role = str(message.get("role") or message.get("type") or "").lower()
+                content = (
+                    message.get("content")
+                    or message.get("message")
+                    or message.get("text")
+                    or message.get("prompt")
+                )
+                if role in ("", "user", "human") and isinstance(content, str) and content.strip():
+                    return clean_user_prompt(content)
+                if role in ("", "user", "human") and isinstance(content, list):
+                    parts = []
+                    for part in content:
+                        if isinstance(part, str):
+                            parts.append(part)
+                        elif isinstance(part, dict):
+                            text = part.get("text") or part.get("content")
+                            if isinstance(text, str):
+                                parts.append(text)
+                    joined = "\n".join(parts).strip()
+                    if joined:
+                        return clean_user_prompt(joined)
+
+    recorded_prompt = recorded.get("prompt")
+    if isinstance(recorded_prompt, str):
+        return clean_user_prompt(recorded_prompt)
+    return ""
+
+
+def last_agent_message(payload: dict) -> str:
+    value = pick(
+        payload,
+        "last_agent_message",
+        "last-assistant-message",
+        "last_assistant_message",
+        "lastAssistantMessage",
+        "assistant_message",
+        "assistantMessage",
+        "message",
+        "summary",
+        "text",
+        "raw",
+    )
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("text", "content", "message", "summary"):
+            if isinstance(value.get(key), str):
+                return value[key]
+    return ""
+
+
+def event_name(payload: dict) -> str:
+    value = pick(payload, "event", "hookEventName", "hook_event_name", "type")
+    return compact_text(str(value or "")).lower()
+
+
+def event_subtitle_fallback(event: str) -> str:
+    mapping = {
+        "turn_complete": "turn complete",
+        "stop": "turn complete",
+        "approval_required": "需要你的确认",
+        "agent_error": "agent error",
+        "stopfailure": "agent error",
+        "stop_failure": "agent error",
+        "task_complete": "task complete",
+        "session_ready": "session ready",
+        "notification": "notification",
+    }
+    return mapping.get(event.replace("-", "_"), event or "")
+
+
+def build_notification(payload: dict) -> tuple[str, str, str, str]:
+    session_id = str(
+        pick(payload, "sessionId", "session_id")
+        or os.environ.get("GROK_SESSION_ID")
+        or ""
+    )
+    recorded = load_recorded_prompt(session_id)
+    cwd = (
+        pick(payload, "cwd", "workspaceRoot", "workspace_root", "workspace")
+        or recorded.get("cwd")
+        or os.environ.get("GROK_WORKSPACE_ROOT")
+        or os.environ.get("CLAUDE_PROJECT_DIR")
+        or os.getcwd()
+    )
+    cwd = str(cwd or "")
+
+    event = event_name(payload)
+    project = project_title(cwd)
+    tmux_title = tmux_notification_title()
+    title = f"{tmux_title} · {project}" if tmux_title else project
+    transcript_prompt, transcript_message = latest_transcript_messages(payload)
+
+    prompt_source = transcript_prompt or latest_user_prompt(payload, recorded)
+    subtitle = notification_subtitle(first_non_empty_line(prompt_source))
+    if not subtitle:
+        subtitle = notification_subtitle(event_subtitle_fallback(event))
+
+    body_source = last_agent_message(payload) or transcript_message
+    # Prefer agent summary; for pure ui.notifications env, GROK_MESSAGE is often the body.
+    if not body_source and payload.get("source") == "env":
+        body_source = str(payload.get("message") or "")
+
+    if event in {"approval_required", "notification"} and not first_non_empty_line(body_source):
+        body = short_text(str(payload.get("message") or "需要你的确认"), 140)
+    elif event in {"agent_error", "stopfailure", "stop_failure"}:
+        body = short_text(first_non_empty_line(body_source), 140) or "任务执行出错。"
+    else:
+        body = short_text(first_non_empty_line(body_source), 140) or "当前任务已执行完成。"
+
+    return title, subtitle, body, session_id
+
+
+def should_skip_duplicate(session_id: str, title: str, subtitle: str, body: str, event: str) -> bool:
+    """Dedup dual-channel fires (Stop + ui.notifications) within a short TTL.
+
+    Prefer session + coarse event class so the richer Stop payload and the
+    thinner ui.notifications env fire still collapse into one toast.
+    """
+    DEDUP_DIR.mkdir(parents=True, exist_ok=True)
+    event_class = (event or "turn").replace("-", "_")
+    if event_class in {"stop", "turn_complete", ""}:
+        event_class = "turn_complete"
+    elif event_class in {"stopfailure", "stop_failure", "agent_error"}:
+        event_class = "agent_error"
+    material = f"{session_id or title}|{event_class}"
+    digest = hashlib.sha1(material.encode("utf-8")).hexdigest()[:16]
+    key = safe_id(session_id or "nosession") + "-" + digest
+    path = DEDUP_DIR / f"{key}.stamp"
+    now = time.time()
+
+    try:
+        if path.is_file():
+            age = now - path.stat().st_mtime
+            if age < DEDUP_TTL_SECONDS:
+                return True
+        path.write_text(
+            json.dumps(
+                {"ts": now, "title": title, "subtitle": subtitle, "body": body, "event": event},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        return False
+
+    # Best-effort cleanup of old stamps
+    try:
+        for stamp in DEDUP_DIR.glob("*.stamp"):
+            if now - stamp.stat().st_mtime > 60:
+                stamp.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    return False
+
+
+def write_log(payload: dict, title: str, subtitle: str, body: str, skipped: bool = False) -> None:
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "payload": payload,
+                        "title": title,
+                        "subtitle": subtitle,
+                        "body": body,
+                        "skipped_dedup": skipped,
+                        "ts": time.time(),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+
+
+def tmux_focus_target() -> tuple[str, str, str, str]:
+    pane_id = os.environ.get("TMUX_PANE", "")
+    if not pane_id:
+        return "", "", "", ""
+
+    try:
+        result = subprocess.run(
+            [
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                pane_id,
+                "#{session_name}\t#{window_id}\t#{pane_id}\t#{window_index}",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return "", "", pane_id, ""
+
+    parts = result.stdout.strip().split("\t")
+    if len(parts) != 4:
+        return "", "", pane_id, ""
+    return parts[0], parts[1], parts[2], parts[3]
+
+
+def build_focus_command() -> str:
+    if not FOCUS_TMUX_SCRIPT.is_file():
+        return ""
+
+    session, window_id, pane_id, window_index = tmux_focus_target()
+    if not any([session, window_id, pane_id, window_index]):
+        return ""
+
+    return " ".join(
+        shlex.quote(part)
+        for part in [
+            str(FOCUS_TMUX_SCRIPT),
+            session,
+            window_id,
+            pane_id,
+            window_index,
+        ]
+    )
+
+
+def run_grok_notifier(title: str, subtitle: str, body: str, sound: str) -> bool:
+    if not GROK_NOTIFIER.is_file() or not os.access(GROK_NOTIFIER, os.X_OK):
+        return False
+
+    notifier_args = [
+        "-title",
+        title,
+        "-subtitle",
+        subtitle,
+        "-message",
+        body,
+        "-sound",
+        sound,
+        "-group",
+        NOTIFICATION_GROUP,
+    ]
+
+    focus_command = build_focus_command()
+    if focus_command:
+        notifier_args.extend(["-execute", focus_command])
+
+    # Launch the embedded notifier directly. LaunchServices reuses an existing
+    # app process for `open`, which can silently discard later argument sets.
+    cmd = [str(GROK_NOTIFIER), *notifier_args]
+
+    try:
+        subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=NOTIFIER_TIMEOUT_SECONDS,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def apple_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def run_ghostty_osascript(title: str, subtitle: str, body: str, sound: str) -> bool:
+    script = (
+        'tell application id "{}" to display notification "{}" with title "{}" subtitle "{}" sound name "{}"'.format(
+            GHOSTTY_BUNDLE_ID,
+            apple_escape(body),
+            apple_escape(title),
+            apple_escape(subtitle),
+            apple_escape(sound),
+        )
+    )
+    try:
+        subprocess.run(
+            ["/usr/bin/osascript", "-e", script],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=NOTIFIER_TIMEOUT_SECONDS,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def run_osascript(title: str, subtitle: str, body: str, sound: str) -> None:
+    script = 'display notification "{}" with title "{}" subtitle "{}" sound name "{}"'.format(
+        apple_escape(body),
+        apple_escape(title),
+        apple_escape(subtitle),
+        apple_escape(sound),
+    )
+    try:
+        subprocess.run(
+            ["/usr/bin/osascript", "-e", script],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=NOTIFIER_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        pass
+
+
+def main() -> int:
+    payload = read_payload()
+    event = event_name(payload)
+    deferred = is_deferred_worker()
+    dry_run = os.environ.get("GROK_NOTIFY_DRY_RUN", "").lower() in {"1", "true", "yes"}
+
+    # Grok emits an observation-only Stop while a session is closing. It uses
+    # `shutdown` or `channel_closed` here; only `end_turn` is a completed turn
+    # that should produce a desktop notification.
+    if event == "stop":
+        reason = compact_text(str(pick(payload, "reason") or "")).lower()
+        if reason != "end_turn":
+            return 0
+
+    if not dry_run and not deferred and event in {"stop", "turn_complete", "task_complete"}:
+        if start_deferred_worker(payload):
+            return 0
+
+    if deferred and not dry_run:
+        wait_for_transcript_message(payload)
+
+    title, subtitle, body, session_id = build_notification(payload)
+    sound = notification_sound()
+
+    if dry_run:
+        print(
+            json.dumps(
+                {
+                    "title": title,
+                    "subtitle": subtitle,
+                    "body": body,
+                    "event": event,
+                    "sound": sound,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
+
+    if should_skip_duplicate(session_id, title, subtitle, body, event):
+        write_log(payload, title, subtitle, body, skipped=True)
+        return 0
+
+    write_log(payload, title, subtitle, body, skipped=False)
+
+    if not run_grok_notifier(title, subtitle, body, sound):
+        if not run_ghostty_osascript(title, subtitle, body, sound):
+            run_osascript(title, subtitle, body, sound)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
