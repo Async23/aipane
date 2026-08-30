@@ -111,7 +111,7 @@ def main() -> int:
     real_notify = Path(
         os.environ.get(
             "AIPANE_CODEX_REAL_NOTIFY",
-            str(home / ".codex" / "bin" / "codex-notify.py"),
+            str(Path(__file__).resolve().with_name("aipane-codex-desktop-notify")),
         )
     ).expanduser()
     return delegate(real_notify)

@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Grok Build 0.2.93 may still execute Claude-compatible hooks even when
+# [compat.claude] hooks = false. Keep this hook exclusive to Claude Code.
+if [[ -n "${GROK_HOOK_EVENT:-}" ]]; then
+  exit 0
+fi
+
+# Cursor Agent imports Claude-compatible user hooks. Its hook runner exposes
+# CURSOR_PROJECT_DIR/CURSOR_VERSION, so skip this notifier and let Cursor's
+# dedicated stop hook provide the correctly branded notification.
+if [[ -n "${CURSOR_PROJECT_DIR:-}" || -n "${CURSOR_VERSION:-}" ]]; then
+  exit 0
+fi
+
+title="${CLAUDE_NOTIFY_TITLE:-Claude Code}"
+fallback_message="${1:-${CLAUDE_NOTIFY_MESSAGE:-任务已完成}}"
+group_id="claude-code-task-complete"
+icon_path="${HOME}/.claude/hooks/claude-code-icon.png"
+notifier_bin="${HOME}/Applications/Claude Code Notifier.app/Contents/MacOS/terminal-notifier"
+focus_tmux_script="${HOME}/.claude/hooks/focus-tmux.sh"
+state_dir="${HOME}/.claude/hooks/state"
+tmux_bin="${TMUX_BIN:-/opt/homebrew/bin/tmux}"
+notification_sounds=(Glass Ping Pop Purr Submarine Tink)
+notification_sound="${CLAUDE_NOTIFY_SOUND:-}"
+if [[ -z "$notification_sound" ]]; then
+  notification_sound="${notification_sounds[RANDOM % ${#notification_sounds[@]}]}"
+fi
+
+if [[ -t 0 ]]; then
+  hook_input=""
+else
+  hook_input="$(cat || true)"
+fi
+
+json_value() {
+  local query="$1"
+  if [[ -n "${hook_input//[[:space:]]/}" ]] && command -v jq >/dev/null 2>&1; then
+    jq -r "$query // empty" <<<"$hook_input" 2>/dev/null || true
+  fi
+}
+
+compact_text() {
+  tr '\r\n\t' '   ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+first_non_empty_line() {
+  awk 'NF { print; exit }'
+}
+
+truncate_text() {
+  local max_len="$1"
+  awk -v max_len="$max_len" '{
+    if (length($0) > max_len) {
+      print substr($0, 1, max_len - 3) "..."
+    } else {
+      print
+    }
+  }'
+}
+
+build_focus_command() {
+  if [[ ! -x "$focus_tmux_script" ]] || [[ -z "${TMUX_PANE:-}" ]]; then
+    return 0
+  fi
+
+  local tmux_cmd focus_target session window_id pane_id window_index
+  tmux_cmd="$tmux_bin"
+  if [[ ! -x "$tmux_cmd" ]]; then
+    tmux_cmd="$(command -v tmux || true)"
+  fi
+  if [[ -z "$tmux_cmd" || ! -x "$tmux_cmd" ]]; then
+    return 0
+  fi
+
+  focus_target="$("$tmux_cmd" display-message -p -t "$TMUX_PANE" $'#{session_name}\t#{window_id}\t#{pane_id}\t#{window_index}' 2>/dev/null || true)"
+  if [[ -z "$focus_target" ]]; then
+    return 0
+  fi
+
+  IFS=$'\t' read -r session window_id pane_id window_index <<<"$focus_target"
+  if [[ -z "${session:-}${window_id:-}${pane_id:-}${window_index:-}" ]]; then
+    return 0
+  fi
+
+  shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+  }
+
+  printf '%s %s %s %s %s\n' \
+    "$(shell_quote "$focus_tmux_script")" \
+    "$(shell_quote "${session:-}")" \
+    "$(shell_quote "${window_id:-}")" \
+    "$(shell_quote "${pane_id:-}")" \
+    "$(shell_quote "${window_index:-}")"
+}
+
+cwd="$(json_value '.cwd')"
+if [[ -z "$cwd" ]]; then
+  cwd="$PWD"
+fi
+
+project_name=""
+if git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  repo_root="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$repo_root" ]]; then
+    project_name="$(basename "$repo_root")"
+  fi
+elif [[ -n "$cwd" ]]; then
+  project_name="$(basename "$cwd")"
+fi
+
+if [[ -n "$project_name" ]]; then
+  title="$project_name"
+fi
+
+session_id="$(json_value '.session_id')"
+prompt=""
+if [[ -n "$session_id" && -d "$state_dir" ]] && command -v jq >/dev/null 2>&1; then
+  safe_session_id="$(printf '%s' "$session_id" | LC_ALL=C tr -c 'A-Za-z0-9_.-' '_')"
+  state_file="${state_dir}/${safe_session_id}.json"
+  if [[ -f "$state_file" ]]; then
+    prompt="$(jq -r '.prompt // empty' "$state_file" 2>/dev/null || true)"
+  fi
+fi
+
+subtitle="$(printf '%s\n' "$prompt" | first_non_empty_line | compact_text | truncate_text 80)"
+
+assistant_message="$(json_value '.last_assistant_message')"
+assistant_summary="$(printf '%s\n' "$assistant_message" | first_non_empty_line | compact_text | truncate_text 140)"
+
+message="$fallback_message"
+if [[ -n "$assistant_summary" ]]; then
+  message="$assistant_summary"
+fi
+
+if [[ "${CLAUDE_NOTIFY_DRY_RUN:-}" =~ ^(1|true|yes)$ ]]; then
+  printf '{"sound":"%s"}\n' "$notification_sound"
+  exit 0
+fi
+
+if [[ -x "$notifier_bin" ]] || command -v terminal-notifier >/dev/null 2>&1; then
+  notifier="$notifier_bin"
+  if [[ ! -x "$notifier" ]]; then
+    notifier="$(command -v terminal-notifier)"
+  fi
+
+  args=(-title "$title" -message "$message" -group "$group_id" -appIcon "file://${icon_path}" -sound "$notification_sound")
+  if [[ -n "$subtitle" ]]; then
+    args=(-title "$title" -subtitle "$subtitle" -message "$message" -group "$group_id" -appIcon "file://${icon_path}" -sound "$notification_sound")
+  fi
+  focus_command="$(build_focus_command)"
+  if [[ -n "$focus_command" ]]; then
+    args+=(-execute "$focus_command")
+  fi
+  "$notifier" "${args[@]}" >/dev/null 2>&1 && exit 0
+fi
+
+escaped_message="${message//\"/\\\"}"
+escaped_title="${title//\"/\\\"}"
+escaped_sound="${notification_sound//\"/\\\"}"
+osascript -e "display notification \"${escaped_message}\" with title \"${escaped_title}\" sound name \"${escaped_sound}\"" >/dev/null 2>&1 || true

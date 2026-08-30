@@ -200,6 +200,9 @@ restore is not implemented.
 The full recovery invariants and failure model live in
 [`docs/session-restore-design.md`](docs/session-restore-design.md).
 
+The macOS completion-notification adapters and their sound overrides are indexed in
+[`docs/agent-notifications.md`](docs/agent-notifications.md).
+
 ```bash
 ai-restart --dry-run  # refresh snapshot and preview; does not restart panes
 ai-restart            # preview, confirm, then restart and resume
