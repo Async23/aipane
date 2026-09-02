@@ -60,7 +60,8 @@ still owns the pane, so a marker left by an abnormal exit is ignored.
 The safety source is a versioned JSON record in
 `@tmux-window-wrap-activity-record`. It binds the report to the tmux pane,
 server, TTY, and exact Agent process; Codex records also carry the root session,
-turn, transcript, and per-pane `CODEX_HOME`. The older scalar options remain
+turn, transcript, and per-pane `CODEX_HOME`, while Kimi records carry the exact
+session and per-process `KIMI_CODE_HOME`. The older scalar options remain
 display/compatibility projections and are written only after the record.
 Every call also records the current command in
 `@tmux-window-wrap-activity-reporter`. This lets destructive maintenance tools
@@ -159,6 +160,21 @@ tool-specific interpretation of Agent Activity.
 The helper uses `TMUX_PANE`, which Kimi inherits from tmux. Run `/reload` in an
 idle Kimi session or start a new Kimi process after changing the hook
 configuration. Outside tmux, the helper is a silent no-op.
+
+Kimi Code 0.39.1 launches global hooks with the session's startup cwd, and its
+strict global hook configuration does not accept a per-hook `cwd` override. If
+that directory is renamed or removed during a turn, Kimi can persist a
+successful `turn.ended` event but fail to spawn the `Stop` hook, leaving the
+earlier busy marker behind. For turns whose `TurnStarted` report succeeded, the
+animation probe has a narrow fallback: it resolves that report's exact session
+through
+`${KIMI_CODE_HOME:-~/.kimi-code}/session_index.jsonl`, then requires
+`state.json` and the main agent's `wire.jsonl` to agree on a terminal turn newer
+than both the report and marker. A later `turn.prompt`, a different/dead Kimi
+process, an index deletion, a path outside the Kimi sessions root, or malformed
+evidence fails safe and leaves the pane busy. As with Codex, the repair is
+written only after two identical probe observations and a locked identity
+recheck.
 
 ### Pi extension
 

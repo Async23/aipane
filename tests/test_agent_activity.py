@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
 import urllib.parse
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -114,6 +116,85 @@ def make_codex_history(
     finally:
         history.close()
     return transcript
+
+
+def make_kimi_session(
+    kimi_home: Path,
+    *,
+    session_id: str,
+    wire_records: list[dict[str, object]],
+    last_turn_reason: str,
+    updated_at: int,
+) -> Path:
+    session_dir = kimi_home / "sessions" / "wd_removed_1234" / session_id
+    wire = session_dir / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    wire.write_text(
+        "".join(json.dumps(record) + "\n" for record in wire_records),
+        encoding="utf-8",
+    )
+    (session_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "id": session_id,
+                "updatedAt": updated_at,
+                "lastTurnReason": last_turn_reason,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (kimi_home / "session_index.jsonl").write_text(
+        json.dumps(
+            {
+                "sessionId": session_id,
+                "sessionDir": str(session_dir),
+                # The regression: Kimi's original cwd was renamed mid-turn.
+                "workDir": str(kimi_home.parent / "removed-workspace"),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return session_dir
+
+
+def make_kimi_busy_pane(
+    kimi_home: Path,
+    session_id: str,
+    *,
+    reported_at: int = 1_788_328_946_526,
+) -> PaneActivity:
+    return PaneActivity(
+        pane_id="%7",
+        current_command="kimi",
+        pane_tty="/dev/ttys023",
+        socket_path="/private/tmp/tmux/default",
+        server_pid="30402",
+        marker="kimi",
+        reporter="kimi",
+        marker_updated_at=str(reported_at),
+        record=json.dumps(
+            {
+                "version": 1,
+                "revision": "revision-kimi",
+                "generation": "generation-kimi",
+                "owner": "kimi",
+                "reported": "busy",
+                "updated_at": reported_at,
+                "pane": {
+                    "id": "%7",
+                    "tty": "/dev/ttys023",
+                    "socket": "/private/tmp/tmux/default",
+                    "server_pid": "30402",
+                },
+                "process": {"pid": 123, "started_at": "process-1"},
+                "session": {
+                    "id": session_id,
+                    "kimi_home": str(kimi_home),
+                },
+            }
+        ),
+    )
 
 
 class AgentActivityTests(unittest.TestCase):
@@ -961,6 +1042,164 @@ class AgentActivityTests(unittest.TestCase):
 
             self.assertEqual(view.state, "idle")
             self.assertEqual(view.reason, "grok_update_idle")
+
+    def test_kimi_turn_end_resolves_busy_when_original_cwd_was_renamed(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            kimi_home = Path(raw_tmp) / ".kimi-code"
+            session_id = "session_22d9202e-989b-459f-8ba3-2fafab56df19"
+            make_kimi_session(
+                kimi_home,
+                session_id=session_id,
+                wire_records=[
+                    {
+                        "type": "turn.prompt",
+                        "agentId": "main",
+                        "time": 1_788_328_946_527,
+                    },
+                    {
+                        "type": "turn.ended",
+                        "agentId": "main",
+                        "time": 1_788_329_146_727,
+                        "turnId": 0,
+                        "reason": "completed",
+                    },
+                ],
+                last_turn_reason="completed",
+                updated_at=1_788_329_146_728,
+            )
+            pane = make_kimi_busy_pane(kimi_home, session_id)
+
+            view = AgentActivity(
+                environment={"KIMI_CODE_HOME": str(kimi_home)},
+                process_matches=lambda _process, _pane: True,
+            ).resolve(pane)
+
+            self.assertEqual(view.state, "idle")
+            self.assertEqual(view.reason, "kimi_turn_ended")
+            self.assertEqual(view.evidence_turn_id, "0")
+            self.assertTrue(view.repairable)
+
+    def test_newer_kimi_prompt_prevents_previous_end_from_clearing_busy(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            kimi_home = Path(raw_tmp) / ".kimi-code"
+            session_id = "session_22d9202e-989b-459f-8ba3-2fafab56df19"
+            make_kimi_session(
+                kimi_home,
+                session_id=session_id,
+                wire_records=[
+                    {
+                        "type": "turn.prompt",
+                        "agentId": "main",
+                        "time": 1_788_328_900_000,
+                    },
+                    {
+                        "type": "turn.ended",
+                        "agentId": "main",
+                        "turnId": 0,
+                        "reason": "completed",
+                        "time": 1_788_328_910_000,
+                    },
+                    {
+                        "type": "turn.prompt",
+                        "agentId": "main",
+                        "time": 1_788_328_946_527,
+                    },
+                ],
+                # Simulate reading while state.json still lags the wire append.
+                last_turn_reason="completed",
+                updated_at=1_788_328_910_001,
+            )
+            pane = make_kimi_busy_pane(kimi_home, session_id)
+
+            view = AgentActivity(
+                process_matches=lambda _process, _pane: True,
+            ).resolve(pane)
+
+            self.assertEqual(view.state, "busy")
+            self.assertEqual(view.reason, "reported_activity")
+            self.assertFalse(view.repairable)
+
+    def test_kimi_end_older_than_busy_report_cannot_clear_new_turn(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            kimi_home = Path(raw_tmp) / ".kimi-code"
+            session_id = "session_22d9202e-989b-459f-8ba3-2fafab56df19"
+            make_kimi_session(
+                kimi_home,
+                session_id=session_id,
+                wire_records=[
+                    {
+                        "type": "turn.prompt",
+                        "agentId": "main",
+                        "time": 1_788_328_900_000,
+                    },
+                    {
+                        "type": "turn.ended",
+                        "agentId": "main",
+                        "turnId": 0,
+                        "reason": "completed",
+                        "time": 1_788_328_910_000,
+                    },
+                ],
+                last_turn_reason="completed",
+                updated_at=1_788_328_910_001,
+            )
+            pane = make_kimi_busy_pane(kimi_home, session_id)
+
+            view = AgentActivity(
+                process_matches=lambda _process, _pane: True,
+            ).resolve(pane)
+
+            self.assertEqual(view.state, "busy")
+            self.assertFalse(view.repairable)
+
+    def test_kimi_busy_report_records_session_and_kimi_code_process(self):
+        pane = PaneActivity(
+            pane_id="%7",
+            current_command="kimi",
+            pane_tty="/dev/ttys023",
+            socket_path="/private/tmp/tmux/default",
+            server_pid="30402",
+        )
+        started_at = "Tue Sep  2 14:00:00 2026"
+        process_line = f"1234 {started_at} /opt/kimi-code\n"
+        with (
+            mock.patch("agent_activity.os.getppid", return_value=6322),
+            mock.patch(
+                "agent_activity.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    ["ps"],
+                    0,
+                    stdout=process_line,
+                    stderr="",
+                ),
+            ),
+        ):
+            report = AgentActivity(
+                environment={"KIMI_CODE_HOME": "/tmp/kimi-home"},
+            ).report(
+                pane,
+                "busy",
+                {
+                    "hook_event_name": "TurnStarted",
+                    "session_id": (
+                        "session_22d9202e-989b-459f-8ba3-2fafab56df19"
+                    ),
+                },
+                now_ms=1_788_328_946_526,
+            )
+
+        record = json.loads(report.record)
+        self.assertEqual(
+            record["session"],
+            {
+                "id": "session_22d9202e-989b-459f-8ba3-2fafab56df19",
+                "kimi_home": "/tmp/kimi-home",
+            },
+        )
+        self.assertEqual(
+            record["process"],
+            {"pid": 6322, "started_at": started_at},
+        )
 
     def test_subagent_can_promote_idle_without_replacing_root_binding(self):
         process = {"pid": 6322, "started_at": "process-1"}

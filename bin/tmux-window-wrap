@@ -22,6 +22,7 @@ from agent_activity import (
     claude_idle_supersedes_marker,
     grok_idle_supersedes_marker,
     is_grok_command,
+    is_kimi_command,
     pane_activity_lock,
 )
 
@@ -922,21 +923,27 @@ def animation_probe(socket_name):
             bool(activity_source)
             and activity_source == current_command
         )
-        codex_candidate = (
-            attached != "0"
-            and is_codex_command(current_command)
-            and (
-                marked_busy
-                or bool(activity_record)
-                or activity_reporter == current_command
+        repair_candidate = attached != "0" and (
+            (
+                is_codex_command(current_command)
+                and (
+                    marked_busy
+                    or bool(activity_record)
+                    or activity_reporter == current_command
+                )
+            )
+            or (
+                is_kimi_command(current_command)
+                and marked_busy
+                and bool(activity_record)
             )
         )
-        if codex_candidate:
+        if repair_candidate:
             view = activity_resolver.resolve(
                 PaneActivity(
-                        pane_id=pane_id,
-                        current_command=current_command,
-                        target=target,
+                    pane_id=pane_id,
+                    current_command=current_command,
+                    target=target,
                     pane_tty=pane_tty,
                     socket_path=socket_path,
                     server_pid=server_pid,
@@ -980,6 +987,7 @@ def animation_probe(socket_name):
             ):
                 busy = True
             continue
+        ACTIVITY_REPAIR_CANDIDATES.pop(pane_id, None)
         if attached != "0" and marked_busy:
             if claude_idle_supersedes_marker(
                 claude_states.get(target),
