@@ -1444,7 +1444,7 @@ class WindowWrapCliTests(unittest.TestCase):
                 "active": "@1",
                 "windows": [
                     {"id": "@1", "label": " 1:a\u200b "},
-                    {"id": "@2", "label": " 2:1\ufe0f\u20e3 "},
+                    {"id": "@2", "label": " 2:e\u0301 "},
                 ],
             }
         )
@@ -1452,6 +1452,25 @@ class WindowWrapCliTests(unittest.TestCase):
         self.assertEqual(
             result,
             {"line_count": 1, "lines": [["@1", "@2"]]},
+        )
+
+    def test_vs16_widens_preceding_narrow_character(self):
+        result = self.run_plan(
+            {
+                "width": 10,
+                "left_width": 0,
+                "right_width": 0,
+                "active": "@1",
+                "windows": [
+                    {"id": "@1", "label": " 1:a "},
+                    {"id": "@2", "label": " 2:1\ufe0f\u20e3 "},
+                ],
+            }
+        )
+
+        self.assertEqual(
+            result,
+            {"line_count": 2, "lines": [["@1"], ["@2"]]},
         )
 
     def test_active_window_stays_visible_when_three_lines_are_full(self):
@@ -2274,6 +2293,32 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             .stdout.strip(),
             "on",
         )
+
+    def test_runtime_wraps_vs16_emoji_before_final_label_is_clipped(self):
+        self.tmux("rename-window", "-t", "wrap:0", "⬅️➡️")
+        self.tmux("rename-window", "-t", "wrap:1", "F6")
+
+        first_line = self.render_runtime(line=0, width=21)
+        second_line = self.render_runtime(line=1, width=21)
+
+        self.assertIn("0:⬅️➡️", first_line)
+        self.assertNotIn("1:F6", first_line)
+        self.assertIn("1:F6", second_line)
+
+    def test_runtime_respects_disabled_vs16_widening(self):
+        self.tmux(
+            "set-option",
+            "-s",
+            "variation-selector-always-wide",
+            "off",
+        )
+        self.tmux("rename-window", "-t", "wrap:0", "⬅️➡️")
+        self.tmux("rename-window", "-t", "wrap:1", "F6")
+
+        first_line = self.render_runtime(line=0, width=21)
+
+        self.assertIn("0:⬅️➡️", first_line)
+        self.assertIn("1:F6", first_line)
 
     def test_runtime_pane_count_survives_zoom_and_disappears_at_one(self):
         first_pane = self.tmux(

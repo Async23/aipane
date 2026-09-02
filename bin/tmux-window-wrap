@@ -130,6 +130,7 @@ WINDOW_FORMAT = WINDOW_SEPARATOR.join(
         "#{window_active}",
         "#{pane_synchronized}",
         BUSY_PANES_FORMAT,
+        "#{variation-selector-always-wide}",
         "#{w: #{window_index}:#{window_name}#{?pane_synchronized, ▶,} }",
     )
 )
@@ -141,6 +142,27 @@ STATUS_WIDTH_FORMAT = WINDOW_SEPARATOR.join(
 )
 
 
+def vs16_width_adjustment(text):
+    """Count cells tmux adds for VS16 while drawing, after #{w:...}."""
+    adjustment = 0
+    previous_width = 0
+    for character in text:
+        if character == "\ufe0f":
+            if previous_width == 1:
+                adjustment += 1
+                previous_width = 2
+            continue
+        category = unicodedata.category(character)
+        if category.startswith("M") or category in {"Cc", "Cf"}:
+            continue
+        previous_width = (
+            2
+            if unicodedata.east_asian_width(character) in {"W", "F"}
+            else 1
+        )
+    return adjustment
+
+
 def display_width(text):
     width = 0
     for character in text:
@@ -148,7 +170,7 @@ def display_width(text):
         if category.startswith("M") or category in {"Cc", "Cf"}:
             continue
         width += 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
-    return width
+    return width + vs16_width_adjustment(text)
 
 
 def pane_count_annotation(window, style=DEFAULT_PANE_COUNT_STYLE):
@@ -1478,20 +1500,24 @@ def load_tmux_payload(arguments):
             active,
             synchronized,
             pane_activity_flags,
+            variation_selector_always_wide,
             label_width,
-        ) = record.split(WINDOW_SEPARATOR, 6)
+        ) = record.split(WINDOW_SEPARATOR, 7)
         is_synchronized = synchronized == "1"
         label = f" {index}:{name}"
         if is_synchronized:
             label += " ▶"
         label += " "
+        measured_width = int(label_width)
+        if variation_selector_always_wide != "0":
+            measured_width += vs16_width_adjustment(label)
         windows.append(
             {
                 "id": window_id,
                 "index": index,
                 "name": name,
                 "label": label,
-                "display_width": int(label_width),
+                "display_width": measured_width,
                 "synchronized": is_synchronized,
                 # The pane iterator emits one 0/1 activity flag per pane.
                 "pane_count": len(pane_activity_flags),
