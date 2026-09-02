@@ -26,6 +26,9 @@ import fcntl
 
 
 TERMINAL_CODEX_STATUSES = frozenset({"completed", "failed", "interrupted"})
+TERMINAL_KIMI_REASONS = frozenset(
+    {"completed", "cancelled", "failed", "blocked"}
+)
 
 
 @contextmanager
@@ -175,9 +178,7 @@ def _default_process_started_at(pane: PaneActivity) -> int | None:
             continue
         if command == pane.current_command:
             exact.append(started_at)
-        elif _is_codex_command(command) and _is_codex_command(
-            pane.current_command
-        ):
+        elif _agent_commands_compatible(command, pane.current_command):
             compatible.append(started_at)
     candidates = exact or compatible
     return min(candidates) if candidates else None
@@ -455,6 +456,10 @@ def is_grok_command(current_command):
     return current_command == "grok" or current_command.startswith("grok-")
 
 
+def is_kimi_command(current_command):
+    return current_command == "kimi" or current_command.startswith("kimi-")
+
+
 def grok_idle_supersedes_marker(
     state,
     current_command,
@@ -502,10 +507,7 @@ def _default_process_identity(pane: PaneActivity) -> dict[str, object]:
         if len(identity) >= 26:
             started_at = identity[:24]
             command = Path(identity[24:].strip()).name
-            if command == pane.current_command or (
-                _is_codex_command(command)
-                and _is_codex_command(pane.current_command)
-            ):
+            if _agent_commands_compatible(command, pane.current_command):
                 return {
                     "pid": pid,
                     "started_at": started_at,
@@ -541,6 +543,122 @@ def _path_within(path: Path, root: Path) -> bool:
     except (OSError, ValueError):
         return False
     return True
+
+
+def latest_kimi_turn_completion(
+    session: Mapping[str, object],
+    reported_at_ms: object,
+) -> dict[str, object] | None:
+    """Return a corroborated terminal event for one exact Kimi session.
+
+    Kimi's external hook process can fail to spawn when the session's startup
+    cwd is renamed.  Its session store is independent of that cwd, so use the
+    append-only index to locate the session and require both state.json and the
+    main agent's wire tail to agree before treating a missed Stop hook as idle.
+    """
+
+    session_id = session.get("id")
+    home_value = session.get("kimi_home")
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or Path(session_id).name != session_id
+        or session_id in {".", ".."}
+        or not isinstance(home_value, str)
+        or not home_value
+    ):
+        return None
+
+    if (
+        not isinstance(reported_at_ms, int)
+        or isinstance(reported_at_ms, bool)
+        or reported_at_ms <= 0
+    ):
+        return None
+    kimi_home = Path(home_value).expanduser()
+    sessions_root = kimi_home / "sessions"
+    session_dir = None
+    for entry in reverse_json_records(
+        kimi_home / "session_index.jsonl",
+        max_bytes=4_194_304,
+    ):
+        if entry.get("sessionId") != session_id:
+            continue
+        if entry.get("deleted") is True:
+            return None
+        path_value = entry.get("sessionDir")
+        if not isinstance(path_value, str) or not path_value:
+            continue
+        candidate = Path(path_value).expanduser()
+        if (
+            not candidate.is_absolute()
+            or candidate.name != session_id
+            or not _path_within(candidate, sessions_root)
+        ):
+            continue
+        session_dir = candidate
+        break
+    if session_dir is None:
+        return None
+
+    try:
+        with (session_dir / "state.json").open(encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict) or state.get("id") != session_id:
+        return None
+    state_reason = state.get("lastTurnReason")
+    state_updated_at = _milliseconds(state.get("updatedAt"))
+    if (
+        state_reason not in {"completed", "cancelled", "failed"}
+        or state_updated_at is None
+    ):
+        return None
+
+    terminal = None
+    wire_path = session_dir / "agents" / "main" / "wire.jsonl"
+    for event in reverse_json_records(wire_path):
+        event_type = event.get("type")
+        if event_type in {"prompt.accepted", "turn.prompt", "turn.started"}:
+            # A newer turn has begun after any older terminal in the tail.
+            return None
+        if event_type != "turn.ended":
+            continue
+        agent_id = event.get("agentId")
+        turn_id = event.get("turnId")
+        reason = event.get("reason")
+        ended_at = _milliseconds(event.get("time"))
+        if (
+            agent_id not in {None, "main"}
+            or not isinstance(turn_id, int)
+            or isinstance(turn_id, bool)
+            or turn_id < 0
+            or reason not in TERMINAL_KIMI_REASONS
+            or ended_at is None
+        ):
+            return None
+        terminal = {
+            "status": "idle",
+            "session_id": session_id,
+            "turn_id": str(turn_id),
+            "reason": reason,
+            "updated_at": ended_at,
+        }
+        break
+    if terminal is None:
+        return None
+
+    expected_state_reason = (
+        "failed" if terminal["reason"] == "blocked" else terminal["reason"]
+    )
+    if (
+        state_reason != expected_state_reason
+        or state_updated_at < terminal["updated_at"]
+        or terminal["updated_at"] < reported_at_ms
+    ):
+        return None
+    return terminal
 
 
 def codex_thread_identity(
@@ -863,6 +981,15 @@ class AgentActivity:
                 ),
                 "codex_home": str(Path(codex_home).expanduser()),
             }
+        elif is_kimi_command(pane.current_command):
+            kimi_home = self.environment.get("KIMI_CODE_HOME") or str(
+                Path(self.environment.get("HOME", str(Path.home())))
+                / ".kimi-code"
+            )
+            record["session"] = {
+                "id": session_id if isinstance(session_id, str) else "",
+                "kimi_home": str(Path(kimi_home).expanduser().absolute()),
+            }
         return ActivityReport(
             state=state,
             record=json.dumps(record, separators=(",", ":")),
@@ -984,7 +1111,28 @@ class AgentActivity:
     ) -> ActivityView | None:
         reason = ""
         evidence = ""
-        if is_grok_command(pane.current_command):
+        if is_kimi_command(pane.current_command) and record is not None:
+            session = record.get("session")
+            reported_at = _milliseconds(record.get("updated_at"))
+            try:
+                marker_value = int(pane.marker_updated_at)
+            except (TypeError, ValueError):
+                marker_value = None
+            marker_at = _milliseconds(marker_value)
+            boundary = (
+                max(reported_at, marker_at)
+                if reported_at is not None and marker_at is not None
+                else None
+            )
+            state = (
+                latest_kimi_turn_completion(session, boundary)
+                if isinstance(session, dict) and boundary is not None
+                else None
+            )
+            if state is not None:
+                reason = "kimi_turn_ended"
+                evidence = str(state["turn_id"])
+        elif is_grok_command(pane.current_command):
             tty = pane.pane_tty.removeprefix("/dev/")
             states = load_grok_session_states(
                 {tty},
@@ -1394,3 +1542,11 @@ class AgentActivity:
 
 def _is_codex_command(command: str) -> bool:
     return command == "codex" or command.startswith("codex-")
+
+
+def _agent_commands_compatible(left: str, right: str) -> bool:
+    return (
+        left == right
+        or (_is_codex_command(left) and _is_codex_command(right))
+        or (is_kimi_command(left) and is_kimi_command(right))
+    )

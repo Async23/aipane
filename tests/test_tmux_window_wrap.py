@@ -893,6 +893,163 @@ class WindowWrapCliTests(unittest.TestCase):
             events,
         )
 
+    def test_animation_probe_repairs_kimi_busy_after_missed_stop_hook(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        animation_probe = namespace["animation_probe"]
+        script_globals = animation_probe.__globals__
+        activity_class = namespace["AgentActivity"]
+        separator = namespace["WINDOW_SEPARATOR"]
+        events = []
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            kimi_home = Path(raw_tmp) / ".kimi-code"
+            session_id = "session_22d9202e-989b-459f-8ba3-2fafab56df19"
+            session_dir = (
+                kimi_home / "sessions" / "wd_removed_1234" / session_id
+            )
+            wire = session_dir / "agents" / "main" / "wire.jsonl"
+            wire.parent.mkdir(parents=True)
+            wire.write_text(
+                "\n".join(
+                    (
+                        json.dumps(
+                            {
+                                "type": "turn.prompt",
+                                "agentId": "main",
+                                "time": 1_788_328_946_527,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "turn.ended",
+                                "agentId": "main",
+                                "turnId": 0,
+                                "reason": "completed",
+                                "time": 1_788_329_146_727,
+                            }
+                        ),
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (session_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "id": session_id,
+                        "updatedAt": 1_788_329_146_728,
+                        "lastTurnReason": "completed",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (kimi_home / "session_index.jsonl").write_text(
+                json.dumps(
+                    {
+                        "sessionId": session_id,
+                        "sessionDir": str(session_dir),
+                        "workDir": str(Path(raw_tmp) / "removed-workspace"),
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            record = json.dumps(
+                {
+                    "version": 1,
+                    "revision": "revision-kimi",
+                    "generation": "generation-kimi",
+                    "owner": "kimi",
+                    "reported": "busy",
+                    "updated_at": 1_788_328_946_526,
+                    "pane": {
+                        "id": "%7",
+                        "tty": "/dev/ttys023",
+                        "socket": "/private/tmp/tmux/default",
+                        "server_pid": "30402",
+                    },
+                    "process": {"pid": 6322, "started_at": "process-1"},
+                    "session": {
+                        "id": session_id,
+                        "kimi_home": str(kimi_home),
+                    },
+                },
+                separators=(",", ":"),
+            )
+
+            def fake_run_tmux(_socket_name, *arguments):
+                events.append(arguments)
+                if arguments[0] == "list-panes":
+                    value = separator.join(
+                        (
+                            "owner",
+                            "1",
+                            "work:@8.%7",
+                            "%7",
+                            "/dev/ttys023",
+                            "kimi",
+                            "kimi",
+                            "1788328946526",
+                            "kimi",
+                            record,
+                            "/private/tmp/tmux/default",
+                            "30402",
+                        )
+                    )
+                elif arguments[0] == "show-options":
+                    option = arguments[-1]
+                    value = {
+                        "@tmux-window-wrap-activity": "kimi",
+                        "@tmux-window-wrap-activity-updated-at": (
+                            "1788328946526"
+                        ),
+                        "@tmux-window-wrap-activity-record": record,
+                    }.get(option, "kimi")
+                elif arguments[0] == "display-message":
+                    value = separator.join(
+                        (
+                            "kimi",
+                            "/dev/ttys023",
+                            "/private/tmp/tmux/default",
+                            "30402",
+                        )
+                    )
+                else:
+                    value = ""
+                return subprocess.CompletedProcess(
+                    ["tmux", *arguments],
+                    0,
+                    stdout=value + "\n",
+                    stderr="",
+                )
+
+            script_globals["run_tmux"] = fake_run_tmux
+            script_globals["AgentActivity"] = lambda **_kwargs: activity_class(
+                process_matches=lambda _process, _pane: True,
+            )
+            script_globals["invalidate_cache"] = lambda socket: events.append(
+                ("invalidate-cache", socket)
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {"KIMI_CODE_HOME": str(kimi_home)},
+            ):
+                self.assertEqual(animation_probe("test-socket"), ("owner", True))
+                self.assertEqual(animation_probe("test-socket"), ("owner", False))
+
+        self.assertIn(
+            (
+                "set-option",
+                "-p",
+                "-u",
+                "-t",
+                "%7",
+                "@tmux-window-wrap-activity",
+            ),
+            events,
+        )
+
     def test_animation_probe_promotes_missed_codex_busy_hook(self):
         namespace = runpy.run_path(str(SCRIPT))
         animation_probe = namespace["animation_probe"]
