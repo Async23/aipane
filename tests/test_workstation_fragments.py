@@ -22,6 +22,7 @@ GHOSTTY_CONF = ROOT / "conf" / "ghostty-tmux.conf"
 TMUX_WS = ROOT / "conf" / "tmux-workstation.conf"
 TMUX_WRAP = ROOT / "conf" / "tmux-window-wrap.conf"
 WRAP_BIN = ROOT / "bin" / "tmux-window-wrap"
+DOCTOR_BIN = ROOT / "bin" / "aipane-doctor"
 WINDOW_JUMP_BIN = ROOT / "bin" / "tmux-window-jump"
 RENAME_BIN = ROOT / "bin" / "tmux-rename-window-popup"
 COLOUR_PALETTE_BIN = ROOT / "bin" / "tmux-colour-palette"
@@ -901,12 +902,17 @@ class DocsPointerTests(unittest.TestCase):
     def test_docs_exist_and_name_public_confs(self):
         self.assertTrue(CHEATSHEET.is_file())
         self.assertTrue(WS_DOC.is_file())
+        self.assertTrue(DOCTOR_BIN.is_file())
+        self.assertTrue(os.access(DOCTOR_BIN, os.X_OK))
         doc = WS_DOC.read_text(encoding="utf-8")
         self.assertIn("conf/ghostty-tmux.conf", doc)
         self.assertIn("conf/tmux-workstation.conf", doc)
         self.assertIn("conf/tmux-window-wrap.conf", doc)
         self.assertIn("bin/tmux-rename-window-popup", doc)
         self.assertIn("bin/tmux-colour-palette", doc)
+        self.assertIn("bin/aipane-doctor", doc)
+        self.assertIn("aipane-doctor", README.read_text(encoding="utf-8"))
+        self.assertIn("aipane-doctor", README_CN.read_text(encoding="utf-8"))
         self.assertIn("`Cmd+Opt+P`", doc)
 
         cheatsheet = CHEATSHEET.read_text(encoding="utf-8")

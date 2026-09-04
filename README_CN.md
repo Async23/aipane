@@ -63,6 +63,8 @@ git -C ~/.aipane pull --ff-only
 
 ```bash
 AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
+mkdir -p ~/.local/bin
+ln -sf "$AIPANE_ROOT/bin/aipane-doctor" ~/.local/bin/aipane-doctor
 ln -sf "$AIPANE_ROOT/bin/tmux-rename-window-popup" ~/.local/bin/tmux-rename-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
 ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
@@ -91,6 +93,7 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `conf/ghostty-tmux.conf` | Cmd 桥 + Shift+Enter |
 | `conf/tmux-workstation.conf` | prefix、键位、广播、状态栏样式 |
 | `conf/tmux-window-wrap.conf` | 窗口列表多行 |
+| `bin/aipane-doctor` | 只读检查安装与 Agent Activity 布线 |
 | `bin/tmux-rename-window-popup` | 中央弹窗、稳定目标的窗口重命名 UI |
 | `bin/tmux-colour-palette` | 终端索引色表（`0–255`） |
 | `bin/tmux-window-jump` | 同数字连按、精确 index 的窗口选择器 |
@@ -109,9 +112,12 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | [`docs/cheatsheet.md`](docs/cheatsheet.md) | 键位速查 |
 | [`docs/tmux-window-wrap.md`](docs/tmux-window-wrap.md) | 换行与 Agent Activity 说明 |
 
+安装后或拉取 workstation 变更后运行 `aipane-doctor`。
+
 改 workstation conf 或 wrap 渲染器后：
 
 ```bash
+python3 "$AIPANE_ROOT/tests/test_aipane_doctor.py"
 python3 "$AIPANE_ROOT/tests/test_agent_activity.py"
 python3 "$AIPANE_ROOT/tests/test_agent_activity_integrations.py"
 python3 "$AIPANE_ROOT/tests/test_tmux_window_jump.py"
@@ -279,6 +285,7 @@ killrod --dry-run
 ├── cmd/                     # ai/pane 与 kill* 命令
 ├── bin/
 │   ├── aipane-cleanup
+│   ├── aipane-doctor
 │   ├── aipane-activity
 │   ├── aipane-claude-activity
 │   ├── ai-restart
@@ -314,6 +321,7 @@ killrod --dry-run
     ├── aipane-cleanup-contracts.sh
     ├── init-reload.zsh
     ├── test_ai_restart.py
+    ├── test_aipane_doctor.py
     ├── test_agent_activity.py
     ├── test_agent_activity_integrations.py
     ├── test_agent_notification_sounds.py
@@ -348,6 +356,7 @@ zsh -fc '
 
 # 可选工作台 / window-wrap
 python3 tests/test_ai_restart.py
+python3 tests/test_aipane_doctor.py
 python3 tests/test_agent_activity.py
 python3 tests/test_agent_activity_integrations.py
 python3 tests/test_agent_notification_sounds.py
