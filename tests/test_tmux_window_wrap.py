@@ -143,6 +143,30 @@ class WindowWrapCliTests(unittest.TestCase):
         self.assertEqual(completed.stdout, "")
         self.assertEqual(completed.stderr, "")
 
+    def test_agent_command_detection_uses_process_identity_not_arguments(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        runs_agent = namespace["command_runs_ai_tool"]
+
+        for command in (
+            "/opt/homebrew/bin/codex --yolo",
+            "/opt/homebrew/bin/grok-1.0.13-mac --always-approve",
+            "node /tmp/node_modules/@anthropic-ai/claude-code/cli.js",
+            "node /tmp/node_modules/@openai/codex/bin/codex.js",
+            "npm exec --yes @openai/codex",
+        ):
+            with self.subTest(command=command):
+                self.assertTrue(runs_agent(command))
+
+        for command in (
+            "zsh",
+            "node /tmp/node_modules/vite/bin/vite.js",
+            "npm install @openai/codex",
+            "python3 worker.py --label codex",
+            "sleep 30",
+        ):
+            with self.subTest(command=command):
+                self.assertFalse(runs_agent(command))
+
     def test_codex_stop_idle_is_ignored_for_already_running_agents(self):
         namespace = runpy.run_path(str(SCRIPT))
         ignore = namespace["ignore_early_codex_idle"]

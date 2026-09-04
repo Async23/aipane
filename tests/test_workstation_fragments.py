@@ -48,7 +48,7 @@ class GhosttyFragmentTests(unittest.TestCase):
 
 
 class TmuxWorkstationFragmentTests(unittest.TestCase):
-    def test_kill_pane_only_confirms_for_the_windows_last_pane(self):
+    def test_kill_pane_only_confirms_for_a_last_agent_pane(self):
         socket = f"ws-kill-pane-{os.getpid()}-{id(self)}"
         client_process = None
         client_environment = os.environ.copy()
@@ -75,6 +75,14 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 ).stdout.splitlines()
             )
 
+        def wait_until(predicate, timeout: float = 2.0) -> bool:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if predicate():
+                    return True
+                time.sleep(0.02)
+            return predicate()
+
         try:
             tmux(
                 "-f",
@@ -84,6 +92,12 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 "-s",
                 "kill-pane",
                 "sleep 30",
+            )
+            tmux(
+                "set-option",
+                "-g",
+                "@aipane-agent-status-command",
+                str(WRAP_BIN),
             )
             tmux("source-file", str(TMUX_WS))
             guarded_window = tmux(
@@ -128,6 +142,11 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 tmux("switch-client", "-c", client, "-T", "prefix")
                 tmux("send-keys", "-K", "-c", client, "x")
 
+            def centered_prompt_count() -> int:
+                return tmux("show-messages", "-t", client).stdout.count(
+                    "command: display-menu"
+                )
+
             # Multiple panes use the immediate cleanup path.
             invoke_kill_pane_binding()
             panes = tmux(
@@ -141,26 +160,88 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 panes, "1", "prefix+x did not immediately close a split pane"
             )
 
-            # The last pane stays alive while tmux waits for confirmation.
+            # A non-Agent last pane closes without entering a confirmation prompt.
             invoke_kill_pane_binding()
-            self.assertIn(guarded_window, window_ids())
+            self.assertTrue(
+                wait_until(lambda: guarded_window not in window_ids()),
+                "prefix+x prompted before closing a non-Agent window",
+            )
 
-            tmux("send-keys", "-K", "-c", client, "n")
+            with tempfile.TemporaryDirectory() as raw_tmp:
+                fake_agent = Path(raw_tmp) / "codex"
+                fake_agent.symlink_to("/bin/sleep")
+                agent_window = tmux(
+                    "new-window",
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{window_id}",
+                    "-t",
+                    "kill-pane:",
+                    f"{fake_agent} 30",
+                ).stdout.strip()
+                tmux("switch-client", "-c", client, "-t", agent_window)
+
+                prompts = centered_prompt_count()
+                invoke_kill_pane_binding()
+                wait_until(
+                    lambda: centered_prompt_count() > prompts
+                    or agent_window not in window_ids()
+                )
+                self.assertIn(
+                    agent_window,
+                    window_ids(),
+                    "prefix+x closed an Agent window without confirmation",
+                )
+                self.assertGreater(centered_prompt_count(), prompts)
+
+                tmux("send-keys", "-K", "-c", client, "n")
+                self.assertIn(agent_window, window_ids())
+
+                prompts = centered_prompt_count()
+                invoke_kill_pane_binding()
+                self.assertTrue(
+                    wait_until(lambda: centered_prompt_count() > prompts),
+                    "prefix+x did not show the centered menu again after cancel",
+                )
+                tmux("send-keys", "-K", "-c", client, "y")
+                self.assertTrue(
+                    wait_until(lambda: agent_window not in window_ids()),
+                    "confirming the centered prompt did not close the Agent "
+                    f"window:\n{tmux('show-messages', '-t', client).stdout}",
+                )
+
+            tmux(
+                "set-option",
+                "-g",
+                "@aipane-agent-status-command",
+                str(ROOT / "bin" / "missing-agent-detector"),
+            )
+            unknown_window = tmux(
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-t",
+                "kill-pane:",
+                "sleep 30",
+            ).stdout.strip()
+            tmux("switch-client", "-c", client, "-t", unknown_window)
+
+            prompts = centered_prompt_count()
+            invoke_kill_pane_binding()
+            wait_until(
+                lambda: centered_prompt_count() > prompts
+                or unknown_window not in window_ids()
+            )
             self.assertIn(
-                guarded_window,
+                unknown_window,
                 window_ids(),
-                "declining the prompt closed the last pane's window",
+                "an unavailable Agent detector allowed the window to close",
             )
-
-            # Accepting the prompt closes the pane and its window.
-            invoke_kill_pane_binding()
-            self.assertIn(guarded_window, window_ids())
-            tmux("send-keys", "-K", "-c", client, "y")
-            self.assertNotIn(
-                guarded_window,
-                window_ids(),
-                "accepting the prompt left the last pane's window open",
-            )
+            self.assertGreater(centered_prompt_count(), prompts)
+            tmux("send-keys", "-K", "-c", client, "n")
         finally:
             if client_process is not None:
                 if client_process.stdin is not None:
@@ -191,6 +272,9 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
         self.assertIn("tmux-rename-window-popup", text)
         self.assertIn("tmux-colour-palette", text)
         self.assertIn("tmux-shot-capture", text)
+        self.assertIn("display-menu", text)
+        self.assertIn("-x C -y C", text)
+        self.assertNotIn('confirm-before -p "Close last pane', text)
         self.assertEqual(text.count("#{q:session_id}"), 20)
         self.assertTrue(WINDOW_JUMP_BIN.is_file())
         self.assertTrue(os.access(WINDOW_JUMP_BIN, os.X_OK))

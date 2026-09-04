@@ -72,6 +72,22 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 
 Then: `tmux source-file ~/.tmux.conf`
 
+### Agent-aware pane close
+
+`prefix x` / `Cmd+W` closes ordinary panes immediately. When the selected pane
+is the window's last pane, aipane checks that pane's live process tree first:
+an AI Tool opens a centered confirmation menu, a verified non-Agent closes
+immediately, and an unavailable or inconclusive detector opens the same menu as
+the safe fallback. Press `y` to close; `n` or `Esc` cancels. An idle AI Tool is
+still an Agent for this decision; the animated activity marker is not required.
+
+The default detector is `tmux-window-wrap` on the tmux server's `PATH`. Override
+its executable path before sourcing `tmux-workstation.conf` if needed:
+
+```tmux
+set -g @aipane-agent-status-command '/absolute/path/to/tmux-window-wrap'
+```
+
 ### Repeated-digit window jump
 
 `Cmd+1…9` on the main number row and direct `prefix 1…9` select the exact tmux
