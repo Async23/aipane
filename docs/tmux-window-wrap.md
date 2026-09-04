@@ -277,11 +277,13 @@ destroy a window.
 
 | Path | Role |
 |------|------|
+| `bin/aipane-doctor` | read-only installation and integration wiring audit |
 | `bin/aipane-activity` | canonical Agent Activity CLI |
 | `bin/tmux-window-wrap` | status renderer, animator, pane Agent detector, and compatibility Adapter |
 | `lib/agent_activity.py` | Agent Activity interface, protocol, tmux Adapter, and private evidence readers |
 | `conf/tmux-window-wrap.conf` | Public fragment: `status-format` + lifecycle hooks |
 | `tests/test_agent_activity.py` | Interface and evidence behavior tests |
+| `tests/test_aipane_doctor.py` | installation audit behavior tests |
 | `tests/test_tmux_window_wrap.py` | Unit + live tmux tests |
 
 ## Install
@@ -290,9 +292,14 @@ destroy a window.
 
 ```bash
 AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
+mkdir -p ~/.local/bin
+ln -sf "$AIPANE_ROOT/bin/aipane-doctor" ~/.local/bin/aipane-doctor
 ln -sf "$AIPANE_ROOT/bin/aipane-activity" ~/.local/bin/aipane-activity
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
 ```
+
+Run `aipane-doctor` after installation or after pulling executable/interface
+changes. It validates the active checkout and hook entrypoints without writing.
 
 In personal `~/.tmux.conf` (do not inline the fragment):
 
@@ -306,8 +313,8 @@ Not loaded by `init.zsh`. Symlink the binary; do not copy the script body into `
 
 **Canonical source is this repo.** Machine wiring:
 
-1. Symlink binaries → `~/.local/bin/aipane-activity` and
-   `~/.local/bin/tmux-window-wrap`
+1. Symlink binaries → `~/.local/bin/aipane-doctor`,
+   `~/.local/bin/aipane-activity`, and `~/.local/bin/tmux-window-wrap`
 2. Personal `~/.tmux.conf` only `source-file`s the conf — no inlined `status-format` / wrap hooks
 
 Do **not** commit a full personal `~/.tmux.conf` (prefix, theme, TPM, keybinds).
@@ -323,6 +330,7 @@ Personal-only (prefix, splits, colors, plugins, non-wrap status text) → only `
 ### After changes
 
 ```bash
+python3 tests/test_aipane_doctor.py
 python3 tests/test_agent_activity.py
 python3 tests/test_tmux_window_wrap.py
 ```

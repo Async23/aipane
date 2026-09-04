@@ -18,6 +18,7 @@ Optional terminal shell for multi-agent CLI work. **Not** loaded by `init.zsh`.
 | `conf/ghostty-tmux.conf` | Ghostty keybind bridge + Shift+Enter |
 | `conf/tmux-workstation.conf` | tmux prefix, binds, broadcast, status chrome |
 | `conf/tmux-window-wrap.conf` | multi-line window list |
+| `bin/aipane-doctor` | read-only installation and Agent Activity wiring audit |
 | `bin/tmux-rename-window-popup` | stable-target window rename UI (requires `fzf`) |
 | `bin/tmux-colour-palette` | indexed terminal colour palette (`0–255`) |
 | `bin/tmux-window-jump` | repeated-digit exact-index window selector |
@@ -29,7 +30,9 @@ Optional terminal shell for multi-agent CLI work. **Not** loaded by `init.zsh`.
 
 ```bash
 AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
+mkdir -p ~/.local/bin
 
+ln -sf "$AIPANE_ROOT/bin/aipane-doctor" ~/.local/bin/aipane-doctor
 ln -sf "$AIPANE_ROOT/bin/tmux-rename-window-popup" ~/.local/bin/tmux-rename-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
 ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
@@ -38,6 +41,10 @@ ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
 ```
 
 The rename popup requires `fzf` on `PATH`.
+
+Run `aipane-doctor` after installation and after pulling changes that add or
+move workstation executables. It is read-only: missing or misdirected required
+symlinks fail the command, while supported compatibility commands are warnings.
 
 ### Ghostty (`~/.config/ghostty/config`)
 
@@ -129,6 +136,7 @@ Not in this package: `pane-col.sh`, company skills, full agent home dirs.
 ## Verify
 
 ```bash
+python3 tests/test_aipane_doctor.py
 python3 tests/test_tmux_window_jump.py
 python3 tests/test_workstation_fragments.py
 python3 tests/test_tmux_window_wrap.py

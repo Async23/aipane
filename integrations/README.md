@@ -58,6 +58,8 @@ though the Agent is running. Terminal lifecycle events clear the marker.
 The JSON and TOML files are mergeable configuration fragments; do not replace
 an existing user configuration wholesale. The OpenCode Adapter is executable
 plugin source and may be symlinked into OpenCode's plugin directory.
+After updating registrations, run `aipane-doctor` to verify that their local
+entrypoints resolve to the active aipane checkout.
 
 Pi's Agent Activity remains owned by the separately versioned
 `@async23/pi-tmux-window-wrap` package. `pi/aipane-bind.ts` has a different job:

@@ -63,6 +63,8 @@ Terminal shell tuned for many AI CLI panes. **Not** loaded by `init.zsh`. Person
 
 ```bash
 AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
+mkdir -p ~/.local/bin
+ln -sf "$AIPANE_ROOT/bin/aipane-doctor" ~/.local/bin/aipane-doctor
 ln -sf "$AIPANE_ROOT/bin/tmux-rename-window-popup" ~/.local/bin/tmux-rename-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
 ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
@@ -91,6 +93,7 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `conf/ghostty-tmux.conf` | Cmd bridge + Shift+Enter |
 | `conf/tmux-workstation.conf` | prefix, binds, broadcast, status chrome |
 | `conf/tmux-window-wrap.conf` | multi-line window list |
+| `bin/aipane-doctor` | read-only installation and Agent Activity wiring audit |
 | `bin/tmux-rename-window-popup` | centered stable-target window rename UI |
 | `bin/tmux-colour-palette` | indexed terminal colour palette (`0–255`) |
 | `bin/tmux-window-jump` | repeated-digit exact-index window selector |
@@ -111,9 +114,12 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | [`docs/cheatsheet.md`](docs/cheatsheet.md) | key map |
 | [`docs/tmux-window-wrap.md`](docs/tmux-window-wrap.md) | wrapping and Agent Activity notes |
 
+Run `aipane-doctor` after installation or after pulling workstation changes.
+
 After editing workstation conf or the wrap renderer:
 
 ```bash
+python3 "$AIPANE_ROOT/tests/test_aipane_doctor.py"
 python3 "$AIPANE_ROOT/tests/test_agent_activity.py"
 python3 "$AIPANE_ROOT/tests/test_agent_activity_integrations.py"
 python3 "$AIPANE_ROOT/tests/test_tmux_window_jump.py"
@@ -296,6 +302,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 ├── cmd/                     # ai/pane and kill* commands
 ├── bin/
 │   ├── aipane-cleanup
+│   ├── aipane-doctor
 │   ├── aipane-activity
 │   ├── aipane-claude-activity
 │   ├── ai-restart
@@ -331,6 +338,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
     ├── aipane-cleanup-contracts.sh
     ├── init-reload.zsh
     ├── test_ai_restart.py
+    ├── test_aipane_doctor.py
     ├── test_agent_activity.py
     ├── test_agent_activity_integrations.py
     ├── test_agent_notification_sounds.py
@@ -367,6 +375,7 @@ zsh -fc '
 
 # optional workstation / window-wrap
 python3 tests/test_ai_restart.py
+python3 tests/test_aipane_doctor.py
 python3 tests/test_agent_activity.py
 python3 tests/test_agent_activity_integrations.py
 python3 tests/test_agent_notification_sounds.py

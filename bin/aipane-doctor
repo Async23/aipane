@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""Read-only installation audit for aipane's Agent Activity wiring."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+from pathlib import Path
+
+
+CORE_ENTRYPOINTS = (
+    "aipane-doctor",
+    "aipane-activity",
+    "tmux-window-wrap",
+)
+LOCAL_BIN_ENTRYPOINT = re.compile(r"\.local/bin/(aipane-[a-z0-9-]+)")
+CONFIG_PATHS = (
+    ".codex/hooks.json",
+    ".codex/config.toml",
+    ".claude/settings.json",
+    ".cursor/hooks.json",
+    ".kimi-code/config.toml",
+    ".qoder/settings.json",
+    ".config/opencode/plugins/aipane-bind.js",
+)
+KNOWN_REGISTRATION_LINKS = (
+    (
+        ".grok/hooks/aipane-activity.json",
+        "integrations/grok/hooks.json",
+    ),
+    (
+        ".config/opencode/plugins/aipane-bind.js",
+        "integrations/opencode/aipane-bind.js",
+    ),
+)
+
+
+class Audit:
+    def __init__(self) -> None:
+        self.errors = 0
+        self.warnings = 0
+
+    @staticmethod
+    def ok(message: str) -> None:
+        print(f"OK   {message}")
+
+    def warn(self, message: str) -> None:
+        self.warnings += 1
+        print(f"WARN {message}")
+
+    def fail(self, message: str) -> None:
+        self.errors += 1
+        print(f"FAIL {message}")
+
+
+def display_path(path: Path, home: Path) -> str:
+    try:
+        return f"~/{path.relative_to(home)}"
+    except ValueError:
+        return str(path)
+
+
+def is_present(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def check_entrypoint(
+    audit: Audit,
+    root: Path,
+    home: Path,
+    name: str,
+) -> None:
+    source = root / "bin" / name
+    destination = home / ".local" / "bin" / name
+    shown = display_path(destination, home)
+    if not source.is_file():
+        audit.fail(f"{source}: source executable is missing")
+        return
+    if not os.access(source, os.X_OK):
+        audit.fail(f"{source}: source is not executable")
+        return
+    if not is_present(destination):
+        audit.fail(f"{shown}: missing (expected symlink -> {source})")
+        return
+    if not destination.is_symlink():
+        audit.fail(f"{shown}: not a symlink to this checkout")
+        return
+    try:
+        actual = destination.resolve(strict=True)
+        expected = source.resolve(strict=True)
+    except OSError as error:
+        audit.fail(f"{shown}: broken symlink ({error})")
+        return
+    if actual != expected:
+        audit.fail(
+            f"{shown}: does not point to this checkout "
+            f"(actual {actual}, expected {expected})"
+        )
+        return
+    if not os.access(destination, os.X_OK):
+        audit.fail(f"{shown}: target is not executable")
+        return
+    audit.ok(f"{shown} -> {expected}")
+
+
+def active_config_paths(home: Path) -> list[Path]:
+    paths = [home / relative for relative in CONFIG_PATHS]
+    grok_hooks = home / ".grok" / "hooks"
+    if grok_hooks.is_dir():
+        paths.extend(sorted(grok_hooks.glob("*.json")))
+    unique: dict[Path, None] = {}
+    for path in paths:
+        if is_present(path):
+            unique[path] = None
+    return list(unique)
+
+
+def inspect_activity_registrations(
+    audit: Audit,
+    root: Path,
+    home: Path,
+) -> tuple[int, int, set[str]]:
+    canonical_files: set[Path] = set()
+    legacy_references: list[tuple[Path, int]] = []
+    referenced_entrypoints: set[str] = set()
+
+    for path in active_config_paths(home):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as error:
+            audit.fail(f"{display_path(path, home)}: cannot read ({error})")
+            continue
+        if "aipane-activity" in text:
+            canonical_files.add(path)
+        normalized_text = re.sub(r"\\+/", "/", text)
+        referenced_entrypoints.update(
+            LOCAL_BIN_ENTRYPOINT.findall(normalized_text)
+        )
+        for number, line in enumerate(text.splitlines(), start=1):
+            if "tmux-window-wrap activity" in line:
+                legacy_references.append((path, number))
+
+    if canonical_files:
+        audit.ok(f"canonical activity registrations: {len(canonical_files)}")
+    else:
+        audit.warn("canonical activity registrations: none found")
+    for path, number in legacy_references:
+        audit.warn(
+            "legacy activity command: "
+            f"{display_path(path, home)}:{number} "
+            "(supported compatibility consumer)"
+        )
+
+    for home_relative, root_relative in KNOWN_REGISTRATION_LINKS:
+        destination = home / home_relative
+        if not destination.is_symlink():
+            continue
+        source = root / root_relative
+        shown = display_path(destination, home)
+        try:
+            actual = destination.resolve(strict=True)
+            expected = source.resolve(strict=True)
+        except OSError as error:
+            audit.fail(f"{shown}: broken registration symlink ({error})")
+            continue
+        if actual != expected:
+            audit.fail(
+                f"{shown}: registration does not point to this checkout "
+                f"(actual {actual}, expected {expected})"
+            )
+        else:
+            audit.ok(f"{shown} -> {expected}")
+
+    return (
+        len(canonical_files),
+        len(legacy_references),
+        referenced_entrypoints,
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="aipane-doctor",
+        description="read-only audit of Agent Activity installation wiring",
+    )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path(__file__).resolve().parents[1],
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--home",
+        type=Path,
+        default=Path.home(),
+        help=argparse.SUPPRESS,
+    )
+    arguments = parser.parse_args()
+    root = arguments.root.expanduser().resolve()
+    home = arguments.home.expanduser().resolve()
+    audit = Audit()
+
+    canonical_count, legacy_count, referenced = inspect_activity_registrations(
+        audit,
+        root,
+        home,
+    )
+    checked = set(CORE_ENTRYPOINTS)
+    checked.update(referenced)
+    for name in sorted(checked):
+        check_entrypoint(audit, root, home, name)
+
+    summary = (
+        f"{len(checked)} entrypoints, "
+        f"canonical activity registrations: {canonical_count}, "
+        f"compatibility references: {legacy_count}, "
+        f"warnings: {audit.warnings}"
+    )
+    if audit.errors:
+        print(f"FAIL aipane doctor: {audit.errors} error(s); {summary}")
+        return 1
+    print(f"PASS aipane doctor: {summary}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
