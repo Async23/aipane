@@ -1,29 +1,29 @@
 [[hooks]]
 event = "SessionStart"
-command = "$HOME/.local/bin/tmux-window-wrap activity idle"
+command = "$HOME/.local/bin/aipane-activity report idle"
 timeout = 5
 
 [[hooks]]
 event = "TurnStarted"
-command = "$HOME/.local/bin/tmux-window-wrap activity busy"
+command = "$HOME/.local/bin/aipane-activity report busy"
 timeout = 5
 
 [[hooks]]
 event = "Stop"
-command = "$HOME/.local/bin/tmux-window-wrap activity idle"
+command = "$HOME/.local/bin/aipane-activity report idle"
 timeout = 5
 
 [[hooks]]
 event = "StopFailure"
-command = "$HOME/.local/bin/tmux-window-wrap activity idle"
+command = "$HOME/.local/bin/aipane-activity report idle"
 timeout = 5
 
 [[hooks]]
 event = "Interrupt"
-command = "$HOME/.local/bin/tmux-window-wrap activity idle"
+command = "$HOME/.local/bin/aipane-activity report idle"
 timeout = 5
 
 [[hooks]]
 event = "SessionEnd"
-command = "$HOME/.local/bin/tmux-window-wrap activity idle"
+command = "$HOME/.local/bin/aipane-activity report idle"
 timeout = 5

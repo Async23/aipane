@@ -1,6 +1,7 @@
 # Agent Activity integrations
 
-`tmux-window-wrap activity busy|idle` is the Agent Activity Interface. Each
+`aipane-activity report busy|idle` is the canonical Agent Activity Interface.
+`tmux-window-wrap activity busy|idle` remains a compatibility Adapter. Each
 AI Tool integration in this directory is an Adapter from that tool's lifecycle
 events to this Interface.
 
@@ -16,17 +17,17 @@ delegated turn finishes. An in-turn `SessionStart(source=compact)` preserves
 the existing marker.
 
 If a hard Claude failure returns to the prompt without delivering its terminal
-hook, `tmux-window-wrap` reconciles the marker with Claude Code's live session
-registry. The registry target, process, version, status, and status timestamp
-must all agree, so this fallback does not infer activity from terminal titles
-or process CPU usage.
+hook, the Agent Activity module reconciles the marker with Claude Code's live
+session registry. The registry target, process, version, status, and status
+timestamp must all agree, so this fallback does not infer activity from
+terminal titles or process CPU usage.
 
 Grok does not emit `Stop` or `StopFailure` for interrupted, refused, or
 turn-limit outcomes. Its Adapter still reports ordinary hook transitions, and
-`tmux-window-wrap` reconciles a missing terminal transition from Grok's active
-session registry and authoritative `turn_completed` update. The live process,
-TTY, session id, command, and timestamp must agree before a marker is cleared;
-an older completion cannot override a newer prompt.
+the Agent Activity module reconciles a missing terminal transition from Grok's
+active session registry and authoritative `turn_completed` update. The live
+process, TTY, session id, command, and timestamp must agree before a marker is
+cleared; an older completion cannot override a newer prompt.
 
 Codex completion is handled by `bin/aipane-codex-notify`, not its `Stop` hook.
 Another Codex `Stop` hook can ask the current turn to continue, so `Stop` is not

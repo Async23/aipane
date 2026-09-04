@@ -66,6 +66,7 @@ AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
 ln -sf "$AIPANE_ROOT/bin/tmux-rename-window-popup" ~/.local/bin/tmux-rename-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
 ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
+ln -sf "$AIPANE_ROOT/bin/aipane-activity" ~/.local/bin/aipane-activity
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
 ln -sf "$AIPANE_ROOT/bin/ai-restart" ~/.local/bin/ai-restart
 ```
@@ -94,10 +95,12 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `bin/tmux-colour-palette` | indexed terminal colour palette (`0–255`) |
 | `bin/tmux-window-jump` | repeated-digit exact-index window selector |
 | `bin/tmux-window-wrap` | renderer CLI |
+| `bin/aipane-activity` | Agent Activity CLI |
 | `bin/ai-restart` | confirm and seal an exact in-place AI pane restart plan |
 | `bin/aipane-restore-executor` | exclusively execute, verify, retry, and persist recovery |
 | `lib/recovery_plan.py` | versioned, digest-protected restart plan contract |
 | [`integrations/`](integrations/README.md) | Agent lifecycle hook fragments and OpenCode Adapter |
+| `tests/test_agent_activity.py` | Agent Activity behavior tests |
 | `tests/test_agent_activity_integrations.py` | Agent Activity contract tests |
 | `tests/test_restore_executor.py` | verified recovery, retry, and pending-intent tests |
 | `tests/test_recovery_plan.py` | sealed recovery plan contract tests |
@@ -111,6 +114,7 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 After editing workstation conf or the wrap renderer:
 
 ```bash
+python3 "$AIPANE_ROOT/tests/test_agent_activity.py"
 python3 "$AIPANE_ROOT/tests/test_agent_activity_integrations.py"
 python3 "$AIPANE_ROOT/tests/test_tmux_window_jump.py"
 python3 "$AIPANE_ROOT/tests/test_workstation_fragments.py"
@@ -291,6 +295,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 ├── cmd/                     # ai/pane and kill* commands
 ├── bin/
 │   ├── aipane-cleanup
+│   ├── aipane-activity
 │   ├── aipane-claude-activity
 │   ├── ai-restart
 │   ├── ai-restore
@@ -324,6 +329,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
     ├── aipane-cleanup-contracts.sh
     ├── init-reload.zsh
     ├── test_ai_restart.py
+    ├── test_agent_activity.py
     ├── test_agent_activity_integrations.py
     ├── test_recovery_plan.py
     ├── test_restore_executor.py
@@ -356,6 +362,7 @@ zsh -fc '
 
 # optional workstation / window-wrap
 python3 tests/test_ai_restart.py
+python3 tests/test_agent_activity.py
 python3 tests/test_agent_activity_integrations.py
 python3 tests/test_recovery_plan.py
 python3 tests/test_session_restore.py

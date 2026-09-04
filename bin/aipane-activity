@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Canonical CLI for pane-local Agent Activity."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+
+LIB_DIR = Path(__file__).resolve().parents[1] / "lib"
+if str(LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(LIB_DIR))
+
+from agent_activity import (  # noqa: E402
+    ActivityError,
+    AgentActivity,
+    TmuxActivityAdapter,
+)
+
+
+def hook_payload(input_stream) -> dict[str, object]:
+    if input_stream.isatty():
+        return {}
+    try:
+        value = json.load(input_stream)
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def controller(socket_name: str | None) -> AgentActivity:
+    adapter = TmuxActivityAdapter(socket_name=socket_name)
+    return AgentActivity(adapter=adapter)
+
+
+def inspection_payload(result) -> dict[str, object]:
+    session = result.session
+    return {
+        "state": result.state,
+        "reported": result.reported,
+        "reason": result.reason,
+        "available": result.available,
+        "repairable": result.repairable,
+        "evidence": result.evidence,
+        "pane_id": result.pane_id,
+        "current_command": result.current_command,
+        "session": (
+            {"id": session.session_id, "tool": session.tool_key}
+            if session is not None
+            else None
+        ),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="aipane-activity")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    report_parser = commands.add_parser("report")
+    report_parser.add_argument("state", choices=("busy", "idle"))
+    report_parser.add_argument("--pane", default=os.environ.get("TMUX_PANE"))
+    report_parser.add_argument("--socket-name")
+
+    inspect_parser = commands.add_parser("inspect")
+    inspect_parser.add_argument("--pane", default=os.environ.get("TMUX_PANE"))
+    inspect_parser.add_argument("--socket-name")
+    inspect_parser.add_argument("--json", action="store_true")
+
+    reconcile_parser = commands.add_parser("reconcile")
+    reconcile_parser.add_argument("--socket-name")
+    reconcile_parser.add_argument("--json", action="store_true")
+
+    clear_parser = commands.add_parser("clear")
+    clear_parser.add_argument("--pane", default=os.environ.get("TMUX_PANE"))
+    clear_parser.add_argument("--socket-name")
+
+    arguments = parser.parse_args()
+    pane = getattr(arguments, "pane", None)
+    if arguments.command == "report" and not pane:
+        return 0
+    if arguments.command in {"inspect", "clear"} and not pane:
+        parser.error("--pane or TMUX_PANE is required")
+
+    activity = controller(getattr(arguments, "socket_name", None))
+    try:
+        if arguments.command == "report":
+            activity.report(pane, arguments.state, hook_payload(sys.stdin))
+            return 0
+        if arguments.command == "inspect":
+            result = activity.inspect(pane)
+            if arguments.json:
+                json.dump(inspection_payload(result), sys.stdout, separators=(",", ":"))
+                sys.stdout.write("\n")
+            else:
+                print(result.state)
+            return 0 if result.available else 1
+        if arguments.command == "reconcile":
+            result = activity.reconcile()
+            if arguments.json:
+                json.dump(
+                    {
+                        "owner": result.owner,
+                        "busy": result.busy,
+                        "changed": result.changed,
+                        "available": result.available,
+                        "errors": list(result.errors),
+                    },
+                    sys.stdout,
+                    separators=(",", ":"),
+                )
+                sys.stdout.write("\n")
+            else:
+                print(
+                    "unknown"
+                    if not result.available
+                    else ("busy" if result.busy else "idle")
+                )
+            return 1 if result.errors else 0
+        activity.clear(pane)
+        return 0
+    except (ActivityError, ValueError) as error:
+        parser.error(str(error))
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

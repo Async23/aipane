@@ -2,7 +2,7 @@
 //
 // OpenCode creates its session id lazily, so this plugin records the
 // pane-to-session binding on the first message. It also translates OpenCode
-// session lifecycle events to the tmux-window-wrap Agent Activity Interface.
+// session lifecycle events to the Agent Activity Interface.
 // All integration work is best-effort and never blocks OpenCode.
 
 import { spawn } from "node:child_process"
@@ -10,7 +10,7 @@ import { appendFileSync } from "node:fs"
 
 const HOME = process.env.HOME || ""
 const BIND = HOME + "/.local/bin/aipane-bind"
-const WINDOW_WRAP = HOME + "/.local/bin/tmux-window-wrap"
+const ACTIVITY = HOME + "/.local/bin/aipane-activity"
 
 function debug(msg) {
   if (!process.env.AIPANE_OPENCODE_DEBUG) return
@@ -34,7 +34,7 @@ function reportActivity(state) {
   const pane = process.env.TMUX_PANE
   if (!pane) return
   debug("activity pane=" + pane + " state=" + state)
-  spawnDetached(WINDOW_WRAP, ["activity", state, "--pane", pane])
+  spawnDetached(ACTIVITY, ["report", state, "--pane", pane])
 }
 
 function createActivityTracker(report) {

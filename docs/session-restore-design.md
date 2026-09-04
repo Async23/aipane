@@ -446,7 +446,7 @@ codex 无启动期 `--session-id`，其会话 id（`thread-id`）在**运行后*
 ### 已知残留
 - 二者都属懒惰派：**重启前从未发消息**（opencode）/ **从未开过会话**（kimi 该 cwd）时无 id 可恢复——opencode 落 fresh、kimi `--continue` 若无历史则自然新开。属 §1 早已承认的边界。
 - opencode 插件加载依赖该版本的 `{id, server}` 默认导出形态（本机实测通过）；若将来 opencode 换加载器需回看。
-- kimi 同一事件挂两条 `[[hooks]]`（既有 `tmux-window-wrap` + 新 `aipane-kimi-hook`）依赖 kimi「同事件多钩子皆执行」；`doctor` 已验证 config 合法，实跑时如只执行其一需改为串接。
+- kimi 同一事件挂两条 `[[hooks]]`（`aipane-activity` + `aipane-kimi-hook`）依赖 kimi「同事件多钩子皆执行」；`doctor` 已验证 config 合法，实跑时如只执行其一需改为串接。
 
 ## 15. Pi 进程内换会话修正（2026-08-17）
 
