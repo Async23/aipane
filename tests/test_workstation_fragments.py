@@ -48,6 +48,19 @@ class GhosttyFragmentTests(unittest.TestCase):
 
 
 class TmuxWorkstationFragmentTests(unittest.TestCase):
+    def test_kill_pane_only_confirms_for_the_windows_last_pane(self):
+        text = TMUX_WS.read_text(encoding="utf-8")
+        self.assertIn(
+            "bind x if-shell -F '#{==:#{window_panes},1}'",
+            text,
+        )
+        self.assertIn(
+            'confirm-before -p "Close last pane and window #I:#W? (y/N)" '
+            "kill-pane",
+            text,
+        )
+        self.assertNotIn("bind x kill-pane", text)
+
     def test_workstation_sets_c_space_prefix_and_broadcast(self):
         text = TMUX_WS.read_text(encoding="utf-8")
         self.assertIn("set -g prefix C-Space", text)

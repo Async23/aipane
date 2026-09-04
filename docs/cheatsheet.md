@@ -11,7 +11,7 @@ also send complete prefix+key chords.
 | `Cmd+S` | prefix only |
 | `Cmd+Opt+P` | popup pane ID list |
 | `Cmd+T` | new window |
-| `Cmd+W` | kill pane |
+| `Cmd+W` | kill pane; confirm first when it is the window's last pane |
 | `Cmd+D` / `Cmd+Shift+D` | split L-R / T-B |
 | `Cmd+[` / `Cmd+]` | prev / next pane |
 | `Cmd+Shift+[` / `]` | prev / next window |
