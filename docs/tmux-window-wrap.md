@@ -241,11 +241,26 @@ system appearance and updates `@tmux-window-wrap-color-scheme` automatically.
 After each indicator, the renderer restores the normal window-name foreground
 colour.
 
+## Agent process detection
+
+`tmux-window-wrap pane-agent-status --pane %N` reports whether a pane's live
+process subtree contains an AI Tool. It prints exactly one of `agent`, `none`,
+or `unknown`. Detection follows the actual processes owned by that pane, so a
+waiting/idle AI Tool remains `agent`, while a stale activity marker or window
+name does not create a match. Native aipane tool commands and their common
+runtime/package-runner wrappers are recognized.
+
+`conf/tmux-workstation.conf` uses this command for `prefix x`: a known
+non-Agent last pane closes immediately, while an Agent last pane asks for
+confirmation in a centered tmux menu. Process or tmux lookup failures return
+`unknown`, which the binding also confirms so detector failure cannot silently
+destroy a window.
+
 ## Files
 
 | Path | Role |
 |------|------|
-| `bin/tmux-window-wrap` | `plan` / `render` / `animate` / `invalidate` CLI |
+| `bin/tmux-window-wrap` | status renderer, animator, and pane Agent detector CLI |
 | `lib/agent_activity.py` | shared report/resolution policy and AI Tool evidence adapters |
 | `conf/tmux-window-wrap.conf` | Public fragment: `status-format` + lifecycle hooks |
 | `tests/test_tmux_window_wrap.py` | Unit + live tmux tests |

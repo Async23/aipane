@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -56,6 +57,54 @@ DEFAULT_PANE_COUNT_STYLE = "subscript"
 PANE_COUNT_STYLES = ("subscript", "plain", "off")
 SUBSCRIPT_DIGITS = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
 ANIMATOR_OWNER_ENVIRONMENT = "TMUX_WINDOW_WRAP_ANIMATOR_OWNER"
+AI_TOOL_EXECUTABLES = frozenset(
+    {
+        "claude",
+        "claude-code",
+        "claude-guard",
+        "codex",
+        "codex-cli",
+        "codexx",
+        "cursor-agent",
+        "droid",
+        "factory-droid",
+        "gemini",
+        "gemini-cli",
+        "grok",
+        "kimi",
+        "kimi-code",
+        "opencode",
+        "pi",
+        "qoder",
+        "qodercli",
+    }
+)
+AI_TOOL_EXECUTABLE_PREFIXES = ("codex-", "grok-", "kimi-", "opencode-", "pi-")
+AI_TOOL_PATH_MARKERS = (
+    "/@anthropic-ai/claude-code",
+    "/@openai/codex",
+    "/cursor-agent/",
+    "/pi-coding-agent/",
+)
+RUNTIME_EXECUTABLES = frozenset(
+    {
+        "bash",
+        "bun",
+        "deno",
+        "node",
+        "perl",
+        "php",
+        "ruby",
+        "sh",
+        "zsh",
+    }
+)
+PACKAGE_RUNNERS = frozenset({"bunx", "npm", "npx", "pnpm", "yarn"})
+PACKAGE_RUNNER_SUBCOMMANDS = {
+    "npm": frozenset({"exec", "x"}),
+    "pnpm": frozenset({"dlx", "exec"}),
+    "yarn": frozenset({"dlx", "exec"}),
+}
 DEFAULT_ACTIVITY_PALETTES = {
     "light": {
         "inactive": (
@@ -573,6 +622,128 @@ def run_tmux(socket_name, *arguments):
         capture_output=True,
         check=True,
     )
+
+
+def _command_arguments(command):
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+
+def _executable_name(token):
+    return Path(token).name.lower()
+
+
+def _is_ai_tool_executable(token):
+    name = _executable_name(token)
+    return name in AI_TOOL_EXECUTABLES or name.startswith(
+        AI_TOOL_EXECUTABLE_PREFIXES
+    )
+
+
+def _is_ai_tool_script(token):
+    normalized = token.lower().replace("\\", "/")
+    return _is_ai_tool_executable(token) or any(
+        marker in normalized for marker in AI_TOOL_PATH_MARKERS
+    )
+
+
+def command_runs_ai_tool(command):
+    arguments = _command_arguments(command)
+    if not arguments:
+        return False
+    executable = _executable_name(arguments[0])
+    if _is_ai_tool_executable(arguments[0]):
+        return True
+    if executable == "agent-browser":
+        return "daemon" in arguments[1:]
+    if executable in PACKAGE_RUNNERS:
+        candidates = arguments[1:]
+        subcommands = PACKAGE_RUNNER_SUBCOMMANDS.get(executable)
+        if subcommands is not None:
+            if not candidates or candidates[0] not in subcommands:
+                return False
+            candidates = candidates[1:]
+        return any(_is_ai_tool_script(token) for token in candidates[:4])
+    if executable in RUNTIME_EXECUTABLES or executable.startswith("python"):
+        script = next(
+            (token for token in arguments[1:] if not token.startswith("-")),
+            "",
+        )
+        return bool(script) and _is_ai_tool_script(script)
+    return False
+
+
+def _process_table():
+    completed = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,stat=,command="],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=2,
+    )
+    if completed.returncode != 0:
+        return None
+    processes = {}
+    for line in completed.stdout.splitlines():
+        fields = line.strip().split(maxsplit=3)
+        if len(fields) != 4 or fields[2].startswith("Z"):
+            continue
+        try:
+            pid = int(fields[0])
+            parent_pid = int(fields[1])
+        except ValueError:
+            continue
+        processes[pid] = (parent_pid, fields[3])
+    return processes
+
+
+def _pane_process_commands(pane_pid):
+    try:
+        processes = _process_table()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if processes is None or pane_pid not in processes:
+        return None
+    children = {}
+    for pid, (parent_pid, _command) in processes.items():
+        children.setdefault(parent_pid, []).append(pid)
+    commands = []
+    pending = [pane_pid]
+    seen = set()
+    while pending:
+        pid = pending.pop()
+        if pid in seen or pid not in processes:
+            continue
+        seen.add(pid)
+        commands.append(processes[pid][1])
+        pending.extend(children.get(pid, ()))
+    return commands
+
+
+def pane_agent_status(socket_name, pane_id):
+    """Return agent, none, or unknown for the process tree owned by pane_id."""
+    if not pane_id:
+        return "unknown"
+    try:
+        completed = run_tmux(
+            socket_name,
+            "display-message",
+            "-p",
+            "-t",
+            pane_id,
+            "#{pane_pid}",
+        )
+        pane_pid = int(completed.stdout.strip())
+    except (OSError, subprocess.CalledProcessError, TypeError, ValueError):
+        return "unknown"
+    if pane_pid <= 0:
+        return "unknown"
+    commands = _pane_process_commands(pane_pid)
+    if commands is None:
+        return "unknown"
+    return "agent" if any(map(command_runs_ai_tool, commands)) else "none"
 
 
 def narrowest_client_width(session_id, socket_name, fallback):
@@ -1612,6 +1783,9 @@ def main():
     commands.add_parser("plan")
     invalidate_parser = commands.add_parser("invalidate")
     invalidate_parser.add_argument("--socket-name")
+    pane_agent_parser = commands.add_parser("pane-agent-status")
+    pane_agent_parser.add_argument("--pane", default=os.environ.get("TMUX_PANE"))
+    pane_agent_parser.add_argument("--socket-name")
     activity_parser = commands.add_parser("activity")
     activity_parser.add_argument("state", choices=("busy", "idle"))
     activity_parser.add_argument("--pane", default=os.environ.get("TMUX_PANE"))
@@ -1691,6 +1865,10 @@ def main():
 
     if arguments.command == "invalidate":
         invalidate_cache(arguments.socket_name)
+        return
+
+    if arguments.command == "pane-agent-status":
+        print(pane_agent_status(arguments.socket_name, arguments.pane))
         return
 
     if arguments.command == "activity":
