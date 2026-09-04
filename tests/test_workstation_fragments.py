@@ -49,17 +49,130 @@ class GhosttyFragmentTests(unittest.TestCase):
 
 class TmuxWorkstationFragmentTests(unittest.TestCase):
     def test_kill_pane_only_confirms_for_the_windows_last_pane(self):
-        text = TMUX_WS.read_text(encoding="utf-8")
-        self.assertIn(
-            "bind x if-shell -F '#{==:#{window_panes},1}'",
-            text,
-        )
-        self.assertIn(
-            'confirm-before -p "Close last pane and window #I:#W? (y/N)" '
-            "kill-pane",
-            text,
-        )
-        self.assertNotIn("bind x kill-pane", text)
+        socket = f"ws-kill-pane-{os.getpid()}-{id(self)}"
+        client_process = None
+        client_environment = os.environ.copy()
+        client_environment.pop("TMUX", None)
+        client_environment.pop("TMUX_PANE", None)
+        client_environment["TERM"] = "xterm-256color"
+
+        def tmux(*args: str, check: bool = True):
+            return subprocess.run(
+                ["tmux", "-L", socket, *args],
+                check=check,
+                capture_output=True,
+                text=True,
+            )
+
+        def window_ids() -> set[str]:
+            return set(
+                tmux(
+                    "list-windows",
+                    "-t",
+                    "kill-pane",
+                    "-F",
+                    "#{window_id}",
+                ).stdout.splitlines()
+            )
+
+        try:
+            tmux(
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "kill-pane",
+                "sleep 30",
+            )
+            tmux("source-file", str(TMUX_WS))
+            guarded_window = tmux(
+                "display-message",
+                "-p",
+                "-t",
+                "kill-pane",
+                "#{window_id}",
+            ).stdout.strip()
+            tmux("new-window", "-d", "-t", "kill-pane:", "sleep 30")
+            tmux("select-window", "-t", guarded_window)
+            tmux("split-window", "-d", "-t", guarded_window, "sleep 30")
+
+            client_process = subprocess.Popen(
+                [
+                    "tmux",
+                    "-L",
+                    socket,
+                    "-C",
+                    "attach-session",
+                    "-t",
+                    "kill-pane",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                env=client_environment,
+            )
+
+            client = ""
+            for _ in range(50):
+                client = tmux(
+                    "list-clients", "-F", "#{client_name}"
+                ).stdout.strip()
+                if client:
+                    break
+                time.sleep(0.02)
+            self.assertTrue(client, "tmux client did not attach")
+
+            def invoke_kill_pane_binding() -> None:
+                tmux("switch-client", "-c", client, "-T", "prefix")
+                tmux("send-keys", "-K", "-c", client, "x")
+
+            # Multiple panes use the immediate cleanup path.
+            invoke_kill_pane_binding()
+            panes = tmux(
+                "display-message",
+                "-p",
+                "-t",
+                guarded_window,
+                "#{window_panes}",
+            ).stdout.strip()
+            self.assertEqual(
+                panes, "1", "prefix+x did not immediately close a split pane"
+            )
+
+            # The last pane stays alive while tmux waits for confirmation.
+            invoke_kill_pane_binding()
+            self.assertIn(guarded_window, window_ids())
+
+            tmux("send-keys", "-K", "-c", client, "n")
+            self.assertIn(
+                guarded_window,
+                window_ids(),
+                "declining the prompt closed the last pane's window",
+            )
+
+            # Accepting the prompt closes the pane and its window.
+            invoke_kill_pane_binding()
+            self.assertIn(guarded_window, window_ids())
+            tmux("send-keys", "-K", "-c", client, "y")
+            self.assertNotIn(
+                guarded_window,
+                window_ids(),
+                "accepting the prompt left the last pane's window open",
+            )
+        finally:
+            if client_process is not None:
+                if client_process.stdin is not None:
+                    client_process.stdin.close()
+                if client_process.poll() is None:
+                    client_process.terminate()
+                try:
+                    client_process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    client_process.kill()
+                    client_process.wait()
+            tmux("kill-server", check=False)
 
     def test_workstation_sets_c_space_prefix_and_broadcast(self):
         text = TMUX_WS.read_text(encoding="utf-8")
