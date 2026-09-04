@@ -1,7 +1,20 @@
 # macOS Agent Notifications
 
-The notification adapters in `bin/` normalize completion notifications without
-changing each agent's hook trigger or dedicated notifier app identity.
+`lib/agent_notifications.py` is the deep Agent Notifications module. Its
+`AgentNotifications.handle(agent, payload)` Interface owns payload adaptation,
+session/transcript evidence, title and message normalization, sound selection,
+deduplication, focus actions, delivery results, and diagnostic logging.
+
+The executables in `bin/` are thin input/output Adapters. They preserve each AI
+Tool's hook invocation and dry-run output while delegating notification decisions
+to the shared module. `MacOSNotificationAdapter` preserves the dedicated app and
+fallback identities; `InMemoryNotificationAdapter` exercises the same Interface
+without sending a desktop notification.
+
+Preview mode is read-only: it does not claim a deduplication key, write a log, or
+cross the delivery seam. Grok transcript settling and Kimi background delivery
+remain Adapter scheduling details; the shared module still owns the final
+decision and result.
 
 Each delivered completion chooses one sound from `Glass`, `Ping`, `Pop`, `Purr`,
 `Submarine`, and `Tink`. A logical notification chooses once, so its primary and
@@ -21,3 +34,11 @@ macOS sound name when one stable sound is preferred.
 The adapters expect the corresponding dedicated notifier apps and focus scripts
 to remain in each agent's configured home paths. Install them through symlinks so
 the tracked adapter remains the single source of truth.
+
+Run the Interface and compatibility contracts with:
+
+```bash
+python3 tests/test_agent_notifications.py
+python3 tests/test_agent_notification_sounds.py
+python3 tests/test_kimi_notify.py
+```

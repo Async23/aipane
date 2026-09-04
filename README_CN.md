@@ -193,6 +193,9 @@ ai cc                                     # 重复的键会启动重复的工具
 `~/.local/share/aipane/restore-pending.json`，不会再被后续 continuum 快照抹掉。
 Qoder 和 Droid 因尚未支持会话恢复而直接忽略。
 
+macOS 完成通知 Adapter 与声音覆盖入口统一记录在
+[`docs/agent-notifications.md`](docs/agent-notifications.md)。
+
 ```bash
 ai-restart --dry-run  # 刷新快照并预览，不重启 pane
 ai-restart            # 预览、确认，然后重启并恢复
@@ -272,6 +275,7 @@ killrod --dry-run
 ├── aipane.zsh               # 兼容入口
 ├── lib/core.zsh
 ├── lib/agent_activity.py    # Agent Activity 策略与证据 Adapter
+├── lib/agent_notifications.py # 通知适配与投递策略
 ├── cmd/                     # ai/pane 与 kill* 命令
 ├── bin/
 │   ├── aipane-cleanup
@@ -299,6 +303,7 @@ killrod --dry-run
 │   ├── pi/
 │   └── qoder/
 ├── docs/
+│   ├── agent-notifications.md
 │   ├── cheatsheet.md
 │   ├── ghostty-tmux-workstation.md
 │   └── tmux-window-wrap.md
@@ -311,6 +316,9 @@ killrod --dry-run
     ├── test_ai_restart.py
     ├── test_agent_activity.py
     ├── test_agent_activity_integrations.py
+    ├── test_agent_notification_sounds.py
+    ├── test_agent_notifications.py
+    ├── test_kimi_notify.py
     ├── test_session_restore.py
     ├── test_tmux_window_jump.py
     ├── test_tmux_window_wrap.py
@@ -321,7 +329,7 @@ killrod --dry-run
 
 ```bash
 zsh -n init.zsh aipane.zsh cmd/*.zsh lib/*.zsh tests/*.zsh
-sh -n bin/aipane-cleanup bin/aipane-claude-activity bin/aipane-codex-notify bin/rod-cleanup bin/tmux-colour-palette bin/tmux-rename-window-popup bin/tmux-window-jump tests/*.sh
+sh -n bin/aipane-cleanup bin/aipane-claude-activity bin/rod-cleanup bin/tmux-colour-palette bin/tmux-rename-window-popup bin/tmux-window-jump tests/*.sh
 
 zsh -fc '
   source ./init.zsh
@@ -342,6 +350,9 @@ zsh -fc '
 python3 tests/test_ai_restart.py
 python3 tests/test_agent_activity.py
 python3 tests/test_agent_activity_integrations.py
+python3 tests/test_agent_notification_sounds.py
+python3 tests/test_agent_notifications.py
+python3 tests/test_kimi_notify.py
 python3 tests/test_session_restore.py
 python3 tests/test_restore_executor.py
 node --experimental-strip-types --test tests/pi-session-binding.test.mjs

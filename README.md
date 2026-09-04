@@ -291,6 +291,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 ├── aipane.zsh               # compatibility entrypoint
 ├── lib/core.zsh
 ├── lib/agent_activity.py    # shared Agent Activity policy + evidence adapters
+├── lib/agent_notifications.py # shared notification adaptation + delivery policy
 ├── lib/recovery_plan.py     # immutable restart plan contract
 ├── cmd/                     # ai/pane and kill* commands
 ├── bin/
@@ -319,6 +320,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 │   ├── pi/
 │   └── qoder/
 ├── docs/
+│   ├── agent-notifications.md
 │   ├── cheatsheet.md
 │   ├── ghostty-tmux-workstation.md
 │   └── tmux-window-wrap.md
@@ -331,6 +333,9 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
     ├── test_ai_restart.py
     ├── test_agent_activity.py
     ├── test_agent_activity_integrations.py
+    ├── test_agent_notification_sounds.py
+    ├── test_agent_notifications.py
+    ├── test_kimi_notify.py
     ├── test_recovery_plan.py
     ├── test_restore_executor.py
     ├── test_session_restore.py
@@ -343,7 +348,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 
 ```bash
 zsh -n init.zsh aipane.zsh cmd/*.zsh lib/*.zsh tests/*.zsh
-sh -n bin/aipane-cleanup bin/aipane-claude-activity bin/aipane-codex-notify bin/rod-cleanup bin/tmux-colour-palette bin/tmux-rename-window-popup bin/tmux-window-jump tests/*.sh
+sh -n bin/aipane-cleanup bin/aipane-claude-activity bin/rod-cleanup bin/tmux-colour-palette bin/tmux-rename-window-popup bin/tmux-window-jump tests/*.sh
 
 zsh -fc '
   source ./init.zsh
@@ -364,6 +369,9 @@ zsh -fc '
 python3 tests/test_ai_restart.py
 python3 tests/test_agent_activity.py
 python3 tests/test_agent_activity_integrations.py
+python3 tests/test_agent_notification_sounds.py
+python3 tests/test_agent_notifications.py
+python3 tests/test_kimi_notify.py
 python3 tests/test_recovery_plan.py
 python3 tests/test_session_restore.py
 python3 tests/test_restore_executor.py
