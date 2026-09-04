@@ -53,10 +53,12 @@ The animator advances exactly one adjacent level per rendered frame. If a tmux
 or theme probe is briefly slow, the current frame lasts slightly longer rather
 than skipping levels to catch up, which avoids visible jumps.
 
-AI Tool integrations report state with `tmux-window-wrap activity busy` and
-`tmux-window-wrap activity idle`. The command stores the pane's current command
-in `@tmux-window-wrap-activity`; a marker is honored only while that command
-still owns the pane, so a marker left by an abnormal exit is ignored.
+AI Tool integrations report state through the canonical
+`aipane-activity report busy|idle` command. The older
+`tmux-window-wrap activity busy|idle` command remains a compatibility Adapter
+to the same module. A report stores the pane's current command in
+`@tmux-window-wrap-activity`; a marker is honored only while that command still
+owns the pane, so a marker left by an abnormal exit is ignored.
 The safety source is a versioned JSON record in
 `@tmux-window-wrap-activity-record`. It binds the report to the tmux pane,
 server, TTY, and exact Agent process; Codex records also carry the root session,
@@ -75,9 +77,24 @@ record from clearing a newly submitted turn.
 
 Agent Activity is turn-level: `busy` starts when the user submits a prompt and
 ends when the AI Tool completes or fails the turn. New AI Tool integrations
-should report this state explicitly through `tmux-window-wrap activity
-busy|idle`. Hooks and plugins inherit `TMUX_PANE`, so no pane id needs to appear
-in model messages.
+should report this state explicitly through `aipane-activity report
+busy|idle`. Hooks and plugins inherit `TMUX_PANE`, so no pane id needs to
+appear in model messages.
+
+`lib/agent_activity.py` is the protocol-owning module. Its narrow interface is:
+
+- `report`: accept a lifecycle event and update the pane projection;
+- `inspect`: resolve `busy`, `idle`, or `unknown` without writing;
+- `reconcile`: require stable authoritative evidence, revalidate under the
+  per-pane lock, and repair a stale projection;
+- `clear`: explicitly remove projection state after an authorized replacement.
+
+The tmux Adapter only reads and writes projection fields. Identity checks,
+timestamps, compare-before-write, rollback, and the two-observation repair rule
+stay local to the Agent Activity module. A missing or conflicting read resolves
+to `unknown`; repair errors are explicit and never turn `busy` into `idle`.
+The status renderer still reads only the cached scalar marker at 20 FPS.
+Evidence files and databases are inspected only by the lower-frequency probe.
 
 Claude Code agent-team teammates do not receive a user-submitted prompt, even
 when each teammate owns a separate tmux pane. The Claude Adapter therefore
@@ -260,9 +277,11 @@ destroy a window.
 
 | Path | Role |
 |------|------|
-| `bin/tmux-window-wrap` | status renderer, animator, and pane Agent detector CLI |
-| `lib/agent_activity.py` | shared report/resolution policy and AI Tool evidence adapters |
+| `bin/aipane-activity` | canonical Agent Activity CLI |
+| `bin/tmux-window-wrap` | status renderer, animator, pane Agent detector, and compatibility Adapter |
+| `lib/agent_activity.py` | Agent Activity interface, protocol, tmux Adapter, and private evidence readers |
 | `conf/tmux-window-wrap.conf` | Public fragment: `status-format` + lifecycle hooks |
+| `tests/test_agent_activity.py` | Interface and evidence behavior tests |
 | `tests/test_tmux_window_wrap.py` | Unit + live tmux tests |
 
 ## Install
@@ -271,6 +290,7 @@ destroy a window.
 
 ```bash
 AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
+ln -sf "$AIPANE_ROOT/bin/aipane-activity" ~/.local/bin/aipane-activity
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
 ```
 
@@ -286,7 +306,8 @@ Not loaded by `init.zsh`. Symlink the binary; do not copy the script body into `
 
 **Canonical source is this repo.** Machine wiring:
 
-1. Symlink binary → `~/.local/bin/tmux-window-wrap`
+1. Symlink binaries → `~/.local/bin/aipane-activity` and
+   `~/.local/bin/tmux-window-wrap`
 2. Personal `~/.tmux.conf` only `source-file`s the conf — no inlined `status-format` / wrap hooks
 
 Do **not** commit a full personal `~/.tmux.conf` (prefix, theme, TPM, keybinds).
@@ -302,6 +323,7 @@ Personal-only (prefix, splits, colors, plugins, non-wrap status text) → only `
 ### After changes
 
 ```bash
+python3 tests/test_agent_activity.py
 python3 tests/test_tmux_window_wrap.py
 ```
 

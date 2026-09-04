@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import sqlite3
 import subprocess
 import tempfile
@@ -16,19 +17,58 @@ import time
 import urllib.parse
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Iterable, Mapping, Protocol
 
 import fcntl
+
+
+__all__ = (
+    "ActivityError",
+    "ActivityInspection",
+    "ActivityReadError",
+    "ActivityReconcileResult",
+    "ActivityReportResult",
+    "ActivitySession",
+    "ActivityWriteError",
+    "AgentActivity",
+    "InMemoryActivityAdapter",
+    "TmuxActivityAdapter",
+    "codex_goal_state",
+    "codex_thread_identity",
+)
 
 
 TERMINAL_CODEX_STATUSES = frozenset({"completed", "failed", "interrupted"})
 TERMINAL_KIMI_REASONS = frozenset(
     {"completed", "cancelled", "failed", "blocked"}
 )
+ACTIVITY_MARKER_OPTION = "@tmux-window-wrap-activity"
+ACTIVITY_REPORTER_OPTION = "@tmux-window-wrap-activity-reporter"
+ACTIVITY_UPDATED_AT_OPTION = "@tmux-window-wrap-activity-updated-at"
+ACTIVITY_RECORD_OPTION = "@tmux-window-wrap-activity-record"
+ACTIVITY_OPTIONS = (
+    ACTIVITY_MARKER_OPTION,
+    ACTIVITY_REPORTER_OPTION,
+    ACTIVITY_UPDATED_AT_OPTION,
+    ACTIVITY_RECORD_OPTION,
+)
+ACTIVITY_FIELD_SEPARATOR = "\x1f"
+
+
+class ActivityError(RuntimeError):
+    """Base error for the Agent Activity interface."""
+
+
+class ActivityReadError(ActivityError):
+    """The pane projection could not be read safely."""
+
+
+class ActivityWriteError(ActivityError):
+    """The pane projection could not be changed safely."""
 
 
 @contextmanager
@@ -50,21 +90,26 @@ def pane_activity_lock(
         or environment.get("TMPDIR")
         or tempfile.gettempdir()
     )
-    lock_dir = runtime_root / f"aipane-activity-locks-{os.getuid()}"
-    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmux_identity = socket_name
-    if not tmux_identity:
-        # TMUX is "socket_path,server_pid,client_id".  Writers inherited
-        # from different clients must still contend on the same pane lock.
-        tmux_identity = environment.get("TMUX", "").split(",", 1)[0]
-    identity = f"{tmux_identity}\0{pane_id}"
-    lock_path = lock_dir / f"{sha256(identity.encode()).hexdigest()}.lock"
-    with lock_path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    try:
+        lock_dir = runtime_root / f"aipane-activity-locks-{os.getuid()}"
+        lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmux_identity = socket_name
+        if not tmux_identity:
+            # TMUX is "socket_path,server_pid,client_id". Writers inherited
+            # from different clients must still contend on the same pane lock.
+            tmux_identity = environment.get("TMUX", "").split(",", 1)[0]
+        identity = f"{tmux_identity}\0{pane_id}"
+        lock_path = lock_dir / f"{sha256(identity.encode()).hexdigest()}.lock"
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError as error:
+        raise ActivityWriteError(
+            f"could not lock Agent Activity for pane {pane_id}: {error}"
+        ) from error
 
 
 @dataclass(frozen=True)
@@ -75,6 +120,7 @@ class PaneActivity:
     pane_tty: str = ""
     socket_path: str = ""
     server_pid: str = ""
+    pane_pid: str = ""
     marker: str = ""
     reporter: str = ""
     marker_updated_at: str = ""
@@ -107,6 +153,366 @@ class ActivityReport:
 class CodexThreadIdentity:
     root_session_id: str
     scope: str
+
+
+@dataclass(frozen=True)
+class ActivitySession:
+    """A session binding validated against the current pane projection."""
+
+    session_id: str
+    tool_key: str
+
+
+@dataclass(frozen=True)
+class ActivityGuard:
+    """Opaque exact pane state used to seal a destructive recovery plan."""
+
+    pane_id: str
+    socket_path: str
+    server_pid: str
+    pane_pid: str
+    current_command: str
+    marker: str
+    reporter: str
+    updated_at: str
+    record: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "pane_id": self.pane_id,
+            "socket_path": self.socket_path,
+            "server_pid": self.server_pid,
+            "pane_pid": self.pane_pid,
+            "current_command": self.current_command,
+            "activity_marker": self.marker,
+            "activity_reporter": self.reporter,
+            "activity_updated_at": self.updated_at,
+            "activity_record": self.record,
+        }
+
+
+@dataclass(frozen=True)
+class ActivityInspection:
+    """Stable, read-only result returned to Agent Activity consumers."""
+
+    state: str
+    reported: bool
+    reason: str
+    available: bool = True
+    repairable: bool = False
+    evidence: str = ""
+    pane_id: str = ""
+    current_command: str = ""
+    session: ActivitySession | None = None
+    guard: ActivityGuard | None = None
+
+
+@dataclass(frozen=True)
+class ActivityReportResult:
+    state: str
+    accepted: bool
+    changed: bool
+
+
+@dataclass(frozen=True)
+class ActivityReconcileResult:
+    owner: str | None
+    busy: bool
+    changed: bool
+    available: bool = True
+    errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ListedPaneActivity:
+    attached: bool
+    pane: PaneActivity
+
+
+class ActivityProjectionAdapter(Protocol):
+    """Primitive projection I/O; AgentActivity owns all protocol rules."""
+
+    socket_name: str | None
+    lock_identity: str | None
+    environment: Mapping[str, str]
+
+    def read(self, target: str) -> PaneActivity: ...
+
+    def list_panes(self) -> tuple[str | None, list[ListedPaneActivity]]: ...
+
+    def set_option(self, target: str, option: str, value: str) -> None: ...
+
+    def unset_option(self, target: str, option: str) -> None: ...
+
+    def wake(self) -> None: ...
+
+
+class TmuxActivityAdapter:
+    """Read and write the Agent Activity projection in tmux."""
+
+    def __init__(
+        self,
+        *,
+        socket_name: str | None = None,
+        environment: Mapping[str, str] | None = None,
+        command: Iterable[str] | None = None,
+        runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+        wake: Callable[[str | None], None] | None = None,
+    ) -> None:
+        self.socket_name = socket_name
+        self.environment = dict(
+            os.environ if environment is None else environment
+        )
+        configured = list(command) if command is not None else shlex.split(
+            self.environment.get("AIPANE_TMUX", "tmux")
+        )
+        if not configured:
+            raise ActivityReadError("AIPANE_TMUX resolved to an empty command")
+        self.command = configured
+        inherited_socket = self.environment.get("TMUX", "").split(",", 1)[0]
+        self.lock_identity = (
+            socket_name or inherited_socket or shlex.join(configured)
+        )
+        self.runner = runner
+        self.wake_callback = wake
+
+    @staticmethod
+    def pane_format() -> str:
+        return ACTIVITY_FIELD_SEPARATOR.join(
+            (
+                "#{pane_id}",
+                "#{pane_current_command}",
+                "#{session_name}:#{window_id}.#{pane_id}",
+                "#{pane_tty}",
+                "#{socket_path}",
+                "#{pid}",
+                "#{pane_pid}",
+                f"#{{{ACTIVITY_MARKER_OPTION}}}",
+                f"#{{{ACTIVITY_REPORTER_OPTION}}}",
+                f"#{{{ACTIVITY_UPDATED_AT_OPTION}}}",
+                f"#{{{ACTIVITY_RECORD_OPTION}}}",
+            )
+        )
+
+    def _run(
+        self,
+        *arguments: str,
+        write: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            if self.runner is not None:
+                completed = self.runner(self.socket_name, *arguments)
+            else:
+                command = list(self.command)
+                if self.socket_name:
+                    command.extend(("-L", self.socket_name))
+                completed = subprocess.run(
+                    [*command, *arguments],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=self.environment,
+                )
+        except (OSError, subprocess.SubprocessError) as error:
+            error_type = ActivityWriteError if write else ActivityReadError
+            raise error_type(str(error)) from error
+        if completed.returncode != 0:
+            message = completed.stderr.strip() or "tmux rejected the operation"
+            error_type = ActivityWriteError if write else ActivityReadError
+            raise error_type(message)
+        return completed
+
+    @staticmethod
+    def _pane(fields: list[str]) -> PaneActivity:
+        if len(fields) != 11:
+            raise ActivityReadError("tmux returned an invalid activity projection")
+        return PaneActivity(
+            pane_id=fields[0],
+            current_command=fields[1],
+            target=fields[2],
+            pane_tty=fields[3],
+            socket_path=fields[4],
+            server_pid=fields[5],
+            pane_pid=fields[6],
+            marker=fields[7],
+            reporter=fields[8],
+            marker_updated_at=fields[9],
+            record=fields[10],
+        )
+
+    def read(self, target: str) -> PaneActivity:
+        completed = self._run(
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            self.pane_format(),
+        )
+        fields = completed.stdout.rstrip("\n").split(
+            ACTIVITY_FIELD_SEPARATOR,
+            10,
+        )
+        pane = self._pane(fields)
+        if not pane.pane_id or not pane.current_command:
+            raise ActivityReadError(f"pane {target} has no live identity")
+        return pane
+
+    def list_panes(self) -> tuple[str | None, list[ListedPaneActivity]]:
+        pane_format = ACTIVITY_FIELD_SEPARATOR.join(
+            (
+                "#{TMUX_WINDOW_WRAP_ANIMATOR_OWNER}",
+                "#{session_attached}",
+                self.pane_format(),
+            )
+        )
+        completed = self._run("list-panes", "-a", "-F", pane_format)
+        owner = None
+        panes: list[ListedPaneActivity] = []
+        invalid_projection = False
+        for line in completed.stdout.splitlines():
+            fields = line.split(ACTIVITY_FIELD_SEPARATOR, 12)
+            if len(fields) != 13:
+                invalid_projection = True
+                continue
+            if owner is None:
+                owner = fields[0]
+            try:
+                pane = self._pane(fields[2:])
+            except ActivityReadError:
+                invalid_projection = True
+                continue
+            if not pane.pane_id or not pane.current_command:
+                invalid_projection = True
+                continue
+            panes.append(
+                ListedPaneActivity(attached=fields[1] != "0", pane=pane)
+            )
+        if invalid_projection:
+            raise ActivityReadError(
+                "tmux returned an invalid activity projection list"
+            )
+        return owner, panes
+
+    def set_option(self, target: str, option: str, value: str) -> None:
+        self._run(
+            "set-option",
+            "-p",
+            "-t",
+            target,
+            option,
+            value,
+            write=True,
+        )
+
+    def unset_option(self, target: str, option: str) -> None:
+        self._run(
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            target,
+            option,
+            write=True,
+        )
+
+    def wake(self) -> None:
+        if self.wake_callback is not None:
+            try:
+                self.wake_callback(self.socket_name)
+            except (OSError, subprocess.SubprocessError) as error:
+                raise ActivityWriteError(str(error)) from error
+            return
+        self._run(
+            "set-environment",
+            "-g",
+            "TMUX_WINDOW_WRAP_GENERATION",
+            uuid.uuid4().hex,
+            write=True,
+        )
+        clients = self._run("list-clients", "-F", "#{client_name}")
+        for client in clients.stdout.splitlines():
+            if client:
+                self._run(
+                    "refresh-client",
+                    "-S",
+                    "-t",
+                    client,
+                    write=True,
+                )
+
+
+class InMemoryActivityAdapter:
+    """Deterministic projection adapter for interface-level tests."""
+
+    _OPTION_FIELDS = {
+        ACTIVITY_MARKER_OPTION: "marker",
+        ACTIVITY_REPORTER_OPTION: "reporter",
+        ACTIVITY_UPDATED_AT_OPTION: "marker_updated_at",
+        ACTIVITY_RECORD_OPTION: "record",
+    }
+
+    def __init__(
+        self,
+        panes: Iterable[PaneActivity] = (),
+        *,
+        socket_name: str | None = "memory",
+        environment: Mapping[str, str] | None = None,
+        owner: str | None = "owner",
+        attached: bool = True,
+    ) -> None:
+        self.socket_name = socket_name
+        self.lock_identity = socket_name
+        self.environment = dict(environment or {})
+        self.owner = owner
+        self.default_attached = attached
+        self.panes = {pane.pane_id: pane for pane in panes}
+        self.attached = {
+            pane.pane_id: attached for pane in panes
+        }
+        self.writes: list[tuple[str, str, str | None]] = []
+        self.wake_count = 0
+
+    def add(self, pane: PaneActivity, *, attached: bool | None = None) -> None:
+        self.panes[pane.pane_id] = pane
+        self.attached[pane.pane_id] = (
+            self.default_attached if attached is None else attached
+        )
+
+    def _pane_id(self, target: str) -> str:
+        if target in self.panes:
+            return target
+        for pane_id, pane in self.panes.items():
+            if pane.target == target:
+                return pane_id
+        raise ActivityReadError(f"pane {target} is unavailable")
+
+    def read(self, target: str) -> PaneActivity:
+        return self.panes[self._pane_id(target)]
+
+    def list_panes(self) -> tuple[str | None, list[ListedPaneActivity]]:
+        return self.owner, [
+            ListedPaneActivity(self.attached.get(pane_id, False), pane)
+            for pane_id, pane in self.panes.items()
+        ]
+
+    def set_option(self, target: str, option: str, value: str) -> None:
+        pane_id = self._pane_id(target)
+        field = self._OPTION_FIELDS.get(option)
+        if field is None:
+            raise ActivityWriteError(f"unsupported activity option: {option}")
+        self.panes[pane_id] = replace(self.panes[pane_id], **{field: value})
+        self.writes.append((pane_id, option, value))
+
+    def unset_option(self, target: str, option: str) -> None:
+        pane_id = self._pane_id(target)
+        field = self._OPTION_FIELDS.get(option)
+        if field is None:
+            raise ActivityWriteError(f"unsupported activity option: {option}")
+        self.panes[pane_id] = replace(self.panes[pane_id], **{field: ""})
+        self.writes.append((pane_id, option, None))
+
+    def wake(self) -> None:
+        self.wake_count += 1
 
 
 def _default_process_matches(
@@ -754,11 +1160,12 @@ def codex_goal_state(
 
 
 class AgentActivity:
-    """Resolve effective Agent Activity without mutating pane state."""
+    """Own Agent Activity reporting, inspection, and projection repair."""
 
     def __init__(
         self,
         *,
+        adapter: ActivityProjectionAdapter,
         environment: Mapping[str, str] | None = None,
         process_matches: Callable[
             [Mapping[str, object], PaneActivity], bool
@@ -770,9 +1177,13 @@ class AgentActivity:
         process_exists: Callable[[int], bool] | None = None,
         process_tty: Callable[[int], str] | None = None,
     ) -> None:
-        self.environment = dict(
-            os.environ if environment is None else environment
+        self.adapter = adapter
+        source_environment = (
+            adapter.environment
+            if environment is None
+            else environment
         )
+        self.environment = dict(source_environment)
         self.process_matches = process_matches or _default_process_matches
         self.process_started_at = (
             process_started_at or _default_process_started_at
@@ -780,8 +1191,467 @@ class AgentActivity:
         self.process_identity = process_identity or _default_process_identity
         self.process_exists = process_exists or process_is_running
         self.process_tty = process_tty or globals()["process_tty"]
+        self._repair_candidates: dict[str, tuple[str, ...]] = {}
 
     def report(
+        self,
+        target: str,
+        state: str,
+        payload: Mapping[str, object] | None = None,
+        *,
+        hook_event_name: str = "",
+        hook_source: str = "",
+        now_ms: int | None = None,
+    ) -> ActivityReportResult:
+        """Accept a lifecycle report and project it to one live pane."""
+
+        adapter = self.adapter
+        if state not in {"busy", "idle"}:
+            raise ValueError(f"unsupported Agent Activity state: {state}")
+        normalized = dict(payload) if isinstance(payload, Mapping) else {}
+        if hook_event_name and not normalized.get("hook_event_name"):
+            normalized["hook_event_name"] = hook_event_name
+        if hook_source and not normalized.get("source"):
+            normalized["source"] = hook_source
+        event_name = normalized.get("hook_event_name", "")
+        source = normalized.get("source", "")
+
+        try:
+            initial = adapter.read(target)
+        except ActivityReadError:
+            return ActivityReportResult(
+                state="unknown",
+                accepted=False,
+                changed=False,
+            )
+        with pane_activity_lock(
+            adapter.lock_identity,
+            initial.pane_id,
+            self.environment,
+        ):
+            try:
+                pane = adapter.read(initial.pane_id)
+            except ActivityReadError:
+                return ActivityReportResult(
+                    state="unknown",
+                    accepted=False,
+                    changed=False,
+                )
+            if not self._same_live_identity(initial, pane):
+                return ActivityReportResult(
+                    state="unknown",
+                    accepted=False,
+                    changed=False,
+                )
+            if self._ignore_early_codex_idle(
+                state,
+                str(event_name) if isinstance(event_name, str) else "",
+                str(source) if isinstance(source, str) else "",
+                pane.current_command,
+            ):
+                current = self._resolve(pane)
+                return ActivityReportResult(
+                    state=current.state,
+                    accepted=False,
+                    changed=False,
+                )
+
+            timestamp = int(
+                now_ms if now_ms is not None else time.time_ns() // 1_000_000
+            )
+            decision = self._prepare_report(
+                pane,
+                state,
+                normalized,
+                now_ms=timestamp,
+            )
+            if not decision.accepted:
+                return ActivityReportResult(
+                    state=decision.state,
+                    accepted=False,
+                    changed=False,
+                )
+
+            desired_marker = (
+                pane.current_command if decision.state == "busy" else ""
+            )
+            changes: list[tuple[str, str | None]] = []
+            if decision.record != pane.record:
+                # The record is safety truth; compatibility/display fields are
+                # projected only after this write succeeds.
+                changes.append((ACTIVITY_RECORD_OPTION, decision.record))
+            changes.append(
+                (
+                    ACTIVITY_UPDATED_AT_OPTION,
+                    str(timestamp) if decision.state == "busy" else None,
+                )
+            )
+            changes.append((ACTIVITY_REPORTER_OPTION, pane.current_command))
+            changes.append(
+                (ACTIVITY_MARKER_OPTION, desired_marker or None)
+            )
+            changed = self._apply_changes(pane, changes)
+
+            repeated_busy = (
+                decision.state == "busy"
+                and pane.marker == desired_marker
+                and pane.reporter == pane.current_command
+                and event_name != "PreToolUse"
+            )
+            marker_changed = pane.marker != desired_marker
+            if marker_changed or repeated_busy:
+                self._wake_best_effort()
+            return ActivityReportResult(
+                state=decision.state,
+                accepted=True,
+                changed=changed,
+            )
+
+    def inspect(self, target: str) -> ActivityInspection:
+        """Read effective state without repairing or otherwise mutating tmux."""
+
+        try:
+            pane = self.adapter.read(target)
+        except ActivityReadError:
+            return ActivityInspection(
+                state="unknown",
+                reported=False,
+                reason="activity_projection_unavailable",
+                available=False,
+            )
+        return self._inspection(pane)
+
+    def reconcile(self) -> ActivityReconcileResult:
+        """Probe all panes and repair only stable, revalidated evidence."""
+
+        adapter = self.adapter
+        try:
+            owner, listed_panes = adapter.list_panes()
+        except ActivityReadError as error:
+            return ActivityReconcileResult(
+                owner=None,
+                busy=False,
+                changed=False,
+                available=False,
+                errors=(str(error),),
+            )
+
+        live_ids = {listed.pane.pane_id for listed in listed_panes}
+        for pane_id in tuple(self._repair_candidates):
+            if pane_id not in live_ids:
+                self._repair_candidates.pop(pane_id, None)
+
+        busy = False
+        changed = False
+        errors: list[str] = []
+        for listed in listed_panes:
+            pane = listed.pane
+            marked_busy = bool(pane.marker) and pane.marker == pane.current_command
+            if not listed.attached:
+                self._repair_candidates.pop(pane.pane_id, None)
+                continue
+            if not (pane.marker or pane.reporter or pane.record):
+                self._repair_candidates.pop(pane.pane_id, None)
+                continue
+
+            view = self._resolve(pane)
+            stable_repair = (
+                (
+                    _is_codex_command(pane.current_command)
+                    and (marked_busy or pane.record or pane.reporter == pane.current_command)
+                )
+                or (
+                    is_kimi_command(pane.current_command)
+                    and marked_busy
+                    and bool(pane.record)
+                )
+            )
+            if stable_repair and view.repairable:
+                candidate = (
+                    view.state,
+                    pane.record,
+                    pane.marker_updated_at,
+                    view.evidence_turn_id,
+                    view.reason,
+                )
+                if self._repair_candidates.get(pane.pane_id) == candidate:
+                    try:
+                        repaired = self._repair(pane, view)
+                    except ActivityError as error:
+                        repaired = False
+                        errors.append(f"{pane.pane_id}: {error}")
+                    if repaired:
+                        self._repair_candidates.pop(pane.pane_id, None)
+                        changed = True
+                        if view.state == "busy":
+                            busy = True
+                        continue
+                else:
+                    self._repair_candidates[pane.pane_id] = candidate
+                if view.state == "busy" or marked_busy:
+                    busy = True
+                continue
+
+            self._repair_candidates.pop(pane.pane_id, None)
+            legacy_idle = (
+                marked_busy
+                and view.state == "idle"
+                and view.reason in {"claude_registry_idle", "grok_update_idle"}
+            )
+            if legacy_idle:
+                try:
+                    repaired = self._repair_legacy_marker(pane, view)
+                except ActivityError as error:
+                    repaired = False
+                    errors.append(f"{pane.pane_id}: {error}")
+                if repaired:
+                    changed = True
+                    continue
+                busy = True
+                continue
+            if view.state == "busy" or (
+                view.state == "unknown" and marked_busy
+            ):
+                busy = True
+
+        if changed:
+            try:
+                adapter.wake()
+            except ActivityError as error:
+                errors.append(str(error))
+        return ActivityReconcileResult(
+            owner=owner,
+            busy=busy,
+            changed=changed,
+            errors=tuple(errors),
+        )
+
+    def clear(self, target: str) -> bool:
+        """Explicitly remove all Agent Activity projection fields."""
+
+        adapter = self.adapter
+        initial = adapter.read(target)
+        with pane_activity_lock(
+            adapter.lock_identity,
+            initial.pane_id,
+            self.environment,
+        ):
+            pane = adapter.read(initial.pane_id)
+            if not self._same_live_identity(initial, pane):
+                return False
+            return self._apply_changes(
+                pane,
+                [(option, None) for option in ACTIVITY_OPTIONS],
+            )
+
+    def _inspection(self, pane: PaneActivity) -> ActivityInspection:
+        view = self._resolve(pane)
+        return ActivityInspection(
+            state=view.state,
+            reported=view.reported,
+            reason=view.reason,
+            repairable=view.repairable,
+            evidence=view.evidence_turn_id,
+            pane_id=pane.pane_id,
+            current_command=pane.current_command,
+            session=self._validated_session(pane),
+            guard=ActivityGuard(
+                pane_id=pane.pane_id,
+                socket_path=pane.socket_path,
+                server_pid=pane.server_pid,
+                pane_pid=pane.pane_pid,
+                current_command=pane.current_command,
+                marker=pane.marker,
+                reporter=pane.reporter,
+                updated_at=pane.marker_updated_at,
+                record=pane.record,
+            ),
+        )
+
+    def _validated_session(self, pane: PaneActivity) -> ActivitySession | None:
+        record = _record_object(pane.record)
+        if record is None or record.get("version") != 1:
+            return None
+        owner = record.get("owner")
+        identity = record.get("pane")
+        root = record.get("root")
+        session_id = root.get("session_id") if isinstance(root, dict) else None
+        if (
+            not isinstance(owner, str)
+            or not _is_codex_command(owner)
+            or owner != pane.current_command
+            or not isinstance(identity, dict)
+            or identity.get("id") != pane.pane_id
+            or identity.get("socket") != pane.socket_path
+            or str(identity.get("server_pid", "")) != pane.server_pid
+            or not isinstance(session_id, str)
+            or not session_id
+        ):
+            return None
+        return ActivitySession(session_id=session_id, tool_key="x")
+
+    def _apply_changes(
+        self,
+        pane: PaneActivity,
+        changes: Iterable[tuple[str, str | None]],
+    ) -> bool:
+        adapter = self.adapter
+        current = {
+            ACTIVITY_MARKER_OPTION: pane.marker,
+            ACTIVITY_REPORTER_OPTION: pane.reporter,
+            ACTIVITY_UPDATED_AT_OPTION: pane.marker_updated_at,
+            ACTIVITY_RECORD_OPTION: pane.record,
+        }
+        applied: list[tuple[str, str]] = []
+        try:
+            for option, desired in changes:
+                desired_value = desired or ""
+                if current[option] == desired_value:
+                    continue
+                previous = current[option]
+                if desired_value:
+                    adapter.set_option(pane.pane_id, option, desired_value)
+                else:
+                    adapter.unset_option(pane.pane_id, option)
+                current[option] = desired_value
+                applied.append((option, previous))
+        except ActivityError as error:
+            rollback_errors = []
+            for option, previous in reversed(applied):
+                try:
+                    if previous:
+                        adapter.set_option(pane.pane_id, option, previous)
+                    else:
+                        adapter.unset_option(pane.pane_id, option)
+                except ActivityError as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+            detail = f"activity projection write failed: {error}"
+            if rollback_errors:
+                detail += "; rollback failed: " + "; ".join(rollback_errors)
+            raise ActivityWriteError(detail) from error
+        return bool(applied)
+
+    def _repair(self, pane: PaneActivity, view: ActivityView) -> bool:
+        adapter = self.adapter
+        with pane_activity_lock(
+            adapter.lock_identity,
+            pane.pane_id,
+            self.environment,
+        ):
+            fresh = adapter.read(pane.pane_id)
+            if not self._same_projection(fresh, pane):
+                return False
+            fresh_view = self._resolve(fresh)
+            if (
+                fresh_view.state != view.state
+                or fresh_view.reason != view.reason
+                or fresh_view.evidence_turn_id != view.evidence_turn_id
+                or not fresh_view.repairable
+            ):
+                return False
+            changes: list[tuple[str, str | None]] = [
+                (ACTIVITY_RECORD_OPTION, fresh_view.repair_record)
+            ]
+            if fresh_view.state == "idle":
+                changes.extend(
+                    (
+                        (ACTIVITY_MARKER_OPTION, None),
+                        (ACTIVITY_UPDATED_AT_OPTION, None),
+                    )
+                )
+            elif fresh_view.state == "busy":
+                changes.extend(
+                    (
+                        (
+                            ACTIVITY_UPDATED_AT_OPTION,
+                            str(time.time_ns() // 1_000_000),
+                        ),
+                        (ACTIVITY_MARKER_OPTION, fresh.current_command),
+                    )
+                )
+            return self._apply_changes(fresh, changes)
+
+    def _repair_legacy_marker(
+        self,
+        pane: PaneActivity,
+        view: ActivityView,
+    ) -> bool:
+        adapter = self.adapter
+        with pane_activity_lock(
+            adapter.lock_identity,
+            pane.pane_id,
+            self.environment,
+        ):
+            fresh = adapter.read(pane.pane_id)
+            if not self._same_projection(fresh, pane):
+                return False
+            fresh_view = self._resolve(fresh)
+            if (
+                fresh_view.state != "idle"
+                or fresh_view.reason != view.reason
+            ):
+                return False
+            return self._apply_changes(
+                fresh,
+                (
+                    (ACTIVITY_MARKER_OPTION, None),
+                    (ACTIVITY_UPDATED_AT_OPTION, None),
+                ),
+            )
+
+    @staticmethod
+    def _same_projection(left: PaneActivity, right: PaneActivity) -> bool:
+        # A pane id and a canonical coordinate may both address the same pane;
+        # target is routing metadata, not part of the safety identity.
+        return replace(left, target="") == replace(right, target="")
+
+    @staticmethod
+    def _same_live_identity(left: PaneActivity, right: PaneActivity) -> bool:
+        return (
+            left.pane_id,
+            left.current_command,
+            left.pane_tty,
+            left.socket_path,
+            left.server_pid,
+            left.pane_pid,
+        ) == (
+            right.pane_id,
+            right.current_command,
+            right.pane_tty,
+            right.socket_path,
+            right.server_pid,
+            right.pane_pid,
+        )
+
+    def _wake_best_effort(self) -> None:
+        try:
+            self.adapter.wake()
+        except ActivityError:
+            # Projection truth is already durable. The animator's next probe
+            # will observe it even if an eager status refresh was unavailable.
+            pass
+
+    def _ignore_early_codex_idle(
+        self,
+        state: str,
+        hook_event_name: str,
+        hook_source: str,
+        owner: str,
+    ) -> bool:
+        is_early_event = hook_event_name == "Stop" or (
+            hook_event_name == "SessionStart" and hook_source == "compact"
+        )
+        return (
+            state == "idle"
+            and self.environment.get(
+                "TMUX_WINDOW_WRAP_ALLOW_CODEX_STOP_IDLE"
+            )
+            != "1"
+            and is_early_event
+            and _is_codex_command(owner)
+        )
+
+    def _prepare_report(
         self,
         pane: PaneActivity,
         state: str,
@@ -997,7 +1867,7 @@ class AgentActivity:
             wake=True,
         )
 
-    def resolve(self, pane: PaneActivity) -> ActivityView:
+    def _resolve(self, pane: PaneActivity) -> ActivityView:
         record = _record_object(pane.record)
         if record is None:
             busy = bool(pane.marker) and pane.marker == pane.current_command

@@ -1,5 +1,4 @@
 import fcntl
-import io
 import json
 import os
 import pty
@@ -12,7 +11,6 @@ import subprocess
 import termios
 import tempfile
 import time
-import types
 import unittest
 import urllib.parse
 import uuid
@@ -167,55 +165,6 @@ class WindowWrapCliTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertFalse(runs_agent(command))
 
-    def test_codex_stop_idle_is_ignored_for_already_running_agents(self):
-        namespace = runpy.run_path(str(SCRIPT))
-        ignore = namespace["ignore_early_codex_idle"]
-        environment = {}
-
-        self.assertTrue(ignore("idle", "Stop", "", "codex", environment))
-        self.assertTrue(
-            ignore("idle", "Stop", "", "codex-aarch64", environment)
-        )
-        self.assertTrue(
-            ignore("idle", "SessionStart", "compact", "codex", environment)
-        )
-        self.assertFalse(
-            ignore("idle", "SessionStart", "startup", "codex", environment)
-        )
-        self.assertFalse(
-            ignore("idle", "SessionEnd", "", "codex", environment)
-        )
-        self.assertFalse(ignore("busy", "Stop", "", "codex", environment))
-        self.assertFalse(ignore("idle", "Stop", "", "claude", environment))
-
-    def test_codex_stop_idle_compatibility_guard_can_be_overridden(self):
-        namespace = runpy.run_path(str(SCRIPT))
-        ignore = namespace["ignore_early_codex_idle"]
-
-        self.assertFalse(
-            ignore(
-                "idle",
-                "Stop",
-                "",
-                "codex",
-                {"TMUX_WINDOW_WRAP_ALLOW_CODEX_STOP_IDLE": "1"},
-            )
-        )
-
-    def test_hook_context_is_read_from_codex_json_stdin(self):
-        namespace = runpy.run_path(str(SCRIPT))
-        read_hook_context = namespace["read_hook_context"]
-
-        self.assertEqual(
-            read_hook_context(
-                io.StringIO(
-                    '{"hook_event_name":"SessionStart","source":"compact"}'
-                )
-            ),
-            ("SessionStart", "compact"),
-        )
-        self.assertEqual(read_hook_context(io.StringIO("not-json")), ("", ""))
-
     def test_repeated_busy_report_still_invalidates_status_cache(self):
         namespace = runpy.run_path(str(SCRIPT))
         update_pane_activity = namespace["update_pane_activity"]
@@ -234,7 +183,21 @@ class WindowWrapCliTests(unittest.TestCase):
                     else ""
                 )
             elif arguments[0] == "display-message":
-                value = "codex"
+                value = namespace["WINDOW_SEPARATOR"].join(
+                    (
+                        "%1",
+                        "codex",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "codex",
+                        "codex",
+                        "",
+                        "",
+                    )
+                )
             elif arguments[0] == "set-option":
                 value = ""
             else:
@@ -263,7 +226,21 @@ class WindowWrapCliTests(unittest.TestCase):
             if arguments[0] == "show-options":
                 value = "codex"
             elif arguments[0] == "display-message":
-                value = "codex"
+                value = namespace["WINDOW_SEPARATOR"].join(
+                    (
+                        "%1",
+                        "codex",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "codex",
+                        "codex",
+                        "codex",
+                        "codex",
+                    )
+                )
             elif arguments[0] == "set-option":
                 value = ""
             else:
@@ -301,10 +278,17 @@ class WindowWrapCliTests(unittest.TestCase):
             elif arguments[0] == "display-message":
                 value = namespace["WINDOW_SEPARATOR"].join(
                     (
+                        "%12",
                         "codex",
+                        "",
                         "/dev/ttys031",
                         "/private/tmp/tmux/default",
                         "30402",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
                     )
                 )
             elif arguments[0] == "set-option":
@@ -322,7 +306,8 @@ class WindowWrapCliTests(unittest.TestCase):
         script_globals["invalidate_cache"] = lambda socket: events.append(
             ("invalidate-cache", socket)
         )
-        script_globals["AgentActivity"] = lambda **_kwargs: activity_class(
+        script_globals["AgentActivity"] = lambda **kwargs: activity_class(
+            adapter=kwargs.get("adapter"),
             environment={"CODEX_HOME": "/tmp/codex"},
             process_identity=lambda _pane: {
                 "pid": 6322,
@@ -519,12 +504,17 @@ class WindowWrapCliTests(unittest.TestCase):
                 (
                     "owner",
                     "1",
-                    "work:@1.%1",
                     "%1",
-                    "/dev/ttys001",
-                    activity_source["value"],
                     "codex",
+                    "work:@1.%1",
+                    "/dev/ttys001",
+                    "",
+                    "",
+                    "",
+                    activity_source["value"],
+                    "",
                     "1000",
+                    "",
                 )
             )
             return subprocess.CompletedProcess(
@@ -573,15 +563,41 @@ class WindowWrapCliTests(unittest.TestCase):
                         (
                             "owner",
                             "1",
-                            "work:@8.%7",
                             "%7",
+                            "2.1.229",
+                            "work:@8.%7",
                             "/dev/ttys007",
+                            "",
+                            "",
+                            "",
                             "2.1.229",
-                            "2.1.229",
+                            "",
                             "1000",
+                            "",
                         )
                     )
                     stdout = record + "\n"
+                elif arguments[0] == "display-message":
+                    stdout = separator.join(
+                        (
+                            "%7",
+                            "2.1.229",
+                            "work:@8.%7",
+                            "/dev/ttys007",
+                            "",
+                            "",
+                            "",
+                            "2.1.229",
+                            "",
+                            "1000",
+                            "",
+                        )
+                    ) + "\n"
+                elif arguments[0] == "show-options":
+                    stdout = {
+                        "@tmux-window-wrap-activity": "2.1.229",
+                        "@tmux-window-wrap-activity-updated-at": "1000",
+                    }.get(arguments[-1], "") + "\n"
                 else:
                     stdout = ""
                 return subprocess.CompletedProcess(
@@ -592,7 +608,12 @@ class WindowWrapCliTests(unittest.TestCase):
                 )
 
             script_globals["run_tmux"] = fake_run_tmux
-            script_globals["process_tty"] = lambda _pid: "ttys007"
+            activity_class = namespace["AgentActivity"]
+            script_globals["AgentActivity"] = lambda **kwargs: activity_class(
+                adapter=kwargs.get("adapter"),
+                process_exists=lambda _pid: True,
+                process_tty=lambda _pid: "ttys007",
+            )
             script_globals["invalidate_cache"] = lambda socket: events.append(
                 ("invalidate-cache", socket)
             )
@@ -617,30 +638,6 @@ class WindowWrapCliTests(unittest.TestCase):
             events,
         )
         self.assertIn(("invalidate-cache", "test-socket"), events)
-
-    def test_claude_idle_state_cannot_clear_a_newer_busy_marker(self):
-        namespace = runpy.run_path(str(SCRIPT))
-        supersedes = namespace["claude_idle_supersedes_marker"]
-        idle = {
-            "status": "idle",
-            "updated_at": 1_000,
-            "version": "2.1.229",
-            "tty": "ttys007",
-        }
-
-        self.assertFalse(supersedes(idle, "2.1.229", "/dev/ttys007", "1001"))
-        self.assertTrue(supersedes(idle, "2.1.229", "/dev/ttys007", "1000"))
-        self.assertTrue(supersedes(idle, "2.1.229", "/dev/ttys007", ""))
-        self.assertFalse(
-            supersedes(
-                {**idle, "status": "busy", "updated_at": 2_000},
-                "2.1.229",
-                "/dev/ttys007",
-                "1000",
-            )
-        )
-        self.assertFalse(supersedes(idle, "grok", "/dev/ttys007", "1000"))
-        self.assertFalse(supersedes(idle, "2.1.229", "/dev/ttys008", "1000"))
 
     def test_animation_probe_clears_marker_after_grok_cancelled_turn(self):
         namespace = runpy.run_path(str(SCRIPT))
@@ -718,15 +715,41 @@ class WindowWrapCliTests(unittest.TestCase):
                         (
                             "owner",
                             "1",
-                            "work:@8.%7",
                             "%7",
+                            "grok-1.0.3-maco",
+                            "work:@8.%7",
                             "/dev/ttys023",
+                            "",
+                            "",
+                            "",
                             "grok-1.0.3-maco",
-                            "grok-1.0.3-maco",
+                            "",
                             "1786700389907",
+                            "",
                         )
                     )
                     stdout = record + "\n"
+                elif arguments[0] == "display-message":
+                    stdout = separator.join(
+                        (
+                            "%7",
+                            "grok-1.0.3-maco",
+                            "work:@8.%7",
+                            "/dev/ttys023",
+                            "",
+                            "",
+                            "",
+                            "grok-1.0.3-maco",
+                            "",
+                            "1786700389907",
+                            "",
+                        )
+                    ) + "\n"
+                elif arguments[0] == "show-options":
+                    stdout = {
+                        "@tmux-window-wrap-activity": "grok-1.0.3-maco",
+                        "@tmux-window-wrap-activity-updated-at": "1786700389907",
+                    }.get(arguments[-1], "") + "\n"
                 else:
                     stdout = ""
                 return subprocess.CompletedProcess(
@@ -737,7 +760,12 @@ class WindowWrapCliTests(unittest.TestCase):
                 )
 
             script_globals["run_tmux"] = fake_run_tmux
-            script_globals["process_tty"] = lambda _pid: "ttys023"
+            activity_class = namespace["AgentActivity"]
+            script_globals["AgentActivity"] = lambda **kwargs: activity_class(
+                adapter=kwargs.get("adapter"),
+                process_exists=lambda _pid: True,
+                process_tty=lambda _pid: "ttys023",
+            )
             script_globals["invalidate_cache"] = lambda socket: events.append(
                 ("invalidate-cache", socket)
             )
@@ -857,16 +885,17 @@ class WindowWrapCliTests(unittest.TestCase):
                         (
                             "owner",
                             "1",
-                            "work:@8.%7",
                             "%7",
+                            "codex",
+                            "work:@8.%7",
                             "/dev/ttys031",
+                            "/private/tmp/tmux/default",
+                            "30402",
+                            "",
                             "codex",
                             "codex",
                             "1786706587976",
-                            "codex",
                             record,
-                            "/private/tmp/tmux/default",
-                            "30402",
                         )
                     )
                 elif arguments[0] == "show-options":
@@ -879,10 +908,17 @@ class WindowWrapCliTests(unittest.TestCase):
                 elif arguments[0] == "display-message":
                     value = separator.join(
                         (
+                            "%7",
                             "codex",
+                            "work:@8.%7",
                             "/dev/ttys031",
                             "/private/tmp/tmux/default",
                             "30402",
+                            "",
+                            "codex",
+                            "codex",
+                            "1786706587976",
+                            record,
                         )
                     )
                 else:
@@ -895,7 +931,8 @@ class WindowWrapCliTests(unittest.TestCase):
                 )
 
             script_globals["run_tmux"] = fake_run_tmux
-            script_globals["AgentActivity"] = lambda **_kwargs: activity_class(
+            script_globals["AgentActivity"] = lambda **kwargs: activity_class(
+                adapter=kwargs.get("adapter"),
                 process_matches=lambda _process, _pane: True,
             )
             script_globals["invalidate_cache"] = lambda socket: events.append(
@@ -1008,16 +1045,17 @@ class WindowWrapCliTests(unittest.TestCase):
                         (
                             "owner",
                             "1",
-                            "work:@8.%7",
                             "%7",
+                            "kimi",
+                            "work:@8.%7",
                             "/dev/ttys023",
+                            "/private/tmp/tmux/default",
+                            "30402",
+                            "",
                             "kimi",
                             "kimi",
                             "1788328946526",
-                            "kimi",
                             record,
-                            "/private/tmp/tmux/default",
-                            "30402",
                         )
                     )
                 elif arguments[0] == "show-options":
@@ -1032,10 +1070,17 @@ class WindowWrapCliTests(unittest.TestCase):
                 elif arguments[0] == "display-message":
                     value = separator.join(
                         (
+                            "%7",
                             "kimi",
+                            "work:@8.%7",
                             "/dev/ttys023",
                             "/private/tmp/tmux/default",
                             "30402",
+                            "",
+                            "kimi",
+                            "kimi",
+                            "1788328946526",
+                            record,
                         )
                     )
                 else:
@@ -1048,7 +1093,8 @@ class WindowWrapCliTests(unittest.TestCase):
                 )
 
             script_globals["run_tmux"] = fake_run_tmux
-            script_globals["AgentActivity"] = lambda **_kwargs: activity_class(
+            script_globals["AgentActivity"] = lambda **kwargs: activity_class(
+                adapter=kwargs.get("adapter"),
                 process_matches=lambda _process, _pane: True,
             )
             script_globals["invalidate_cache"] = lambda socket: events.append(
@@ -1169,16 +1215,17 @@ class WindowWrapCliTests(unittest.TestCase):
                         (
                             "owner",
                             "1",
-                            "work:@8.%7",
                             "%7",
+                            "codex",
+                            "work:@8.%7",
                             "/dev/ttys031",
-                            "",
-                            "codex",
-                            "",
-                            "codex",
-                            record,
                             "/private/tmp/tmux/default",
                             "30402",
+                            "",
+                            "",
+                            "codex",
+                            "",
+                            record,
                         )
                     )
                 elif arguments[0] == "show-options":
@@ -1189,10 +1236,17 @@ class WindowWrapCliTests(unittest.TestCase):
                 elif arguments[0] == "display-message":
                     value = separator.join(
                         (
+                            "%7",
                             "codex",
+                            "work:@8.%7",
                             "/dev/ttys031",
                             "/private/tmp/tmux/default",
                             "30402",
+                            "",
+                            "",
+                            "codex",
+                            "",
+                            record,
                         )
                     )
                 else:
@@ -1205,7 +1259,8 @@ class WindowWrapCliTests(unittest.TestCase):
                 )
 
             script_globals["run_tmux"] = fake_run_tmux
-            script_globals["AgentActivity"] = lambda **_kwargs: activity_class(
+            script_globals["AgentActivity"] = lambda **kwargs: activity_class(
+                adapter=kwargs.get("adapter"),
                 process_matches=lambda _process, _pane: True,
             )
             script_globals["invalidate_cache"] = lambda socket: events.append(
@@ -1227,179 +1282,10 @@ class WindowWrapCliTests(unittest.TestCase):
             events,
         )
 
-    def test_activity_repair_rejects_reused_pane_identity(self):
+    def test_renderer_does_not_expose_activity_repair_protocol(self):
         namespace = runpy.run_path(str(SCRIPT))
-        repair = namespace["repair_pane_activity"]
-        script_globals = repair.__globals__
-        events = []
-        pane = (
-            "1",
-            "work:@8.%7",
-            "%7",
-            "/dev/ttys031",
-            "codex",
-            "codex",
-            "1000",
-            "codex",
-            "old-record",
-            "/private/tmp/tmux/default",
-            "30402",
-        )
-        view = types.SimpleNamespace(
-            state="idle",
-            repair_record="new-record",
-        )
 
-        def fake_run_tmux(_socket_name, *arguments):
-            events.append(arguments)
-            if arguments[0] == "show-options":
-                value = {
-                    "@tmux-window-wrap-activity-record": "old-record",
-                    "@tmux-window-wrap-activity": "codex",
-                    "@tmux-window-wrap-activity-updated-at": "1000",
-                }[arguments[-1]]
-            elif arguments[0] == "display-message":
-                value = namespace["WINDOW_SEPARATOR"].join(
-                    (
-                        "codex",
-                        "/dev/ttys099",
-                        "/private/tmp/tmux/default",
-                        "30402",
-                    )
-                )
-            else:
-                value = ""
-            return subprocess.CompletedProcess(
-                ["tmux", *arguments],
-                0,
-                stdout=value + "\n",
-                stderr="",
-            )
-
-        script_globals["run_tmux"] = fake_run_tmux
-
-        self.assertFalse(repair("test-socket", pane, view))
-        self.assertFalse(any(event[0] == "set-option" for event in events))
-
-    def test_activity_repair_revalidates_agent_process_inside_lock(self):
-        namespace = runpy.run_path(str(SCRIPT))
-        repair = namespace["repair_pane_activity"]
-        script_globals = repair.__globals__
-        events = []
-        old_record = json.dumps(
-            {
-                "version": 1,
-                "revision": "revision-old-process",
-                "generation": "generation-old-process",
-                "owner": "python3",
-                "reported": "busy",
-                "updated_at": 1_000,
-                "pane": {
-                    "id": "%7",
-                    "tty": "",
-                    "socket": "/private/tmp/tmux/default",
-                    "server_pid": "30402",
-                },
-                "process": {
-                    "pid": os.getpid(),
-                    "started_at": "Mon Jan 01 00:00:00 2001",
-                },
-            },
-            separators=(",", ":"),
-        )
-        pane = (
-            "1",
-            "work:@8.%7",
-            "%7",
-            "",
-            "python3",
-            "python3",
-            "1000",
-            "python3",
-            old_record,
-            "/private/tmp/tmux/default",
-            "30402",
-        )
-        view = types.SimpleNamespace(
-            state="idle",
-            reason="terminal",
-            evidence_turn_id="turn-1",
-            repair_record="new-record",
-        )
-
-        def fake_run_tmux(_socket_name, *arguments):
-            events.append(arguments)
-            if arguments[0] == "show-options":
-                value = {
-                    "@tmux-window-wrap-activity-record": old_record,
-                    "@tmux-window-wrap-activity": "python3",
-                    "@tmux-window-wrap-activity-updated-at": "1000",
-                }[arguments[-1]]
-            elif arguments[0] == "display-message":
-                value = namespace["WINDOW_SEPARATOR"].join(
-                    (
-                        "python3",
-                        "",
-                        "/private/tmp/tmux/default",
-                        "30402",
-                    )
-                )
-            else:
-                value = ""
-            return subprocess.CompletedProcess(
-                ["tmux", *arguments],
-                0,
-                stdout=value + "\n",
-                stderr="",
-            )
-
-        script_globals["run_tmux"] = fake_run_tmux
-
-        self.assertFalse(repair("test-socket", pane, view))
-        self.assertFalse(any(event[0] == "set-option" for event in events))
-
-    def test_grok_completion_cannot_clear_a_newer_busy_marker(self):
-        namespace = runpy.run_path(str(SCRIPT))
-        supersedes = namespace["grok_idle_supersedes_marker"]
-        idle = {
-            "status": "idle",
-            "updated_at": 1_786_700_391_390,
-            "stop_reason": "cancelled",
-            "pid": os.getpid(),
-            "session_id": "e841e6b4-e97e-4ef1-b0b8-a321c7e9f7ce",
-            "tty": "ttys023",
-        }
-
-        self.assertTrue(
-            supersedes(
-                idle,
-                "grok-1.0.3-maco",
-                "/dev/ttys023",
-                "1786700391390",
-            )
-        )
-        self.assertFalse(
-            supersedes(
-                idle,
-                "grok-1.0.3-maco",
-                "/dev/ttys023",
-                "1786700391391",
-            )
-        )
-        self.assertFalse(
-            supersedes(idle, "grok-1.0.3-maco", "/dev/ttys023", "")
-        )
-        self.assertFalse(
-            supersedes(idle, "codex", "/dev/ttys023", "1786700390000")
-        )
-        self.assertFalse(
-            supersedes(
-                idle,
-                "grok-1.0.3-maco",
-                "/dev/ttys024",
-                "1786700390000",
-            )
-        )
+        self.assertNotIn("repair_pane_activity", namespace)
 
     def test_windows_stay_on_one_line_when_they_fit(self):
         result = self.run_plan(

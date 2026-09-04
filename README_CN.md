@@ -66,6 +66,7 @@ AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
 ln -sf "$AIPANE_ROOT/bin/tmux-rename-window-popup" ~/.local/bin/tmux-rename-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
 ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
+ln -sf "$AIPANE_ROOT/bin/aipane-activity" ~/.local/bin/aipane-activity
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
 ln -sf "$AIPANE_ROOT/bin/ai-restart" ~/.local/bin/ai-restart
 ```
@@ -94,9 +95,11 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `bin/tmux-colour-palette` | 终端索引色表（`0–255`） |
 | `bin/tmux-window-jump` | 同数字连按、精确 index 的窗口选择器 |
 | `bin/tmux-window-wrap` | 渲染 CLI |
+| `bin/aipane-activity` | Agent Activity CLI |
 | `bin/ai-restart` | 原地安全重启并续接可恢复的 AI pane |
 | `bin/aipane-restore-executor` | 带验证、重试和持久 pending 意图的恢复执行器 |
 | [`integrations/`](integrations/README.md) | Agent 生命周期 hook 片段与 OpenCode Adapter |
+| `tests/test_agent_activity.py` | Agent Activity 行为测试 |
 | `tests/test_agent_activity_integrations.py` | Agent Activity 契约测试 |
 | `tests/test_restore_executor.py` | 恢复验证、重试与 pending 意图测试 |
 | `tests/test_tmux_window_jump.py` | window-jump 行为 + 真 tmux 测试 |
@@ -109,6 +112,7 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 改 workstation conf 或 wrap 渲染器后：
 
 ```bash
+python3 "$AIPANE_ROOT/tests/test_agent_activity.py"
 python3 "$AIPANE_ROOT/tests/test_agent_activity_integrations.py"
 python3 "$AIPANE_ROOT/tests/test_tmux_window_jump.py"
 python3 "$AIPANE_ROOT/tests/test_workstation_fragments.py"
@@ -267,9 +271,11 @@ killrod --dry-run
 ├── init.zsh                 # zsh 入口
 ├── aipane.zsh               # 兼容入口
 ├── lib/core.zsh
+├── lib/agent_activity.py    # Agent Activity 策略与证据 Adapter
 ├── cmd/                     # ai/pane 与 kill* 命令
 ├── bin/
 │   ├── aipane-cleanup
+│   ├── aipane-activity
 │   ├── aipane-claude-activity
 │   ├── ai-restart
 │   ├── ai-restore
@@ -303,6 +309,7 @@ killrod --dry-run
     ├── aipane-cleanup-contracts.sh
     ├── init-reload.zsh
     ├── test_ai_restart.py
+    ├── test_agent_activity.py
     ├── test_agent_activity_integrations.py
     ├── test_session_restore.py
     ├── test_tmux_window_jump.py
@@ -333,6 +340,7 @@ zsh -fc '
 
 # 可选工作台 / window-wrap
 python3 tests/test_ai_restart.py
+python3 tests/test_agent_activity.py
 python3 tests/test_agent_activity_integrations.py
 python3 tests/test_session_restore.py
 python3 tests/test_restore_executor.py

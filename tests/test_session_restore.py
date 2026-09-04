@@ -50,10 +50,17 @@ class SessionRestoreTests(unittest.TestCase):
                     #!/bin/sh
                     case "$1" in
                       display-message)
-                        printf '/private/tmp/tmux-main\\t999\\n'
+                        case "$*" in
+                          *pane_current_command*)
+                            printf '%%3\\037codex\\0370:@1.%%3\\037\\037/private/tmp/tmux-main\\037999\\037123\\037\\037\\037\\037%s\\n' '{record}'
+                            ;;
+                          *)
+                            printf '/private/tmp/tmux-main\\t999\\n'
+                            ;;
+                        esac
                         ;;
                       list-panes)
-                        printf '%%3\\t0:4.1\\t/Users/test\\tcodex\\t%s\\n' '{record}'
+                        printf '%%3\\t0:4.1\\t/Users/test\\n'
                         ;;
                       *)
                         exit 99
@@ -112,10 +119,17 @@ class SessionRestoreTests(unittest.TestCase):
                     #!/bin/sh
                     case "$1" in
                       display-message)
-                        printf '/private/tmp/tmux-main\\t999\\n'
+                        case "$*" in
+                          *pane_current_command*)
+                            printf '%%3\\037codex\\0370:@1.%%3\\037\\037/private/tmp/tmux-main\\037999\\037123\\037\\037\\037\\037%s\\n' '{record}'
+                            ;;
+                          *)
+                            printf '/private/tmp/tmux-main\\t999\\n'
+                            ;;
+                        esac
                         ;;
                       list-panes)
-                        printf '%%3\\t0:4.1\\t/Users/test\\tcodex\\t%s\\n' '{record}'
+                        printf '%%3\\t0:4.1\\t/Users/test\\n'
                         ;;
                       *)
                         exit 99

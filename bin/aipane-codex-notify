@@ -23,12 +23,12 @@ except ImportError:
 
 
 def report_activity(home: Path, state: str, payload: str) -> None:
-    command = home / ".local" / "bin" / "tmux-window-wrap"
+    command = home / ".local" / "bin" / "aipane-activity"
     if not os.access(command, os.X_OK):
         return
     try:
         subprocess.run(
-            [str(command), "activity", state],
+            [str(command), "report", state],
             input=payload,
             text=True,
             stdout=subprocess.DEVNULL,

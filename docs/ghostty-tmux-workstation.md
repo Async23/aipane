@@ -21,6 +21,7 @@ Optional terminal shell for multi-agent CLI work. **Not** loaded by `init.zsh`.
 | `bin/tmux-rename-window-popup` | stable-target window rename UI (requires `fzf`) |
 | `bin/tmux-colour-palette` | indexed terminal colour palette (`0–255`) |
 | `bin/tmux-window-jump` | repeated-digit exact-index window selector |
+| `bin/aipane-activity` | Agent Activity CLI |
 | `bin/tmux-window-wrap` | renderer (symlink to `~/.local/bin`) |
 | `docs/cheatsheet.md` | key map |
 
@@ -32,6 +33,7 @@ AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
 ln -sf "$AIPANE_ROOT/bin/tmux-rename-window-popup" ~/.local/bin/tmux-rename-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
 ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
+ln -sf "$AIPANE_ROOT/bin/aipane-activity" ~/.local/bin/aipane-activity
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
 ```
 

@@ -22,6 +22,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+
+LIB_DIR = Path(__file__).resolve().parents[1] / "lib"
+if str(LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(LIB_DIR))
+
+from agent_activity import AgentActivity, TmuxActivityAdapter  # noqa: E402
+
 STATE_DIR = Path(
     os.environ.get("AIPANE_STATE_DIR")
     or (Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "aipane")
@@ -29,7 +36,6 @@ STATE_DIR = Path(
 REGISTRY = Path(os.environ.get("AIPANE_REGISTRY") or (STATE_DIR / "registry.jsonl"))
 OUT = STATE_DIR / "coords-last.json"
 TMUX = shlex.split(os.environ.get("AIPANE_TMUX", "tmux"))
-ACTIVITY_RECORD_OPTION = "@tmux-window-wrap-activity-record"
 
 
 def current_server_identity() -> tuple[str, str] | None:
@@ -79,13 +85,9 @@ def latest_by_pane(socket_path: str, server_pid: str) -> dict:
     return result
 
 
-def live_panes() -> list[tuple[str, str, str, str, str]]:
-    """Return live pane coordinates plus their activity/session projection."""
-    fmt = (
-        "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}"
-        "\t#{pane_current_path}\t#{pane_current_command}"
-        f"\t#{{{ACTIVITY_RECORD_OPTION}}}"
-    )
+def live_panes() -> list[tuple[str, str, str]]:
+    """Return the live pane ids, coordinates, and working directories."""
+    fmt = "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_path}"
     try:
         out = subprocess.run(
             [*TMUX, "list-panes", "-a", "-F", fmt],
@@ -98,60 +100,24 @@ def live_panes() -> list[tuple[str, str, str, str, str]]:
     for line in out.splitlines():
         parts = line.split("\t")
         if len(parts) == 3:
-            parts.extend(("", ""))
-        elif len(parts) == 4:
-            # Compatibility for fixture/older wrapper output without command.
-            parts.insert(3, "")
-        if len(parts) == 5:
             rows.append(tuple(parts))
     return rows
-
-
-def activity_binding(
-    pane_id: str,
-    current_command: str,
-    raw: str,
-    server: tuple[str, str] | None,
-) -> dict | None:
-    if not raw:
-        return None
-    try:
-        record = json.loads(raw)
-    except (TypeError, json.JSONDecodeError):
-        return None
-    if not isinstance(record, dict):
-        return None
-    root = record.get("root")
-    pane = record.get("pane")
-    owner = record.get("owner")
-    session_id = root.get("session_id") if isinstance(root, dict) else None
-    if (
-        record.get("version") != 1
-        or not isinstance(session_id, str)
-        or not session_id
-        or not isinstance(owner, str)
-        or not (owner == "codex" or owner.startswith("codex-"))
-        or owner != current_command
-        or server is None
-        or not isinstance(pane, dict)
-        or pane.get("id") != pane_id
-        or pane.get("socket") != server[0]
-        or str(pane.get("server_pid", "")) != server[1]
-    ):
-        return None
-    return {"sid": session_id, "tool": "x"}
 
 
 def main() -> int:
     server = current_server_identity()
     by_pane = latest_by_pane(*server) if server else {}
+    activity = AgentActivity(
+        adapter=TmuxActivityAdapter(command=TMUX)
+    )
     coords: dict[str, dict] = {}
-    for pane_id, coord, cwd, current_command, activity_record in live_panes():
-        rec = activity_binding(
-            pane_id,
-            current_command,
-            activity_record,
-            server,
+    for pane_id, coord, cwd in live_panes():
+        inspection = activity.inspect(pane_id)
+        session = inspection.session
+        rec = (
+            {"sid": session.session_id, "tool": session.tool_key}
+            if session is not None
+            else None
         )
         if rec is None:
             rec = by_pane.get(pane_id)

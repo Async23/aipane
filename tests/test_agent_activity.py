@@ -17,7 +17,16 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
-from agent_activity import AgentActivity, PaneActivity, codex_goal_state  # noqa: E402
+from agent_activity import (  # noqa: E402
+    ACTIVITY_REPORTER_OPTION,
+    ActivityReadError,
+    ActivityWriteError,
+    AgentActivity,
+    InMemoryActivityAdapter,
+    ListedPaneActivity,
+    PaneActivity,
+    codex_goal_state,
+)
 
 
 def make_codex_history(
@@ -198,6 +207,59 @@ def make_kimi_busy_pane(
 
 
 class AgentActivityTests(unittest.TestCase):
+    def activity_for(self, pane: PaneActivity, **kwargs):
+        environment = kwargs.get("environment")
+        adapter = InMemoryActivityAdapter(
+            [pane],
+            environment=environment,
+        )
+        return AgentActivity(adapter=adapter, **kwargs), adapter
+
+    def test_projection_read_failure_is_reported_as_unknown(self):
+        class UnavailableAdapter(InMemoryActivityAdapter):
+            def read(self, target):
+                raise ActivityReadError(f"{target} disappeared")
+
+            def list_panes(self):
+                raise ActivityReadError("tmux unavailable")
+
+        activity = AgentActivity(adapter=UnavailableAdapter())
+        result = activity.inspect("%9")
+
+        self.assertFalse(result.available)
+        self.assertEqual(result.state, "unknown")
+        self.assertEqual(result.reason, "activity_projection_unavailable")
+        report = activity.report("%9", "busy")
+        self.assertEqual(report.state, "unknown")
+        self.assertFalse(report.accepted)
+        reconcile = activity.reconcile()
+        self.assertFalse(reconcile.available)
+        self.assertTrue(reconcile.errors)
+
+    def test_failed_projection_change_rolls_back_prior_writes(self):
+        pane = PaneActivity(
+            pane_id="%7",
+            current_command="codex",
+            marker="codex",
+            reporter="codex",
+            marker_updated_at="1000",
+            record='{"version":1}',
+        )
+
+        class FailingAdapter(InMemoryActivityAdapter):
+            def unset_option(self, target, option):
+                if option == ACTIVITY_REPORTER_OPTION:
+                    raise ActivityWriteError("synthetic failure")
+                super().unset_option(target, option)
+
+        adapter = FailingAdapter([pane])
+        activity = AgentActivity(adapter=adapter)
+
+        with self.assertRaisesRegex(ActivityWriteError, "synthetic failure"):
+            activity.clear(pane.pane_id)
+
+        self.assertEqual(adapter.read(pane.pane_id), pane)
+
     def test_unrecognized_codex_goal_status_fails_closed(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             codex_home = Path(raw_tmp)
@@ -249,7 +311,8 @@ class AgentActivityTests(unittest.TestCase):
             reporter="codex",
             marker_updated_at="1786706587976",
         )
-        resolver = AgentActivity(
+        resolver, _adapter = self.activity_for(
+            pane,
             environment={
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
@@ -379,13 +442,64 @@ class AgentActivityTests(unittest.TestCase):
                 record=record,
             )
 
-            view = AgentActivity(
+            resolver, adapter = self.activity_for(
+                pane,
                 process_matches=lambda _process, _pane: True,
-            ).resolve(pane)
+            )
+            view = resolver.inspect(pane.pane_id)
 
             self.assertEqual(view.state, "idle")
             self.assertTrue(view.repairable)
-            self.assertEqual(view.evidence_turn_id, "turn-1")
+            self.assertEqual(view.evidence, "turn-1")
+
+            self.assertTrue(resolver.reconcile().busy)
+            stale = adapter.read(pane.pane_id)
+            adapter.list_panes = lambda: (
+                "owner",
+                [ListedPaneActivity(True, stale)],
+            )
+            adapter.add(
+                PaneActivity(
+                    **{**stale.__dict__, "pane_tty": "/dev/ttys099"}
+                )
+            )
+            write_count = len(adapter.writes)
+            raced = resolver.reconcile()
+            self.assertFalse(raced.changed)
+            self.assertTrue(raced.busy)
+            self.assertEqual(len(adapter.writes), write_count)
+
+    def test_codex_early_idle_report_is_ignored_unless_compatibility_is_enabled(self):
+        pane = PaneActivity(
+            pane_id="%12",
+            current_command="codex",
+            marker="codex",
+            reporter="codex",
+        )
+        activity, adapter = self.activity_for(pane)
+
+        ignored = activity.report(
+            pane.pane_id,
+            "idle",
+            {"hook_event_name": "Stop"},
+            now_ms=2_000,
+        )
+
+        self.assertFalse(ignored.accepted)
+        self.assertEqual(adapter.read(pane.pane_id).marker, "codex")
+
+        compatible, compatible_adapter = self.activity_for(
+            pane,
+            environment={"TMUX_WINDOW_WRAP_ALLOW_CODEX_STOP_IDLE": "1"},
+        )
+        accepted = compatible.report(
+            pane.pane_id,
+            "idle",
+            {"hook_event_name": "Stop"},
+            now_ms=2_000,
+        )
+        self.assertTrue(accepted.accepted)
+        self.assertEqual(compatible_adapter.read(pane.pane_id).marker, "")
 
     def test_legacy_codex_marker_uses_matching_registry_binding(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -424,7 +538,8 @@ class AgentActivityTests(unittest.TestCase):
                 marker_updated_at="1786706587976",
             )
 
-            resolver = AgentActivity(
+            resolver, adapter = self.activity_for(
+                pane,
                 environment={
                     "HOME": str(home),
                     "CODEX_HOME": str(codex_home),
@@ -432,24 +547,18 @@ class AgentActivityTests(unittest.TestCase):
                 },
                 process_started_at=lambda _pane: 1_786_705_241_000,
             )
-            view = resolver.resolve(pane)
+            view = resolver.inspect(pane.pane_id)
 
             self.assertEqual(view.state, "idle")
             self.assertTrue(view.repairable)
-            self.assertEqual(view.evidence_turn_id, "turn-failed")
+            self.assertEqual(view.evidence, "turn-failed")
 
-            repaired = resolver.resolve(
-                PaneActivity(
-                    **{
-                        **pane.__dict__,
-                        "marker": "",
-                        "marker_updated_at": "",
-                        "record": view.repair_record,
-                    }
-                )
-            )
+            self.assertTrue(resolver.reconcile().busy)
+            self.assertTrue(resolver.reconcile().changed)
+            repaired = resolver.inspect(pane.pane_id)
             self.assertEqual(repaired.state, "idle")
             self.assertEqual(repaired.reason, "codex_turn_failed")
+            self.assertTrue(adapter.read(pane.pane_id).record)
 
     def test_later_codex_turn_prevents_old_terminal_from_clearing_busy(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -467,11 +576,11 @@ class AgentActivityTests(unittest.TestCase):
                 "thread-continuing",
             )
 
-            view = resolver.resolve(pane)
+            view = resolver.inspect(pane.pane_id)
 
             self.assertEqual(view.state, "busy")
             self.assertFalse(view.repairable)
-            self.assertEqual(view.evidence_turn_id, "turn-new")
+            self.assertEqual(view.evidence, "turn-new")
 
     def test_stale_codex_projection_falls_back_to_canonical_rollout(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -502,7 +611,7 @@ class AgentActivityTests(unittest.TestCase):
                 "thread-rollout",
             )
 
-            view = resolver.resolve(pane)
+            view = resolver.inspect(pane.pane_id)
 
             self.assertEqual(view.state, "idle")
             self.assertEqual(view.reason, "codex_rollout_turn_failed")
@@ -549,9 +658,11 @@ class AgentActivityTests(unittest.TestCase):
                 record=record,
             )
 
-            view = AgentActivity(
+            resolver, _adapter = self.activity_for(
+                pane,
                 process_matches=lambda _process, _pane: True,
-            ).resolve(pane)
+            )
+            view = resolver.inspect(pane.pane_id)
 
             self.assertEqual(view.state, "idle")
             self.assertEqual(view.reason, "codex_session_idle")
@@ -571,15 +682,22 @@ class AgentActivityTests(unittest.TestCase):
             "transcript_path": "/tmp/codex/sessions/prompt.jsonl",
         }
 
-        report = AgentActivity(
+        activity, adapter = self.activity_for(
+            pane,
             environment={"CODEX_HOME": "/tmp/codex"},
             process_identity=lambda _pane: {
                 "pid": 6322,
                 "started_at": "Fri Aug 14 19:00:41 2026",
             },
-        ).report(pane, "busy", payload, now_ms=1_786_706_587_976)
+        )
+        report = activity.report(
+            pane.pane_id,
+            "busy",
+            payload,
+            now_ms=1_786_706_587_976,
+        )
 
-        record = json.loads(report.record)
+        record = json.loads(adapter.read(pane.pane_id).record)
         self.assertEqual(report.state, "busy")
         self.assertEqual(
             record["root"],
@@ -598,19 +716,20 @@ class AgentActivityTests(unittest.TestCase):
             "pid": 6322,
             "started_at": "Fri Aug 14 19:00:41 2026",
         }
-        activity = AgentActivity(
+        activity, adapter = self.activity_for(
+            PaneActivity(
+                pane_id="%12",
+                current_command="codex",
+                pane_tty="/dev/ttys031",
+                socket_path="/private/tmp/tmux/default",
+                server_pid="30402",
+            ),
             environment={"CODEX_HOME": "/tmp/codex"},
             process_identity=lambda _pane: process,
         )
-        pane = PaneActivity(
-            pane_id="%12",
-            current_command="codex",
-            pane_tty="/dev/ttys031",
-            socket_path="/private/tmp/tmux/default",
-            server_pid="30402",
-        )
+        pane = adapter.read("%12")
         busy = activity.report(
-            pane,
+            pane.pane_id,
             "busy",
             {
                 "hook_event_name": "UserPromptSubmit",
@@ -620,18 +739,10 @@ class AgentActivityTests(unittest.TestCase):
             },
             now_ms=2_000,
         )
-        busy_pane = PaneActivity(
-            **{
-                **pane.__dict__,
-                "marker": "codex",
-                "reporter": "codex",
-                "marker_updated_at": "2000",
-                "record": busy.record,
-            }
-        )
+        busy_record = adapter.read(pane.pane_id).record
 
         late = activity.report(
-            busy_pane,
+            pane.pane_id,
             "idle",
             {
                 "type": "agent-turn-complete",
@@ -643,7 +754,7 @@ class AgentActivityTests(unittest.TestCase):
 
         self.assertFalse(late.accepted)
         self.assertEqual(late.state, "busy")
-        self.assertEqual(late.record, busy.record)
+        self.assertEqual(adapter.read(pane.pane_id).record, busy_record)
 
     def test_matching_completion_preserves_turn_start_for_later_resolution(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -661,11 +772,6 @@ class AgentActivityTests(unittest.TestCase):
                 ],
             )
             process = {"pid": 6322, "started_at": "process-1"}
-            activity = AgentActivity(
-                environment={"CODEX_HOME": str(codex_home)},
-                process_identity=lambda _pane: process,
-                process_matches=lambda _process, _pane: True,
-            )
             pane = PaneActivity(
                 pane_id="%12",
                 current_command="codex",
@@ -673,8 +779,14 @@ class AgentActivityTests(unittest.TestCase):
                 socket_path="/private/tmp/tmux/default",
                 server_pid="30402",
             )
-            busy = activity.report(
+            activity, adapter = self.activity_for(
                 pane,
+                environment={"CODEX_HOME": str(codex_home)},
+                process_identity=lambda _pane: process,
+                process_matches=lambda _process, _pane: True,
+            )
+            busy = activity.report(
+                pane.pane_id,
                 "busy",
                 {
                     "hook_event_name": "UserPromptSubmit",
@@ -684,18 +796,10 @@ class AgentActivityTests(unittest.TestCase):
                 },
                 now_ms=1_786_706_587_976,
             )
-            busy_pane = PaneActivity(
-                **{
-                    **pane.__dict__,
-                    "marker": "codex",
-                    "reporter": "codex",
-                    "marker_updated_at": "1786706587976",
-                    "record": busy.record,
-                }
-            )
+            busy_record = adapter.read(pane.pane_id).record
 
             completed = activity.report(
-                busy_pane,
+                pane.pane_id,
                 "idle",
                 {
                     "type": "agent-turn-complete",
@@ -704,17 +808,8 @@ class AgentActivityTests(unittest.TestCase):
                 },
                 now_ms=1_786_707_037_000,
             )
-            completed_record = json.loads(completed.record)
-            resolved = activity.resolve(
-                PaneActivity(
-                    **{
-                        **busy_pane.__dict__,
-                        "marker": "",
-                        "marker_updated_at": "",
-                        "record": completed.record,
-                    }
-                )
-            )
+            completed_record = json.loads(adapter.read(pane.pane_id).record)
+            resolved = activity.inspect(pane.pane_id)
 
             self.assertEqual(
                 completed_record["updated_at"],
@@ -732,8 +827,9 @@ class AgentActivityTests(unittest.TestCase):
             marker_updated_at="2000",
         )
 
-        completion = AgentActivity().report(
-            pane,
+        activity, adapter = self.activity_for(pane)
+        completion = activity.report(
+            pane.pane_id,
             "idle",
             {
                 "type": "agent-turn-complete",
@@ -745,14 +841,10 @@ class AgentActivityTests(unittest.TestCase):
 
         self.assertFalse(completion.accepted)
         self.assertEqual(completion.state, "busy")
-        self.assertEqual(completion.record, "")
+        self.assertEqual(adapter.read(pane.pane_id).record, "")
 
     def test_codex_subagent_progress_does_not_replace_root_turn(self):
         process = {"pid": 6322, "started_at": "process-1"}
-        activity = AgentActivity(
-            environment={"CODEX_HOME": "/tmp/codex"},
-            process_identity=lambda _pane: process,
-        )
         pane = PaneActivity(
             pane_id="%12",
             current_command="codex",
@@ -760,8 +852,13 @@ class AgentActivityTests(unittest.TestCase):
             socket_path="/private/tmp/tmux/default",
             server_pid="30402",
         )
-        root = activity.report(
+        activity, adapter = self.activity_for(
             pane,
+            environment={"CODEX_HOME": "/tmp/codex"},
+            process_identity=lambda _pane: process,
+        )
+        root = activity.report(
+            pane.pane_id,
             "busy",
             {
                 "hook_event_name": "UserPromptSubmit",
@@ -771,18 +868,11 @@ class AgentActivityTests(unittest.TestCase):
             },
             now_ms=2_000,
         )
-        busy_pane = PaneActivity(
-            **{
-                **pane.__dict__,
-                "marker": "codex",
-                "reporter": "codex",
-                "marker_updated_at": "2000",
-                "record": root.record,
-            }
-        )
+        root_record = adapter.read(pane.pane_id).record
+        wake_count = adapter.wake_count
 
         progress = activity.report(
-            busy_pane,
+            pane.pane_id,
             "busy",
             {
                 "hook_event_name": "PreToolUse",
@@ -795,15 +885,11 @@ class AgentActivityTests(unittest.TestCase):
         )
 
         self.assertTrue(progress.accepted)
-        self.assertFalse(progress.wake)
-        self.assertEqual(progress.record, root.record)
+        self.assertEqual(adapter.wake_count, wake_count)
+        self.assertEqual(adapter.read(pane.pane_id).record, root_record)
 
     def test_root_pre_tool_use_rebinds_when_a_new_turn_was_missed(self):
         process = {"pid": 6322, "started_at": "process-1"}
-        activity = AgentActivity(
-            environment={"CODEX_HOME": "/tmp/codex"},
-            process_identity=lambda _pane: process,
-        )
         pane = PaneActivity(
             pane_id="%12",
             current_command="codex",
@@ -811,8 +897,13 @@ class AgentActivityTests(unittest.TestCase):
             socket_path="/private/tmp/tmux/default",
             server_pid="30402",
         )
-        old_turn = activity.report(
+        activity, adapter = self.activity_for(
             pane,
+            environment={"CODEX_HOME": "/tmp/codex"},
+            process_identity=lambda _pane: process,
+        )
+        old_turn = activity.report(
+            pane.pane_id,
             "busy",
             {
                 "hook_event_name": "UserPromptSubmit",
@@ -822,18 +913,10 @@ class AgentActivityTests(unittest.TestCase):
             },
             now_ms=2_000,
         )
-        busy_pane = PaneActivity(
-            **{
-                **pane.__dict__,
-                "marker": "codex",
-                "reporter": "codex",
-                "marker_updated_at": "2000",
-                "record": old_turn.record,
-            }
-        )
+        old_record = adapter.read(pane.pane_id).record
 
         new_turn = activity.report(
-            busy_pane,
+            pane.pane_id,
             "busy",
             {
                 "hook_event_name": "PreToolUse",
@@ -844,11 +927,10 @@ class AgentActivityTests(unittest.TestCase):
             now_ms=2_100,
         )
 
-        before = json.loads(old_turn.record)
-        after = json.loads(new_turn.record)
+        before = json.loads(old_record)
+        after = json.loads(adapter.read(pane.pane_id).record)
         self.assertEqual(after["root"]["turn_id"], "turn-new")
         self.assertNotEqual(after["generation"], before["generation"])
-        self.assertTrue(new_turn.wake)
 
     def test_reused_process_id_does_not_validate_a_stale_record(self):
         pane = PaneActivity(
@@ -880,17 +962,14 @@ class AgentActivityTests(unittest.TestCase):
             ),
         )
 
-        view = AgentActivity().resolve(pane)
+        activity, _adapter = self.activity_for(pane)
+        view = activity.inspect(pane.pane_id)
 
         self.assertEqual(view.state, "unknown")
         self.assertEqual(view.reason, "activity_identity_mismatch")
 
     def test_old_codex_session_end_cannot_clear_new_session(self):
         process = {"pid": 6322, "started_at": "process-1"}
-        activity = AgentActivity(
-            environment={"CODEX_HOME": "/tmp/codex"},
-            process_identity=lambda _pane: process,
-        )
         pane = PaneActivity(
             pane_id="%12",
             current_command="codex",
@@ -898,8 +977,13 @@ class AgentActivityTests(unittest.TestCase):
             socket_path="/private/tmp/tmux/default",
             server_pid="30402",
         )
-        busy = activity.report(
+        activity, adapter = self.activity_for(
             pane,
+            environment={"CODEX_HOME": "/tmp/codex"},
+            process_identity=lambda _pane: process,
+        )
+        busy = activity.report(
+            pane.pane_id,
             "busy",
             {
                 "hook_event_name": "UserPromptSubmit",
@@ -909,18 +993,10 @@ class AgentActivityTests(unittest.TestCase):
             },
             now_ms=2_000,
         )
-        busy_pane = PaneActivity(
-            **{
-                **pane.__dict__,
-                "marker": "codex",
-                "reporter": "codex",
-                "marker_updated_at": "2000",
-                "record": busy.record,
-            }
-        )
+        busy_record = adapter.read(pane.pane_id).record
 
         ended = activity.report(
-            busy_pane,
+            pane.pane_id,
             "idle",
             {
                 "hook_event_name": "SessionEnd",
@@ -931,7 +1007,7 @@ class AgentActivityTests(unittest.TestCase):
 
         self.assertFalse(ended.accepted)
         self.assertEqual(ended.state, "busy")
-        self.assertEqual(ended.record, busy.record)
+        self.assertEqual(adapter.read(pane.pane_id).record, busy_record)
 
     def test_claude_idle_registry_resolves_stale_busy_through_same_interface(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -979,15 +1055,25 @@ class AgentActivityTests(unittest.TestCase):
                 ),
             )
 
-            view = AgentActivity(
+            activity, adapter = self.activity_for(
+                pane,
                 environment={"CLAUDE_CONFIG_DIR": str(config)},
                 process_matches=lambda _process, _pane: True,
                 process_exists=lambda _pid: True,
                 process_tty=lambda _pid: "ttys007",
-            ).resolve(pane)
+            )
+            view = activity.inspect(pane.pane_id)
 
             self.assertEqual(view.state, "idle")
             self.assertEqual(view.reason, "claude_registry_idle")
+
+            adapter.add(
+                PaneActivity(
+                    **{**pane.__dict__, "marker_updated_at": "2001"}
+                )
+            )
+            newer = activity.inspect(pane.pane_id)
+            self.assertEqual(newer.state, "busy")
 
     def test_grok_completion_resolves_stale_busy_through_same_interface(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -1034,14 +1120,24 @@ class AgentActivityTests(unittest.TestCase):
                 marker_updated_at="1000",
             )
 
-            view = AgentActivity(
+            activity, adapter = self.activity_for(
+                pane,
                 environment={"GROK_HOME": str(grok_home)},
                 process_exists=lambda _pid: True,
                 process_tty=lambda _pid: "ttys023",
-            ).resolve(pane)
+            )
+            view = activity.inspect(pane.pane_id)
 
             self.assertEqual(view.state, "idle")
             self.assertEqual(view.reason, "grok_update_idle")
+
+            adapter.add(
+                PaneActivity(
+                    **{**pane.__dict__, "marker_updated_at": "2000001"}
+                )
+            )
+            newer = activity.inspect(pane.pane_id)
+            self.assertEqual(newer.state, "busy")
 
     def test_kimi_turn_end_resolves_busy_when_original_cwd_was_renamed(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -1069,14 +1165,16 @@ class AgentActivityTests(unittest.TestCase):
             )
             pane = make_kimi_busy_pane(kimi_home, session_id)
 
-            view = AgentActivity(
+            activity, _adapter = self.activity_for(
+                pane,
                 environment={"KIMI_CODE_HOME": str(kimi_home)},
                 process_matches=lambda _process, _pane: True,
-            ).resolve(pane)
+            )
+            view = activity.inspect(pane.pane_id)
 
             self.assertEqual(view.state, "idle")
             self.assertEqual(view.reason, "kimi_turn_ended")
-            self.assertEqual(view.evidence_turn_id, "0")
+            self.assertEqual(view.evidence, "0")
             self.assertTrue(view.repairable)
 
     def test_newer_kimi_prompt_prevents_previous_end_from_clearing_busy(self):
@@ -1111,9 +1209,11 @@ class AgentActivityTests(unittest.TestCase):
             )
             pane = make_kimi_busy_pane(kimi_home, session_id)
 
-            view = AgentActivity(
+            activity, _adapter = self.activity_for(
+                pane,
                 process_matches=lambda _process, _pane: True,
-            ).resolve(pane)
+            )
+            view = activity.inspect(pane.pane_id)
 
             self.assertEqual(view.state, "busy")
             self.assertEqual(view.reason, "reported_activity")
@@ -1145,9 +1245,11 @@ class AgentActivityTests(unittest.TestCase):
             )
             pane = make_kimi_busy_pane(kimi_home, session_id)
 
-            view = AgentActivity(
+            activity, _adapter = self.activity_for(
+                pane,
                 process_matches=lambda _process, _pane: True,
-            ).resolve(pane)
+            )
+            view = activity.inspect(pane.pane_id)
 
             self.assertEqual(view.state, "busy")
             self.assertFalse(view.repairable)
@@ -1174,10 +1276,12 @@ class AgentActivityTests(unittest.TestCase):
                 ),
             ),
         ):
-            report = AgentActivity(
-                environment={"KIMI_CODE_HOME": "/tmp/kimi-home"},
-            ).report(
+            activity, adapter = self.activity_for(
                 pane,
+                environment={"KIMI_CODE_HOME": "/tmp/kimi-home"},
+            )
+            report = activity.report(
+                pane.pane_id,
                 "busy",
                 {
                     "hook_event_name": "TurnStarted",
@@ -1188,7 +1292,7 @@ class AgentActivityTests(unittest.TestCase):
                 now_ms=1_788_328_946_526,
             )
 
-        record = json.loads(report.record)
+        record = json.loads(adapter.read(pane.pane_id).record)
         self.assertEqual(
             record["session"],
             {
@@ -1203,10 +1307,6 @@ class AgentActivityTests(unittest.TestCase):
 
     def test_subagent_can_promote_idle_without_replacing_root_binding(self):
         process = {"pid": 6322, "started_at": "process-1"}
-        activity = AgentActivity(
-            environment={"CODEX_HOME": "/tmp/codex"},
-            process_identity=lambda _pane: process,
-        )
         pane = PaneActivity(
             pane_id="%12",
             current_command="codex",
@@ -1214,8 +1314,13 @@ class AgentActivityTests(unittest.TestCase):
             socket_path="/private/tmp/tmux/default",
             server_pid="30402",
         )
-        session = activity.report(
+        activity, adapter = self.activity_for(
             pane,
+            environment={"CODEX_HOME": "/tmp/codex"},
+            process_identity=lambda _pane: process,
+        )
+        session = activity.report(
+            pane.pane_id,
             "idle",
             {
                 "hook_event_name": "SessionStart",
@@ -1225,16 +1330,10 @@ class AgentActivityTests(unittest.TestCase):
             },
             now_ms=2_000,
         )
-        idle_pane = PaneActivity(
-            **{
-                **pane.__dict__,
-                "reporter": "codex",
-                "record": session.record,
-            }
-        )
+        session_record = adapter.read(pane.pane_id).record
 
         progress = activity.report(
-            idle_pane,
+            pane.pane_id,
             "busy",
             {
                 "hook_event_name": "PreToolUse",
@@ -1246,8 +1345,8 @@ class AgentActivityTests(unittest.TestCase):
             now_ms=2_100,
         )
 
-        before = json.loads(session.record)
-        after = json.loads(progress.record)
+        before = json.loads(session_record)
+        after = json.loads(adapter.read(pane.pane_id).record)
         self.assertEqual(progress.state, "busy")
         self.assertEqual(after["root"], before["root"])
         self.assertEqual(after["generation"], before["generation"])

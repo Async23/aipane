@@ -28,6 +28,11 @@ LIB_DIR = Path(__file__).resolve().parents[1] / "lib"
 if str(LIB_DIR) not in sys.path:
     sys.path.insert(0, str(LIB_DIR))
 
+from agent_activity import (  # noqa: E402
+    ActivityError,
+    AgentActivity,
+    TmuxActivityAdapter,
+)
 from recovery_plan import GUARD_FIELDS, RecoveryPlanError, load_sealed_plan
 
 
@@ -53,12 +58,6 @@ TOOL_TAGS = {
 }
 PENDING_VERSION = 1
 FIELD_SEPARATOR = "\x1f"
-ACTIVITY_OPTIONS = (
-    "@tmux-window-wrap-activity",
-    "@tmux-window-wrap-activity-reporter",
-    "@tmux-window-wrap-activity-updated-at",
-    "@tmux-window-wrap-activity-record",
-)
 
 
 class RestoreExecutionError(RuntimeError):
@@ -210,6 +209,12 @@ class Tmux:
         self.command = shlex.split(environment.get("AIPANE_TMUX", "tmux"))
         if not self.command:
             raise RestoreExecutionError("AIPANE_TMUX resolved to an empty command")
+        self.activity = AgentActivity(
+            adapter=TmuxActivityAdapter(
+                command=self.command,
+                environment=environment,
+            )
+        )
 
     def run(
         self,
@@ -255,26 +260,10 @@ class Tmux:
         return fields[0], fields[1], fields[2]
 
     def recovery_guard(self, target: str) -> dict[str, str] | None:
-        pane_format = FIELD_SEPARATOR.join(
-            (
-                "#{pane_id}",
-                "#{socket_path}",
-                "#{pid}",
-                "#{pane_pid}",
-                "#{pane_current_command}",
-                "#{@tmux-window-wrap-activity}",
-                "#{@tmux-window-wrap-activity-reporter}",
-                "#{@tmux-window-wrap-activity-updated-at}",
-                "#{@tmux-window-wrap-activity-record}",
-            )
-        )
-        completed = self.run("display-message", "-p", "-t", target, pane_format)
-        if completed.returncode != 0:
+        inspection = self.activity.inspect(target)
+        if not inspection.available or inspection.guard is None:
             return None
-        fields = completed.stdout.rstrip("\n").split(FIELD_SEPARATOR, len(GUARD_FIELDS) - 1)
-        if len(fields) != len(GUARD_FIELDS):
-            return None
-        guard = dict(zip(GUARD_FIELDS, fields, strict=True))
+        guard = inspection.guard.as_dict()
         if any(not guard[field_name] for field_name in GUARD_FIELDS[:5]):
             return None
         return guard
@@ -410,10 +399,10 @@ class Tmux:
         return completed.stderr.strip() or "tmux rejected respawn-pane"
 
     def clear_activity(self, target: str) -> str:
-        for option in ACTIVITY_OPTIONS:
-            completed = self.run("set-option", "-p", "-u", "-t", target, option)
-            if completed.returncode != 0:
-                return completed.stderr.strip() or f"could not unset {option}"
+        try:
+            self.activity.clear(target)
+        except ActivityError as error:
+            return str(error)
         return ""
 
     def notify(self, message: str) -> None:

@@ -18,15 +18,8 @@ LIB_DIR = Path(__file__).resolve().parents[1] / "lib"
 if str(LIB_DIR) not in sys.path:
     sys.path.insert(0, str(LIB_DIR))
 
-from agent_activity import AgentActivity, PaneActivity
+from agent_activity import AgentActivity, TmuxActivityAdapter
 from recovery_plan import GUARD_FIELDS, RecoveryPlanError, seal_plan
-
-
-FIELD_SEPARATOR = "\x1f"
-ACTIVITY_OPTION = "@tmux-window-wrap-activity"
-ACTIVITY_REPORTER_OPTION = "@tmux-window-wrap-activity-reporter"
-ACTIVITY_UPDATED_AT_OPTION = "@tmux-window-wrap-activity-updated-at"
-ACTIVITY_RECORD_OPTION = "@tmux-window-wrap-activity-record"
 
 
 class RestartError(RuntimeError):
@@ -171,88 +164,30 @@ def pane_state(
     target: str,
     resolver: AgentActivity | None = None,
 ) -> dict[str, object] | None:
-    pane_format = FIELD_SEPARATOR.join(
-        (
-            "#{pane_id}",
-            "#{pane_current_command}",
-            "#{session_name}:#{window_id}.#{pane_id}",
-            "#{pane_tty}",
-            "#{socket_path}",
-            "#{pid}",
-            "#{pane_pid}",
-            f"#{{{ACTIVITY_OPTION}}}",
-            f"#{{{ACTIVITY_REPORTER_OPTION}}}",
-            f"#{{{ACTIVITY_UPDATED_AT_OPTION}}}",
-            f"#{{{ACTIVITY_RECORD_OPTION}}}",
-        )
+    resolver = resolver or AgentActivity(
+        adapter=TmuxActivityAdapter(command=tmux.command)
     )
-    completed = tmux.run(
-        "display-message",
-        "-p",
-        "-t",
-        target,
-        pane_format,
-        check=False,
-    )
-    if completed.returncode != 0:
+    view = resolver.inspect(target)
+    if not view.available or view.guard is None:
         return None
-    fields = completed.stdout.rstrip("\n").split(FIELD_SEPARATOR, 10)
-    if len(fields) != 11:
-        return None
-    (
-        pane_id,
-        current_command,
-        canonical_target,
-        pane_tty,
-        socket_path,
-        server_pid,
-        pane_pid,
-        activity_marker,
-        activity_reporter,
-        activity_updated_at,
-        activity_record,
-    ) = fields
-    resolver = resolver or AgentActivity()
-    view = resolver.resolve(
-        PaneActivity(
-            pane_id=pane_id,
-            current_command=current_command,
-            target=canonical_target,
-            pane_tty=pane_tty,
-            socket_path=socket_path,
-            server_pid=server_pid,
-            marker=activity_marker,
-            reporter=activity_reporter,
-            marker_updated_at=activity_updated_at,
-            record=activity_record,
-        )
-    )
     return {
-        "pane_id": pane_id,
-        "current_command": current_command,
+        "pane_id": view.pane_id,
+        "current_command": view.current_command,
         "busy": view.state == "busy",
         "reported": view.reported,
         "activity_state": view.state,
         "activity_reason": view.reason,
-        "activity_evidence": view.evidence_turn_id,
-        "guard": {
-            "pane_id": pane_id,
-            "socket_path": socket_path,
-            "server_pid": server_pid,
-            "pane_pid": pane_pid,
-            "current_command": current_command,
-            "activity_marker": activity_marker,
-            "activity_reporter": activity_reporter,
-            "activity_updated_at": activity_updated_at,
-            "activity_record": activity_record,
-        },
+        "activity_evidence": view.evidence,
+        "guard": view.guard.as_dict(),
     }
 
 
 def live_plan(tmux: Tmux, plan: list[dict[str, object]]) -> list[dict[str, object]]:
     result: list[dict[str, object]] = []
     seen: set[str] = set()
-    resolver = AgentActivity()
+    resolver = AgentActivity(
+        adapter=TmuxActivityAdapter(command=tmux.command)
+    )
     for item in plan:
         target = str(item.get("target", ""))
         if not target or target in seen:

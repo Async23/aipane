@@ -5,14 +5,14 @@
 # different: their initial task starts with SessionStart(agent_type=...), and
 # later delegated work may first become observable at PreToolUse. TeammateIdle
 # is their explicit completion boundary. Keep those Claude-specific lifecycle
-# details out of tmux-window-wrap, whose interface remains activity busy|idle.
+# details out of the Agent Activity module.
 #
 # This adapter must never block or fail Claude Code. Invalid/unknown payloads
-# are ignored and all tmux-window-wrap failures are swallowed.
+# are ignored and all Agent Activity failures are swallowed.
 
 PAYLOAD=$(cat 2>/dev/null)
 PYTHON="${AIPANE_PYTHON:-/opt/homebrew/bin/python3}"
-ACTIVITY="$HOME/.local/bin/tmux-window-wrap"
+ACTIVITY="$HOME/.local/bin/aipane-activity"
 
 if [ -z "$PAYLOAD" ] || [ ! -x "$ACTIVITY" ]; then
   exit 0
@@ -41,9 +41,9 @@ elif event in {"Stop","StopFailure","TeammateIdle","SessionEnd"}:
 
 case "$STATE" in
   busy|idle)
-    # Preserve the hook payload so tmux-window-wrap can identify repeated
+    # Preserve the hook payload so Agent Activity can identify repeated
     # PreToolUse fallbacks without needlessly invalidating animation frames.
-    printf '%s' "$PAYLOAD" | "$ACTIVITY" activity "$STATE" >/dev/null 2>&1 || :
+    printf '%s' "$PAYLOAD" | "$ACTIVITY" report "$STATE" >/dev/null 2>&1 || :
     ;;
 esac
 

@@ -7,17 +7,19 @@ import tempfile
 import time
 import tomllib
 import unittest
+import uuid
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 INTEGRATIONS = ROOT / "integrations"
 WINDOW_WRAP = ROOT / "bin" / "tmux-window-wrap"
+ACTIVITY = ROOT / "bin" / "aipane-activity"
 CLAUDE_ACTIVITY = ROOT / "bin" / "aipane-claude-activity"
 CODEX_NOTIFY = ROOT / "bin" / "aipane-codex-notify"
 TMUX_CONFIG = ROOT / "conf" / "tmux-window-wrap.conf"
-BUSY_COMMAND = "$HOME/.local/bin/tmux-window-wrap activity busy"
-IDLE_COMMAND = "$HOME/.local/bin/tmux-window-wrap activity idle"
+BUSY_COMMAND = "$HOME/.local/bin/aipane-activity report busy"
+IDLE_COMMAND = "$HOME/.local/bin/aipane-activity report idle"
 CLAUDE_ACTIVITY_COMMAND = "$HOME/.local/bin/aipane-claude-activity"
 
 
@@ -36,6 +38,98 @@ class AgentActivityIntegrationTests(unittest.TestCase):
 
     def assert_nested_event(self, hooks, event, command):
         self.assertIn(command, nested_commands(hooks[event]))
+
+    def test_canonical_cli_and_compatibility_adapter_share_projection(self):
+        socket_name = f"aipane-activity-test-{uuid.uuid4().hex}"
+        tmux = ["tmux", "-L", socket_name]
+        environment = os.environ.copy()
+        environment.pop("TMUX", None)
+        try:
+            subprocess.run(
+                [*tmux, "-f", "/dev/null", "new-session", "-d", "sleep 30"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            pane_id = subprocess.run(
+                [*tmux, "display-message", "-p", "#{pane_id}"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=environment,
+            ).stdout.strip()
+            hook_environment = {
+                **environment,
+                "AIPANE_TMUX": f"tmux -L {socket_name}",
+                "TMUX_PANE": pane_id,
+            }
+
+            subprocess.run(
+                [str(ACTIVITY), "report", "busy"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=hook_environment,
+            )
+            marker = subprocess.run(
+                [
+                    *tmux,
+                    "show-options",
+                    "-p",
+                    "-q",
+                    "-v",
+                    "-t",
+                    pane_id,
+                    "@tmux-window-wrap-activity",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=environment,
+            ).stdout.strip()
+            self.assertEqual(marker, "sleep")
+
+            subprocess.run(
+                [
+                    str(WINDOW_WRAP),
+                    "activity",
+                    "idle",
+                    "--socket-name",
+                    socket_name,
+                    "--pane",
+                    pane_id,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            cleared = subprocess.run(
+                [
+                    *tmux,
+                    "show-options",
+                    "-p",
+                    "-q",
+                    "-v",
+                    "-t",
+                    pane_id,
+                    "@tmux-window-wrap-activity",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=environment,
+            ).stdout.strip()
+            self.assertEqual(cleared, "")
+        finally:
+            subprocess.run(
+                [*tmux, "kill-server"],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
 
     def test_claude_hook_fragment_implements_turn_level_contract(self):
         hooks = self.load_json_hooks("claude")
@@ -58,13 +152,13 @@ class AgentActivityIntegrationTests(unittest.TestCase):
             local_bin = home / ".local" / "bin"
             local_bin.mkdir(parents=True)
             activity_log = home / "activity.log"
-            (local_bin / "tmux-window-wrap").write_text(
+            (local_bin / "aipane-activity").write_text(
                 "#!/bin/sh\n"
                 f"printf '%s|' \"$*\" >> {activity_log}\n"
                 f"cat >> {activity_log}\n",
                 encoding="utf-8",
             )
-            (local_bin / "tmux-window-wrap").chmod(0o755)
+            (local_bin / "aipane-activity").chmod(0o755)
 
             environment = os.environ.copy()
             environment.update(
@@ -120,10 +214,10 @@ class AgentActivityIntegrationTests(unittest.TestCase):
                 activity_log.read_text(),
                 "".join(
                     (
-                        "activity idle|" + json.dumps(main_start),
-                        "activity busy|" + json.dumps(teammate_start),
-                        "activity busy|" + json.dumps(pre_tool),
-                        "activity idle|" + json.dumps(teammate_idle),
+                        "report idle|" + json.dumps(main_start),
+                        "report busy|" + json.dumps(teammate_start),
+                        "report busy|" + json.dumps(pre_tool),
+                        "report idle|" + json.dumps(teammate_idle),
                     )
                 ),
             )
@@ -178,7 +272,7 @@ class AgentActivityIntegrationTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            (local_bin / "tmux-window-wrap").write_text(
+            (local_bin / "aipane-activity").write_text(
                 "#!/bin/sh\n"
                 f"printf '%s|' \"$*\" >> {activity_log}\n"
                 f"cat >> {activity_log}\n",
@@ -226,7 +320,7 @@ class AgentActivityIntegrationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(
                 activity_log.read_text(),
-                f"activity idle|{payload}",
+                f"report idle|{payload}",
             )
             self.assertIn(f"--tool x --sid {thread_id}", bind_log.read_text())
             self.assertEqual(notify_log.read_text(), payload + "\n")
@@ -259,7 +353,7 @@ class AgentActivityIntegrationTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            (local_bin / "tmux-window-wrap").write_text(
+            (local_bin / "aipane-activity").write_text(
                 "#!/bin/sh\n"
                 f"printf '%s|' \"$*\" >> {activity_log}\n"
                 f"cat >> {activity_log}\n",
@@ -342,7 +436,7 @@ class AgentActivityIntegrationTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            (local_bin / "tmux-window-wrap").write_text(
+            (local_bin / "aipane-activity").write_text(
                 "#!/bin/sh\n"
                 f"printf '%s|' \"$*\" >> {activity_log}\n"
                 f"cat >> {activity_log}\n",
@@ -390,7 +484,7 @@ class AgentActivityIntegrationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(
                 activity_log.read_text(),
-                f"activity busy|{payload}",
+                f"report busy|{payload}",
             )
             self.assertIn(f"--tool x --sid {thread_id}", bind_log.read_text())
             self.assertEqual(notify_log.read_text(), payload + "\n")
@@ -421,7 +515,7 @@ class AgentActivityIntegrationTests(unittest.TestCase):
                 "not a sqlite database",
                 encoding="utf-8",
             )
-            (local_bin / "tmux-window-wrap").write_text(
+            (local_bin / "aipane-activity").write_text(
                 "#!/bin/sh\n"
                 f"printf '%s|' \"$*\" >> {activity_log}\n"
                 f"cat >> {activity_log}\n",
@@ -466,7 +560,7 @@ class AgentActivityIntegrationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(
                 activity_log.read_text(),
-                f"activity busy|{payload}",
+                f"report busy|{payload}",
             )
 
     def test_codex_unknown_completion_cannot_clear_or_rebind_pane(self):
@@ -477,7 +571,7 @@ class AgentActivityIntegrationTests(unittest.TestCase):
             activity_log = home / "activity.log"
             bind_log = home / "bind.log"
             notify_log = home / "notify.log"
-            (local_bin / "tmux-window-wrap").write_text(
+            (local_bin / "aipane-activity").write_text(
                 "#!/bin/sh\n"
                 f"printf '%s|' \"$*\" >> {activity_log}\n"
                 f"cat >> {activity_log}\n",
@@ -554,7 +648,8 @@ class AgentActivityIntegrationTests(unittest.TestCase):
         path = INTEGRATIONS / "opencode" / "aipane-bind.js"
         source = path.read_text(encoding="utf-8")
 
-        self.assertIn('["activity", state, "--pane", pane]', source)
+        self.assertIn('["report", state, "--pane", pane]', source)
+        self.assertIn('"/.local/bin/aipane-activity"', source)
         self.assertIn('"chat.message"', source)
         self.assertIn('event.type === "session.status"', source)
         self.assertIn('event.type === "session.idle"', source)
