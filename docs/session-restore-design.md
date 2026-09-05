@@ -427,7 +427,7 @@ codex 无启动期 `--session-id`，其会话 id（`thread-id`）在**运行后*
 | 序号 | 工具 | 有 id（坐标快照命中） | 无 id 兜底 |
 |---|---|---|---|
 | 1 | opencode | `opencode --session <id>`（resume） | **fresh 跳过**：`opencode --continue` 是全局「上一个」、跨 pane 有歧义，不可信 |
-| 2 | kimi | `kimi --yolo --session <id>`（resume） | `kimi --yolo --continue`（**按 cwd 续接**，pane 的 cwd 已被 resurrect 恢复 → 仍是真 resume） |
+| 2 | kimi | `kimi --auto --session <id>`（resume） | `kimi --auto --continue`（**按 cwd 续接**，pane 的 cwd 已被 resurrect 恢复 → 仍是真 resume） |
 
 ### 已落地清单（本轮新增/改动）
 | 序号 | 位置 | 内容 |
