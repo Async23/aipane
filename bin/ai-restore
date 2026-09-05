@@ -123,7 +123,7 @@ typeset CLAUDE_BASE="${AIPANE_CLAUDE_LAUNCH_CMD:-claude --dangerously-skip-permi
 typeset CURSOR_BASE="${AIPANE_CURSOR_LAUNCH_CMD:-cursor-agent --force}"
 typeset CODEX_BASE="${AIPANE_CODEX_LAUNCH_CMD:-codex --yolo}"
 typeset OPENCODE_BASE="${AIPANE_OPENCODE_LAUNCH_CMD:-opencode}"
-typeset KIMI_BASE="${AIPANE_KIMI_LAUNCH_CMD:-kimi --yolo}"
+typeset KIMI_BASE="${AIPANE_KIMI_LAUNCH_CMD:-kimi --auto}"
 
 # Migrate exact retired local overrides that can survive in an already-running
 # Ghostty shell or a restored tmux global environment.

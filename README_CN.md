@@ -140,7 +140,7 @@ export AIPANE_OPENCODE_LAUNCH_CMD="opencode"
 export AIPANE_CURSOR_LAUNCH_CMD="cursor-agent --force"
 export AIPANE_QODER_LAUNCH_CMD="qodercli"
 export AIPANE_PI_LAUNCH_CMD="pi"
-export AIPANE_KIMI_LAUNCH_CMD="kimi --yolo"
+export AIPANE_KIMI_LAUNCH_CMD="kimi --auto"
 ```
 
 加载这些覆盖值后，`ai --help` 会显示实际生效的启动命令。
@@ -159,7 +159,7 @@ export AIPANE_KIMI_LAUNCH_CMD="kimi --yolo"
 | `r` | Cursor | `cursor-agent --force` |
 | `q` | Qoder | `qodercli` |
 | `p` | Pi | `pi` |
-| `k` | Kimi Code | `kimi --yolo` |
+| `k` | Kimi Code | `kimi --auto` |
 
 示例：
 
