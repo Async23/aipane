@@ -29,6 +29,24 @@ set -g @tmux-window-wrap-pane-count-style 'off'    # 2:grid
 
 Accepted values are `subscript`, `plain`, and `off`.
 
+### Annotation appearance
+
+The count can use its own tmux text style. Set these personal options before
+sourcing `conf/tmux-window-wrap.conf`:
+
+```tmux
+set -g @tmux-window-wrap-pane-count-light-style 'fg=#096f8c,nobold,noitalics,nounderscore'
+set -g @tmux-window-wrap-pane-count-dark-style 'fg=#4cd8f0,nobold,noitalics,nounderscore'
+set -g @tmux-window-wrap-pane-count-active-style 'fg=#103b49,nobold,noitalics,nounderscore'
+```
+
+This example uses upright cyan subscripts without a separate background. The
+active style gives the count a darker foreground on the selected window's blue
+background. An empty active style uses the current light/dark count style;
+all three options default to empty, preserving the window's original style.
+The existing theme detector selects the light/dark style. Count styling does
+not add columns, and the window's text style is restored after the count.
+
 ## Agent activity indicators
 
 Each busy agent pane adds one fixed dark-shade cell before the window index:
