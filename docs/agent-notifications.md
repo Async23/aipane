@@ -35,6 +35,19 @@ The adapters expect the corresponding dedicated notifier apps and focus scripts
 to remain in each agent's configured home paths. Install them through symlinks so
 the tracked adapter remains the single source of truth.
 
+Codex TUI's temporary task-title and catch-up recap requests inherit the legacy
+`notify` program. They can finish after the visible task has ended, each with a
+new thread/turn ID. The module suppresses these internal completions by matching
+the `codex-tui` client and the single generated prompt's instruction/context
+signature. Legacy payloads omit `thread_source`, and ephemeral threads have no
+persisted metadata, so this compatibility filter needs checking if Codex changes
+those templates. Normal user completions, subagent notifications, and goal
+handling keep their existing behavior. Suppressed internal events log only IDs
+and the reason (`internal_title` or `internal_recap`), without conversation text.
+
+Codex subagent titles use `<tmux coordinate> · L<depth> · <main task title>`.
+Missing coordinates or depth are omitted.
+
 Run the Interface and compatibility contracts with:
 
 ```bash

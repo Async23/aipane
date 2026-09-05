@@ -826,6 +826,20 @@ class AgentNotifications:
         self,
         payload: dict[str, object],
     ) -> tuple[Notification, str]:
+        internal_reason = _codex_internal_task(payload)
+        if internal_reason:
+            return (
+                Notification(
+                    title="Codex",
+                    subtitle="",
+                    body="",
+                    sound="",
+                    event="agent-turn-complete",
+                    group="codex-agent-turn-complete-ghostty-clean",
+                    category="internal",
+                ),
+                internal_reason,
+            )
         cwd = str(payload.get("cwd") or payload.get("workspace") or "")
         thread_id = _compact(payload.get("thread-id") or payload.get("thread_id"))
         pane_title = _short_display_text(
@@ -854,8 +868,10 @@ class AgentNotifications:
         metadata = _codex_thread_metadata(payload, self.environment)
         if metadata.get("is_subagent"):
             depth = metadata.get("depth")
-            level = f" · L{depth}" if isinstance(depth, int) else ""
-            title = f"{base_title} · Subagent{level}"
+            level = f"L{depth}" if isinstance(depth, int) else ""
+            title = " · ".join(
+                part for part in (coordinate, level, original_title) if part
+            )
             model_label = "/".join(
                 part
                 for part in (
@@ -1113,13 +1129,23 @@ class AgentNotifications:
         reason: str,
     ) -> None:
         path = _codex_home(self.environment) / "log" / "codex-notify.log"
+        logged_payload = dict(payload)
+        if notification.category == "internal":
+            # Recap inputs embed conversation history; retain only diagnostic IDs.
+            logged_payload = {
+                key: payload[key]
+                for key in (
+                    "type", "client", "thread-id", "turn-id", "thread_id", "turn_id"
+                )
+                if key in payload
+            }
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(
                     json.dumps(
                         {
-                            "payload": dict(payload),
+                            "payload": logged_payload,
                             "title": notification.title,
                             "subtitle": notification.subtitle,
                             "body": notification.body,
@@ -1682,6 +1708,47 @@ def _grok_event_subtitle(event: str) -> str:
         "notification": "notification",
     }
     return mapping.get(event.replace("-", "_"), event or "")
+
+
+def _codex_internal_task(payload: Mapping[str, object]) -> str:
+    """Recognize TUI metadata requests leaked through legacy notify.
+
+    Codex's ephemeral title/recap threads inherit notify even with hooks disabled.
+    The legacy payload omits thread_source and these threads have no persisted
+    metadata, so match their single generated prompt as well as the TUI client.
+    A JSON title/recap response alone is also valid output from a user's task.
+    """
+    if (
+        payload.get("type") != "agent-turn-complete"
+        or payload.get("client") != "codex-tui"
+    ):
+        return ""
+    messages = payload.get("input-messages") or payload.get("input_messages")
+    if not isinstance(messages, list) or len(messages) != 1:
+        return ""
+    prompt = messages[0]
+    if not isinstance(prompt, str):
+        return ""
+    instructions, separator, context = prompt.partition("\n\n")
+    if not separator:
+        return ""
+    if (
+        instructions.startswith(
+            "Write a brief catch-up for a user returning to this Codex task. "
+        )
+        and instructions.endswith("markdown, lists, and tool chatter.")
+        and context.startswith("Recent conversation:\n")
+    ):
+        return "internal_recap"
+    if (
+        instructions.startswith(
+            "Generate a concise, single-line task title of at most "
+        )
+        and "Do not answer the request." in instructions
+        and context.startswith(("User prompt:\n", "Recent conversation messages:\n"))
+    ):
+        return "internal_title"
+    return ""
 
 
 def _codex_latest_user_prompt(payload: Mapping[str, object]) -> str:

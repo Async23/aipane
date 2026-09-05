@@ -24,6 +24,28 @@ from agent_notifications import (  # noqa: E402
 )
 
 
+# Codex TUI's temporary structured requests, with synthetic conversation text.
+CODEX_TITLE_INSTRUCTIONS = (
+    "Generate a concise, single-line task title of at most 36 characters and "
+    "under five words where possible. Start with an imperative verb. "
+    "Capitalize only the first word unless the user's language, proper nouns, "
+    "acronyms, or code terms require otherwise. Preserve ticket references "
+    "exactly. Write in the user's language. Do not use quotes, markdown, or "
+    "trailing punctuation. Do not answer the request."
+)
+CODEX_RECAP_PROMPT = (
+    "Write a brief catch-up for a user returning to this Codex task. "
+    "In at most 40 words and one or two plain-text sentences, explain the "
+    "objective, what was completed or learned, and the next step or blocker. "
+    "Mention changed files, tests, approvals, or requested decisions only "
+    "when relevant. Never claim changes were made or tests passed unless "
+    "the conversation confirms it. If the task is complete, say so instead "
+    "of inventing more work. Use the user's language; omit greetings, "
+    "markdown, lists, and tool chatter.\n\nRecent conversation:\n"
+    "User: Fix the bug.\nAssistant: Fixed and tested."
+)
+
+
 class AgentNotificationsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -606,6 +628,126 @@ class AgentNotificationsTests(unittest.TestCase):
             },
         )
 
+    def test_codex_internal_completions_stay_silent_after_task_finishes(self) -> None:
+        delivery = InMemoryNotificationAdapter()
+        environment = {
+            "HOME": str(self.home),
+            "CODEX_HOME": str(self.home / ".codex"),
+            "TMUX_PANE": "",
+        }
+        payload = {
+            "type": "agent-turn-complete",
+            "client": "codex-tui",
+            "thread-id": "thread-main",
+            "turn-id": "turn-main",
+            "cwd": str(self.project),
+            "input-messages": ["Fix the bug."],
+            "last-assistant-message": "Fixed and tested.",
+        }
+        AgentNotifications(adapter=delivery, environment=environment).handle(
+            "codex", payload
+        )
+        self.assertEqual(len(delivery.deliveries), 1)
+
+        internal_requests = (
+            (
+                "internal_title",
+                CODEX_TITLE_INSTRUCTIONS + "\n\nUser prompt:\nFix the bug.",
+                '{"title":"Fix the bug"}',
+            ),
+            ("internal_recap", CODEX_RECAP_PROMPT, '{"recap":"Fixed and tested."}'),
+            ("internal_recap", CODEX_RECAP_PROMPT, '{"recap":"The task is complete."}'),
+            (
+                "internal_title",
+                CODEX_TITLE_INSTRUCTIONS
+                + "\nPrioritize the current task and latest substantive user request."
+                + "\n\nRecent conversation messages:\n"
+                + '<conversation><message role="user">Fix the bug.</message></conversation>',
+                '{"title":"Fix the bug"}',
+            ),
+            ("internal_recap", CODEX_RECAP_PROMPT, None),
+        )
+        for index, (reason, prompt, response) in enumerate(internal_requests):
+            with self.subTest(reason=reason, index=index):
+                # Each helper has a new thread/turn, so duplicate-key filtering
+                # cannot fix these notifications after the visible task ends.
+                result = AgentNotifications(
+                    adapter=delivery, environment=environment
+                ).handle(
+                    "codex",
+                    {
+                        **payload,
+                        "thread-id": f"temporary-{index}",
+                        "turn-id": f"temporary-turn-{index}",
+                        "input-messages": [prompt],
+                        "last-assistant-message": response,
+                    },
+                )
+                self.assertEqual(len(delivery.deliveries), 1)
+                self.assertEqual(result.outcome, "suppressed")
+                self.assertEqual(result.reason, reason)
+                self.assertEqual(result.notification.category, "internal")
+
+        log = self.home / ".codex" / "log" / "codex-notify.log"
+        internal_records = [
+            json.loads(line) for line in log.read_text().splitlines()
+        ][1:]
+        self.assertEqual(len(internal_records), len(internal_requests))
+        for record in internal_records:
+            self.assertTrue(record["suppressed"])
+            self.assertNotIn("input-messages", record["payload"])
+            self.assertNotIn("last-assistant-message", record["payload"])
+            self.assertIn("thread-id", record["payload"])
+
+    def test_codex_internal_preview_is_read_only(self) -> None:
+        delivery = InMemoryNotificationAdapter()
+        result = AgentNotifications(
+            adapter=delivery,
+            environment={"HOME": str(self.home), "TMUX_PANE": ""},
+        ).handle(
+            "codex",
+            {
+                "type": "agent-turn-complete",
+                "client": "codex-tui",
+                "input-messages": [CODEX_RECAP_PROMPT],
+            },
+            preview=True,
+        )
+        self.assertEqual(result.outcome, "suppressed")
+        self.assertEqual(result.reason, "internal_recap")
+        self.assertEqual(delivery.deliveries, [])
+        self.assertFalse((self.home / ".codex").exists())
+
+    def test_codex_user_title_and_recap_requests_still_notify(self) -> None:
+        title_prompt = CODEX_TITLE_INSTRUCTIONS + "\n\nUser prompt:\nFix the bug."
+        cases = (
+            (["Generate a task title for this bug fix."], "codex-tui"),
+            (["Write a brief catch-up for this task."], "codex-tui"),
+            (["Explain this prompt:\n" + CODEX_RECAP_PROMPT], "codex-tui"),
+            ([CODEX_TITLE_INSTRUCTIONS], "codex-tui"),
+            ([title_prompt, "Now implement the fix."], "codex-tui"),
+            ([title_prompt], "codex-exec"),
+            ([CODEX_RECAP_PROMPT], None),
+        )
+        for messages, client in cases:
+            with self.subTest(messages=messages, client=client):
+                delivery = InMemoryNotificationAdapter()
+                result = AgentNotifications(
+                    adapter=delivery,
+                    environment={"HOME": str(self.home), "TMUX_PANE": ""},
+                ).handle(
+                    "codex",
+                    {
+                        "type": "agent-turn-complete",
+                        "client": client,
+                        "cwd": str(self.project),
+                        "input-messages": messages,
+                        "last-assistant-message": '{"recap":"Fixed and tested."}',
+                    },
+                )
+                self.assertEqual(result.outcome, "delivered")
+                self.assertEqual(len(delivery.deliveries), 1)
+
     def test_codex_subagent_completion_keeps_thread_identity(self) -> None:
         codex_home = self.home / ".codex"
         codex_home.mkdir()
@@ -688,7 +830,7 @@ class AgentNotificationsTests(unittest.TestCase):
         self.assertEqual(result.notification.category, "subagent")
         self.assertEqual(
             result.notification.title,
-            "Parent task · Subagent · L1",
+            "L1 · Parent task",
         )
         self.assertEqual(
             result.notification.subtitle,
