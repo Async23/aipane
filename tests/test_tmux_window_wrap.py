@@ -2,6 +2,7 @@ import fcntl
 import json
 import os
 import pty
+import re
 import runpy
 import select
 import signal
@@ -1489,6 +1490,59 @@ class WindowWrapCliTests(unittest.TestCase):
 
                 self.assertIn(expected, self.run_render(payload, 0))
 
+    def test_pane_count_text_styles_preserve_labels_and_wrapping(self):
+        payload = {
+            "width": 18,
+            "left_width": 0,
+            "right_width": 0,
+            "active": "@2",
+            "windows": [
+                {
+                    "id": "@1", "index": "1", "name": "one",
+                    "label": " 1:one ",
+                },
+                {
+                    "id": "@2", "index": "2", "name": "many",
+                    "label": " 2:many ", "pane_count": 12,
+                },
+                {
+                    "id": "@3", "index": "3", "name": "pair",
+                    "label": " 3:pair ", "pane_count": 2,
+                },
+            ],
+        }
+        for count_style in ("subscript", "plain", "off"):
+            with self.subTest(count_style=count_style):
+                original = {**payload, "pane_count_style": count_style}
+                styled = {
+                    **original,
+                    "pane_count_text_style": "fg=#4cd8f0,nobold",
+                    "pane_count_active_text_style": "fg=#103b49,nobold",
+                }
+                layout = self.run_plan(original)
+                self.assertEqual(self.run_plan(styled), layout)
+                rows = []
+                for line in range(layout["line_count"]):
+                    before = self.run_render(original, line)
+                    after = self.run_render(styled, line)
+                    self.assertEqual(
+                        re.sub(r"#\[[^\]]*\]", "", after),
+                        re.sub(r"#\[[^\]]*\]", "", before),
+                    )
+                    rows.append(after)
+                rendered = "".join(rows)
+                self.assertIn("1:one", rendered)
+                if count_style == "off":
+                    self.assertNotIn("#[push-default]", rendered)
+                    continue
+                count = "₁₂" if count_style == "subscript" else "[12]"
+                self.assertIn(
+                    f"2#[push-default]#[fg=#103b49,nobold]{count}"
+                    "#[default]#[pop-default]:many",
+                    rendered,
+                )
+                self.assertIn("#[fg=#4cd8f0,nobold]", rendered)
+
     def test_pane_count_width_participates_in_wrapping(self):
         result = self.run_plan(
             {
@@ -2629,6 +2683,16 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "#{pane_id}",
         ).stdout.strip()
         self.set_pane_activity(pane_id, "busy")
+        self.tmux("split-window", "-d", "-t", "wrap:1", "sleep 120")
+        count_styles = {
+            "light": "fg=#1188bb nobold noitalics nounderscore",
+            "dark": "fg=#55ddff,nobold,noitalics,nounderscore",
+        }
+        for scheme, style in count_styles.items():
+            self.tmux(
+                "set-option", "-g",
+                f"@tmux-window-wrap-pane-count-{scheme}-style", style,
+            )
         self.source_window_wrap_config()
         _, master_fd = self.attach_client(width=80)
         self.wait_for_client_count(1)
@@ -2657,11 +2721,17 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             unexpected_scheme = (
                 "dark" if expected_scheme == "light" else "light"
             )
+            count_marker = (
+                f"#[{count_styles[expected_scheme]}]₂"
+                "#[default]#[pop-default]"
+            )
             while time.monotonic() < deadline:
                 rows = cached_rows()
                 if (
                     palette_markers[expected_scheme] in rows
                     and palette_markers[unexpected_scheme] not in rows
+                    and count_marker in rows
+                    and count_styles[unexpected_scheme] not in rows
                 ):
                     return
                 time.sleep(0.02)
@@ -3048,22 +3118,22 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             self.assertIn(command, configured)
 
     def test_sourcing_config_preserves_pane_count_style_override(self):
-        self.tmux(
-            "set-option",
-            "-g",
-            "@tmux-window-wrap-pane-count-style",
-            "plain",
-        )
+        overrides = {
+            "@tmux-window-wrap-pane-count-style": "plain",
+            "@tmux-window-wrap-pane-count-light-style": "fg=cyan nobold",
+            "@tmux-window-wrap-pane-count-dark-style": "fg=brightcyan,nobold",
+            "@tmux-window-wrap-pane-count-active-style": "fg=black,nobold",
+        }
+        for option, value in overrides.items():
+            self.tmux("set-option", "-g", option, value)
 
         self.source_window_wrap_config()
 
-        configured = self.tmux(
-            "show-options",
-            "-g",
-            "-v",
-            "@tmux-window-wrap-pane-count-style",
-        ).stdout.strip()
-        self.assertEqual(configured, "plain")
+        for option, value in overrides.items():
+            configured = self.tmux(
+                "show-options", "-g", "-v", option,
+            ).stdout.strip()
+            self.assertEqual(configured, value)
 
     def test_window_wrap_config_connects_all_status_rows_to_complete_cache_keys(self):
         self.source_window_wrap_config()
@@ -3133,6 +3203,12 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "--animation-option @tmux-window-wrap-animation-tick",
             "--color-scheme #{@tmux-window-wrap-color-scheme}",
             "--pane-count-style #{@tmux-window-wrap-pane-count-style}",
+            "--pane-count-text-style=#{?"
+            "#{==:#{@tmux-window-wrap-color-scheme},dark},"
+            "#{q:@tmux-window-wrap-pane-count-dark-style},"
+            "#{q:@tmux-window-wrap-pane-count-light-style}}",
+            "--pane-count-active-text-style="
+            "#{q:@tmux-window-wrap-pane-count-active-style}",
             "--light-inactive-palette "
             "#{@tmux-window-wrap-activity-light-inactive}",
             "--light-active-palette "

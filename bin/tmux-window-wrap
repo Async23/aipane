@@ -507,6 +507,8 @@ def render_window(
     animation_option=None,
     color_scheme_option=None,
     pane_count_style=DEFAULT_PANE_COUNT_STYLE,
+    pane_count_text_style="",
+    pane_count_active_text_style="",
 ):
     window_range = f"#[range=window|{window['index']}]"
     synchronized = window.get("synchronized", False)
@@ -536,10 +538,18 @@ def render_window(
         name_colour = "colour15" if active else "colour7"
         pane_activity += f"#[fg={name_colour}]"
     escaped_name = window["name"].replace("#", "##")
-    index_label = (
-        f"{window['index']}"
-        f"{pane_count_annotation(window, pane_count_style)}"
+    count_label = pane_count_annotation(window, pane_count_style)
+    count_text_style = (
+        pane_count_active_text_style
+        if active and pane_count_active_text_style
+        else pane_count_text_style
     )
+    if count_label and count_text_style:
+        count_label = (
+            f"#[push-default]#[{count_text_style}]{count_label}"
+            "#[default]#[pop-default]"
+        )
+    index_label = f"{window['index']}{count_label}"
     if active:
         inner_padding = "" if pane_activity else " "
         rendered = (
@@ -599,6 +609,8 @@ def render(payload, line):
             animation_option,
             color_scheme_option,
             pane_count_style,
+            payload.get("pane_count_text_style", ""),
+            payload.get("pane_count_active_text_style", ""),
         )
         for window_id in layout["lines"][line]
     )
@@ -1126,6 +1138,12 @@ def load_tmux_payload(arguments):
             getattr(arguments, "pane_count_style", None)
             or DEFAULT_PANE_COUNT_STYLE
         ),
+        "pane_count_text_style": (
+            getattr(arguments, "pane_count_text_style", None) or ""
+        ),
+        "pane_count_active_text_style": (
+            getattr(arguments, "pane_count_active_text_style", None) or ""
+        ),
         "activity_palettes": {
             "light": {
                 "inactive": getattr(
@@ -1223,6 +1241,8 @@ def main():
         "--pane-count-style",
         choices=PANE_COUNT_STYLES,
     )
+    render_parser.add_argument("--pane-count-text-style")
+    render_parser.add_argument("--pane-count-active-text-style")
     render_parser.add_argument(
         "--light-inactive-palette",
         type=parse_palette,
@@ -1315,8 +1335,14 @@ def main():
             )
     else:
         payload = json.load(sys.stdin)
-        if arguments.pane_count_style is not None:
-            payload["pane_count_style"] = arguments.pane_count_style
+        for key in (
+            "pane_count_style",
+            "pane_count_text_style",
+            "pane_count_active_text_style",
+        ):
+            value = getattr(arguments, key)
+            if value is not None:
+                payload[key] = value
     rendered = render(payload, arguments.line)
     if arguments.store_option:
         if not arguments.session_id:
