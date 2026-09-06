@@ -521,3 +521,19 @@ session；启动 argv 不变，但 `session_start(reason=new|resume|fork)` 会�
    `-c check_for_update_on_startup=false`，不改变日常 Codex 启动配置。验证阶段仍把可见的
    `Update available!` / `Skip until next version` 选择页标为 `blocked`，保留 pending、
    不绑定 session，并返回非零，作为配置失效或未来行为变化时的第二道防线。
+
+## 18. 批量启动不能消耗验证窗口（2026-09-06）
+
+一次 29 pane 的 `ai-restart` 中，发送全部启动命令耗时约 14 秒。旧执行器在每个
+pane 提交命令时就计算默认 10 秒的验证期限，却等整个批次启动完才开始轮询。
+前面的正常进程第一次被观察时期限已经过去，来不及满足 1 秒稳定窗口便被误判
+超时。后续重试发送 `C-c`；部分 Agent 的退出时间又超过停止等待期限，最终留下
+shell 和 pending 意图。
+
+`Attempt` 现在只携带各工具的验证时长，期限在 `verify_round` 开始轮询时统一计算。
+批量发送耗时不再扣减验证时间，稳定窗口仍由实际观察到的运行状态决定；进程
+退出、Codex 升级提示、Grok 加载超时的原有判断与重试继续保留。
+
+回归覆盖两层：`test_restore_executor.py` 用两个 pane 与超过验证时长的启动间隔
+检查全部恢复成功；`test_ai_restart.py` 在隔离的真实 tmux server 中运行收到
+`SIGINT` 后延迟退出的测试 Agent，确保批量恢复不会中断正常会话。

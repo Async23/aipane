@@ -548,8 +548,7 @@ class PendingStore:
 @dataclass
 class Attempt:
     item: dict[str, Any]
-    started_at: float
-    deadline: float
+    verify_timeout: float
     grok_offset: int | None
     existing_process: bool
     sent: bool
@@ -745,12 +744,10 @@ class RestoreExecutor:
             matches_existing = True
         if matches_existing:
             if not interrupt_running:
-                now = time.monotonic()
                 return (
                     Attempt(
                         item=item,
-                        started_at=now,
-                        deadline=now + self.verify_timeout,
+                        verify_timeout=self.verify_timeout,
                         grok_offset=None,
                         existing_process=True,
                         sent=False,
@@ -775,13 +772,11 @@ class RestoreExecutor:
         if not self.tmux.send("-t", target, "Enter"):
             return None, "could not submit recovery command"
 
-        now = time.monotonic()
         timeout = self.grok_verify_timeout if item["tool"] == "grok" else self.verify_timeout
         return (
             Attempt(
                 item=item,
-                started_at=now,
-                deadline=now + timeout,
+                verify_timeout=timeout,
                 grok_offset=offset,
                 existing_process=False,
                 sent=True,
@@ -793,6 +788,14 @@ class RestoreExecutor:
         self, attempts: list[Attempt]
     ) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, str]]:
         active = {attempt.item["target"]: attempt for attempt in attempts}
+        # Launching the rest of a batch can exceed an earlier pane's timeout.
+        # Start each verification budget when polling begins, so healthy panes
+        # get their stability window before a timeout can trigger interruption.
+        verification_started = time.monotonic()
+        deadlines = {
+            target: verification_started + attempt.verify_timeout
+            for target, attempt in active.items()
+        }
         verified: list[dict[str, Any]] = []
         failures: dict[str, str] = {}
         blocked: dict[str, str] = {}
@@ -848,7 +851,7 @@ class RestoreExecutor:
                     active.pop(target)
                     continue
 
-                if now >= attempt.deadline:
+                if now >= deadlines[target]:
                     if item["tool"] == "grok" and attempt.seen_running:
                         failures[target] = "Grok did not report session loaded before timeout"
                     elif current.lower() in SHELL_COMMANDS:

@@ -384,6 +384,52 @@ class AiRestartTests(unittest.TestCase):
         self.assertEqual(self.plan_log.read_text(), "plan\n")
         self.assertFalse(self.restore_log.exists())
 
+    def test_batch_restart_does_not_interrupt_healthy_resumed_agents(self):
+        interrupted = self.tmp / "agent-interrupted"
+        source = self.tmp / "claude.c"
+        source.write_text(
+            "#include <signal.h>\n#include <stdio.h>\n#include <unistd.h>\n"
+            "volatile sig_atomic_t stopped = 0;\n"
+            "void stop(int signal) { stopped = 1; }\n"
+            "int main(void) {\n"
+            "  signal(SIGINT, stop);\n"
+            "  while (!stopped) pause();\n"
+            f"  FILE *log = fopen({json.dumps(str(interrupted))}, \"w\");\n"
+            "  if (log) { fputs(\"interrupted\\n\", log); fclose(log); }\n"
+            "  usleep(250000);\n"
+            "  return 0;\n}\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            ["cc", str(source), "-o", str(self.fake_agent)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        second_target = self.tmux(
+            "split-window", "-h", "-P", "-F",
+            "#{session_name}:#{window_index}.#{pane_index}",
+            "-t", self.target, "-c", str(self.tmp), "sleep 120",
+        ).stdout.strip()
+        self.extra_environment = {
+            "TEST_SECOND_TARGET": second_target,
+            "AI_RESTORE_LAUNCH_DELAY": "0.4",
+            "AI_RESTORE_MAX_ATTEMPTS": "2",
+            "AI_RESTORE_RETRY_DELAY": "0",
+            "AI_RESTORE_INTERRUPT_TIMEOUT": "0.05",
+        }
+
+        result = self.run_restart("--yes", "--force")
+
+        self.assertFalse(interrupted.exists(), "restart interrupted a healthy Agent")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("verified 2 AI pane(s) resumed", result.stdout)
+        for target in (self.target, second_target):
+            current = self.tmux(
+                "display-message", "-p", "-t", target, "#{pane_current_command}",
+            ).stdout.strip()
+            self.assertEqual(current, "claude")
+
     def test_restart_clears_activity_metadata_from_replaced_process(self):
         for option, value in (
             ("@tmux-window-wrap-activity", "sleep"),

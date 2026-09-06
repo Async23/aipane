@@ -65,6 +65,11 @@ class RestoreExecutorTests(unittest.TestCase):
 
                 args = sys.argv[1:]
                 state_path = Path(os.environ["FAKE_RUNTIME_STATE"])
+                if os.environ.get("FAKE_PER_PANE_STATE") == "1" and "-t" in args:
+                    target = args[args.index("-t") + 1]
+                    state_path = state_path.with_name(state_path.name + "-" + target)
+                    if not state_path.exists():
+                        state_path.write_text("zsh\\n", encoding="utf-8")
                 log_path = Path(os.environ["TMUX_LOG"])
                 with log_path.open("a", encoding="utf-8") as log:
                     log.write(json.dumps(args) + "\\n")
@@ -178,6 +183,8 @@ class RestoreExecutorTests(unittest.TestCase):
         respawn_fail: bool = False,
         lock_held: bool = False,
         guard_overrides: dict[str, str] | None = None,
+        launch_delay: float = 0,
+        per_pane_state: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         dump = self.tmp / "resurrect.txt"
         dump.touch()
@@ -222,9 +229,10 @@ class RestoreExecutorTests(unittest.TestCase):
                 "AI_RESTORE_VERIFY_STABILITY": "0.03",
                 "AI_RESTORE_GROK_VERIFY_TIMEOUT": "0.15",
                 "AI_RESTORE_RETRY_DELAY": "0.01",
-                "AI_RESTORE_LAUNCH_DELAY": "0",
+                "AI_RESTORE_LAUNCH_DELAY": str(launch_delay),
                 "AI_RESTORE_POLL_INTERVAL": "0.01",
                 "FAKE_RUNTIME_STATE": str(self.runtime_state),
+                "FAKE_PER_PANE_STATE": "1" if per_pane_state else "0",
                 "FAKE_PANE_ID": pane_id,
                 "FAKE_LAUNCH_COUNT": str(self.launch_count),
                 "FAKE_LAUNCH_MODE": launch_mode,
@@ -400,6 +408,30 @@ class RestoreExecutorTests(unittest.TestCase):
             and self.grok_plan()["command"] in call
         ]
         self.assertEqual(len(literal_launches), 2)
+
+    def test_batch_launch_time_does_not_expire_unobserved_healthy_agents(self):
+        plan = [
+            {
+                **self.grok_plan(),
+                "target": target,
+                "tool": "claude",
+                "command": f"claude --resume {GROK_SID}",
+            }
+            for target in ("0:4.1", "0:4.2")
+        ]
+
+        result = self.run_executor(
+            plan,
+            launch_mode="running",
+            running_command="claude",
+            launch_delay=0.2,  # The first pane's 0.15s timeout passes before polling.
+            per_pane_state=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("verified=2 pending=0", result.stdout)
+        self.assertEqual(self.pending_items(), [])
+        self.assertEqual(self.launch_count.read_text().strip(), "2")
 
     def test_codex_update_prompt_is_blocked_instead_of_verified(self):
         plan = {
