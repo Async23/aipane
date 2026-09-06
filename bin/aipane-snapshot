@@ -2,12 +2,12 @@
 """aipane-snapshot — pair each live pane's tmux coordinate with its recorded AI
 session id, at the same instant tmux-resurrect writes its dump.
 
-Why: most gold-case tools put their id straight into the pane's launch command,
-but Pi can resume/fork to another session in-process and Codex can fork threads.
-Their current ids reach us later through lifecycle Adapters, keyed by the pane's
-unique id (%N). But %N does not survive a server restart, and the dump stores
-coordinates, not %N. So at save time we resolve %N -> coordinate here and emit a
-coordinate -> sid map that ai-restore can consult after restore.
+Why: launch commands only identify the initial session. Pi can resume/fork,
+Codex can fork threads, and Grok can /new or /resume in-process. Their current
+ids come from lifecycle Adapters or Grok's live process/TTY session registry,
+keyed by the pane's unique id (%N). But %N does not survive a server restart,
+and the dump stores coordinates, not %N. So at save time we resolve %N ->
+coordinate here and emit a coordinate -> sid map that ai-restore can consult.
 
 Trigger: @resurrect-hook-post-save-layout '$HOME/.local/bin/aipane-snapshot'
 (resurrect passes the just-written dump path as argv[1]; we only need the timing.)

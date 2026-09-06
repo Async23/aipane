@@ -8,7 +8,7 @@
 #     (pi/grok/claude via --session-id, cursor via a pre-created chat id), and any
 #     `resume`-style launch already carries its id too.
 #   - For tools whose active session still matches their launch argv, the resurrect
-#     dump contains the id directly. Pi/Codex can replace sessions in-process, so
+#     dump contains the id directly. Pi/Codex/Grok can replace sessions in-process, so
 #     their current coordinate binding takes precedence over stale launch argv.
 #   - We parse that durable identity into a declarative plan. The adjacent
 #     aipane-restore-executor persists unfinished intent, launches cleanly,
@@ -210,6 +210,43 @@ claude_session_exists() {
   (( ${#matches[@]} > 0 ))
 }
 
+# Grok's native active-session registry can name a newly opened, unsaved session.
+# Require both its metadata and replay transcript for this cwd before stopping a
+# live pane. A missing current conversation must never select its old launch id.
+grok_session_exists() {
+  local sid="$1" cwd="$2" root="${GROK_HOME:-$HOME/.grok}"
+  local -a matches
+  matches=("$root"/sessions/*/"$sid"/summary.json(N))
+  (( ${#matches[@]} > 0 )) || return 1
+  command -v python3 &>/dev/null || return 1
+  python3 - "$sid" "$cwd" "${matches[@]}" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+sid, cwd, *paths = sys.argv[1:]
+expected_cwd = os.path.normcase(os.path.realpath(cwd))
+for path in paths:
+    try:
+        summary = json.loads(Path(path).read_text(encoding="utf-8"))
+        info = summary.get("info") if isinstance(summary, dict) else None
+        transcript = Path(path).with_name("updates.jsonl")
+        if (
+            isinstance(info, dict)
+            and info.get("id") == sid
+            and isinstance(info.get("cwd"), str)
+            and os.path.normcase(os.path.realpath(info["cwd"])) == expected_cwd
+            and transcript.is_file()
+            and transcript.stat().st_size > 0
+        ):
+            raise SystemExit(0)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        continue
+raise SystemExit(1)
+PY
+}
+
 # pi_session_exists <uuid> <cwd> — `pi --session-id` creates a new session when
 # the id is absent. Treating any UUID as resumable therefore turns stale bindings
 # into convincing empty sessions. Require a durable JSONL whose header identifies
@@ -257,7 +294,7 @@ pi_session_id_exists() {
 
 # build_resume <tool> <full_cmd> <title> <coord_sid> <cwd>
 # -> REPLY = command to send, or ""
-# Gold-case tools begin with their session id in argv. Codex and Pi are different:
+# Gold-case tools begin with their session id in argv. Codex, Pi and Grok can change:
 # an in-process resume/fork changes the current session without changing the launch
 # argv, so a durable current coordinate binding must supersede that stale id.
 # opencode/kimi ids are not UUIDs and only come from the coordinate snapshot.
@@ -268,9 +305,9 @@ build_resume() {
   extract_uuid "$full"; id="$REPLY"
   if [[ "$tool" == codex && -n "$coord_sid" ]] && codex_session_exists "$coord_sid"; then
     id="$coord_sid"
-  elif [[ "$tool" == pi && -n "$coord_sid" ]]; then
-    # Pi can replace its session in-process. The current coordinate binding is
-    # authoritative even when that new session is still empty and has no JSONL.
+  elif [[ ( "$tool" == pi || "$tool" == grok ) && -n "$coord_sid" ]]; then
+    # The current coordinate binding is authoritative even when that new session
+    # is still empty. Check durability below without falling back to stale argv.
     id="$coord_sid"
   elif [[ -z "$id" && -n "$coord_sid" ]]; then
     id="$coord_sid"
@@ -287,7 +324,10 @@ build_resume() {
       if [[ -n "$id" ]]; then REPLY="$CURSOR_BASE --resume $id"; REPLY_KIND=resume
       else REPLY="$CURSOR_BASE"; REPLY_KIND=fresh; fi ;;
     grok)
-      if [[ -n "$id" ]]; then REPLY="$GROK_BASE --resume $id"; REPLY_KIND=resume
+      if [[ -n "$id" ]]; then
+        REPLY="$GROK_BASE --resume $id"
+        if grok_session_exists "$id" "$cwd"; then REPLY_KIND=resume
+        else REPLY_KIND=invalid; fi
       else REPLY="$GROK_BASE"; REPLY_KIND=fresh; fi ;;
     claude)
       if [[ -n "$id" ]]; then

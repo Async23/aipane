@@ -14,6 +14,8 @@
   续接这些 pane。
 - 默认检测到任一 `busy` Agent Activity 就整体中止；旧进程显示 `unknown` 时，命令
   要求明确确认所有任务已空闲。非交互覆盖必须使用 `--force`。
+- Grok 在进程内 `/new` 或 `/resume` 后，存盘按原生活跃会话表中的存活 PID 与 pane TTY
+  记录当前会话；恢复优先使用这份坐标绑定，并校验当前目录的会话文件（见 §19）。
 - Qoder 与 Droid 暂不在恢复范围内。
 
 ## 0. 一个绕不开的前提
@@ -78,14 +80,15 @@ tmux pane 里的进程都是 tmux server 的子进程；server 一退出（`kill
 | 1 | claude (`c`) | **gold-case**（`--session-id <uuid>`）→ aipane 预指定 id，不用 hook/探测（见 §12） |
 | 2 | codex (`x`) | **核心工具中唯一非 gold-case**：懒惰 + 无预指定旗标 → **用 hook**（见 §12） |
 | 3 | opencode (`o`) | 懒惰 + 事件插件 → **用插件**（未纳入本轮核实） |
-| 4 | grok (`g`) | **gold-case**（`-s/--session-id <uuid>`，仅新建）→ aipane 预指定 id（见 §12） |
+| 4 | grok (`g`) | **初始 gold-case + 存盘时动态绑定**：启动预指定 id；`/new`、`/resume` 后从原生活跃会话表读取当前 id（见 §19） |
 | 5 | kimi (`k`) | 懒惰 + 无钩子 → **回落**（cwd+时间解析，未纳入本轮核实） |
 | 6 | cursor (`r`) | **半 gold-case**：无旗标，但 `create-chat` 回吐 uuid → 先建后 `--resume`（见 §12） |
 | 7 | pi (`p`) | **初始 gold-case + 动态 Adapter**：启动预指定 id；new/resume/fork 后由 `session_start` 覆盖绑定（见 §15） |
 | 8 | qoder (`q`) | 急切（虽有 hook）→ **store 探测，不用钩子**（未纳入本轮核实） |
 
 `ai x resume <id>` 这类 **resume 启动是最省事的一档**：id 在命令里，启动即可直接绑定，
-无需 store 探测/钩子。gold-case（§12）把这一档从「resume 时」提前到「首次启动时」。
+无需 store 探测/钩子。gold-case（§12）把这一档从「resume 时」提前到「首次启动时」；
+它只确定初始身份，Pi、Codex、Grok 的进程内会话切换仍需在存盘时取当前身份。
 
 ### 3.2 绑定机制：aipane 注入关联令牌 + 统一接收脚本
 
@@ -537,3 +540,25 @@ shell 和 pending 意图。
 回归覆盖两层：`test_restore_executor.py` 用两个 pane 与超过验证时长的启动间隔
 检查全部恢复成功；`test_ai_restart.py` 在隔离的真实 tmux server 中运行收到
 `SIGINT` 后延迟退出的测试 Agent，确保批量恢复不会中断正常会话。
+
+## 19. Grok 进程内换会话不能恢复启动时的旧 ID（2026-09-06）
+
+一次 `ai-restart` 恢复到了 Grok 最初的短对话，而非重启前正在使用的完整会话。
+原进程已通过 `/new` 切换会话，但命令行仍保留最初的 `--session-id`，aipane 启动注册表
+也没有变化。旧快照接口只提取 Codex 的动态身份；即使坐标快照包含正确 Grok ID，
+旧恢复计划仍优先采用命令行里的旧 ID。这两个缺口与 pane 坐标变化无关。
+
+- `AgentActivity.inspect().session` 从 `$GROK_HOME/active_sessions.json`（默认
+  `~/.grok/active_sessions.json`）提取 Grok 当前身份。记录须有合法 UUID、存活 PID，
+  且 PID 的 TTY 与正在运行 Grok 的 pane 一致；多个候选不按时间猜选。身份读取不依赖
+  已完成的回合，也不会把“知道会话 ID”当作“Agent 已空闲”。
+- `aipane-snapshot` 使用该接口，当前身份覆盖 aipane 启动注册表中的旧绑定。
+- `ai-restore` 优先采用 Grok 坐标绑定，再检查 `summary.json` 中的 ID、cwd 与非空
+  `updates.jsonl`。缺失的当前会话标为 `invalid`，不回退到旧 ID，也不停止对应 pane。
+  没有当前绑定时，仍可使用经过相同落盘校验的命令行 ID。
+- 本机命令通过 symlink 使用仓库源码，无需重装 hook 或重启其他 Agent。
+
+回归测试在隔离的真实 tmux server 中重放“启动 ID=A、同进程当前 ID=B”，经过
+`ai-restart` 的实际快照、计划、重启与重新绑定链路，断言恢复后的进程仍使用 B；
+另覆盖旧 `--resume` 参数、
+未完成首轮、失效 PID、其他 TTY、候选冲突、会话缺失及 cwd 不匹配。

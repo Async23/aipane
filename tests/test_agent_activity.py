@@ -1075,6 +1075,57 @@ class AgentActivityTests(unittest.TestCase):
             newer = activity.inspect(pane.pane_id)
             self.assertEqual(newer.state, "busy")
 
+    def test_grok_current_session_is_available_before_any_completed_turn(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            grok_home = Path(raw_tmp)
+            session_id = "e841e6b4-e97e-4ef1-b0b8-a321c7e9f7ce"
+            active = grok_home / "active_sessions.json"
+            active.write_text(json.dumps([{
+                "session_id": session_id, "pid": 123, "cwd": raw_tmp,
+            }]), encoding="utf-8")
+            pane = PaneActivity(
+                pane_id="%7", current_command="grok-1.0.13-mac",
+                pane_tty="/dev/ttys023",
+            )
+            activity, adapter = self.activity_for(
+                pane, environment={"GROK_HOME": str(grok_home)},
+                process_exists=lambda pid: pid == 123,
+                process_tty=lambda _pid: "ttys023",
+            )
+            view = activity.inspect(pane.pane_id)
+            self.assertIsNotNone(view.session)
+            self.assertEqual(view.session.session_id, session_id)
+            self.assertEqual(view.session.tool_key, "g")
+            self.assertEqual(view.state, "unknown")
+            self.assertEqual(adapter.writes, [])
+
+    def test_grok_current_session_rejects_dead_foreign_and_ambiguous_records(self):
+        sid = "e841e6b4-e97e-4ef1-b0b8-a321c7e9f7ce"
+        for scenario in ("dead", "foreign_tty", "ambiguous", "invalid", "shell"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as raw_tmp:
+                grok_home = Path(raw_tmp)
+                records = [{"session_id": sid, "pid": 123, "cwd": raw_tmp}]
+                if scenario == "ambiguous":
+                    records.append({
+                        "session_id": "11111111-2222-4333-8444-555555555555",
+                        "pid": 124, "cwd": raw_tmp,
+                    })
+                if scenario == "invalid":
+                    records[0]["session_id"] = "not-a-session-id"
+                (grok_home / "active_sessions.json").write_text(
+                    json.dumps(records), encoding="utf-8",
+                )
+                pane = PaneActivity(
+                    pane_id="%7", current_command="zsh" if scenario == "shell" else "grok",
+                    pane_tty="/dev/ttys023",
+                )
+                activity, _adapter = self.activity_for(
+                    pane, environment={"GROK_HOME": str(grok_home)},
+                    process_exists=lambda _pid: scenario != "dead",
+                    process_tty=lambda _pid: "ttys099" if scenario == "foreign_tty" else "ttys023",
+                )
+                self.assertIsNone(activity.inspect(pane.pane_id).session)
+
     def test_grok_completion_resolves_stale_busy_through_same_interface(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             grok_home = Path(raw_tmp) / ".grok"

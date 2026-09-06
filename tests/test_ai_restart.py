@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -209,6 +210,107 @@ class AiRestartTests(unittest.TestCase):
         self.assertEqual(self.save_log.read_text(), "saved\n")
         self.assertEqual(self.snapshot_log.read_text(), "snapshot\n")
         self.assertFalse(self.restore_log.exists())
+
+    def test_restart_preserves_grok_session_switched_in_same_process(self):
+        original_sid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        current_sid = "11111111-2222-4333-8444-555555555555"
+        grok = self.tmp / "grok"
+        grok.write_bytes(self.fake_agent.read_bytes())
+        grok.chmod(0o755)
+        self.tmux(
+            "respawn-pane", "-k", "-t", self.target,
+            str(grok), "--session-id", original_sid,
+        )
+        identity = self.tmux(
+            "display-message", "-p", "-t", self.target,
+            "#{pane_pid}\t#{socket_path}\t#{pid}",
+        ).stdout.strip().split("\t")
+        agent_pid, socket_path, server_pid = identity
+        state_dir = self.tmp / "aipane-state"
+        state_dir.mkdir()
+        registry = state_dir / "registry.jsonl"
+        registry.write_text(json.dumps({
+            "pane": self.pane_id, "sock": socket_path, "srv": server_pid,
+            "tool": "g", "sid": original_sid,
+        }) + "\n", encoding="utf-8")
+        grok_home = self.tmp / "grok-home"
+        for sid in (original_sid, current_sid):
+            session = (
+                grok_home / "sessions"
+                / urllib.parse.quote(str(self.tmp), safe="") / sid
+            )
+            session.mkdir(parents=True)
+            (session / "summary.json").write_text(json.dumps({
+                "info": {"id": sid, "cwd": str(self.tmp)},
+            }), encoding="utf-8")
+            (session / "updates.jsonl").write_text(json.dumps({
+                "timestamp": 1788632471,
+                "params": {"sessionId": sid,
+                           "update": {"sessionUpdate": "turn_completed"}},
+            }) + "\n", encoding="utf-8")
+        (grok_home / "active_sessions.json").write_text(json.dumps([{
+            "session_id": current_sid, "pid": int(agent_pid),
+            "cwd": str(self.tmp),
+        }]), encoding="utf-8")
+        session_name, coordinate = self.target.split(":")
+        window, pane = coordinate.split(".")
+        dump_line = "\t".join([
+            "pane", session_name, window, "0", ":-", pane, "grok",
+            f":{self.tmp}", "1", "grok", f":{grok} --session-id {original_sid}",
+        ])
+        self.fake_save.write_text(
+            '#!/bin/sh\nmkdir -p "$TEST_RESURRECT_DIR"\n'
+            'printf "%s\\n" "$TEST_GROK_DUMP" > "$TEST_RESURRECT_DIR/dump.txt"\n'
+            'ln -sf dump.txt "$TEST_RESURRECT_DIR/last"\n',
+            encoding="utf-8",
+        )
+        self.extra_environment = {
+            "AIPANE_SNAPSHOT_COMMAND": str(ROOT / "bin" / "aipane-snapshot"),
+            "AIPANE_AI_RESTORE_COMMAND": str(ROOT / "bin" / "ai-restore"),
+            "AIPANE_REGISTRY": str(registry),
+            "AIPANE_GROK_LAUNCH_CMD": f"{grok} --always-approve",
+            "GROK_HOME": str(grok_home),
+            "TEST_GROK_DUMP": dump_line,
+        }
+
+        result = self.run_restart("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan_result = subprocess.run(
+            [str(ROOT / "bin" / "ai-restore"), "--plan-json", "--dump",
+             str(self.resurrect_dir / "last")],
+            check=True, capture_output=True, text=True, env=self.environment(),
+        )
+        plan = json.loads(plan_result.stdout)
+        coords = json.loads((state_dir / "coords-last.json").read_text())
+        self.assertEqual({
+            "snapshot": coords[self.target]["sid"],
+            "resume": plan["sid"],
+        }, {"snapshot": current_sid, "resume": current_sid})
+        self.assertEqual(plan["command"], f"{grok} --always-approve --resume {current_sid}")
+
+        # This fixture only models session selection, so verify its stable
+        # process through the executor's existing no-Grok-log fallback.
+        self.extra_environment.update({
+            "AIPANE_GROK_LOG": str(self.tmp / "absent-grok.log"),
+            "AI_RESTORE_GROK_VERIFY_TIMEOUT": "1",
+            "AI_RESTORE_GROK_FALLBACK_STABILITY": "0.1",
+            "AIPANE_BIND_COMMAND": str(ROOT / "bin" / "aipane-bind"),
+        })
+        restarted = self.run_restart("--yes", "--force")
+        self.assertEqual(restarted.returncode, 0, restarted.stderr)
+        self.assertIn("verified 1 AI pane(s) resumed", restarted.stdout)
+        tty = self.tmux(
+            "display-message", "-p", "-t", self.target, "#{pane_tty}",
+        ).stdout.strip().removeprefix("/dev/")
+        processes = subprocess.run(
+            ["ps", "-t", tty, "-o", "command="],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        self.assertIn(f"{grok} --always-approve --resume {current_sid}", processes)
+        self.assertNotIn(original_sid, processes)
+        rebound = json.loads(registry.read_text().splitlines()[-1])
+        self.assertEqual(rebound["pane"], self.pane_id)
+        self.assertEqual(rebound["sid"], current_sid)
 
     def test_dry_run_preserves_sync(self):
         self.tmux(

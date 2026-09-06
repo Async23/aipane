@@ -781,7 +781,7 @@ def latest_grok_turn_completion(updates_path):
     return None
 
 
-def load_grok_session_states(
+def _load_grok_active_sessions(
     ttys=None,
     environment=None,
     process_exists=None,
@@ -809,7 +809,7 @@ def load_grok_session_states(
     if not isinstance(records, list):
         return {}
 
-    states = {}
+    sessions = {}
     for record in records:
         try:
             if not isinstance(record, dict):
@@ -832,29 +832,44 @@ def load_grok_session_states(
             tty = process_tty_lookup(pid).removeprefix("/dev/")
             if not tty or (ttys is not None and tty not in ttys):
                 continue
-            encoded_cwd = urllib.parse.quote(cwd, safe="")
-            completion = latest_grok_turn_completion(
-                os.path.join(
-                    grok_home,
-                    "sessions",
-                    encoded_cwd,
-                    session_id,
-                    "updates.jsonl",
-                )
-            )
-            if completion is None:
-                continue
         except (AttributeError, OSError, TypeError, ValueError):
             continue
-        state = {
-            **completion,
+        sessions.setdefault(tty, []).append({
             "pid": pid,
             "session_id": session_id,
             "tty": tty,
-        }
-        previous = states.get(tty)
-        if previous is None or state["updated_at"] > previous["updated_at"]:
-            states[tty] = state
+            "updates_path": os.path.join(
+                grok_home, "sessions", urllib.parse.quote(cwd, safe=""),
+                session_id, "updates.jsonl",
+            ),
+        })
+    return sessions
+
+
+def load_grok_session_states(
+    ttys=None,
+    environment=None,
+    process_exists=None,
+    process_tty_lookup=None,
+):
+    sessions = _load_grok_active_sessions(
+        ttys, environment, process_exists, process_tty_lookup,
+    )
+    states = {}
+    for tty, candidates in sessions.items():
+        for session in candidates:
+            completion = latest_grok_turn_completion(session["updates_path"])
+            if completion is None:
+                continue
+            state = {
+                **completion,
+                "pid": session["pid"],
+                "session_id": session["session_id"],
+                "tty": tty,
+            }
+            previous = states.get(tty)
+            if previous is None or state["updated_at"] > previous["updated_at"]:
+                states[tty] = state
     return states
 
 
@@ -1469,6 +1484,19 @@ class AgentActivity:
         )
 
     def _validated_session(self, pane: PaneActivity) -> ActivitySession | None:
+        if is_grok_command(pane.current_command):
+            # Grok's /new and /resume replace the active session without changing
+            # argv or aipane's launch binding. Its native registry identifies the
+            # current session even before a completed turn or a hook report exists.
+            tty = pane.pane_tty.removeprefix("/dev/")
+            if not tty:
+                return None
+            sessions = _load_grok_active_sessions(
+                {tty}, self.environment, self.process_exists, self.process_tty,
+            ).get(tty, [])
+            if len(sessions) != 1:
+                return None
+            return ActivitySession(session_id=sessions[0]["session_id"], tool_key="g")
         record = _record_object(pane.record)
         if record is None or record.get("version") != 1:
             return None

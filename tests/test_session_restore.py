@@ -9,6 +9,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+import urllib.parse
 from pathlib import Path
 
 
@@ -19,6 +20,7 @@ RESTORE = ROOT / "bin" / "ai-restore"
 VALID_CODEX_SID = "019fdad7-16c3-7a13-89cf-ec8c2184e5f7"
 FOREIGN_SID = "1fa8ab6a-cba1-4189-abcd-64a29ffb2fc3"
 VALID_PI_SID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+VALID_GROK_SID = "11111111-2222-4333-8444-555555555555"
 
 
 class SessionRestoreTests(unittest.TestCase):
@@ -383,6 +385,72 @@ class SessionRestoreTests(unittest.TestCase):
             self.assertTrue(plan["restorable"])
             self.assertEqual(plan["command"], f"pi --session-id {VALID_PI_SID}")
 
+    def test_restore_prefers_current_grok_binding_over_stale_argv(self):
+        for flag in ("--session-id", "--resume"):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as raw_tmp:
+                tmp = Path(raw_tmp)
+                grok_home = tmp / "grok-home"
+                self.write_grok_session(grok_home, FOREIGN_SID, tmp)
+                self.write_grok_session(grok_home, VALID_GROK_SID, tmp)
+                result = self.run_restore(
+                    tmp, coord={"sid": VALID_GROK_SID, "tool": "g"},
+                    title="grok", saved_codex_ids=set(), plan_json=True,
+                    current_command="grok-1.0.13-mac",
+                    full_command=f"grok {flag} {FOREIGN_SID}",
+                    extra_env={"GROK_HOME": str(grok_home)},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                plan = json.loads(result.stdout)
+                self.assertEqual(plan["kind"], "resume")
+                self.assertTrue(plan["restorable"])
+                self.assertEqual(plan["sid"], VALID_GROK_SID)
+                self.assertEqual(
+                    plan["command"], f"grok --always-approve --resume {VALID_GROK_SID}"
+                )
+
+    def test_restore_rejects_unavailable_current_grok_session_without_using_old_id(self):
+        for missing in ("session", "transcript", "cwd", "metadata"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as raw_tmp:
+                tmp = Path(raw_tmp)
+                grok_home = tmp / "grok-home"
+                self.write_grok_session(grok_home, FOREIGN_SID, tmp)
+                if missing != "session":
+                    current = self.write_grok_session(
+                        grok_home, VALID_GROK_SID,
+                        tmp / "other-project" if missing == "cwd" else tmp,
+                    )
+                    if missing == "transcript":
+                        (current / "updates.jsonl").unlink()
+                    elif missing == "metadata":
+                        (current / "summary.json").write_text("{}", encoding="utf-8")
+                result = self.run_restore(
+                    tmp, coord={"sid": VALID_GROK_SID, "tool": "g"},
+                    title="grok", saved_codex_ids=set(), plan_json=True,
+                    current_command="grok",
+                    full_command=f"grok --session-id {FOREIGN_SID}",
+                    extra_env={"GROK_HOME": str(grok_home)},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                plan = json.loads(result.stdout)
+                self.assertEqual(plan["sid"], VALID_GROK_SID)
+                self.assertEqual(plan["kind"], "invalid")
+                self.assertFalse(plan["restorable"])
+
+    def test_restore_uses_durable_grok_argv_without_a_current_binding(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            grok_home = tmp / "grok-home"
+            self.write_grok_session(grok_home, FOREIGN_SID, tmp)
+            result = self.run_restore(
+                tmp, coord={}, title="grok", saved_codex_ids=set(), plan_json=True,
+                current_command="grok", full_command=f"grok --resume {FOREIGN_SID}",
+                extra_env={"GROK_HOME": str(grok_home)},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(result.stdout)
+            self.assertEqual(plan["sid"], FOREIGN_SID)
+            self.assertEqual(plan["kind"], "resume")
+
     def test_restore_recreates_current_empty_pi_binding_instead_of_stale_argv(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
@@ -672,6 +740,20 @@ class SessionRestoreTests(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
+        return session
+
+    def write_grok_session(self, grok_home: Path, sid: str, cwd: Path) -> Path:
+        session = grok_home / "sessions" / urllib.parse.quote(str(cwd), safe="") / sid
+        session.mkdir(parents=True, exist_ok=True)
+        (session / "summary.json").write_text(
+            json.dumps({"info": {"id": sid, "cwd": str(cwd)}}), encoding="utf-8",
+        )
+        (session / "updates.jsonl").write_text(json.dumps({
+            "params": {"sessionId": sid, "update": {
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": "Saved conversation"},
+            }},
+        }) + "\n", encoding="utf-8")
         return session
 
 
