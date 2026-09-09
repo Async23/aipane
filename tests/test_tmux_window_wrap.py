@@ -1,4 +1,5 @@
 import fcntl
+import io
 import json
 import os
 import pty
@@ -415,7 +416,7 @@ class WindowWrapCliTests(unittest.TestCase):
         namespace = runpy.run_path(str(SCRIPT))
         run_with_error_log = namespace["run_animation_with_error_log"]
 
-        def failing_animator(_socket_name, _fps):
+        def failing_animator(_socket_name, _fps, log):
             raise RuntimeError("animation probe failed")
 
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -431,6 +432,132 @@ class WindowWrapCliTests(unittest.TestCase):
         self.assertIn("tmux-window-wrap animator crashed", log_text)
         self.assertIn("Traceback (most recent call last)", log_text)
         self.assertIn("RuntimeError: animation probe failed", log_text)
+
+    def test_animator_logs_tmux_failure_during_startup(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        run_with_error_log = namespace["run_animation_with_error_log"]
+        script_globals = namespace["animate_status"].__globals__
+        failure = subprocess.CalledProcessError(
+            1,
+            ["tmux", "set-environment", "-g", "PRIVATE_VALUE"],
+            stderr="no server running",
+        )
+        script_globals["run_tmux"] = mock.Mock(side_effect=failure)
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            log_path = Path(raw_tmp) / "animate.log"
+            run_with_error_log("test-socket", 20, str(log_path))
+            self.assertTrue(log_path.exists(), "startup failure left no log")
+            log_text = log_path.read_text()
+
+        self.assertIn("started", log_text)
+        self.assertIn("tmux_error", log_text)
+        self.assertIn("no server running", log_text)
+        self.assertIn("stopped", log_text)
+        self.assertNotIn("PRIVATE_VALUE", log_text)
+
+    def test_animator_logs_activity_failure_during_probe(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        run_with_error_log = namespace["run_animation_with_error_log"]
+        script_globals = namespace["animate_status"].__globals__
+        script_globals["run_tmux"] = mock.Mock()
+        script_globals["animation_probe"] = mock.Mock(
+            side_effect=namespace["ActivityError"]("invalid activity projection")
+        )
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            log_path = Path(raw_tmp) / "animate.log"
+            run_with_error_log("test-socket", 20, str(log_path))
+            self.assertTrue(log_path.exists(), "probe failure left no log")
+            log_text = log_path.read_text()
+
+        self.assertIn("activity_error", log_text)
+        self.assertIn("invalid activity projection", log_text)
+        self.assertIn("stopped", log_text)
+
+    def test_animator_logs_frame_failure_with_its_stage(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        script_globals = namespace["animate_status"].__globals__
+        owner = {}
+
+        def run_tmux(_socket, *arguments):
+            if arguments[0] == "set-environment":
+                owner["value"] = arguments[-1]
+            if "@tmux-window-wrap-animation-tick" in arguments:
+                raise subprocess.CalledProcessError(
+                    1, ["tmux", *arguments], stderr="server exited"
+                )
+
+        script_globals["run_tmux"] = run_tmux
+        script_globals["animation_probe"] = lambda _socket, log: (
+            owner["value"], True
+        )
+        script_globals["detect_color_scheme"] = lambda: "light"
+        script_globals["invalidate_cache"] = mock.Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "animate.log"
+            namespace["run_animation_with_error_log"]("test", 20, str(path))
+            events = [json.loads(line) for line in path.read_text().splitlines()]
+        failure = next(event for event in events if event["event"] == "tmux_error")
+        self.assertEqual(failure["stage"], "frame_update")
+        self.assertEqual(failure["returncode"], 1)
+        self.assertEqual(events[-1]["reason"], "tmux_error")
+
+    def test_animator_heartbeats_without_logging_each_frame(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        script_globals = namespace["animate_status"].__globals__
+        log = mock.Mock(context={"owner": "test-owner"})
+        ticks = []
+
+        class FakeTime:
+            now = 0.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+            @classmethod
+            def sleep(cls, seconds):
+                cls.now += max(seconds, 0.01)
+
+        def run_tmux(_socket, *arguments):
+            if "@tmux-window-wrap-animation-tick" in arguments:
+                ticks.append(int(arguments[-1]))
+
+        script_globals["time"] = FakeTime
+        script_globals["run_tmux"] = run_tmux
+        script_globals["animation_probe"] = lambda _socket, log: (
+            "test-owner" if FakeTime.now < 61 else "successor", True
+        )
+        script_globals["detect_color_scheme"] = lambda: "light"
+        script_globals["invalidate_cache"] = mock.Mock()
+        reason = namespace["animate_status"]("test", 20, log=log)
+
+        self.assertEqual(reason, "superseded")
+        self.assertGreater(len(ticks), 1000)
+        self.assertTrue(all(b == (a + 1) % 24 for a, b in zip(ticks, ticks[1:])))
+        events = [call.args[0] for call in log.emit.call_args_list]
+        self.assertEqual(events.count("heartbeat"), 1)
+        self.assertEqual(events.count("activity_changed"), 1)
+        self.assertLess(len(events), 10)
+
+    def test_animation_probe_logs_partial_errors_and_recovery(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        controller = mock.Mock()
+        controller.reconcile.side_effect = [
+            mock.Mock(owner="owner", busy=True, errors=("%1: write failed",)),
+            mock.Mock(owner="owner", busy=True, errors=()),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "animate.log"
+            log = namespace["AnimationLog"](path)
+            for _ in range(2):
+                self.assertEqual(
+                    namespace["animation_probe"]("test", controller, log),
+                    ("owner", True),
+                )
+            events = [json.loads(line)["event"] for line in path.read_text().splitlines()]
+        self.assertEqual(events, ["activity_probe_errors", "activity_probe_recovered"])
 
     def test_animation_tick_never_skips_breathing_levels(self):
         namespace = runpy.run_path(str(SCRIPT))
@@ -1942,9 +2069,63 @@ class WindowWrapCliTests(unittest.TestCase):
         )
 
 
+class AnimationLogTests(unittest.TestCase):
+    def setUp(self):
+        self.log_class = runpy.run_path(str(SCRIPT))["AnimationLog"]
+
+    def test_shared_log_rotation_keeps_complete_events_and_bounded_backups(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "animate.log"
+            first = self.log_class(path, max_bytes=600, backups=3, owner="first")
+            second = self.log_class(path, max_bytes=600, backups=3, owner="second")
+            for index in range(40):
+                (first if index % 2 else second).emit("test", sequence=index)
+            files = [path, *(path.with_name(f"animate.log.{n}") for n in range(1, 4))]
+            records = []
+            for file in reversed(files):
+                self.assertLessEqual(file.stat().st_size, 600)
+                records.extend(json.loads(line) for line in file.read_text().splitlines())
+            self.assertFalse(path.with_name("animate.log.4").exists())
+        self.assertEqual(records[-1]["sequence"], 39)
+        self.assertEqual(
+            [record["sequence"] for record in records],
+            list(range(records[0]["sequence"], 40)),
+        )
+        self.assertEqual({record["owner"] for record in records}, {"first", "second"})
+
+    def test_log_write_failure_falls_back_to_stderr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory) / "not-a-directory"
+            parent.write_text("occupied")
+            log = self.log_class(parent / "animate.log")
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                log.emit("started")
+                output = stderr.getvalue()
+        self.assertIn("log_write_failed", output)
+        self.assertIn('"event": "started"', output)
+
+    def test_identical_probe_errors_are_rate_limited_and_recovery_is_logged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "animate.log"
+            log = self.log_class(path)
+            with mock.patch("tmux_animation_log.time.monotonic", side_effect=[0, 1, 60, 61]):
+                log.probe_errors(["cannot read pane"])
+                log.probe_errors(["cannot read pane"])
+                log.probe_errors(["cannot read pane"])
+                log.probe_errors([])
+            events = [json.loads(line)["event"] for line in path.read_text().splitlines()]
+        self.assertEqual(events, [
+            "activity_probe_errors", "activity_probe_errors", "activity_probe_recovered"
+        ])
+
+
 class WindowWrapTmuxIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.attached_clients = []
+        self.animators = []
+        self.config_animators = set()
+        self.log_directory = tempfile.TemporaryDirectory()
+        self.animation_log_path = Path(self.log_directory.name) / "animate.log"
         self.socket_name = f"window-wrap-test-{uuid.uuid4().hex}"
         self.tmux(
             "-f",
@@ -1974,6 +2155,21 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         )
 
     def tearDown(self):
+        for animator in self.animators:
+            if animator.poll() is None:
+                animator.terminate()
+                try:
+                    animator.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    animator.kill()
+                    animator.wait(timeout=2)
+        if self.config_animators:
+            self.tmux(
+                "set-environment", "-g", "TMUX_WINDOW_WRAP_ANIMATOR_OWNER",
+                "test-shutdown", check=False,
+            )
+            for pid in self.config_animators:
+                self.wait_for_animation_event("stopped", pid)
         self.tmux("kill-server", check=False)
         for process, master_fd in self.attached_clients:
             try:
@@ -1990,6 +2186,55 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
                     process.kill()
                     process.wait(timeout=1)
         self.socket_path.unlink(missing_ok=True)
+        self.log_directory.cleanup()
+
+    def start_animator(self):
+        process = subprocess.Popen(
+            [str(SCRIPT), "animate", "--socket-name", self.socket_name,
+             "--log-file", str(self.animation_log_path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self.animators.append(process)
+        return process
+
+    def wait_for_animation_event(self, event, pid=None):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if self.animation_log_path.exists():
+                for line in self.animation_log_path.read_text().splitlines():
+                    record = json.loads(line)
+                    matches_pid = (
+                        record["pid"] == pid if pid is not None
+                        else record["pid"] not in self.config_animators
+                    )
+                    if record["event"] == event and matches_pid:
+                        return record
+            time.sleep(0.02)
+        self.fail(f"missing animator event {event} for PID {pid}")
+
+    def test_animator_records_signal_and_restores_terminal_exit_behavior(self):
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(signal=signum):
+                process = self.start_animator()
+                self.wait_for_animation_event("theme_changed", process.pid)
+                process.send_signal(signum)
+                self.assertEqual(process.wait(timeout=3), 0)
+                received = self.wait_for_animation_event("signal_received", process.pid)
+                stopped = self.wait_for_animation_event("stopped", process.pid)
+                self.assertEqual(received["signal"], signal.Signals(signum).name)
+                self.assertEqual(stopped["reason"], "signal")
+
+    def test_animator_records_clean_handoff_to_successor(self):
+        first = self.start_animator()
+        self.wait_for_animation_event("theme_changed", first.pid)
+        second = self.start_animator()
+        successor = self.wait_for_animation_event("theme_changed", second.pid)
+        self.assertEqual(first.wait(timeout=3), 0)
+        lost = self.wait_for_animation_event("ownership_lost", first.pid)
+        stopped = self.wait_for_animation_event("stopped", first.pid)
+        self.assertEqual(lost["successor"], successor["owner"])
+        self.assertEqual(stopped["reason"], "superseded")
+        self.assertIsNone(second.poll())
 
     def tmux(self, *arguments, check=True):
         return subprocess.run(
@@ -2184,6 +2429,9 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         config_text = CONFIG.read_text().replace(
             "$HOME/.local/bin/tmux-window-wrap",
             str(SCRIPT),
+        ).replace(
+            "$HOME/.local/state/aipane/tmux-window-wrap-animate.log",
+            str(self.animation_log_path),
         )
         if not animate:
             config_text = "\n".join(
@@ -2211,6 +2459,11 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             config_path = Path(directory) / "tmux.conf"
             config_path.write_text(preamble + config_text)
             self.tmux("source-file", str(config_path))
+        if animate:
+            # Wait for this launch before teardown can revoke its ownership.
+            # Otherwise a delayed job could recreate the deleted log directory.
+            started = self.wait_for_animation_event("ownership_acquired")
+            self.config_animators.add(started["pid"])
 
     def wait_for_status(self, expected, timeout=3):
         deadline = time.monotonic() + timeout

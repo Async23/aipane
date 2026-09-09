@@ -259,11 +259,38 @@ current light or dark palette is cached;
 a system appearance change updates the cache key and reruns the renderer once.
 The fragment does not lower tmux's global `status-interval`.
 
-The animator records uncaught exceptions in
-`~/.local/state/aipane/tmux-window-wrap-animate.log`. A logged crash ends the
-animator cleanly so tmux does not replace the active pane with its background
-job error view. Normal ownership handoff between animator processes is not
-logged.
+The animator writes JSON Lines to
+`~/.local/state/aipane/tmux-window-wrap-animate.log`, including when launched
+without an explicit log argument. `--log-file PATH` and the compatible
+`--error-log PATH` select another file. Existing plain-text crash entries can
+remain at the beginning of a log until it rotates.
+
+Each entry includes a timestamp with timezone, severity, PID, owner token,
+tmux socket selector, FPS, and execution stage. Events cover startup, busy/idle
+and theme changes, ownership handoff, and shutdown with reason and uptime.
+Every minute, a heartbeat records the current busy state and frame; individual
+frames are not logged. tmux failures record the stage, return code, and stderr
+without dumping command arguments or pane contents. Activity probe errors are
+logged even when the animator can continue; identical errors are repeated at
+most once per minute, and recovery is recorded. Unexpected exceptions include
+a traceback. Logged failures retain a clean process exit so tmux does not
+replace the active pane with its background job error view.
+
+`SIGTERM`, `SIGINT`, and `SIGHUP` produce signal and shutdown entries. A forced
+`SIGKILL`, OS crash, or power loss cannot produce a final entry; the last
+heartbeat and PID provide the last known state. The logger does not restart a
+stopped animator. To restart it and inspect recent events:
+
+```bash
+tmux run-shell -b '$HOME/.local/bin/tmux-window-wrap animate --fps 20'
+tail -n 20 ~/.local/state/aipane/tmux-window-wrap-animate.log
+```
+
+The log rotates before exceeding 1 MiB and retains three backups (`.1` through
+`.3`). A sibling `.lock` file serializes writes and rotation during process
+handoff. Files are reopened per event, so an outgoing process cannot keep
+writing to an obsolete backup. If file creation, writing, or rotation fails,
+the diagnostic and event fall back to stderr without stopping the animation.
 
 Four thirteen-colour palettes cover active/inactive windows in light/dark
 terminal themes:

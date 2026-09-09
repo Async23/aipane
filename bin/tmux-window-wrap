@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -22,6 +23,7 @@ from agent_activity import (
     AgentActivity,
     TmuxActivityAdapter,
 )
+from tmux_animation_log import AnimationLog, DEFAULT_LOG
 
 
 WINDOW_SEPARATOR = "\x1f"
@@ -858,9 +860,11 @@ def activity_controller(socket_name, environment=None):
     return controller
 
 
-def animation_probe(socket_name, controller=None):
+def animation_probe(socket_name, controller=None, log=None):
     controller = controller or activity_controller(socket_name)
     result = controller.reconcile()
+    if log is not None:
+        log.probe_errors(result.errors)
     if result.owner is None:
         if result.errors:
             try:
@@ -905,18 +909,23 @@ def next_animation_tick(last_tick):
     return (last_tick + 1) % len(ACTIVITY_LEVEL_SEQUENCE)
 
 
-def animate_status(socket_name, fps):
-    owner = uuid.uuid4().hex
-    try:
-        run_tmux(
-            socket_name,
-            "set-environment",
-            "-g",
-            ANIMATOR_OWNER_ENVIRONMENT,
-            owner,
-        )
-    except subprocess.CalledProcessError:
-        return
+def animate_status(socket_name, fps, log=None):
+    owner = log.context["owner"] if log is not None else uuid.uuid4().hex
+
+    def stage(name):
+        if log is not None:
+            log.context["stage"] = name
+
+    stage("claim_owner")
+    run_tmux(
+        socket_name,
+        "set-environment",
+        "-g",
+        ANIMATOR_OWNER_ENVIRONMENT,
+        owner,
+    )
+    if log is not None:
+        log.emit("ownership_acquired")
 
     busy = False
     last_tick = None
@@ -924,55 +933,77 @@ def animate_status(socket_name, fps):
     next_probe = 0.0
     next_scheme_probe = 0.0
     next_tick_at = 0.0
+    next_heartbeat = time.monotonic() + 60.0
+    previous_busy = None
     while True:
         now = time.monotonic()
-        try:
-            if now >= next_probe:
+        if now >= next_probe:
+            stage("activity_probe")
+            if log is None:
                 current_owner, busy = animation_probe(socket_name)
-                if current_owner != owner:
-                    return
-                next_probe = now + (1.0 if busy else 0.25)
-                if not busy:
-                    last_tick = None
-                    next_tick_at = 0.0
-
-            if now >= next_scheme_probe:
-                detected_scheme = detect_color_scheme()
-                if detected_scheme != color_scheme:
-                    run_tmux(
-                        socket_name,
-                        "set-option",
-                        "-g",
-                        COLOR_SCHEME_OPTION,
-                        detected_scheme,
-                    )
-                    color_scheme = detected_scheme
-                    invalidate_cache(socket_name)
-                next_scheme_probe = now + 5.0
-
-            if busy:
-                frame_now = time.monotonic()
-                if last_tick is None or frame_now >= next_tick_at:
-                    tick = next_animation_tick(last_tick)
-                    run_tmux(
-                        socket_name,
-                        "set-option",
-                        "-g",
-                        ANIMATION_TICK_OPTION,
-                        str(tick),
-                    )
-                    last_tick = tick
-                    # Schedule from the frame actually rendered. If another
-                    # probe stalls briefly, stretch that frame instead of
-                    # jumping over intermediate breathing levels to catch up.
-                    next_tick_at = time.monotonic() + (1 / fps)
-                wake_at = min(next_probe, next_tick_at, next_scheme_probe)
             else:
-                wake_at = min(next_probe, next_scheme_probe)
-        except (subprocess.CalledProcessError, ActivityError):
-            return
+                current_owner, busy = animation_probe(socket_name, log=log)
+            if current_owner != owner:
+                if log is not None:
+                    log.emit("ownership_lost", successor=current_owner)
+                return "superseded"
+            if log is not None and busy != previous_busy:
+                log.emit("activity_changed", busy=busy)
+            previous_busy = busy
+            next_probe = now + (1.0 if busy else 0.25)
+            if not busy:
+                last_tick = None
+                next_tick_at = 0.0
 
+        if now >= next_scheme_probe:
+            stage("theme_probe")
+            detected_scheme = detect_color_scheme()
+            if detected_scheme != color_scheme:
+                stage("theme_update")
+                run_tmux(
+                    socket_name,
+                    "set-option",
+                    "-g",
+                    COLOR_SCHEME_OPTION,
+                    detected_scheme,
+                )
+                color_scheme = detected_scheme
+                stage("cache_invalidation")
+                invalidate_cache(socket_name)
+                if log is not None:
+                    log.emit("theme_changed", color_scheme=color_scheme)
+            next_scheme_probe = now + 5.0
+
+        if busy:
+            frame_now = time.monotonic()
+            if last_tick is None or frame_now >= next_tick_at:
+                tick = next_animation_tick(last_tick)
+                stage("frame_update")
+                run_tmux(
+                    socket_name,
+                    "set-option",
+                    "-g",
+                    ANIMATION_TICK_OPTION,
+                    str(tick),
+                )
+                last_tick = tick
+                # Schedule from the frame actually rendered. If another
+                # probe stalls briefly, stretch that frame instead of
+                # jumping over intermediate breathing levels to catch up.
+                next_tick_at = time.monotonic() + (1 / fps)
+            wake_at = min(next_probe, next_tick_at, next_scheme_probe)
+        else:
+            wake_at = min(next_probe, next_scheme_probe)
+        stage("waiting")
+        if log is not None and time.monotonic() >= next_heartbeat:
+            log.emit("heartbeat", busy=busy, tick=last_tick)
+            next_heartbeat = time.monotonic() + 60.0
         time.sleep(max(0.01, wake_at - time.monotonic()))
+
+
+class AnimationSignal(BaseException):
+    def __init__(self, signum):
+        self.signum = signum
 
 
 def run_animation_with_error_log(
@@ -983,27 +1014,52 @@ def run_animation_with_error_log(
 ):
     if animator is None:
         animator = animate_status
+    log = AnimationLog(
+        error_log or DEFAULT_LOG,
+        owner=uuid.uuid4().hex,
+        socket=socket_name or os.environ.get("TMUX", "").split(",", 1)[0] or "default",
+        fps=fps,
+        stage="startup",
+    )
+    started_at = time.monotonic()
+    previous_handlers = {}
+    reason = "returned"
+
+    def receive_signal(signum, _frame):
+        raise AnimationSignal(signum)
+
     try:
-        animator(socket_name, fps)
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            previous_handlers[signum] = signal.signal(signum, receive_signal)
+        log.emit("started")
+        reason = animator(socket_name, fps, log=log) or "returned"
+    except AnimationSignal as error:
+        reason = "signal"
+        log.emit("signal_received", signal=signal.Signals(error.signum).name)
+    except subprocess.CalledProcessError as error:
+        reason = "tmux_error"
+        # The full argv/stdout may contain pane records or cached window labels.
+        # Stage, return code and tmux's stderr identify the failed operation.
+        log.emit(
+            "tmux_error", level="error", returncode=error.returncode,
+            stderr=str(error.stderr or "")[:4096],
+        )
+    except ActivityError as error:
+        reason = "activity_error"
+        log.emit("activity_error", level="error", error=str(error)[:4096])
     except Exception:
-        crash_text = traceback.format_exc()
-        expanded_log = os.path.abspath(os.path.expanduser(error_log))
-        timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-        try:
-            os.makedirs(os.path.dirname(expanded_log), exist_ok=True)
-            with open(expanded_log, "a", encoding="utf-8") as handle:
-                handle.write(
-                    f"[{timestamp}] tmux-window-wrap animator crashed\n"
-                )
-                handle.write(crash_text)
-                if not crash_text.endswith("\n"):
-                    handle.write("\n")
-        except OSError as log_error:
-            sys.stderr.write(
-                "tmux-window-wrap could not write animator crash log "
-                f"{expanded_log}: {log_error}\n"
-            )
-            sys.stderr.write(crash_text)
+        reason = "crashed"
+        log.emit(
+            "crashed", level="error", message="tmux-window-wrap animator crashed",
+            traceback=traceback.format_exc()[-16384:],
+        )
+    finally:
+        log.emit(
+            "stopped", reason=reason,
+            uptime_seconds=round(time.monotonic() - started_at, 3),
+        )
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 def invalidate_cache(socket_name):
@@ -1236,7 +1292,10 @@ def main():
         type=float,
         default=DEFAULT_ACTIVITY_FPS,
     )
-    animate_parser.add_argument("--error-log")
+    animate_parser.add_argument(
+        "--error-log", "--log-file", default=DEFAULT_LOG,
+        help="rotating lifecycle/error log (default: %(default)s)",
+    )
     animate_parser.add_argument("--socket-name")
     render_parser = commands.add_parser("render")
     render_parser.add_argument(
@@ -1337,14 +1396,11 @@ def main():
         return
 
     if arguments.command == "animate":
-        if arguments.error_log:
-            run_animation_with_error_log(
-                arguments.socket_name,
-                arguments.fps,
-                arguments.error_log,
-            )
-        else:
-            animate_status(arguments.socket_name, arguments.fps)
+        run_animation_with_error_log(
+            arguments.socket_name,
+            arguments.fps,
+            arguments.error_log,
+        )
         return
 
     if arguments.session_id:
