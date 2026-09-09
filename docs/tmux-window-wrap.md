@@ -2,6 +2,21 @@
 
 Optional multi-line tmux status window list (up to 3 rows).
 
+## Window selection
+
+Cached rows resolve the selected window against tmux's current `window_id` at
+each client redraw. A window switch therefore updates the highlight, activity
+palette, and pane count style together, without waiting for the Python renderer.
+Rows that finish rendering out of order cannot restore an old selection or
+highlight two different windows. The active-window cache fingerprint still
+updates the layout when a selected window must be brought into the three-row
+visible area.
+
+`render --store-option` always stores these live selection expressions. Plain
+`render` output retains the snapshot's selection for standalone callers.
+Cached rows are written through `source-file -` on standard input so large
+animated window lists do not exceed tmux's command argument size limit.
+
 ## Pane count annotations
 
 Window labels show the pane total as subscript digits when a window owns more
@@ -264,6 +279,10 @@ The animator writes JSON Lines to
 without an explicit log argument. `--log-file PATH` and the compatible
 `--error-log PATH` select another file. Existing plain-text crash entries can
 remain at the beginning of a log until it rotates.
+
+The animator can start before the first tmux session. If that session appears
+between an empty pane read and the session check, it retries the activity
+snapshot once before treating the read as a fatal error.
 
 Each entry includes a timestamp with timezone, severity, PID, owner token,
 tmux socket selector, FPS, and execution stage. Events cover startup, busy/idle

@@ -519,7 +519,26 @@ def render_window(
     pane_count_style=DEFAULT_PANE_COUNT_STYLE,
     pane_count_text_style="",
     pane_count_active_text_style="",
+    live_active=False,
 ):
+    if live_active:
+        # Cache both appearances, not the selection from this job's snapshot.
+        # All rows resolve the same current window at the client's redraw,
+        # even when independent renderer jobs finish out of order.
+        appearances = [
+            render_window(
+                window, selected_id, animation_tick, activity_phase_offsets,
+                activity_palettes, color_scheme, animation_option,
+                color_scheme_option, pane_count_style, pane_count_text_style,
+                pane_count_active_text_style,
+            )
+            for selected_id in (window["id"], None)
+        ]
+        return (
+            "#{?#{==:#{window_id}," + window["id"] + "},"
+            + ",".join(escape_format_branch(value) for value in appearances)
+            + "}"
+        )
     window_range = f"#[range=window|{window['index']}]"
     synchronized = window.get("synchronized", False)
     active = window["id"] == active_id
@@ -582,6 +601,32 @@ def render_window(
     return rendered + " #[norange]"
 
 
+def escape_format_branch(value):
+    """Quote branch delimiters while preserving nested tmux replacements."""
+    result = []
+    depth = 0
+    index = 0
+    while index < len(value):
+        pair = value[index:index + 2]
+        if pair in ("##", "#,", "#}"):
+            result.append(pair)
+            index += 2
+            continue
+        if pair == "#{":
+            depth += 1
+            result.append(pair)
+            index += 2
+            continue
+        character = value[index]
+        if character == "}" and depth:
+            depth -= 1
+        elif character in (",", "}") and not depth:
+            result.append("#")
+        result.append(character)
+        index += 1
+    return "".join(result)
+
+
 def render(payload, line):
     layout = plan(payload)
     if line >= layout["line_count"]:
@@ -637,18 +682,20 @@ def render(payload, line):
             pane_count_style,
             count_text_style,
             count_active_text_style,
+            payload.get("live_active", False),
         )
         for window_id in layout["lines"][line]
     )
 
 
-def run_tmux(socket_name, *arguments):
+def run_tmux(socket_name, *arguments, input=None):
     command = ["tmux"]
     if socket_name:
         command.extend(("-L", socket_name))
     command.extend(arguments)
     return subprocess.run(
         command,
+        input=input,
         text=True,
         capture_output=True,
         check=True,
@@ -869,6 +916,14 @@ def animation_probe(socket_name, controller=None, log=None):
         if result.errors:
             try:
                 if tmux_has_sessions(socket_name):
+                    # The first session may have appeared after list-panes
+                    # failed on an empty server. Recheck that snapshot before
+                    # treating the earlier read as a fatal activity error.
+                    retry = controller.reconcile()
+                    if log is not None:
+                        log.probe_errors(retry.errors)
+                    if retry.owner is not None:
+                        return retry.owner, retry.busy
                     raise ActivityError(result.errors[0])
             except subprocess.CalledProcessError:
                 pass
@@ -1431,17 +1486,23 @@ def main():
             value = getattr(arguments, key)
             if value is not None:
                 payload[key] = value
+    if arguments.store_option:
+        payload["live_active"] = True
     rendered = render(payload, arguments.line)
     if arguments.store_option:
         if not arguments.session_id:
             parser.error("--store-option requires --session-id")
+        # Animated rows can exceed tmux's command IPC argument limit. Stream
+        # the quoted command through stdin instead; source-file preserves the
+        # row literally, including quotes and format expressions in names.
+        command = shlex.join([
+            "set-option", "-t", arguments.session_id,
+            arguments.store_option, rendered,
+        ])
         run_tmux(
             arguments.socket_name,
-            "set-option",
-            "-t",
-            arguments.session_id,
-            arguments.store_option,
-            rendered,
+            "source-file", "-",
+            input=command + "\n",
         )
         sys.stdout.write("\n")
         return

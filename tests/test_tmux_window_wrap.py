@@ -559,6 +559,18 @@ class WindowWrapCliTests(unittest.TestCase):
             events = [json.loads(line)["event"] for line in path.read_text().splitlines()]
         self.assertEqual(events, ["activity_probe_errors", "activity_probe_recovered"])
 
+    def test_animation_probe_still_raises_when_snapshot_retry_fails(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        probe = namespace["animation_probe"]
+        controller = mock.Mock()
+        controller.reconcile.return_value = mock.Mock(
+            owner=None, busy=False, errors=("activity read failed",),
+        )
+        with mock.patch.dict(probe.__globals__, {"tmux_has_sessions": lambda _: True}):
+            with self.assertRaisesRegex(namespace["ActivityError"], "activity read failed"):
+                probe("test", controller)
+        self.assertEqual(controller.reconcile.call_count, 2)
+
     def test_animation_tick_never_skips_breathing_levels(self):
         namespace = runpy.run_path(str(SCRIPT))
         next_animation_tick = namespace["next_animation_tick"]
@@ -2902,6 +2914,31 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             f"animator exited before the first session; saw {seen_ticks!r}",
         )
 
+    def test_animation_probe_survives_session_created_during_empty_read(self):
+        self.tmux("set-option", "-g", "exit-empty", "off")
+        self.tmux("kill-session", "-t", "wrap")
+        self.tmux("set-environment", "-g", "TMUX_WINDOW_WRAP_ANIMATOR_OWNER", "owner")
+        namespace = runpy.run_path(str(SCRIPT))
+        probe = namespace["animation_probe"]
+        run_tmux = namespace["run_tmux"]
+        created = False
+
+        def create_session_after_empty_read(socket, *arguments, **kwargs):
+            nonlocal created
+            try:
+                return run_tmux(socket, *arguments, **kwargs)
+            except subprocess.CalledProcessError:
+                if arguments[0] == "list-panes" and not created:
+                    # list-panes saw no session, but the next list-sessions
+                    # sees the newly created one. The earlier error is stale.
+                    self.tmux("new-session", "-d", "-s", "wrap", "sleep 120")
+                    created = True
+                raise
+
+        with mock.patch.dict(probe.__globals__, {"run_tmux": create_session_after_empty_read}):
+            self.assertEqual(probe(self.socket_name), ("owner", False))
+        self.assertTrue(created)
+
     def test_attached_status_advances_activity_at_twenty_fps(self):
         first_pane = self.tmux(
             "display-message",
@@ -3348,6 +3385,208 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
                     timeout=0.5,
                 )
                 self.assertLess(rendered - started, 0.5)
+
+    def store_runtime_row(self, line, before_store=None, width=12, extra_arguments=()):
+        # Run the real CLI read/render/store path. A callback pauses the writer
+        # after its snapshot is rendered, reproducing a late background job.
+        namespace = runpy.run_path(str(SCRIPT))
+        main = namespace["main"]
+        render = namespace["render"]
+
+        def render_then_pause(payload, row):
+            result = render(payload, row)
+            if before_store is not None:
+                before_store()
+            return result
+
+        arguments = [
+            str(SCRIPT), "render", "--line", str(line),
+            "--session-id", self.session_id, "--socket-name", self.socket_name,
+            "--width", str(width), "--left-width", "0", "--right-width", "0",
+            "--client-theme", "--store-option", f"@tmux-window-wrap-row-{line}",
+            *extra_arguments,
+        ]
+        with mock.patch("sys.argv", arguments), mock.patch("sys.stdout", io.StringIO()):
+            with mock.patch.dict(main.__globals__, {"render": render_then_pause}):
+                main()
+
+    def assert_cached_selection(self, expected):
+        rows = self.tmux(
+            "display-message", "-p", "-t", self.session_id,
+            "#{E:@tmux-window-wrap-row-0}"
+            "#{E:@tmux-window-wrap-row-1}"
+            "#{E:@tmux-window-wrap-row-2}",
+        ).stdout
+        selected = [
+            index for index, style in re.findall(
+                r"#\[range=window\|(\d+)\](.*?)#\[norange\]", rows,
+            ) if "#[bg=blue]" in style
+        ]
+        self.assertEqual(selected, [expected], f"highlighted windows: {selected}")
+
+    def test_cached_rows_follow_selection_without_renderer(self):
+        for line in range(3):
+            self.store_runtime_row(line)
+        self.assert_cached_selection("1")
+        for index in ("0", "2", "1", "2", "0"):
+            self.tmux("select-window", "-t", f"wrap:{index}")
+            self.assert_cached_selection(index)
+
+    def test_late_row_writer_cannot_restore_previous_selection(self):
+        self.tmux("select-window", "-t", "wrap:0")
+        for line in range(3):
+            self.store_runtime_row(line)
+
+        def switch_and_finish_newer_rows():
+            self.tmux("select-window", "-t", "wrap:2")
+            for line in range(3):
+                self.store_runtime_row(line)
+
+        self.store_runtime_row(0, before_store=switch_and_finish_newer_rows)
+        self.assert_cached_selection("2")
+
+    def test_cached_selection_preserves_literal_names_and_count_styles(self):
+        name = "a,b}#{window_id}#[bg=red]'\"$HOME;set -g @oops 1"
+        # rename-window itself expands formats; preserve the literal name.
+        self.tmux("rename-window", "-t", "wrap:1", name.replace("#{", "##{"))
+        self.assertEqual(
+            self.tmux("display-message", "-p", "-t", "wrap:1", "#{window_name}")
+            .stdout.strip(), name,
+        )
+        self.tmux("split-window", "-d", "-t", "wrap:1", "sleep 120")
+        for option, style in (
+            ("light", "fg=#123456,nobold"),
+            ("active", "fg=#654321,bold"),
+        ):
+            self.tmux(
+                "set-option", "-g", f"@tmux-window-wrap-pane-count-{option}-style",
+                style,
+            )
+        self.store_runtime_row(0, width=100)
+        for index, colour in (("1", "654321"), ("0", "123456"), ("1", "654321")):
+            self.tmux("select-window", "-t", f"wrap:{index}")
+            row = self.tmux(
+                "display-message", "-p", "-t", self.session_id,
+                "#{E:@tmux-window-wrap-row-0}",
+            ).stdout
+            self.assertIn(":" + name.replace("#[", "##[") + " ", row)
+            self.assertIn(f"#[fg=#{colour},", row)
+            self.assertNotIn("#{?", row)
+            self.assert_cached_selection(index)
+        self.assertEqual(self.tmux("show-options", "-gqv", "@oops").stdout, "")
+
+    def test_cached_selection_resolves_activity_palette_for_every_frame(self):
+        render = runpy.run_path(str(SCRIPT))["render"]
+        payload = {
+            "width": 80, "left_width": 0, "right_width": 0, "active": "@1",
+            "activity_palettes": TEST_ACTIVITY_PALETTES,
+            "windows": [
+                {"id": f"@{i}", "index": str(i), "name": f"busy{i}", "label": f" {i}:busy{i} ",
+                 "busy_activity_count": i + 1}
+                for i in (0, 1)
+            ],
+        }
+        cached = render({
+            **payload, "live_active": True, "client_theme": True,
+            "animation_option": "@tmux-window-wrap-animation-tick",
+        }, 0)
+        self.tmux("set-option", "-t", self.session_id, "@cached", cached)
+        for scheme in ("light", "dark"):
+            self.tmux("set-option", "-g", "@tmux-window-wrap-color-scheme", scheme)
+            for index in ("0", "1"):
+                self.tmux("select-window", "-t", f"wrap:{index}")
+                for tick in range(24):
+                    with self.subTest(scheme=scheme, index=index, tick=tick):
+                        self.tmux(
+                            "set-option", "-g", "@tmux-window-wrap-animation-tick", str(tick),
+                        )
+                        expanded = self.tmux(
+                            "display-message", "-p", "-t", self.session_id, "#{E:@cached}",
+                        ).stdout.rstrip("\n")
+                        expected = render({
+                            **payload, "active": f"@{index}",
+                            "color_scheme": scheme, "animation_tick": tick,
+                        }, 0)
+                        self.assertEqual(expanded, expected)
+
+    def test_cached_rows_store_large_busy_window_lists(self):
+        for index in range(3, 5):
+            self.tmux("new-window", "-d", "-t", "wrap", "-n", f"busy{index}", "sleep 120")
+        for index in range(5):
+            self.tmux(
+                "set-option", "-p", "-t", f"wrap:{index}",
+                "@tmux-window-wrap-activity", "sleep",
+            )
+        try:
+            self.store_runtime_row(
+                0, width=100,
+                extra_arguments=("--animation-option", "@tmux-window-wrap-animation-tick"),
+            )
+        except subprocess.CalledProcessError as error:
+            raise self.failureException(
+                f"large cached row could not be stored: {error.stderr}"
+            ) from None
+        row = self.tmux(
+            "show-options", "-qv", "-t", self.session_id, "@tmux-window-wrap-row-0",
+        ).stdout
+        # tmux command IPC rejects arguments above approximately 16 KiB.
+        self.assertGreater(len(row.encode()), 16384)
+        for index in ("1", "4", "0"):
+            self.tmux("select-window", "-t", f"wrap:{index}")
+            self.assert_cached_selection(index)
+
+    def captured_selection(self):
+        # An outer tmux pane is a real terminal emulator: capture its final
+        # cells, not substrings from a stream of incremental ANSI updates.
+        output = self.tmux("capture-pane", "-ep", "-t", "observer:").stdout
+        selected = []
+        blue = False
+        for match in re.finditer(r"\x1b\[([0-9;]*)m|([^\x1b]+)", output):
+            codes, text = match.groups()
+            if codes is not None:
+                for code in map(int, codes.split(";") if codes else ["0"]):
+                    if code in (0, 49) or 40 <= code <= 47:
+                        next_blue = code == 44
+                        if next_blue and not blue:
+                            selected.append("")
+                        blue = next_blue
+            elif blue:
+                selected[-1] += text
+        return [label.strip() for label in selected], output
+
+    def test_terminal_selection_tracks_switches_across_all_status_rows(self):
+        self.source_window_wrap_config(animate=False)
+        self.tmux("set-option", "-g", "status-left", "")
+        self.tmux("set-option", "-g", "status-right", "")
+        self.tmux("set-option", "-g", "status-style", "bg=default,fg=default")
+        for index in range(3, 8):
+            self.tmux("new-window", "-d", "-t", "wrap", "-n", "x", "sleep 120")
+        for index in range(8):
+            self.tmux("rename-window", "-t", f"wrap:{index}", f"window{index}")
+        self.tmux(
+            "new-session", "-d", "-s", "observer", "-x", "24", "-y", "24",
+            "env", "-u", "TMUX", "tmux", "-L", self.socket_name,
+            "attach-session", "-t", "wrap",
+        )
+        self.wait_for_client_count(1)
+        self.wait_for_status("3")
+        for index in ("0", "7", "2", "6", "1", "5", "7", "0"):
+            self.tmux("select-window", "-t", f"wrap:{index}")
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                selection, output = self.captured_selection()
+                if selection == [f"{index}:window{index}"]:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail(f"selected {index}, terminal highlights {selection}: {output!r}")
+            # Check that a later renderer completion does not restore stale
+            # highlights after the first correct frame has already appeared.
+            until = time.monotonic() + 0.15
+            while time.monotonic() < until:
+                selection, output = self.captured_selection()
+                self.assertEqual(selection, [f"{index}:window{index}"], output)
+                time.sleep(0.01)
 
     def test_alt_shift_arrows_refresh_reordered_window_without_cached_delay(self):
         self.source_window_wrap_config()
