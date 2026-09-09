@@ -2180,11 +2180,16 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             time.sleep(0.02)
         self.fail(f"client widths did not become {expected}")
 
-    def source_window_wrap_config(self):
+    def source_window_wrap_config(self, animate=True):
         config_text = CONFIG.read_text().replace(
             "$HOME/.local/bin/tmux-window-wrap",
             str(SCRIPT),
         )
+        if not animate:
+            config_text = "\n".join(
+                line for line in config_text.splitlines()
+                if "tmux-window-wrap animate " not in line
+            )
         # Fixture chrome that real users keep in personal ~/.tmux.conf — not in
         # the published conf fragment. Matches the integration assumptions used
         # before window-wrap was extracted from the full home config.
@@ -2461,6 +2466,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         explicit_deferred_option = (
             "@tmux-window-wrap-test-explicit-deferred-frame"
         )
+        client_deferred_option = "@tmux-window-wrap-test-client-deferred-frame"
         direct_option = "@tmux-window-wrap-test-direct-frame"
         payload = {
             "width": 80,
@@ -2522,6 +2528,10 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         }
         deferred = expose_activity_colours(render_payload(deferred_payload))
         self.tmux("set-option", "-g", deferred_option, deferred)
+        client_deferred = expose_activity_colours(render_payload({
+            **deferred_payload, "client_theme": True,
+        }))
+        self.tmux("set-option", "-g", client_deferred_option, client_deferred)
 
         for color_scheme in ("light", "dark"):
             explicit_deferred_payload = {
@@ -2542,6 +2552,10 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
                 "set-option",
                 "-g",
                 color_scheme_option,
+                color_scheme,
+            )
+            self.tmux(
+                "set-option", "-g", "@tmux-window-wrap-color-scheme",
                 color_scheme,
             )
             for animation_tick in range(24):
@@ -2571,6 +2585,10 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         expand_option(explicit_deferred_option),
+                        expand_option(direct_option),
+                    )
+                    self.assertEqual(
+                        expand_option(client_deferred_option),
                         expand_option(direct_option),
                     )
 
@@ -2674,7 +2692,140 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             f"expected at least eight 20 FPS ticks, saw {seen_ticks!r}",
         )
 
-    def test_attached_status_rebuilds_cache_when_color_scheme_changes(self):
+    def wait_for_badge_colour(self, master_fd, colour, timeout=0.5):
+        deadline = time.monotonic() + timeout
+        output = b""
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([master_fd], [], [], 0.01)
+            if not readable:
+                continue
+            output = (output + os.read(master_fd, 65536))[-32768:]
+            # Require the final SGR to colour the count itself, not a nearby cell.
+            for match in re.finditer(
+                rb"((?:\x1b\[[0-9;]*m)+)" + "₂".encode(), output,
+            ):
+                colours = re.findall(
+                    rb"38;2;(\d+);(\d+);(\d+)", match.group(1),
+                )
+                if colours and tuple(map(int, colours[-1])) == colour:
+                    return
+        self.fail(f"badge RGB {colour} was not rendered; tail={output[-1000:]!r}")
+
+    def configure_theme_badge(self):
+        self.tmux("split-window", "-d", "-t", "wrap:0", "sleep 120")
+        self.tmux("set-option", "-as", "terminal-features", ",xterm*:RGB")
+        self.tmux("set-option", "-g", "@tmux-window-wrap-color-scheme", "dark")
+        self.tmux(
+            "set-option", "-g", "@tmux-window-wrap-pane-count-light-style",
+            "fg=#f00000,bold,noitalics,nounderscore",
+        )
+        self.tmux(
+            "set-option", "-g", "@tmux-window-wrap-pane-count-dark-style",
+            "fg=#4cd8f0,nobold,noitalics,nounderscore",
+        )
+        self.source_window_wrap_config(animate=False)
+
+    def report_client_theme(self, master_fd, report, colour):
+        self.drain_client_output(master_fd)
+        # The same native theme report Ghostty sends to tmux (DSR 997).
+        os.write(master_fd, f"\x1b[?997;{report}n".encode())
+        self.wait_for_badge_colour(master_fd, colour)
+
+    def test_client_theme_updates_badge_without_animator(self):
+        self.configure_theme_badge()
+        _, master_fd = self.attach_client(width=100)
+        self.wait_for_client_count(1)
+        self.wait_for_badge_colour(master_fd, (76, 216, 240), timeout=3)
+
+        for report, colour in (
+            (2, (240, 0, 0)), (1, (76, 216, 240)), (2, (240, 0, 0)),
+        ):
+            self.report_client_theme(master_fd, report, colour)
+        self.assertEqual(
+            self.tmux("list-clients", "-F", "#{client_theme}").stdout.strip(),
+            "light",
+        )
+        # This intentionally stays stale: native reporting must work even then.
+        self.assertEqual(
+            self.tmux("show-options", "-gqv", "@tmux-window-wrap-color-scheme")
+            .stdout.strip(),
+            "dark",
+        )
+
+    def test_client_themes_are_independent_in_shared_cached_rows(self):
+        self.configure_theme_badge()
+        first_process, first_fd = self.attach_client(width=100)
+        self.wait_for_client_count(1)
+        self.wait_for_badge_colour(first_fd, (76, 216, 240), timeout=3)
+        _, second_fd = self.attach_client(width=100)
+        self.wait_for_client_count(2)
+        self.wait_for_badge_colour(second_fd, (76, 216, 240), timeout=3)
+        self.report_client_theme(first_fd, 1, (76, 216, 240))
+        self.report_client_theme(second_fd, 2, (240, 0, 0))
+
+        # A redraw on the dark client must not pick up the other client's theme.
+        self.drain_client_output(first_fd)
+        first_client = next(
+            line.split("|", 1)[1]
+            for line in self.tmux(
+                "list-clients", "-F", "#{client_pid}|#{client_name}",
+            ).stdout.splitlines()
+            if line.split("|", 1)[0] == str(first_process.pid)
+        )
+        self.tmux("refresh-client", "-S", "-t", first_client)
+        self.wait_for_badge_colour(first_fd, (76, 216, 240))
+        self.report_client_theme(second_fd, 1, (76, 216, 240))
+        self.report_client_theme(first_fd, 2, (240, 0, 0))
+
+    def test_client_theme_updates_continuation_rows_and_active_count_style(self):
+        self.configure_theme_badge()
+        self.tmux("set-option", "-g", "status-left", "")
+        self.tmux("set-option", "-g", "status-right", "")
+        for index in range(3):
+            self.tmux("rename-window", "-t", f"wrap:{index}", f"window{index}")
+            if index:
+                self.tmux("split-window", "-d", "-t", f"wrap:{index}", "sleep 120")
+        _, master_fd = self.attach_client(width=15)
+        self.wait_for_client_count(1)
+        self.wait_for_status("3")
+        self.wait_for_badge_colour(master_fd, (76, 216, 240), timeout=3)
+        for line in range(3):
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                row = self.tmux(
+                    "show-options", "-t", self.session_id, "-qv",
+                    f"@tmux-window-wrap-row-{line}",
+                ).stdout
+                if "₂" in row:
+                    break
+                time.sleep(0.02)
+            self.assertIn("₂", row)
+        for report, colour, style in (
+            (2, (240, 0, 0), "fg=#f00000,bold,noitalics,nounderscore"),
+            (1, (76, 216, 240), "fg=#4cd8f0,nobold,noitalics,nounderscore"),
+        ):
+            self.report_client_theme(master_fd, report, colour)
+            for line in range(3):
+                expanded = self.tmux(
+                    "display-message", "-p", "-t", self.session_id,
+                    f"#{{E:@tmux-window-wrap-row-{line}}}",
+                ).stdout
+                self.assertIn(f"#[{style}]₂#[default]#[pop-default]", expanded)
+
+        self.drain_client_output(master_fd)
+        self.tmux(
+            "set-option", "-g", "@tmux-window-wrap-pane-count-active-style",
+            "fg=#fff5e8,bold,noitalics,nounderscore",
+        )
+        self.wait_for_badge_colour(master_fd, (255, 245, 232))
+        self.report_client_theme(master_fd, 2, (240, 0, 0))
+        active_row = self.tmux(
+            "display-message", "-p", "-t", self.session_id,
+            "#{E:@tmux-window-wrap-row-1}",
+        ).stdout
+        self.assertIn("#[fg=#fff5e8,bold,noitalics,nounderscore]₂", active_row)
+
+    def test_attached_status_falls_back_when_client_theme_is_unknown(self):
         pane_id = self.tmux(
             "display-message",
             "-p",
@@ -2693,7 +2844,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
                 "set-option", "-g",
                 f"@tmux-window-wrap-pane-count-{scheme}-style", style,
             )
-        self.source_window_wrap_config()
+        self.source_window_wrap_config(animate=False)
         _, master_fd = self.attach_client(width=80)
         self.wait_for_client_count(1)
         self.wait_for_status_text(master_fd, "▓", timeout=1)
@@ -2706,12 +2857,8 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         def cached_rows():
             return "".join(
                 self.tmux(
-                    "show-options",
-                    "-t",
-                    self.session_id,
-                    "-q",
-                    "-v",
-                    f"@tmux-window-wrap-row-{line}",
+                    "display-message", "-p", "-t", self.session_id,
+                    f"#{{E:@tmux-window-wrap-row-{line}}}",
                 ).stdout
                 for line in range(3)
             )
@@ -3101,6 +3248,8 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
 
     def test_sourcing_config_preserves_external_indexed_hooks(self):
         external_hooks = {
+            "client-light-theme": "set-environment -g EXTERNAL_LIGHT preserved",
+            "client-dark-theme": "set-environment -g EXTERNAL_DARK preserved",
             "after-select-window": (
                 "set-environment -g AIPANE_EXTERNAL_AFTER_SELECT preserved"
             ),
@@ -3201,14 +3350,8 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "#{q:client_name}_#{client_width}",
             "TMUX_WINDOW_WRAP_ACTIVE=#{q:window_id}:#{window_index}",
             "--animation-option @tmux-window-wrap-animation-tick",
-            "--color-scheme #{@tmux-window-wrap-color-scheme}",
+            "--client-theme",
             "--pane-count-style #{@tmux-window-wrap-pane-count-style}",
-            "--pane-count-text-style=#{?"
-            "#{==:#{@tmux-window-wrap-color-scheme},dark},"
-            "#{q:@tmux-window-wrap-pane-count-dark-style},"
-            "#{q:@tmux-window-wrap-pane-count-light-style}}",
-            "--pane-count-active-text-style="
-            "#{q:@tmux-window-wrap-pane-count-active-style}",
             "--light-inactive-palette "
             "#{@tmux-window-wrap-activity-light-inactive}",
             "--light-active-palette "
@@ -3252,6 +3395,10 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         ):
             configured = self.tmux("show-hooks", "-g", hook).stdout
             self.assertIn("tmux-window-wrap invalidate", configured)
+
+        for hook in ("client-light-theme", "client-dark-theme"):
+            configured = self.tmux("show-hooks", "-g", hook).stdout
+            self.assertIn("refresh-client -S", configured)
 
         # conf must stay a public fragment: no personal prefix/plugins.
         conf_text = CONFIG.read_text()

@@ -344,6 +344,14 @@ def animated_activity_indicator(
     )
 
 
+def color_scheme_reference(option):
+    if option == "client_theme":
+        # Resolve per client at redraw time, including already cached rows.
+        # The animator's OS probe is only a fallback for older terminals.
+        return "#{?client_theme,#{client_theme},#{" + COLOR_SCHEME_OPTION + "}}"
+    return "#{" + option + "}"
+
+
 def activity_indicator_format(
     phase_offsets,
     animation_option,
@@ -366,7 +374,7 @@ def activity_indicator_format(
         animation_option,
         dark_palette,
     )
-    scheme_reference = "#{" + color_scheme_option + "}"
+    scheme_reference = color_scheme_reference(color_scheme_option)
     return (
         "#{?#{==:"
         + scheme_reference
@@ -581,6 +589,22 @@ def render(payload, line):
     animation_option = payload.get("animation_option")
     color_scheme = payload.get("color_scheme", "light")
     color_scheme_option = payload.get("color_scheme_option")
+    count_text_style = payload.get("pane_count_text_style", "")
+    count_active_text_style = payload.get("pane_count_active_text_style", "")
+    if payload.get("client_theme"):
+        color_scheme_option = "client_theme"
+        # Keep option references in the cached row, so neither a theme change
+        # nor a personal style change needs a renderer job to finish first.
+        count_text_style = (
+            "#{?#{==:" + color_scheme_reference(color_scheme_option) + ",dark},"
+            "#{@tmux-window-wrap-pane-count-dark-style},"
+            "#{@tmux-window-wrap-pane-count-light-style}}"
+        )
+        count_active_text_style = (
+            "#{?@tmux-window-wrap-pane-count-active-style,"
+            "#{@tmux-window-wrap-pane-count-active-style},"
+            + count_text_style + "}"
+        )
     pane_count_style = payload.get(
         "pane_count_style",
         DEFAULT_PANE_COUNT_STYLE,
@@ -609,8 +633,8 @@ def render(payload, line):
             animation_option,
             color_scheme_option,
             pane_count_style,
-            payload.get("pane_count_text_style", ""),
-            payload.get("pane_count_active_text_style", ""),
+            count_text_style,
+            count_active_text_style,
         )
         for window_id in layout["lines"][line]
     )
@@ -1128,6 +1152,7 @@ def load_tmux_payload(arguments):
             )
         ),
         "animation_option": getattr(arguments, "animation_option", None),
+        "client_theme": getattr(arguments, "client_theme", False),
         "color_scheme": getattr(arguments, "color_scheme", "light"),
         "color_scheme_option": getattr(
             arguments,
@@ -1238,6 +1263,12 @@ def main():
     )
     render_parser.add_argument("--color-scheme-option")
     render_parser.add_argument(
+        "--client-theme",
+        action="store_true",
+        default=None,
+        help="resolve terminal theme and pane-count style options at tmux redraw",
+    )
+    render_parser.add_argument(
         "--pane-count-style",
         choices=PANE_COUNT_STYLES,
     )
@@ -1336,6 +1367,7 @@ def main():
     else:
         payload = json.load(sys.stdin)
         for key in (
+            "client_theme",
             "pane_count_style",
             "pane_count_text_style",
             "pane_count_active_text_style",

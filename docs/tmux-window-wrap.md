@@ -44,8 +44,13 @@ This example uses upright cyan subscripts without a separate background. The
 active style gives the count a darker foreground on the selected window's blue
 background. An empty active style uses the current light/dark count style;
 all three options default to empty, preserving the window's original style.
-The existing theme detector selects the light/dark style. Count styling does
-not add columns, and the window's text style is restored after the count.
+The renderer resolves the terminal's reported `client_theme` when tmux redraws
+each client's status. Light/dark theme hooks refresh the status immediately;
+cached rows retain theme and style references instead of freezing one colour.
+Theme changes therefore work even if the animation driver has stopped, and
+clients sharing a session can use different themes. An unreported client theme
+falls back to `@tmux-window-wrap-color-scheme`. Count styling does not add
+columns, and the window's text style is restored after the count.
 
 ## Agent activity indicators
 
@@ -271,8 +276,13 @@ set -g @tmux-window-wrap-activity-dark-active 'RRGGBB,...'
 ```
 
 Set personal palettes before sourcing `conf/tmux-window-wrap.conf`. The public
-fragment supplies neutral fallbacks. On macOS the animation driver checks the
-system appearance and updates `@tmux-window-wrap-color-scheme` automatically.
+fragment supplies neutral fallbacks. Its `render --client-theme` mode resolves
+both indicator palettes and count styles per client at redraw time. On macOS
+the animation driver checks the system appearance every five seconds and
+updates `@tmux-window-wrap-color-scheme` as a fallback for terminals that do not
+report a theme. A reported terminal theme always takes precedence, including
+when the terminal uses a theme different from the OS. Without terminal theme
+reports, automatic switching still requires the animation driver.
 After each indicator, the renderer restores the normal window-name foreground
 colour.
 
