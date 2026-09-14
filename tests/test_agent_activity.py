@@ -1190,6 +1190,116 @@ class AgentActivityTests(unittest.TestCase):
             newer = activity.inspect(pane.pane_id)
             self.assertEqual(newer.state, "busy")
 
+    def test_grok_hook_report_reconciles_ctrl_c_and_preserves_next_turn(self):
+        # tmux reports the versioned executable while ps reports the launch
+        # symlink. Exercise the actual identity reader, not an injected identity.
+        for command in ("grok", "grok-1.0.30-mac"):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as raw_tmp:
+                grok_home = Path(raw_tmp)
+                session_id = "e841e6b4-e97e-4ef1-b0b8-a321c7e9f7ce"
+                session_dir = (
+                    grok_home / "sessions"
+                    / urllib.parse.quote(raw_tmp, safe="") / session_id
+                )
+                session_dir.mkdir(parents=True)
+                (grok_home / "active_sessions.json").write_text(
+                    json.dumps([{
+                        "session_id": session_id, "pid": 123, "cwd": raw_tmp,
+                    }]), encoding="utf-8",
+                )
+                pane = PaneActivity(
+                    pane_id="%7", current_command=command,
+                    pane_tty="/dev/ttys018",
+                )
+                activity, adapter = self.activity_for(
+                    pane, environment={"GROK_HOME": raw_tmp},
+                    process_exists=lambda pid: pid == 123,
+                    process_tty=lambda _pid: "ttys018",
+                )
+                started_at = "Mon Sep 14 11:02:30 2026"
+                live_start, live_tty = started_at, "ttys018"
+
+                def fake_ps(arguments, **_kwargs):
+                    self.assertEqual(arguments[0], "ps")
+                    output = {
+                        "ppid=,lstart=,comm=": f"1 {started_at} grok\n",
+                        "lstart=,tty=": f"{live_start} {live_tty}\n",
+                        "lstart=,comm=": f"{started_at} grok\n",
+                    }[arguments[-1]]
+                    return subprocess.CompletedProcess(arguments, 0, output, "")
+
+                with (
+                    mock.patch("agent_activity.os.getppid", return_value=123),
+                    mock.patch("agent_activity.os.kill"),
+                    mock.patch("agent_activity.subprocess.run", side_effect=fake_ps),
+                ):
+                    activity.report(
+                        pane.pane_id, "busy",
+                        {"hook_event_name": "UserPromptSubmit"},
+                        now_ms=1_789_354_965_249,
+                    )
+                    self.assertEqual(activity.inspect(pane.pane_id).state, "busy")
+                    (session_dir / "updates.jsonl").write_text(
+                        json.dumps({
+                            "timestamp": 1_789_355_332,
+                            "method": "_x.ai/session/update",
+                            "params": {
+                                "sessionId": session_id,
+                                "update": {
+                                    "sessionUpdate": "turn_completed",
+                                    "stop_reason": "cancelled",
+                                },
+                                "_meta": {
+                                    "agentTimestampMs": 1_789_355_332_237,
+                                    "cancelTrigger": "ctrl_c",
+                                    "cancellationCategory": "MidTurnAbort",
+                                },
+                            },
+                        }) + "\n", encoding="utf-8",
+                    )
+                    # Completion evidence must not bypass process identity.
+                    for live_start, live_tty in (
+                        ("Mon Sep 14 11:10:00 2026", "ttys018"),
+                        (started_at, "ttys099"),
+                    ):
+                        self.assertEqual(activity.inspect(pane.pane_id).state, "unknown")
+                        for _ in range(2):
+                            self.assertFalse(activity.reconcile().changed)
+                        self.assertEqual(adapter.read(pane.pane_id).marker, command)
+                    live_start, live_tty = started_at, "ttys018"
+                    view = activity.inspect(pane.pane_id)
+                    self.assertEqual(view.state, "idle")
+                    self.assertEqual(view.reason, "grok_update_idle")
+                    self.assertTrue(view.repairable)
+
+                    first = activity.reconcile()
+                    self.assertTrue(first.busy)
+                    self.assertFalse(first.changed)
+                    second = activity.reconcile()
+                    self.assertFalse(second.busy)
+                    self.assertTrue(second.changed)
+                    repaired = adapter.read(pane.pane_id)
+                    self.assertEqual(repaired.marker, "")
+                    self.assertEqual(json.loads(repaired.record)["reported"], "idle")
+                    self.assertEqual(activity.inspect(pane.pane_id).state, "idle")
+                    self.assertFalse(activity.reconcile().busy)
+
+                    # A new report between the two observations invalidates
+                    # the pending repair even when it is the same session.
+                    activity.report(pane.pane_id, "busy", now_ms=1_789_354_965_249)
+                    self.assertFalse(activity.reconcile().changed)
+                    activity.report(
+                        pane.pane_id, "busy",
+                        {"hook_event_name": "UserPromptSubmit"},
+                        now_ms=1_789_355_333_000,
+                    )
+                    self.assertEqual(activity.inspect(pane.pane_id).state, "busy")
+                    for _ in range(2):
+                        result = activity.reconcile()
+                        self.assertTrue(result.busy)
+                        self.assertFalse(result.changed)
+                    self.assertEqual(adapter.read(pane.pane_id).marker, command)
+
     def test_kimi_turn_end_resolves_busy_when_original_cwd_was_renamed(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             kimi_home = Path(raw_tmp) / ".kimi-code"

@@ -198,7 +198,12 @@ marked Grok pane with `${GROK_HOME:-~/.grok}/active_sessions.json` and the
 session's authoritative `updates.jsonl` stream. The live process, TTY, session
 id, and Grok command must agree, and only a `turn_completed` timestamp at least
 as new as the busy marker clears it. A previous turn's completion therefore
-cannot clear a newly submitted turn. Other AI Tools remain hook/plugin-driven.
+cannot clear a newly submitted turn. Process identity accepts `grok` and its
+versioned executable names as the same AI Tool: macOS can report `grok` in
+`ps` while tmux reports `grok-1.0.30-mac`. Structured Grok reports are repaired
+after two matching observations and a locked identity recheck; both the record
+and its display marker become idle together. Other AI Tools remain
+hook/plugin-driven.
 
 ### Kimi Code hooks
 

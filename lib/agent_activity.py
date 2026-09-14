@@ -1376,7 +1376,10 @@ class AgentActivity:
                     and (marked_busy or pane.record or pane.reporter == pane.current_command)
                 )
                 or (
-                    is_kimi_command(pane.current_command)
+                    (
+                        is_kimi_command(pane.current_command)
+                        or is_grok_command(pane.current_command)
+                    )
                     and marked_busy
                     and bool(pane.record)
                 )
@@ -2447,4 +2450,5 @@ def _agent_commands_compatible(left: str, right: str) -> bool:
         left == right
         or (_is_codex_command(left) and _is_codex_command(right))
         or (is_kimi_command(left) and is_kimi_command(right))
+        or (is_grok_command(left) and is_grok_command(right))
     )
