@@ -81,7 +81,7 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 
 Then: `tmux source-file ~/.tmux.conf`
 
-### Agent-aware pane close
+### Agent-aware pane and window close
 
 `prefix x` / `Cmd+W` closes ordinary panes immediately. When the selected pane
 is the window's last pane, aipane checks that pane's live process tree first:
@@ -89,6 +89,13 @@ an AI Tool opens a centered confirmation menu, a verified non-Agent closes
 immediately, and an unavailable or inconclusive detector opens the same menu as
 the safe fallback. Press `y` to close; `n` or `Esc` cancels. An idle AI Tool is
 still an Agent for this decision; the animated activity marker is not required.
+
+The window tab's right-click menu (including Option/right-click) uses the same
+check for **Kill**. Because this action closes the entire window, it checks
+every pane in that window and asks for confirmation if any pane contains an
+AI Tool or cannot be classified. A window containing only verified non-Agent
+panes closes immediately. The clicked window remains the target, even when it
+is inactive or window indexes change before confirmation.
 
 The default detector is `tmux-window-wrap` on the tmux server's `PATH`. Override
 its executable path before sourcing `tmux-workstation.conf` if needed:

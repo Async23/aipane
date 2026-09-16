@@ -346,11 +346,13 @@ waiting/idle AI Tool remains `agent`, while a stale activity marker or window
 name does not create a match. Native aipane tool commands and their common
 runtime/package-runner wrappers are recognized.
 
-`conf/tmux-workstation.conf` uses this command for `prefix x`: a known
-non-Agent last pane closes immediately, while an Agent last pane asks for
-confirmation in a centered tmux menu. Process or tmux lookup failures return
-`unknown`, which the binding also confirms so detector failure cannot silently
-destroy a window.
+`conf/tmux-workstation.conf` uses this command for `prefix x` and the window
+tab's right-click **Kill** action. Both share the same window-close check:
+known non-Agent panes close immediately, while any Agent pane asks for
+confirmation in a centered tmux menu. The right-click action checks every pane
+in the clicked window; `prefix x` only enters this check for the last pane.
+Process or tmux lookup failures return `unknown`, which also requires
+confirmation so detector failure cannot silently destroy a window.
 
 ## Files
 

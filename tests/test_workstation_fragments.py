@@ -11,6 +11,7 @@ import re
 import signal
 import subprocess
 import tempfile
+import termios
 import time
 import unittest
 from pathlib import Path
@@ -49,6 +50,235 @@ class GhosttyFragmentTests(unittest.TestCase):
 
 
 class TmuxWorkstationFragmentTests(unittest.TestCase):
+    def test_status_menu_kill_guards_every_pane_in_the_clicked_window(self):
+        socket = f"ws-window-menu-{os.getpid()}-{id(self)}"
+        child_pid = None
+        master_fd = None
+        environment = os.environ.copy()
+        environment.pop("TMUX", None)
+        environment.pop("TMUX_PANE", None)
+        environment["TERM"] = "xterm-256color"
+
+        def tmux(*args: str, check: bool = True):
+            return subprocess.run(
+                ["tmux", "-L", socket, *args],
+                check=check,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+        def drain_terminal() -> bytes:
+            output = b""
+            if master_fd is not None:
+                while True:
+                    try:
+                        chunk = os.read(master_fd, 65536)
+                        if not chunk:
+                            break
+                        output += chunk
+                    except BlockingIOError:
+                        break
+            return output
+
+        def wait_until(predicate, timeout: float = 3.0) -> bool:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                drain_terminal()
+                if predicate():
+                    return True
+                time.sleep(0.02)
+            return predicate()
+
+        def window_ids() -> set[str]:
+            return set(
+                tmux("list-windows", "-t", "window-menu", "-F", "#{window_id}")
+                .stdout.splitlines()
+            )
+
+        def menu_count(centered: bool = False) -> int:
+            return sum(
+                ": display-menu" in line
+                and (not centered or "-x C -y C" in line)
+                for line in tmux("show-messages", "-t", client).stdout.splitlines()
+            )
+
+        def new_target(command: str = "sleep 120") -> str:
+            return tmux(
+                "new-window", "-d", "-P", "-F", "#{window_id}",
+                "-t", "window-menu:1", "-n", "target", command,
+            ).stdout.strip()
+
+        def invoke_menu_kill(*, option: bool = False) -> int:
+            # Separate clicks so tmux does not interpret them as DoubleClick3.
+            time.sleep(0.35)
+            menus = menu_count()
+            prompts = menu_count(centered=True)
+            # SGR mouse events hit the inactive window's actual status range.
+            button = 10 if option else 2
+            os.write(
+                master_fd,
+                f"\x1b[<{button};9;30M\x1b[<{button};9;30m".encode(),
+            )
+            self.assertTrue(
+                wait_until(lambda: menu_count() > menus),
+                "right-click did not open the window status menu:\n"
+                + tmux("show-messages", "-t", client).stdout,
+            )
+            tmux("send-keys", "-K", "-c", client, "X")
+            return prompts
+
+        def assert_guarded(target: str, *, option: bool = False) -> None:
+            prompts = invoke_menu_kill(option=option)
+            self.assertTrue(
+                wait_until(
+                    lambda: menu_count(centered=True) > prompts
+                    or target not in window_ids()
+                ),
+                "the window menu Kill action did not resolve",
+            )
+            self.assertIn(
+                target, window_ids(),
+                "window menu Kill destroyed an Agent/unknown window without "
+                "confirmation",
+            )
+            self.assertGreater(menu_count(centered=True), prompts)
+            self.assertEqual(
+                tmux("display-message", "-p", "-t", "window-menu", "#{window_id}")
+                .stdout.strip(),
+                active_window,
+                "right-clicking an inactive tab changed the active window",
+            )
+
+        try:
+            tmux(
+                "-f", "/dev/null", "new-session", "-d", "-s", "window-menu",
+                "-x", "100", "-y", "30", "sleep 120",
+            )
+            tmux("source-file", str(TMUX_WS))
+            tmux("set-option", "-g", "@aipane-agent-status-command", str(WRAP_BIN))
+            tmux("set-option", "-g", "renumber-windows", "off")
+            tmux("set-option", "-g", "status-position", "bottom")
+            tmux(
+                "set-option", "-g", "status-format[0]",
+                "#[range=window|0]ACTIVE#[norange] "
+                "#[range=window|1]TARGET#[norange]",
+            )
+            active_window = tmux(
+                "display-message", "-p", "-t", "window-menu:0", "#{window_id}",
+            ).stdout.strip()
+            target = new_target()
+            tmux("split-window", "-d", "-t", target, "sleep 120")
+
+            child_pid, master_fd = pty.fork()
+            if child_pid == 0:
+                termios.tcsetwinsize(0, (30, 100))
+                os.execvpe(
+                    "tmux", ["tmux", "-L", socket, "attach-session", "-t", "window-menu"],
+                    environment,
+                )
+            os.set_blocking(master_fd, False)
+            client = ""
+            for _ in range(100):
+                client = tmux("list-clients", "-F", "#{client_name}").stdout.strip()
+                if client:
+                    break
+                time.sleep(0.02)
+            self.assertTrue(client, "tmux client did not attach")
+            terminal_output = b""
+            for _ in range(100):
+                terminal_output += drain_terminal()
+                if b"TARGET" in terminal_output:
+                    break
+                time.sleep(0.02)
+            self.assertIn(b"TARGET", terminal_output)
+
+            # A plain window closes immediately, without touching the active tab.
+            prompts = invoke_menu_kill()
+            self.assertTrue(wait_until(lambda: target not in window_ids()))
+            self.assertEqual(menu_count(centered=True), prompts)
+            self.assertIn(active_window, window_ids())
+
+            with tempfile.TemporaryDirectory() as raw_tmp:
+                fake_agent = Path(raw_tmp) / "codex"
+                fake_agent.symlink_to("/bin/sleep")
+                # The original reported case: one last pane running an Agent.
+                target = new_target(f"{fake_agent} 120")
+                assert_guarded(target)
+                tmux("send-keys", "-K", "-c", client, "y")
+                self.assertTrue(wait_until(lambda: target not in window_ids()))
+                self.assertIn(active_window, window_ids())
+
+                target = new_target()
+                agent_pane = tmux(
+                    "split-window", "-d", "-P", "-F", "#{pane_id}", "-t", target,
+                    f"{fake_agent} 120",
+                ).stdout.strip()
+                # The selected pane is ordinary; the Agent runs in another pane.
+                self.assertNotEqual(
+                    tmux("display-message", "-p", "-t", target, "#{pane_id}")
+                    .stdout.strip(), agent_pane,
+                )
+                detected = subprocess.run(
+                    [str(WRAP_BIN), "pane-agent-status", "--socket-name", socket,
+                     "--pane", agent_pane],
+                    check=True, capture_output=True, text=True, env=environment,
+                ).stdout.strip()
+                self.assertEqual(detected, "agent")
+
+                assert_guarded(target)
+                tmux("send-keys", "-K", "-c", client, "n")
+                self.assertIn(target, window_ids())
+                assert_guarded(target, option=True)
+                tmux("send-keys", "-K", "-c", client, "Escape")
+                self.assertIn(target, window_ids())
+                assert_guarded(target)
+                # A tab can move while its prompt is open. Keep the original ID.
+                tmux("move-window", "-s", target, "-t", "window-menu:2")
+                replacement = new_target()
+                tmux("send-keys", "-K", "-c", client, "y")
+                self.assertTrue(wait_until(lambda: target not in window_ids()))
+                self.assertIn(active_window, window_ids())
+                self.assertIn(replacement, window_ids())
+                tmux("kill-window", "-t", replacement)
+
+                # Even a reassuring stdout value is unknown if detection failed.
+                detector = Path(raw_tmp) / "detector's command"
+                detector.write_text("#!/bin/sh\nprintf 'none\\n'\nexit 1\n")
+                detector.chmod(0o755)
+                tmux("set-option", "-g", "@aipane-agent-status-command", str(detector))
+                target = new_target()
+                assert_guarded(target)
+                tmux("send-keys", "-K", "-c", client, "y")
+                self.assertTrue(wait_until(lambda: target not in window_ids()))
+
+            # Failure to classify also needs a confirmation, including Option-click.
+            tmux(
+                "set-option", "-g", "@aipane-agent-status-command",
+                str(ROOT / "bin" / "missing-agent-detector"),
+            )
+            target = new_target()
+            assert_guarded(target, option=True)
+            tmux("send-keys", "-K", "-c", client, "n")
+            self.assertIn(target, window_ids())
+            self.assertIn(active_window, window_ids())
+        finally:
+            tmux("kill-server", check=False)
+            if master_fd is not None:
+                os.close(master_fd)
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGHUP)
+                except ProcessLookupError:
+                    pass
+                for _ in range(50):
+                    if os.waitpid(child_pid, os.WNOHANG)[0]:
+                        break
+                    time.sleep(0.02)
+                else:
+                    os.kill(child_pid, signal.SIGKILL)
+                    os.waitpid(child_pid, 0)
+
     def test_kill_pane_only_confirms_for_a_last_agent_pane(self):
         socket = f"ws-kill-pane-{os.getpid()}-{id(self)}"
         client_process = None
