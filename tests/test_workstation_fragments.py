@@ -279,10 +279,11 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                     os.kill(child_pid, signal.SIGKILL)
                     os.waitpid(child_pid, 0)
 
-    def test_last_agent_close_menu_accepts_mouse_click(self):
+    def test_last_agent_close_menu_accepts_mouse_click_after_motion(self):
         socket = f"ws-last-agent-mouse-{os.getpid()}-{id(self)}"
         child_pid = None
         master_fd = None
+        terminal_output = bytearray()
         environment = os.environ.copy()
         environment.pop("TMUX", None)
         environment.pop("TMUX_PANE", None)
@@ -306,8 +307,8 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
             while time.monotonic() < deadline:
                 if master_fd is not None:
                     try:
-                        while os.read(master_fd, 65536):
-                            pass
+                        while chunk := os.read(master_fd, 65536):
+                            terminal_output.extend(chunk)
                     except BlockingIOError:
                         pass
                 if predicate():
@@ -355,22 +356,57 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                     time.sleep(0.02)
                 self.assertTrue(client, "tmux client did not attach")
 
-                tmux("switch-client", "-c", client, "-T", "prefix")
-                tmux("send-keys", "-K", "-c", client, "x")
-                self.assertTrue(
-                    wait_until(
-                        lambda: "command: display-menu"
-                        in tmux("show-messages", "-t", client).stdout,
-                    ),
-                    "last Agent pane did not open a confirmation menu",
-                )
-                self.assertIn(agent_window, window_ids())
+                def open_menu() -> None:
+                    terminal_output.clear()
+                    tmux("switch-client", "-c", client, "-T", "prefix")
+                    tmux("send-keys", "-K", "-c", client, "x")
+                    self.assertTrue(
+                        wait_until(lambda: b"Close window" in terminal_output),
+                        "last Agent pane did not draw a confirmation menu",
+                    )
+                    self.assertIn(agent_window, window_ids())
 
-                # A 100x30 client centers the Close window item at (50, 15).
+                def hover_from_outside(row: int) -> None:
+                    terminal_output.clear()
+                    # SGR 35 is buttonless motion. Moving outside and then
+                    # inside must redraw the menu, without choosing an item.
+                    os.write(
+                        master_fd,
+                        f"\x1b[<35;10;25M\x1b[<35;50;{row}M".encode(),
+                    )
+                    self.assertTrue(
+                        wait_until(lambda: b"Close window" in terminal_output),
+                        "mouse motion dismissed the confirmation menu",
+                    )
+                    self.assertIn(
+                        agent_window, window_ids(),
+                        "hovering Close window confirmed without a click",
+                    )
+
+                # A 100x30 client centers Cancel at (50, 14) and Close window
+                # at (50, 15). Cancellation must consume the menu, so a later
+                # y goes to the pane and cannot close the Agent window.
+                for click in (b"\x1b[<0;50;14M\x1b[<0;50;14m",
+                              b"\x1b[<0;10;25M\x1b[<0;10;25m"):
+                    open_menu()
+                    hover_from_outside(14)
+                    terminal_output.clear()
+                    os.write(master_fd, click)
+                    self.assertTrue(
+                        wait_until(lambda: b"\x1b[?1003l" in terminal_output),
+                        "clicking Cancel or outside did not dismiss the menu",
+                    )
+                    tmux("send-keys", "-K", "-c", client, "y")
+                    self.assertIn(agent_window, window_ids())
+
+                open_menu()
+                hover_from_outside(15)
+                hover_from_outside(15)  # Leaving and re-entering is safe too.
                 os.write(master_fd, b"\x1b[<0;50;15M\x1b[<0;50;15m")
                 self.assertTrue(
                     wait_until(lambda: agent_window not in window_ids()),
-                    "clicking Close window did not close the last Agent pane",
+                    "mouse motion dismissed the menu before Close window "
+                    "could be clicked",
                 )
         finally:
             tmux("kill-server", check=False)
