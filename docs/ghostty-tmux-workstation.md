@@ -87,8 +87,9 @@ Then: `tmux source-file ~/.tmux.conf`
 is the window's last pane, aipane checks that pane's live process tree first:
 an AI Tool opens a centered confirmation menu, a verified non-Agent closes
 immediately, and an unavailable or inconclusive detector opens the same menu as
-the safe fallback. Press `y` to close; `n` or `Esc` cancels. An idle AI Tool is
-still an Agent for this decision; the animated activity marker is not required.
+the safe fallback. Press `y` or click **Close window** to close it. Press `n`
+or `Esc`, or click **Cancel**, to leave it open. An idle AI Tool is still an
+Agent for this decision; the animated activity marker is not required.
 
 The window tab's right-click menu (including Option/right-click) uses the same
 check for **Kill**. Because this action closes the entire window, it checks

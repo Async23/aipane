@@ -279,6 +279,116 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                     os.kill(child_pid, signal.SIGKILL)
                     os.waitpid(child_pid, 0)
 
+    def test_last_agent_close_menu_accepts_mouse_click(self):
+        socket = f"ws-last-agent-mouse-{os.getpid()}-{id(self)}"
+        child_pid = None
+        master_fd = None
+        environment = os.environ.copy()
+        environment.pop("TMUX", None)
+        environment.pop("TMUX_PANE", None)
+        environment["TERM"] = "xterm-256color"
+
+        def tmux(*args: str, check: bool = True):
+            return subprocess.run(
+                ["tmux", "-L", socket, *args],
+                check=check, capture_output=True, text=True, env=environment,
+            )
+
+        def window_ids() -> set[str]:
+            return set(
+                tmux(
+                    "list-windows", "-t", "last-agent-mouse", "-F", "#{window_id}",
+                ).stdout.splitlines()
+            )
+
+        def wait_until(predicate, timeout: float = 2.0) -> bool:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if master_fd is not None:
+                    try:
+                        while os.read(master_fd, 65536):
+                            pass
+                    except BlockingIOError:
+                        pass
+                if predicate():
+                    return True
+                time.sleep(0.02)
+            return predicate()
+
+        try:
+            with tempfile.TemporaryDirectory() as raw_tmp:
+                fake_agent = Path(raw_tmp) / "codex"
+                fake_agent.symlink_to("/bin/sleep")
+                tmux(
+                    "-f", "/dev/null", "new-session", "-d", "-s",
+                    "last-agent-mouse", "-x", "100", "-y", "30", "sleep 120",
+                )
+                tmux("source-file", str(TMUX_WS))
+                tmux("set-option", "-g", "@aipane-agent-status-command", str(WRAP_BIN))
+                agent_window = tmux(
+                    "new-window", "-P", "-F", "#{window_id}",
+                    "-t", "last-agent-mouse:", f"{fake_agent} 120",
+                ).stdout.strip()
+                agent_pane = tmux(
+                    "display-message", "-p", "-t", agent_window, "#{pane_id}",
+                ).stdout.strip()
+                detected = subprocess.run(
+                    [str(WRAP_BIN), "pane-agent-status", "--socket-name", socket,
+                     "--pane", agent_pane],
+                    check=True, capture_output=True, text=True, env=environment,
+                ).stdout.strip()
+                self.assertEqual(detected, "agent")
+
+                child_pid, master_fd = pty.fork()
+                if child_pid == 0:
+                    termios.tcsetwinsize(0, (30, 100))
+                    os.execvpe(
+                        "tmux", ["tmux", "-L", socket, "attach-session", "-t", "last-agent-mouse"],
+                        environment,
+                    )
+                os.set_blocking(master_fd, False)
+                client = ""
+                for _ in range(100):
+                    client = tmux("list-clients", "-F", "#{client_name}").stdout.strip()
+                    if client:
+                        break
+                    time.sleep(0.02)
+                self.assertTrue(client, "tmux client did not attach")
+
+                tmux("switch-client", "-c", client, "-T", "prefix")
+                tmux("send-keys", "-K", "-c", client, "x")
+                self.assertTrue(
+                    wait_until(
+                        lambda: "command: display-menu"
+                        in tmux("show-messages", "-t", client).stdout,
+                    ),
+                    "last Agent pane did not open a confirmation menu",
+                )
+                self.assertIn(agent_window, window_ids())
+
+                # A 100x30 client centers the Close window item at (50, 15).
+                os.write(master_fd, b"\x1b[<0;50;15M\x1b[<0;50;15m")
+                self.assertTrue(
+                    wait_until(lambda: agent_window not in window_ids()),
+                    "clicking Close window did not close the last Agent pane",
+                )
+        finally:
+            tmux("kill-server", check=False)
+            if master_fd is not None:
+                os.close(master_fd)
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGHUP)
+                except ProcessLookupError:
+                    pass
+                for _ in range(50):
+                    if os.waitpid(child_pid, os.WNOHANG)[0]:
+                        break
+                    time.sleep(0.02)
+                else:
+                    os.kill(child_pid, signal.SIGKILL)
+                    os.waitpid(child_pid, 0)
+
     def test_kill_pane_only_confirms_for_a_last_agent_pane(self):
         socket = f"ws-kill-pane-{os.getpid()}-{id(self)}"
         client_process = None
