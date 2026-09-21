@@ -20,6 +20,7 @@ Optional terminal shell for multi-agent CLI work. **Not** loaded by `init.zsh`.
 | `conf/tmux-window-wrap.conf` | multi-line window list |
 | `bin/aipane-doctor` | read-only installation and Agent Activity wiring audit |
 | `bin/tmux-rename-window-popup` | stable-target window rename UI (requires `fzf`) |
+| `bin/tmux-close-window-popup` | stable-target close confirmation with mouse and keyboard input |
 | `bin/tmux-colour-palette` | indexed terminal colour palette (`0–255`) |
 | `bin/tmux-window-jump` | repeated-digit exact-index window selector |
 | `bin/aipane-activity` | Agent Activity CLI |
@@ -34,6 +35,7 @@ mkdir -p ~/.local/bin
 
 ln -sf "$AIPANE_ROOT/bin/aipane-doctor" ~/.local/bin/aipane-doctor
 ln -sf "$AIPANE_ROOT/bin/tmux-rename-window-popup" ~/.local/bin/tmux-rename-window-popup
+ln -sf "$AIPANE_ROOT/bin/tmux-close-window-popup" ~/.local/bin/tmux-close-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
 ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
 ln -sf "$AIPANE_ROOT/bin/aipane-activity" ~/.local/bin/aipane-activity
@@ -85,13 +87,24 @@ Then: `tmux source-file ~/.tmux.conf`
 
 `prefix x` / `Cmd+W` closes ordinary panes immediately. When the selected pane
 is the window's last pane, aipane checks that pane's live process tree first:
-an AI Tool opens a centered confirmation menu, a verified non-Agent closes
-immediately, and an unavailable or inconclusive detector opens the same menu as
+an AI Tool opens a centered confirmation popup, a verified non-Agent closes
+immediately, and an unavailable or inconclusive detector opens the same popup as
 the safe fallback. Press `y` or click **Close window** to close it. Press `n`
-or `Esc`, or click **Cancel** or outside the menu, to leave it open. Moving the
-pointer into or out of the menu does not dismiss it or confirm a choice. An idle
+or `Esc`, or click **Cancel**, to leave it open. Arrow keys select a row and
+Enter chooses it; Enter with no selected row cancels. Mouse clicks always
+choose the row under the pointer, even after the keyboard selected another row.
+Moving the pointer or clicking outside the popup leaves the popup open. An idle
 AI Tool is still an Agent for this decision; the animated activity marker is not
 required.
+
+The popup uses Python's standard-library `curses` module through
+`tmux-close-window-popup` on the tmux server's `PATH`. If the helper is missing,
+the close is cancelled with an installation message. Override its path before
+sourcing `tmux-workstation.conf` when needed:
+
+```tmux
+set -g @aipane-close-window-popup-command '/absolute/path/to/tmux-close-window-popup'
+```
 
 The window tab's right-click menu (including Option/right-click) uses the same
 check for **Kill**. Because this action closes the entire window, it checks

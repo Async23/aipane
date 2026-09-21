@@ -54,10 +54,12 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
         socket = f"ws-window-menu-{os.getpid()}-{id(self)}"
         child_pid = None
         master_fd = None
+        terminal_output = bytearray()
         environment = os.environ.copy()
         environment.pop("TMUX", None)
         environment.pop("TMUX_PANE", None)
         environment["TERM"] = "xterm-256color"
+        environment["PATH"] = f"{ROOT / 'bin'}{os.pathsep}{environment['PATH']}"
 
         def tmux(*args: str, check: bool = True):
             return subprocess.run(
@@ -77,6 +79,7 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                         if not chunk:
                             break
                         output += chunk
+                        terminal_output.extend(chunk)
                     except BlockingIOError:
                         break
             return output
@@ -98,7 +101,7 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
 
         def menu_count(centered: bool = False) -> int:
             return sum(
-                ": display-menu" in line
+                (": display-popup" if centered else ": display-menu") in line
                 and (not centered or "-x C -y C" in line)
                 for line in tmux("show-messages", "-t", client).stdout.splitlines()
             )
@@ -112,6 +115,7 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
         def invoke_menu_kill(*, option: bool = False) -> int:
             # Separate clicks so tmux does not interpret them as DoubleClick3.
             time.sleep(0.35)
+            terminal_output.clear()
             menus = menu_count()
             prompts = menu_count(centered=True)
             # SGR mouse events hit the inactive window's actual status range.
@@ -143,6 +147,10 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 "confirmation",
             )
             self.assertGreater(menu_count(centered=True), prompts)
+            self.assertTrue(
+                wait_until(lambda: b"\x1b[?1003h" in terminal_output),
+                "close popup did not enable input",
+            )
             self.assertEqual(
                 tmux("display-message", "-p", "-t", "window-menu", "#{window_id}")
                 .stdout.strip(),
@@ -185,13 +193,13 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                     break
                 time.sleep(0.02)
             self.assertTrue(client, "tmux client did not attach")
-            terminal_output = b""
+            initial_output = b""
             for _ in range(100):
-                terminal_output += drain_terminal()
-                if b"TARGET" in terminal_output:
+                initial_output += drain_terminal()
+                if b"TARGET" in initial_output:
                     break
                 time.sleep(0.02)
-            self.assertIn(b"TARGET", terminal_output)
+            self.assertIn(b"TARGET", initial_output)
 
             # A plain window closes immediately, without touching the active tab.
             prompts = invoke_menu_kill()
@@ -279,7 +287,7 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                     os.kill(child_pid, signal.SIGKILL)
                     os.waitpid(child_pid, 0)
 
-    def test_last_agent_close_menu_accepts_mouse_click_after_motion(self):
+    def test_last_agent_close_popup_uses_click_coordinates(self):
         socket = f"ws-last-agent-mouse-{os.getpid()}-{id(self)}"
         child_pid = None
         master_fd = None
@@ -288,6 +296,7 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
         environment.pop("TMUX", None)
         environment.pop("TMUX_PANE", None)
         environment["TERM"] = "xterm-256color"
+        environment["PATH"] = f"{ROOT / 'bin'}{os.pathsep}{environment['PATH']}"
 
         def tmux(*args: str, check: bool = True):
             return subprocess.run(
@@ -356,27 +365,29 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                     time.sleep(0.02)
                 self.assertTrue(client, "tmux client did not attach")
 
-                def open_menu() -> None:
+                def open_popup() -> None:
                     terminal_output.clear()
                     tmux("switch-client", "-c", client, "-T", "prefix")
                     tmux("send-keys", "-K", "-c", client, "x")
                     self.assertTrue(
-                        wait_until(lambda: b"Close window" in terminal_output),
-                        "last Agent pane did not draw a confirmation menu",
+                        wait_until(lambda: b"\x1b[?1003h" in terminal_output),
+                        "last Agent pane did not open the confirmation popup",
                     )
                     self.assertIn(agent_window, window_ids())
 
                 def hover_from_outside(row: int) -> None:
                     terminal_output.clear()
                     # SGR 35 is buttonless motion. Moving outside and then
-                    # inside must redraw the menu, without choosing an item.
+                    # inside must redraw the popup, without choosing an item.
                     os.write(
                         master_fd,
                         f"\x1b[<35;10;25M\x1b[<35;50;{row}M".encode(),
                     )
                     self.assertTrue(
-                        wait_until(lambda: b"Close window" in terminal_output),
-                        "mouse motion dismissed the confirmation menu",
+                        wait_until(lambda: any(
+                            label in terminal_output for label in (b"Cancel", b"Close window")
+                        )),
+                        "mouse motion dismissed the confirmation popup",
                     )
                     self.assertIn(
                         agent_window, window_ids(),
@@ -384,30 +395,70 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                     )
 
                 # A 100x30 client centers Cancel at (50, 14) and Close window
-                # at (50, 15). Cancellation must consume the menu, so a later
+                # at (50, 15). Cancellation must consume the popup, so a later
                 # y goes to the pane and cannot close the Agent window.
-                for click in (b"\x1b[<0;50;14M\x1b[<0;50;14m",
-                              b"\x1b[<0;10;25M\x1b[<0;10;25m"):
-                    open_menu()
-                    hover_from_outside(14)
+                open_popup()
+                hover_from_outside(14)
+                terminal_output.clear()
+                # Leave the pointer over Cancel while the keyboard selects
+                # Close window. The click must use its own coordinates.
+                os.write(master_fd, b"\x1b[B")
+                self.assertTrue(
+                    wait_until(lambda: b"Close window" in terminal_output),
+                    "the Down key did not redraw the popup selection",
+                )
+                terminal_output.clear()
+                os.write(master_fd, b"\x1b[<0;50;14M\x1b[<0;50;14m")
+                self.assertTrue(
+                    wait_until(lambda: b"\x1b[?1003l" in terminal_output),
+                    "clicking Cancel did not dismiss the popup",
+                )
+                self.assertIn(
+                    agent_window, window_ids(),
+                    "clicking Cancel executed the keyboard-selected Close window",
+                )
+                tmux("send-keys", "-K", "-c", client, "y")
+                self.assertIn(agent_window, window_ids())
+
+                for key in ("n", "Escape", "Enter"):
+                    open_popup()
                     terminal_output.clear()
-                    os.write(master_fd, click)
+                    tmux("send-keys", "-K", "-c", client, key)
                     self.assertTrue(
                         wait_until(lambda: b"\x1b[?1003l" in terminal_output),
-                        "clicking Cancel or outside did not dismiss the menu",
+                        f"{key} did not cancel the initial popup",
                     )
                     tmux("send-keys", "-K", "-c", client, "y")
                     self.assertIn(agent_window, window_ids())
 
-                open_menu()
+                open_popup()
                 hover_from_outside(15)
-                hover_from_outside(15)  # Leaving and re-entering is safe too.
+                # A click outside a native popup is ignored. The explicit
+                # cancellation actions remain n, Escape, or the Cancel row.
+                os.write(master_fd, b"\x1b[<0;10;25M\x1b[<0;10;25m")
+                tmux("send-keys", "-K", "-c", client, "Up")
+                terminal_output.clear()
+                # The pointer is still over Close window, but the keyboard
+                # now selects Cancel. Click must still choose Close window.
                 os.write(master_fd, b"\x1b[<0;50;15M\x1b[<0;50;15m")
                 self.assertTrue(
                     wait_until(lambda: agent_window not in window_ids()),
-                    "mouse motion dismissed the menu before Close window "
-                    "could be clicked",
+                    "clicking Close window used the keyboard-selected Cancel",
                 )
+
+                # No motion event is required before the first click, and
+                # Enter still follows keyboard selection.
+                for decision in (b"\x1b[<0;50;15M\x1b[<0;50;15m", b"\x1b[B\x1b[B\r"):
+                    agent_window = tmux(
+                        "new-window", "-P", "-F", "#{window_id}",
+                        "-t", "last-agent-mouse:", f"{fake_agent} 120",
+                    ).stdout.strip()
+                    open_popup()
+                    os.write(master_fd, decision)
+                    self.assertTrue(
+                        wait_until(lambda: agent_window not in window_ids()),
+                        "an explicit click or keyboard confirmation did not close the window",
+                    )
         finally:
             tmux("kill-server", check=False)
             if master_fd is not None:
@@ -427,11 +478,14 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
 
     def test_kill_pane_only_confirms_for_a_last_agent_pane(self):
         socket = f"ws-kill-pane-{os.getpid()}-{id(self)}"
-        client_process = None
+        child_pid = None
+        master_fd = None
+        terminal_output = bytearray()
         client_environment = os.environ.copy()
         client_environment.pop("TMUX", None)
         client_environment.pop("TMUX_PANE", None)
         client_environment["TERM"] = "xterm-256color"
+        client_environment["PATH"] = f"{ROOT / 'bin'}{os.pathsep}{client_environment['PATH']}"
 
         def tmux(*args: str, check: bool = True):
             return subprocess.run(
@@ -439,6 +493,7 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 check=check,
                 capture_output=True,
                 text=True,
+                env=client_environment,
             )
 
         def window_ids() -> set[str]:
@@ -455,6 +510,12 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
         def wait_until(predicate, timeout: float = 2.0) -> bool:
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
+                if master_fd is not None:
+                    try:
+                        while chunk := os.read(master_fd, 65536):
+                            terminal_output.extend(chunk)
+                    except BlockingIOError:
+                        pass
                 if predicate():
                     return True
                 time.sleep(0.02)
@@ -488,22 +549,14 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
             tmux("select-window", "-t", guarded_window)
             tmux("split-window", "-d", "-t", guarded_window, "sleep 30")
 
-            client_process = subprocess.Popen(
-                [
-                    "tmux",
-                    "-L",
-                    socket,
-                    "-C",
-                    "attach-session",
-                    "-t",
-                    "kill-pane",
-                ],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                env=client_environment,
-            )
+            child_pid, master_fd = pty.fork()
+            if child_pid == 0:
+                termios.tcsetwinsize(0, (30, 100))
+                os.execvpe(
+                    "tmux", ["tmux", "-L", socket, "attach-session", "-t", "kill-pane"],
+                    client_environment,
+                )
+            os.set_blocking(master_fd, False)
 
             client = ""
             for _ in range(50):
@@ -516,12 +569,25 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
             self.assertTrue(client, "tmux client did not attach")
 
             def invoke_kill_pane_binding() -> None:
+                terminal_output.clear()
                 tmux("switch-client", "-c", client, "-T", "prefix")
                 tmux("send-keys", "-K", "-c", client, "x")
 
             def centered_prompt_count() -> int:
                 return tmux("show-messages", "-t", client).stdout.count(
-                    "command: display-menu"
+                    "command: display-popup"
+                )
+
+            def popup_key(key: str) -> None:
+                self.assertTrue(
+                    wait_until(lambda: b"\x1b[?1003h" in terminal_output),
+                    "close popup did not enable input",
+                )
+                terminal_output.clear()
+                tmux("send-keys", "-K", "-c", client, key)
+                self.assertTrue(
+                    wait_until(lambda: b"\x1b[?1003l" in terminal_output),
+                    "close popup did not finish after a decision",
                 )
 
             # Multiple panes use the immediate cleanup path.
@@ -572,16 +638,16 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 )
                 self.assertGreater(centered_prompt_count(), prompts)
 
-                tmux("send-keys", "-K", "-c", client, "n")
+                popup_key("n")
                 self.assertIn(agent_window, window_ids())
 
                 prompts = centered_prompt_count()
                 invoke_kill_pane_binding()
                 self.assertTrue(
                     wait_until(lambda: centered_prompt_count() > prompts),
-                    "prefix+x did not show the centered menu again after cancel",
+                    "prefix+x did not show the centered popup again after cancel",
                 )
-                tmux("send-keys", "-K", "-c", client, "y")
+                popup_key("y")
                 self.assertTrue(
                     wait_until(lambda: agent_window not in window_ids()),
                     "confirming the centered prompt did not close the Agent "
@@ -618,19 +684,32 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 "an unavailable Agent detector allowed the window to close",
             )
             self.assertGreater(centered_prompt_count(), prompts)
-            tmux("send-keys", "-K", "-c", client, "n")
+            popup_key("n")
+            tmux("set-option", "-g", "@aipane-close-window-popup-command", "/missing/close-popup")
+            prompts = centered_prompt_count()
+            invoke_kill_pane_binding()
+            self.assertTrue(
+                wait_until(lambda: b"Close cancelled" in terminal_output),
+                "a missing confirmation program was not reported",
+            )
+            self.assertEqual(centered_prompt_count(), prompts)
+            self.assertIn(unknown_window, window_ids())
         finally:
-            if client_process is not None:
-                if client_process.stdin is not None:
-                    client_process.stdin.close()
-                if client_process.poll() is None:
-                    client_process.terminate()
-                try:
-                    client_process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    client_process.kill()
-                    client_process.wait()
             tmux("kill-server", check=False)
+            if master_fd is not None:
+                os.close(master_fd)
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGHUP)
+                except ProcessLookupError:
+                    pass
+                for _ in range(50):
+                    if os.waitpid(child_pid, os.WNOHANG)[0]:
+                        break
+                    time.sleep(0.02)
+                else:
+                    os.kill(child_pid, signal.SIGKILL)
+                    os.waitpid(child_pid, 0)
 
     def test_workstation_sets_c_space_prefix_and_broadcast(self):
         text = TMUX_WS.read_text(encoding="utf-8")

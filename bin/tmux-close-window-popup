@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Confirm a stable tmux window target with coordinate-based mouse input."""
+
+import curses
+import os
+import re
+import subprocess
+import sys
+
+
+def confirm(screen):
+    curses.curs_set(0)
+    curses.set_escdelay(25)
+    curses.mouseinterval(0)
+    curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+    # Ask for motion even when no mouse button is held.
+    sys.stdout.write("\033[?1003h")
+    sys.stdout.flush()
+    selected = None
+
+    try:
+        while True:
+            rows, columns = screen.getmaxyx()
+            if rows < 2 or columns < 20:
+                return False
+            screen.erase()
+            for row, (label, key) in enumerate((("Cancel", "n"), ("Close window", "y"))):
+                text = f" {label:<{columns - 6}} ({key}) "
+                style = curses.A_REVERSE if selected == row else curses.A_NORMAL
+                screen.addnstr(row, 0, text, columns - 1, style)
+            screen.refresh()
+
+            key = screen.getch()
+            if key in (ord("n"), ord("q"), 27, 3):
+                return False
+            if key == ord("y"):
+                return True
+            if key in (10, 13, curses.KEY_ENTER):
+                return selected == 1
+            if key in (curses.KEY_DOWN, ord("j"), 9):
+                selected = 0 if selected is None else (selected + 1) % 2
+            elif key in (curses.KEY_UP, ord("k"), curses.KEY_BTAB):
+                selected = 1 if selected is None else (selected - 1) % 2
+            elif key == curses.KEY_MOUSE:
+                _, x, y, _, buttons = curses.getmouse()
+                row = y if 0 <= x < columns and 0 <= y < 2 else None
+                # A click owns its target even if the keyboard selected another
+                # row since the last motion event. Never consult selected here.
+                if buttons & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+                    return row == 1
+                if buttons & curses.REPORT_MOUSE_POSITION:
+                    selected = row
+    finally:
+        sys.stdout.write("\033[?1003l")
+        sys.stdout.flush()
+
+
+def main():
+    if len(sys.argv) != 2 or not re.fullmatch(r"@[0-9]+", sys.argv[1]):
+        print("Close window: expected a stable window ID", file=sys.stderr)
+        return 2
+    try:
+        confirmed = curses.wrapper(confirm)
+    except (curses.error, KeyboardInterrupt):
+        return 1
+    if not confirmed:
+        return 0
+    return subprocess.run(
+        [os.environ.get("AIPANE_TMUX_BIN", "tmux"), "kill-window", "-t", sys.argv[1]],
+        check=False,
+    ).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -349,7 +349,7 @@ runtime/package-runner wrappers are recognized.
 `conf/tmux-workstation.conf` uses this command for `prefix x` and the window
 tab's right-click **Kill** action. Both share the same window-close check:
 known non-Agent panes close immediately, while any Agent pane asks for
-confirmation in a centered tmux menu. The right-click action checks every pane
+confirmation in a centered tmux popup. The right-click action checks every pane
 in the clicked window; `prefix x` only enters this check for the last pane.
 Process or tmux lookup failures return `unknown`, which also requires
 confirmation so detector failure cannot silently destroy a window.
