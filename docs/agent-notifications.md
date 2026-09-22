@@ -27,6 +27,7 @@ fallback delivery paths use the same sound.
 | 3 | Claude Code | `bin/aipane-claude-notify` | `CLAUDE_NOTIFY_SOUND` |
 | 4 | Cursor Agent | `bin/aipane-cursor-notify` | `CURSOR_NOTIFY_SOUND` |
 | 5 | Kimi Code | `bin/aipane-kimi-notify` | — |
+| 6 | dsh / dsh-TUI | [`bin/aipane-dsh-notify`](../bin/aipane-dsh-notify) ([installation](dsh-notifications.md)) | — |
 
 For adapters with an override, leave it unset for random selection. Set it to a
 macOS sound name when one stable sound is preferred.

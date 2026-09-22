@@ -1,0 +1,45 @@
+#!/opt/homebrew/bin/python3
+"""Normalize a dsh lifecycle event and deliver its dedicated macOS notification."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+
+LIB_DIR = Path(__file__).resolve().parents[1] / "lib"
+if str(LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(LIB_DIR))
+
+from agent_notifications import AgentNotifications, MacOSNotificationAdapter  # noqa: E402
+
+
+def main() -> int:
+    # dsh launches this helper asynchronously; its process owns delivery status.
+    try:
+        payload = json.loads(sys.stdin.read(1024 * 1024))
+    except (ValueError, OSError):
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    environment = os.environ.copy()
+    preview = "--dry-run" in sys.argv[1:] or environment.get("DSH_NOTIFY_DRY_RUN") == "1"
+    notifications = AgentNotifications(
+        adapter=MacOSNotificationAdapter(environment=environment),
+        environment=environment,
+    )
+    result = notifications.handle("dsh", payload, preview=preview)
+    if preview and result.notification is not None:
+        print(json.dumps(
+            {**result.notification.as_dict(), "pane_id": result.notification.pane_id},
+            ensure_ascii=False,
+            sort_keys=True,
+        ))
+    # A missing sender or denied permission must never abort the originating turn.
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

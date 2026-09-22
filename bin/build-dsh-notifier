@@ -4,13 +4,11 @@ set -euo pipefail
 self_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$self_dir/.." && pwd)"
 source_file="$repo_root/native/agent-notifier.m"
-bundle_id="com.alfheim.kimi-code-notifier"
-output="$HOME/Applications/Kimi Code Notifier.app"
+icon_file="$repo_root/native/icons/dsh.svg"
+bundle_id="com.alfheim.dsh-notifier"
+output="$HOME/Applications/dsh Notifier.app"
 version="1.0.0"
 build="1"
-kimi_repo="${KIMI_CODE_REPO:-$HOME/code/oss/kimi-code}"
-kimi_ref="${KIMI_CODE_ICON_REF:-@moonshot-ai/kimi-code@0.38.0}"
-kimi_icon_path="apps/vscode/resources/kimi-icon.svg"
 
 while (( $# > 0 )); do
   case "$1" in
@@ -19,28 +17,30 @@ while (( $# > 0 )); do
     --version) shift; version="${1:-}" ;;
     --build) shift; build="${1:-}" ;;
     -h|--help)
-      printf 'usage: build-kimi-notifier [--bundle-id ID] [--output APP] [--version V] [--build N]\n'
+      printf 'usage: build-dsh-notifier [--bundle-id ID] [--output APP] [--version V] [--build N]\n'
       exit 0
       ;;
-    *) printf 'build-kimi-notifier: unknown argument: %s\n' "$1" >&2; exit 2 ;;
+    *) printf 'build-dsh-notifier: unknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
   shift
 done
 
 if [[ -z "$bundle_id" || -z "$output" || -e "$output" ]]; then
-  printf 'build-kimi-notifier: bundle id/output required and output must not exist: %s\n' "$output" >&2
+  printf 'build-dsh-notifier: bundle id/output required and output must not exist: %s\n' "$output" >&2
   exit 2
 fi
-if [[ ! -r "$source_file" ]]; then
-  printf 'build-kimi-notifier: missing source: %s\n' "$source_file" >&2
+if [[ -z "$version" || -z "$build" ]]; then
+  printf 'build-dsh-notifier: version/build must not be empty\n' >&2
   exit 2
 fi
-if ! git -C "$kimi_repo" cat-file -e "${kimi_ref}:${kimi_icon_path}" 2>/dev/null; then
-  printf 'build-kimi-notifier: missing official Kimi icon at %s:%s\n' "$kimi_ref" "$kimi_icon_path" >&2
-  exit 2
-fi
+for input_file in "$source_file" "$icon_file"; do
+  if [[ ! -r "$input_file" ]]; then
+    printf 'build-dsh-notifier: missing input: %s\n' "$input_file" >&2
+    exit 2
+  fi
+done
 
-build_root="$(mktemp -d "${TMPDIR:-/tmp}/kimi-notifier-build.XXXXXX")"
+build_root="$(mktemp -d "${TMPDIR:-/tmp}/dsh-notifier-build.XXXXXX")"
 trap 'rm -rf "$build_root"' EXIT
 app_name="$(basename "$output")"
 display_name="${app_name%.app}"
@@ -48,7 +48,7 @@ stage_app="$build_root/$app_name"
 contents="$stage_app/Contents"
 macos_dir="$contents/MacOS"
 resources="$contents/Resources"
-iconset="$build_root/KimiCode.iconset"
+iconset="$build_root/Dsh.iconset"
 plist="$contents/Info.plist"
 
 mkdir -p "$macos_dir" "$resources" "$iconset" "$(dirname "$output")"
@@ -63,11 +63,10 @@ mkdir -p "$macos_dir" "$resources" "$iconset" "$(dirname "$output")"
   -framework Cocoa \
   -framework UserNotifications \
   "$source_file" \
-  -o "$macos_dir/kimi-notifier"
+  -o "$macos_dir/dsh-notifier"
 
-git -C "$kimi_repo" show "${kimi_ref}:${kimi_icon_path}" >"$build_root/kimi-icon.svg"
 /opt/homebrew/bin/rsvg-convert -w 1024 -h 1024 \
-  "$build_root/kimi-icon.svg" >"$build_root/kimi-icon-1024.png"
+  "$icon_file" >"$build_root/dsh-icon-1024.png"
 
 for icon_spec in \
   '16 icon_16x16.png' \
@@ -81,20 +80,20 @@ for icon_spec in \
   '512 icon_512x512.png' \
   '1024 icon_512x512@2x.png'; do
   read -r pixels filename <<<"$icon_spec"
-  /usr/bin/sips -z "$pixels" "$pixels" "$build_root/kimi-icon-1024.png" \
+  /usr/bin/sips -z "$pixels" "$pixels" "$build_root/dsh-icon-1024.png" \
     --out "$iconset/$filename" >/dev/null
 done
-/usr/bin/iconutil --convert icns --output "$resources/KimiCode.icns" "$iconset"
+/usr/bin/iconutil --convert icns --output "$resources/Dsh.icns" "$iconset"
 
 /usr/bin/plutil -create xml1 "$plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $bundle_id" "$plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleName string $display_name" "$plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $display_name" "$plist"
-/usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string kimi-notifier" "$plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string dsh-notifier" "$plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string APPL" "$plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $version" "$plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $build" "$plist"
-/usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string KimiCode" "$plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string Dsh" "$plist"
 /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$plist"
 /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$plist"
 /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string 13.0" "$plist"

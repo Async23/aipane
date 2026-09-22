@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Return a dsh notification click to its original Ghostty/tmux pane."""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def main() -> int:
+    session, window, pane, index, socket = (sys.argv[1:] + [""] * 5)[:5]
+    if os.environ.get("AIPANE_DSH_SKIP_ACTIVATE") != "1":
+        try:
+            subprocess.run(["/usr/bin/open", "-b", "com.mitchellh.ghostty"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           check=False, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    tmux = os.environ.get("AIPANE_TMUX_BIN") or shutil.which("tmux")
+    if not tmux and Path("/opt/homebrew/bin/tmux").is_file():
+        tmux = "/opt/homebrew/bin/tmux"
+
+    def call(*arguments: str) -> str | None:
+        if not tmux:
+            return None
+        command = [tmux, *(["-S", socket] if socket else []), *arguments]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    check=False, timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    def target(candidate: str) -> str | None:
+        return call("display-message", "-p", "-t", candidate,
+                    "#{session_id}:#{window_id}") if candidate else None
+
+    state = "ghostty-only"
+    destination = target(pane)
+    if destination and call("select-pane", "-t", pane) is not None:
+        call("select-window", "-t", destination)
+        call("switch-client", "-t", destination)
+        state = "pane-selected"
+    else:
+        destination = target(window)
+        if not destination and session and index:
+            destination = target(f"={session}:{index}")
+        if destination:
+            call("select-window", "-t", destination)
+            call("switch-client", "-t", destination)
+            state = "window-selected"
+        elif session and call("has-session", "-t", f"={session}") is not None:
+            call("switch-client", "-t", f"={session}")
+            state = "session-selected"
+
+    log = Path(os.environ.get("AIPANE_DSH_FOCUS_LOG") or
+               Path(os.environ.get("DSH_HOME") or Path.home() / ".dsh") /
+               "logs/dsh-focus.log")
+    try:
+        log.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "at": datetime.now(timezone.utc).isoformat(),
+                "pane": pane, "window": window, "status": state,
+            }, separators=(",", ":")) + "\n")
+        log.chmod(0o600)
+    except OSError:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

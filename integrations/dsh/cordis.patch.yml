@@ -1,0 +1,7 @@
+# Merge this insert into the dsh profile's cordis.patch.yml.
+# Replace the name with the absolute path to this checkout's adapter.
+- insert:
+    - id: aipane-activity
+      name: /absolute/path/to/aipane/integrations/dsh/aipane-activity.mjs
+    - id: aipane-dsh-notify
+      name: /absolute/path/to/aipane/integrations/dsh/aipane-notify.mjs

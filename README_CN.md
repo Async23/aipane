@@ -102,7 +102,7 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `bin/aipane-activity` | Agent Activity CLI |
 | `bin/ai-restart` | 原地安全重启并续接可恢复的 AI pane |
 | `bin/aipane-restore-executor` | 带验证、重试和持久 pending 意图的恢复执行器 |
-| [`integrations/`](integrations/README.md) | Agent 生命周期 hook 片段与 OpenCode Adapter |
+| [`integrations/`](integrations/README.md) | Agent 生命周期集成 |
 | `tests/test_agent_activity.py` | Agent Activity 行为测试 |
 | `tests/test_agent_activity_integrations.py` | Agent Activity 契约测试 |
 | `tests/test_restore_executor.py` | 恢复验证、重试与 pending 意图测试 |
@@ -305,6 +305,7 @@ killrod --dry-run
 │   ├── claude/
 │   ├── codex/
 │   ├── cursor/
+│   ├── dsh/
 │   ├── grok/
 │   ├── kimi/
 │   ├── opencode/

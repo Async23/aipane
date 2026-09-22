@@ -104,7 +104,7 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `bin/ai-restart` | confirm and seal an exact in-place AI pane restart plan |
 | `bin/aipane-restore-executor` | exclusively execute, verify, retry, and persist recovery |
 | `lib/recovery_plan.py` | versioned, digest-protected restart plan contract |
-| [`integrations/`](integrations/README.md) | Agent lifecycle hook fragments and OpenCode Adapter |
+| [`integrations/`](integrations/README.md) | Agent lifecycle integrations |
 | `tests/test_agent_activity.py` | Agent Activity behavior tests |
 | `tests/test_agent_activity_integrations.py` | Agent Activity contract tests |
 | `tests/test_restore_executor.py` | verified recovery, retry, and pending-intent tests |
@@ -323,6 +323,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 │   ├── claude/
 │   ├── codex/
 │   ├── cursor/
+│   ├── dsh/
 │   ├── grok/
 │   ├── kimi/
 │   ├── opencode/

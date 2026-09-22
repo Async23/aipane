@@ -131,6 +131,8 @@ class MacOSNotificationAdapter:
             return self._deliver_codex(notification)
         if agent == "kimi":
             return self._deliver_kimi(notification)
+        if agent == "dsh":
+            return self._deliver_dsh(notification)
         raise ValueError(f"unsupported notification agent: {agent}")
 
     def _deliver_cursor(self, notification: Notification) -> str:
@@ -402,6 +404,43 @@ class MacOSNotificationAdapter:
         except (OSError, subprocess.SubprocessError):
             return False
 
+    def _deliver_dsh(self, notification: Notification) -> str:
+        app = Path(
+            self.environment.get("AIPANE_DSH_NOTIFIER_APP")
+            or self.home / "Applications" / "dsh Notifier.app"
+        ).expanduser()
+        notifier = app / "Contents" / "MacOS" / "dsh-notifier"
+        if not _executable(notifier):
+            return "sender-missing"
+        arguments = [
+            str(notifier),
+            "-title", notification.title,
+            "-subtitle", notification.subtitle,
+            "-message", notification.body,
+            "-group", notification.group,
+        ]
+        if notification.sound:
+            arguments.extend(["-sound", notification.sound])
+        if notification.action:
+            arguments.extend(["-execute", notification.action])
+        if self.run_command is not None:
+            return "sent" if self._run(arguments, timeout=8) else "sender-error"
+        try:
+            result = subprocess.run(
+                arguments,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=8,
+                env=self.environment,
+            )
+        except subprocess.TimeoutExpired:
+            return "sender-timeout"
+        except OSError:
+            return "sender-error"
+        return "sent" if result.returncode == 0 else f"sender-exit-{result.returncode}"
+
 
 class AgentNotifications:
     """Own notification adaptation and delivery for supported AI Tools."""
@@ -493,6 +532,13 @@ class AgentNotifications:
                     outcome="ignored",
                     reason="unsupported_event",
                 )
+        elif agent == "dsh":
+            notification = self._dsh_notification(normalized)
+            if notification is None:
+                return NotificationResult(
+                    outcome="ignored",
+                    reason="unsupported_event_or_identity",
+                )
         else:
             raise ValueError(f"unsupported notification agent: {agent}")
         if preview:
@@ -514,6 +560,13 @@ class AgentNotifications:
                 notification=notification,
                 reason="duplicate_event",
             )
+        if agent == "dsh" and not self._claim_dsh(notification.group):
+            self._write_dsh_log(notification, "deduplicated")
+            return NotificationResult(
+                outcome="deduplicated",
+                notification=notification,
+                reason="duplicate_event",
+            )
         if agent == "grok":
             self._write_grok_log(normalized, notification, skipped=False)
         elif agent == "codex":
@@ -528,6 +581,8 @@ class AgentNotifications:
             self._write_cursor_log(normalized, notification, channel)
         elif agent == "kimi":
             self._write_kimi_log(notification, channel)
+        elif agent == "dsh":
+            self._write_dsh_log(notification, channel)
         return NotificationResult(
             outcome="failed" if _delivery_failed(channel) else "delivered",
             notification=notification,
@@ -583,6 +638,109 @@ class AgentNotifications:
             group=f"cursor-agent-turn-{digest}",
             action=action,
         )
+
+    def _dsh_notification(self, payload: Mapping[str, object]) -> Notification | None:
+        event = payload.get("event")
+        if not isinstance(event, str) or event not in {"complete", "failure", "approval", "question"}:
+            return None
+        if payload.get("is_subagent"):
+            return None
+        session_id = _compact(payload.get("session_id"))
+        turn = payload.get("turn_id")
+        turn_id = str(turn) if isinstance(turn, (str, int)) else ""
+        event_id = _compact(payload.get("event_id"))
+        if not session_id or (not turn_id and not event_id):
+            return None
+        target = _kimi_tmux_target(self.environment)
+        project = _dsh_text(Path(str(payload.get("cwd") or "")).name, 48) or "dsh"
+        title = _dsh_text(payload.get("session_title"), 48) or project
+        numeric_session = target.get("session_id", "").removeprefix("$")
+        if all(
+            part.isdigit()
+            for part in (
+                numeric_session,
+                target.get("window_index", ""),
+                target.get("pane_index", ""),
+            )
+        ):
+            title = (
+                f"{numeric_session}:{target['window_index']}:{target['pane_index']}"
+                f" · {title}"
+            )
+        labels = {
+            "complete": ("任务完成", "当前任务已执行完成。"),
+            "failure": ("任务失败", "任务执行失败，请返回 dsh 查看。"),
+            "approval": ("等待确认", "dsh 需要你的确认。"),
+            "question": ("等待输入", "dsh 需要你的回答。"),
+        }
+        label, fallback = labels[event]
+        if event != "complete":
+            title = f"{title} · {label}"
+        subtitle = _dsh_text(payload.get("prompt"), 80) or label
+        body_source = payload.get("answer") if event == "complete" else payload.get("message")
+        body = _dsh_text(body_source, 140) or fallback
+        home = Path(self.environment.get("HOME", str(Path.home()))).expanduser()
+        focus = home / ".local" / "bin" / "aipane-dsh-focus"
+        action = ""
+        if _executable(focus) and target:
+            focus_args = [
+                str(focus),
+                target.get("session", ""),
+                target.get("window_id", ""),
+                target.get("pane_id", ""),
+                target.get("window_index", ""),
+            ]
+            socket = self.environment.get("TMUX", "").rsplit(",", 2)[0]
+            if socket:
+                focus_args.append(socket)
+            action = shlex.join(focus_args)
+        identity = json.dumps([session_id, turn_id, event, event_id], separators=(",", ":"))
+        return Notification(
+            title=title,
+            subtitle=subtitle,
+            body=body,
+            sound=self.choose_sound(COMPLETION_SOUNDS) if event == "complete" else "default",
+            event=str(event),
+            group="dsh-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32],
+            action=action,
+            pane_id=target.get("pane_id", ""),
+        )
+
+    def _claim_dsh(self, group: str) -> bool:
+        home = Path(self.environment.get("HOME", str(Path.home()))).expanduser()
+        dsh_home = Path(self.environment.get("DSH_HOME") or home / ".dsh").expanduser()
+        directory = dsh_home / "notifications" / "dedupe"
+        try:
+            _ensure_private_directory(directory)
+            descriptor = os.open(directory / group, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return False
+        except OSError:
+            # Notification failures must not interrupt dsh's lifecycle.
+            return True
+        else:
+            os.close(descriptor)
+            return True
+
+    def _write_dsh_log(self, notification: Notification, status: str) -> None:
+        home = Path(self.environment.get("HOME", str(Path.home()))).expanduser()
+        dsh_home = Path(self.environment.get("DSH_HOME") or home / ".dsh").expanduser()
+        path = dsh_home / "logs" / "dsh-notify.log"
+        record = {
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "event": notification.event,
+            "group": notification.group,
+            "pane": notification.pane_id,
+            "status": status,
+        }
+        try:
+            _ensure_private_directory(path.parent)
+            descriptor = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+            with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        except OSError:
+            pass
 
     def _claim_kimi(self, group: str) -> bool:
         home = Path(
@@ -1417,6 +1575,17 @@ def _kimi_tmux_target(environment: Mapping[str, str]) -> dict[str, str]:
             strict=True,
         )
     )
+
+
+def _dsh_text(value: object, limit: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = "".join(
+        character
+        for character in value
+        if character in "\n\t" or not unicodedata.category(character).startswith("C")
+    )
+    return _short_text(_first_plain_line(text), limit, "…")
 
 
 def _executable(path: Path) -> bool:

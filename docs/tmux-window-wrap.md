@@ -253,6 +253,35 @@ evidence fails safe and leaves the pane busy. As with Codex, the repair is
 written only after two identical probe observations and a locked identity
 recheck.
 
+### dsh / dsh-TUI plugin
+
+The native [dsh Adapter](../integrations/dsh/aipane-activity.mjs) reports the
+Agent driver's `running` / `idle` transitions. These boundaries cover normal
+completion, rejected prompts, failures and cancellation; tool calls, retries
+and permission waits remain busy. The pane stays busy while any of the host's
+Agents is running, including background subagents and other open sessions.
+Creating or finishing another idle session does not clear a running Agent.
+
+Merge [the insert fragment](../integrations/dsh/cordis.patch.yml) into
+`${DSH_HOME:-~/.dsh}/profiles/dsh-tui/cordis.patch.yml`, replacing its `name`
+with the absolute path to this checkout's
+`integrations/dsh/aipane-activity.mjs`. Mount it once at the host profile level;
+for another dsh profile, use that profile's patch file. The plugin uses only
+Node built-ins and the injected `agents` service, with no npm installation.
+Keep the Adapter source in aipane so dsh package upgrades do not replace it.
+
+A profile with `patchReload: live` loads the added entry without restarting
+the session. The Adapter reads the existing Agent registry on activation, so
+a turn already running is reported immediately. A profile with
+`patchReload: startup` needs a restart. Changing the Adapter source itself may
+also require a restart; patch watching alone does not guarantee source reload.
+
+The host inherits `TMUX_PANE` and calls `~/.local/bin/aipane-activity`.
+Reports run asynchronously in order so a late idle write cannot hide a newer
+turn. Unloading the plugin drains its final idle report. Outside tmux the
+Adapter does nothing; a missing or failed activity helper does not interrupt
+dsh. Check the current pane with `aipane-activity inspect --json`.
+
 ### Pi extension
 
 Pi can report its lifecycle through the installable
@@ -383,6 +412,8 @@ confirmation so detector failure cannot silently destroy a window.
 | `tests/test_agent_activity.py` | Interface and evidence behavior tests |
 | `tests/test_aipane_doctor.py` | installation audit behavior tests |
 | `tests/test_tmux_window_wrap.py` | Unit + live tmux tests |
+| `tests/test_dsh_activity.mjs` | dsh lifecycle aggregation and report ordering |
+| `tests/test_dsh_activity_tmux.py` | dsh Adapter through the real Activity CLI and tmux |
 
 ## Install
 
@@ -431,6 +462,8 @@ Personal-only (prefix, splits, colors, plugins, non-wrap status text) → only `
 python3 tests/test_aipane_doctor.py
 python3 tests/test_agent_activity.py
 python3 tests/test_tmux_window_wrap.py
+node --test tests/test_dsh_activity.mjs
+python3 tests/test_dsh_activity_tmux.py
 ```
 
 Personal `synchronize-panes` bindings should also run:
