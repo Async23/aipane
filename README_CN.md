@@ -71,6 +71,7 @@ ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
 ln -sf "$AIPANE_ROOT/bin/aipane-activity" ~/.local/bin/aipane-activity
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
 ln -sf "$AIPANE_ROOT/bin/ai-restart" ~/.local/bin/ai-restart
+ln -sf "$AIPANE_ROOT/bin/aipane-dsh-tui-pill" ~/.local/bin/aipane-dsh-tui-pill
 ```
 
 重命名弹窗要求 `PATH` 中存在 `fzf`。

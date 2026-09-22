@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Apply, verify or revert aipane's local dsh-TUI pill patch.
+
+dsh-TUI renders a `↓ back to bottom (Enter/End)` pill — or `↓ N new messages`
+when unseen rows arrived — the moment the transcript viewport leaves the
+bottom (`const showPill = !isSticky` in `lib/types/screens/Chat.js`). It has no
+setting for that affordance, and the view already returns to the bottom with
+Enter, End or a wheel gesture, so aipane removes it.
+
+The edit lands in the installed package copy that actually runs: the profile
+copy under
+`${DSH_HOME}/profiles/dsh-tui/node_modules/@deepseek-harness-tui/dsh-tui/`.
+`/update` reinstalls that package and silently restores the pill, so this
+script owns the edit and re-applies it after an update. The global launcher
+copy under `~/.local/lib/node_modules` is never executed — the launcher
+delegates to the profile copy — so it is never touched here.
+
+Usage:
+    aipane-dsh-tui-pill apply     # patch the installed copy (idempotent)
+    aipane-dsh-tui-pill check     # exit 0 when the patch is in place
+    aipane-dsh-tui-pill restore   # put the upstream line back
+
+Restart dsh-TUI (`/restart`) after applying or restoring: the module is already
+loaded in a running process.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+UPSTREAM = "    const showPill = !isSticky;\n"
+PATCHED = (
+    "    // aipane: the back-to-bottom pill is removed on purpose.\n"
+    "    // bin/aipane-dsh-tui-pill re-applies this edit after /update.\n"
+    "    const showPill = false;\n"
+)
+SCREEN = Path(
+    "profiles/dsh-tui/node_modules/@deepseek-harness-tui/dsh-tui"
+    "/lib/types/screens/Chat.js"
+)
+
+
+def dsh_home() -> Path:
+    """DSH_HOME when set, else ~/.dsh — the same rule the plugins use."""
+    override = os.environ.get("DSH_HOME")
+    return Path(override).expanduser() if override else Path.home() / ".dsh"
+
+
+def screen_path() -> Path:
+    return dsh_home() / SCREEN
+
+
+def rewrite(path: Path, old: str, new: str) -> bool:
+    """Replace the single `old` occurrence with `new`; False when it is absent."""
+    text = path.read_text(encoding="utf-8")
+    if text.count(old) != 1:
+        return False
+    path.write_text(text.replace(old, new), encoding="utf-8")
+    return True
+
+
+def apply_patch(restore: bool) -> int:
+    source, target = (PATCHED, UPSTREAM) if restore else (UPSTREAM, PATCHED)
+    path = screen_path()
+    if not path.is_file():
+        print(f"FAIL {path}: the installed dsh-TUI screen is missing; "
+              "install the dsh-tui profile first", file=sys.stderr)
+        return 2
+    text = path.read_text(encoding="utf-8")
+    if target in text:
+        print(f"OK   {path}: {'upstream' if restore else 'patched'} already")
+        return 0
+    if source not in text:
+        print(f"FAIL {path}: no known `showPill` line; dsh-TUI changed its "
+              "screen source — inspect it before re-applying", file=sys.stderr)
+        return 2
+    if not rewrite(path, source, target):
+        print(f"FAIL {path}: the `showPill` line is not unique; refusing to guess",
+              file=sys.stderr)
+        return 2
+    print(f"OK   {path}: {'restored' if restore else 'patched'} — "
+          "run /restart in dsh-TUI to load it")
+    return 0
+
+
+def check_patch() -> int:
+    path = screen_path()
+    if not path.is_file():
+        print(f"FAIL {path}: the installed dsh-TUI screen is missing", file=sys.stderr)
+        return 2
+    if PATCHED in path.read_text(encoding="utf-8"):
+        print(f"OK   {path}: pill patch in place")
+        return 0
+    print(f"FAIL {path}: the pill patch is missing; run "
+          "aipane-dsh-tui-pill apply and /restart dsh-TUI", file=sys.stderr)
+    return 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="aipane-dsh-tui-pill",
+        description="apply, verify or revert aipane's dsh-TUI pill patch",
+    )
+    parser.add_argument("action", choices=("apply", "check", "restore"),
+                        nargs="?", default="apply")
+    arguments = parser.parse_args()
+    if arguments.action == "check":
+        return check_patch()
+    return apply_patch(restore=arguments.action == "restore")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

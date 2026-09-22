@@ -65,6 +65,34 @@ write from the host process would target the host.
 node --test tests/test_dsh_copy.mjs
 ```
 
+## Local TUI patch: the back-to-bottom pill
+
+dsh-TUI 0.10.2 renders a `↓ back to bottom (Enter/End)` pill — or
+`↓ N new messages` when unseen rows arrived — the moment the transcript
+viewport leaves the bottom (`const showPill = !isSticky` in
+`lib/types/screens/Chat.js`). No setting covers it, and the view already
+returns to the bottom with Enter, End or a wheel gesture.
+`bin/aipane-dsh-tui-pill` owns the local edit that removes it:
+
+```sh
+aipane-dsh-tui-pill apply    # patch the installed profile copy (idempotent)
+aipane-dsh-tui-pill check    # exit 0 while the patch is in place
+aipane-dsh-tui-pill restore  # put the upstream line back
+```
+
+`/restart` dsh-TUI after either direction: the module is already loaded in a
+running process. The edit lands in the profile copy under
+`${DSH_HOME}/profiles/dsh-tui/node_modules/`, which is the copy dsh actually
+loads; the global launcher copy is never executed and stays untouched.
+`/update` reinstalls the package and silently restores the pill, so re-run
+`apply`. `apply` is idempotent, and refuses a `showPill` line it does not
+recognize — a package upgrade that rewrites the expression fails loudly
+instead of guessing.
+
+```sh
+python3 tests/test_dsh_tui_pill.py
+```
+
 ## Session recovery
 
 The TUI channel's selected Agent is authoritative. Creating a background root
