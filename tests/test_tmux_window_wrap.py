@@ -12,6 +12,7 @@ import struct
 import subprocess
 import termios
 import tempfile
+import threading
 import time
 import unittest
 import urllib.parse
@@ -3627,6 +3628,119 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
 
         rendered = self.wait_for_active_label(master_fd, "1:手册", timeout=0.5)
         self.assertLess(rendered - started, 0.5)
+
+    def test_held_move_key_renders_each_position_across_status_rows(self):
+        for index in range(3, 17):
+            self.tmux("new-window", "-d", "-t", "wrap", "-n", "x", "sleep 120")
+        for index in range(17):
+            self.tmux("rename-window", "-t", f"wrap:{index}", f"window{index:02}")
+        # A render takes longer than one repeat interval. Each request must
+        # survive the next key and retain the order it was asked to display.
+        delayed_script = Path(self.log_directory.name) / "tmux-window-wrap"
+        delayed_script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys, time\n"
+            "if sys.argv[1] == 'render':\n"
+            "    time.sleep(0.08)\n"
+            f"os.execv({str(SCRIPT)!r}, [{str(SCRIPT)!r}, *sys.argv[1:]])\n"
+        )
+        delayed_script.chmod(0o755)
+        self.source_window_wrap_config(animate=False, render_script=delayed_script)
+        self.tmux("set-option", "-s", "escape-time", "0")
+        self.tmux("set-option", "-g", "status-left", "")
+        self.tmux("set-option", "-g", "status-right", "")
+        self.tmux("new-session", "-d", "-s", "observer", "-x", "100", "-y", "24", "sleep 120")
+        self.tmux("set-option", "-t", "observer", "status", "off")
+        self.tmux(
+            "respawn-pane", "-k", "-t", "observer:",
+            "env", "-u", "TMUX", "tmux", "-L", self.socket_name,
+            "attach-session", "-t", "wrap",
+        )
+        self.wait_for_client_count(1)
+        self.wait_for_status("3")
+
+        def visible_position():
+            rows = self.tmux("capture-pane", "-p", "-t", "observer:").stdout.splitlines()[-3:]
+            text = " ".join(rows)
+            labels = re.findall(r"\d+:window\d+", text)
+            if labels:
+                self.assertEqual(len(labels), 17, f"incomplete status frame: {rows}")
+            match = re.search(r"(\d+):window01", text)
+            return int(match[1]) if match else None
+
+        deadline = time.monotonic() + 3
+        while visible_position() != 1:
+            self.assertLess(time.monotonic(), deadline, "initial status did not render")
+            time.sleep(0.01)
+
+        for key, expected in (
+            ("M->", list(range(1, 14))),
+            ("M-<", list(range(13, 0, -1))),
+        ):
+            with self.subTest(key=key):
+                started = time.monotonic()
+                errors = []
+
+                def repeat_key():
+                    try:
+                        for press in range(12):
+                            time.sleep(max(0, started + press * 0.05 - time.monotonic()))
+                            self.tmux("send-keys", "-t", "observer:", key)
+                    except Exception as error:
+                        errors.append(error)
+
+                sender = threading.Thread(target=repeat_key)
+                sender.start()
+                observed = [expected[0]]
+                try:
+                    while time.monotonic() - started < 1.1:
+                        position = visible_position()
+                        if position != observed[-1]:
+                            observed.append(position)
+                        time.sleep(0.002)
+                finally:
+                    sender.join(timeout=2)
+                self.assertFalse(sender.is_alive(), "key sender did not finish")
+                self.assertEqual(errors, [])
+                self.assertEqual(observed, expected, "held movement skipped or reversed positions")
+
+    def test_late_layout_writer_cannot_restore_previous_order_or_height(self):
+        main = runpy.run_path(str(SCRIPT))["main"]
+        original_render = main.__globals__["render"]
+
+        def store_rows(width, before_store=None):
+            paused = False
+
+            def render_then_pause(payload, line):
+                nonlocal paused
+                row = original_render(payload, line)
+                if before_store is not None and not paused:
+                    paused = True
+                    before_store()
+                return row
+
+            arguments = [
+                str(SCRIPT), "render", "--store-rows", "--session-id", self.session_id,
+                "--socket-name", self.socket_name, "--width", str(width),
+                "--left-width", "0", "--right-width", "0",
+            ]
+            with mock.patch("sys.argv", arguments), mock.patch("sys.stdout", io.StringIO()):
+                with mock.patch.dict(main.__globals__, {"render": render_then_pause}):
+                    main()
+
+        def finish_newer_layout():
+            self.tmux("swap-window", "-d", "-s", "wrap:1", "-t", "wrap:2")
+            store_rows(80)
+
+        store_rows(8, before_store=finish_newer_layout)
+        rows = self.tmux(
+            "display-message", "-p", "-t", self.session_id,
+            "#{E:@tmux-window-wrap-row-0}#{E:@tmux-window-wrap-row-1}"
+            "#{E:@tmux-window-wrap-row-2}",
+        ).stdout
+        self.assertIn("2:手册", rows)
+        self.assertNotIn("1:手册", rows)
+        self.assertEqual(self.tmux("show-options", "-v", "-t", "wrap", "status").stdout.strip(), "on")
 
     def test_reordering_across_status_rows_never_loses_or_duplicates_labels(self):
         names = ("alpha", "beta", "gamma")

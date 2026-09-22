@@ -12,11 +12,21 @@ highlight two different windows. The active-window cache fingerprint still
 updates the layout when a selected window must be brought into the three-row
 visible area.
 
-The status format starts one `render --store-rows` job, which builds all rows
-from the same window snapshot and publishes them with the status height in one
-tmux command queue. Reordering a window across a row boundary therefore keeps
-the previous complete layout visible until its replacement is ready. Independent
-row jobs could briefly omit or duplicate a label by mixing old and new layouts.
+The first status row starts one lightweight launcher, which assigns a
+session-local request number and schedules `render --store-rows` through
+`run-shell -b`. tmux cancels a running `#()` job when its expanded command
+changes; keeping Python outside that job lets rendering finish during held
+`Option+Shift+</>` movement. The launcher captures window IDs and indexes for
+each request, so Python startup does not collapse successive moves into the
+same later position. If windows were created or closed meanwhile, the renderer
+uses the complete current list.
+
+Each render builds all rows from one snapshot and publishes them with the
+status height in one tmux command queue. Only a request newer than the last
+published request can commit, so a slow earlier job cannot restore an old
+order or height. Reordering a window across a row boundary keeps the previous
+complete layout visible until its replacement is ready. Independent row jobs
+could briefly omit or duplicate a label by mixing old and new layouts.
 
 Both `render --store-rows` and the single-row `render --line N --store-option`
 mode store live selection expressions. Plain `render --line N` output retains

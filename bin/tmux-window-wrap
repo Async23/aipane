@@ -47,6 +47,8 @@ ACTIVITY_LEVEL_SEQUENCE = (
 DEFAULT_ACTIVITY_FPS = 20
 _ACTIVITY_CONTROLLERS = {}
 ANIMATION_TICK_OPTION = "@tmux-window-wrap-animation-tick"
+RENDER_REQUEST_OPTION = "@tmux-window-wrap-render-request"
+RENDERED_REQUEST_OPTION = "@tmux-window-wrap-rendered-request"
 COLOR_SCHEME_OPTION = "@tmux-window-wrap-color-scheme"
 DEFAULT_PANE_COUNT_STYLE = "subscript"
 PANE_COUNT_STYLES = ("subscript", "plain", "off")
@@ -1242,6 +1244,19 @@ def load_tmux_payload(arguments):
         if active == "1":
             active_id = window_id
 
+    order = getattr(arguments, "window_order", None)
+    if order:
+        windows_by_id = {window["id"]: window for window in windows}
+        # Pin the order at the key event, before Python startup. If a window
+        # was created or closed meanwhile, use the complete live list instead.
+        if set(windows_by_id) == {window_id for window_id, _ in order}:
+            windows = [windows_by_id[window_id] for window_id, _ in order]
+            for window, (_, index) in zip(windows, order):
+                window["display_width"] += len(index) - len(window["index"])
+                label_suffix = window["label"][1 + len(window["index"]):]
+                window["label"] = " " + index + label_suffix
+                window["index"] = index
+
     return {
         "width": narrowest_client_width(
             arguments.session_id,
@@ -1333,6 +1348,37 @@ def update_status_height(payload, session_id, socket_name):
         run_tmux(socket_name, *command)
 
 
+def next_render_request(session_id, socket_name):
+    # The same counter is allocated by the lightweight status-format launcher.
+    # Manual --store-rows callers join that ordering before reading a snapshot.
+    completed = run_tmux(
+        socket_name,
+        "set-option", "-qF", "-t", session_id, RENDER_REQUEST_OPTION,
+        "#{e|+:#{?" + RENDER_REQUEST_OPTION + ",#{" + RENDER_REQUEST_OPTION + "},0},1}",
+        ";", "display-message", "-p", "-t", session_id,
+        "#{" + RENDER_REQUEST_OPTION + "}",
+    )
+    return int(completed.stdout.strip())
+
+
+def parse_window_order(value):
+    order = []
+    for slot in value.rstrip("_").split("_"):
+        window_id, separator, index = slot.partition(":")
+        if not (
+            separator and window_id.startswith("@")
+            and window_id[1:].isdecimal() and index.isdecimal()
+        ):
+            raise argparse.ArgumentTypeError("window order must contain @ID:INDEX_ slots")
+        order.append((window_id, index))
+    if (
+        len({window_id for window_id, _ in order}) != len(order)
+        or len({index for _, index in order}) != len(order)
+    ):
+        raise argparse.ArgumentTypeError("window order must contain unique IDs and indexes")
+    return order
+
+
 def main():
     parser = argparse.ArgumentParser(prog="tmux-window-wrap")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1418,6 +1464,13 @@ def main():
         "--store-rows", action="store_true",
         help="store all status rows and their height together from one snapshot",
     )
+    render_parser.add_argument(
+        "--request-id", type=int, help="ordered background render request",
+    )
+    render_parser.add_argument(
+        "--window-order", type=parse_window_order,
+        help="window order captured by the launcher",
+    )
     render_parser.add_argument("--socket-name")
     arguments = parser.parse_args()
     if (
@@ -1435,6 +1488,10 @@ def main():
             parser.error("render requires --line or --store-rows")
         if (arguments.store_option or arguments.store_rows) and not arguments.session_id:
             parser.error("storing rendered rows requires --session-id")
+        if arguments.request_id is not None and (
+            not arguments.store_rows or arguments.request_id <= 0
+        ):
+            parser.error("--request-id requires --store-rows and a positive integer")
     if arguments.command == "activity" and not arguments.pane:
         return
     if arguments.command == "plan":
@@ -1474,6 +1531,11 @@ def main():
             arguments.error_log,
         )
         return
+
+    if arguments.store_rows and arguments.request_id is None:
+        arguments.request_id = next_render_request(
+            arguments.session_id, arguments.socket_name,
+        )
 
     if arguments.session_id:
         missing = [
@@ -1524,18 +1586,40 @@ def main():
         for option, row in rows
     ]
     if arguments.store_rows:
-        height = status_height_command(payload, arguments.session_id, arguments.socket_name)
-        if height is not None:
-            commands.append(height)
+        line_count = plan(payload)["line_count"]
+        desired = "on" if line_count == 1 else str(line_count)
+        # Check hidden status when committing, not before another writer can
+        # change the height. Rows, height and request number form one update.
+        commands.extend((
+            [
+                "if-shell", "-F", "-t", arguments.session_id, "#{!=:#{status},off}",
+                shlex.join(["set-option", "-t", arguments.session_id, "status", desired]),
+            ],
+            [
+                "set-option", "-t", arguments.session_id,
+                RENDERED_REQUEST_OPTION, str(arguments.request_id),
+            ],
+        ))
     # One command queue publishes the complete layout before tmux redraws.
     # Stream through stdin because animated rows can exceed the IPC argument
     # limit; quoting also preserves literal window names and format expressions.
+    source = "".join(shlex.join(command) + "\n" for command in commands)
+    if arguments.store_rows:
+        condition = (
+            "#{e|>:" + str(arguments.request_id) + ",#{?" + RENDERED_REQUEST_OPTION
+            + ",#{" + RENDERED_REQUEST_OPTION + "},0}}"
+        )
+        source = (
+            shlex.join(["if-shell", "-F", "-t", arguments.session_id, condition])
+            + " {\n" + source + "}\n"
+        )
     run_tmux(
         arguments.socket_name,
         "source-file", "-",
-        input="".join(shlex.join(command) + "\n" for command in commands),
+        input=source,
     )
-    sys.stdout.write("\n")
+    if not arguments.store_rows:
+        sys.stdout.write("\n")
 
 
 if __name__ == "__main__":
