@@ -34,6 +34,7 @@ from agent_activity import (  # noqa: E402
     TmuxActivityAdapter,
 )
 from recovery_plan import GUARD_FIELDS, RecoveryPlanError, load_sealed_plan
+from dsh_sessions import current_session as dsh_current_session, matches_session as dsh_matches_session, is_dsh_command_line
 
 
 SHELL_COMMANDS = {
@@ -55,6 +56,7 @@ TOOL_TAGS = {
     "codex": "x",
     "opencode": "o",
     "kimi": "k",
+    "dsh": "d",
 }
 PENDING_VERSION = 1
 FIELD_SEPARATOR = "\x1f"
@@ -119,6 +121,9 @@ def normalize_plan(
             "command": str(raw["command"]),
             "sid": str(raw.get("sid", "")),
         }
+        if item["tool"] == "dsh":
+            for key in ("dsh_home", "session_root"):
+                item[key] = str(raw.get(key, ""))
         if (
             not item["target"]
             or not item["tool"]
@@ -200,6 +205,10 @@ def command_matches(
         return command == "opencode" or command.startswith("opencode-")
     if tool == "kimi":
         return command == "kimi" or command.startswith("kimi-")
+    if tool == "dsh":
+        return command in {"dsh", "dsh-tui", "dst"} or (
+            allow_ambiguous_node and command == "node"
+        )
     return False
 
 
@@ -690,6 +699,8 @@ class RestoreExecutor:
     ) -> bool:
         if not command_matches(item["tool"], current_command):
             return False
+        if item["tool"] == "dsh":
+            return self.dsh_ready(item)
         foreground = self.tmux.foreground_command(item["target"])
         sid = item.get("sid", "")
         if sid and sid in foreground:
@@ -722,6 +733,22 @@ class RestoreExecutor:
             return True
         return False
 
+    def dsh_ready(self, item: dict[str, Any]) -> bool:
+        identity = self.tmux.pane_identity(item["target"])
+        if identity is None:
+            return False
+        pane_id, socket_path, server_pid = identity
+        tty = self.tmux.run("display-message", "-p", "-t", item["target"], "#{pane_tty}").stdout.strip()
+        record = dsh_current_session(
+            pane_id=pane_id, socket_path=socket_path, server_pid=server_pid,
+            pane_tty=tty, environment={**self.environment,
+                                      **({"DSH_HOME": item["dsh_home"]} if item.get("dsh_home") else {})},
+        )
+        return dsh_matches_session(
+            record, session_id=item.get("sid") or (record or {}).get("session_id", ""),
+            cwd=item["cwd"], dsh_home=item.get("dsh_home", ""), session_root=item.get("session_root", ""),
+        )
+
     def pane_guard_matches(self, item: dict[str, Any]) -> bool:
         expected = (
             item.get("pane_id"),
@@ -741,7 +768,12 @@ class RestoreExecutor:
             return None, "pane disappeared"
         matches_existing = self.existing_tool_matches(item, current)
         if interrupt_running and command_matches(item["tool"], current):
-            matches_existing = True
+            if item["tool"] == "dsh" and current == "node":
+                # A retry may see another Node program occupying this pane.
+                # Missing readiness is not authority to interrupt arbitrary node.
+                matches_existing = matches_existing or is_dsh_command_line(self.tmux.foreground_command(target))
+            else:
+                matches_existing = True
         if matches_existing:
             if not interrupt_running:
                 return (
@@ -826,7 +858,9 @@ class RestoreExecutor:
                         attempt.running_since = now
                     stable_for = now - attempt.running_since
                     ready = False
-                    if attempt.existing_process:
+                    if item["tool"] == "dsh":
+                        ready = stable_for >= self.verify_stability and self.dsh_ready(item)
+                    elif attempt.existing_process:
                         ready = stable_for >= self.verify_stability
                     elif item["tool"] == "grok" and item.get("sid") and attempt.grok_offset is not None:
                         ready = stable_for >= self.verify_stability and (
@@ -852,7 +886,9 @@ class RestoreExecutor:
                     continue
 
                 if now >= deadlines[target]:
-                    if item["tool"] == "grok" and attempt.seen_running:
+                    if item["tool"] == "dsh" and attempt.seen_running:
+                        failures[target] = "dsh TUI did not select the requested session before timeout"
+                    elif item["tool"] == "grok" and attempt.seen_running:
                         failures[target] = "Grok did not report session loaded before timeout"
                     elif current.lower() in SHELL_COMMANDS:
                         failures[target] = self.tmux.capture_failure(target)
@@ -1046,6 +1082,10 @@ class RestoreExecutor:
                 raise RestoreExecutionError(
                     f"pane guard changed for {item['target']} after confirmation"
                 )
+            if item["tool"] == "dsh" and not self.dsh_ready(item):
+                raise RestoreExecutionError(
+                    f"dsh selected session changed for {item['target']}; refresh the restart plan"
+                )
 
     def execute_restart(
         self,
@@ -1084,6 +1124,8 @@ class RestoreExecutor:
             item = pending_by_target[target]
             if not self.tmux.guard_matches(target, planned["guard"]):
                 error = "pane guard changed immediately before respawn"
+            elif planned["tool"] == "dsh" and not self.dsh_ready(planned):
+                error = "dsh selected session changed immediately before respawn; refresh the restart plan"
             else:
                 error = self.tmux.respawn(target, item["cwd"], shell)
                 if error:

@@ -25,6 +25,8 @@ from typing import Callable, Iterable, Mapping, Protocol
 
 import fcntl
 
+from dsh_activity import read_runtime as read_dsh_activity_runtime
+
 
 __all__ = (
     "ActivityError",
@@ -161,6 +163,9 @@ class ActivitySession:
 
     session_id: str
     tool_key: str
+    dsh_home: str = ""
+    session_root: str = ""
+    cwd: str = ""
 
 
 @dataclass(frozen=True)
@@ -1371,6 +1376,8 @@ class AgentActivity:
 
             view = self._resolve(pane)
             stable_repair = (
+                bool((_record_object(pane.record) or {}).get("dsh_runtime"))
+                or
                 (
                     _is_codex_command(pane.current_command)
                     and (marked_busy or pane.record or pane.reporter == pane.current_command)
@@ -1487,6 +1494,29 @@ class AgentActivity:
         )
 
     def _validated_session(self, pane: PaneActivity) -> ActivitySession | None:
+        if pane.current_command in {"node", "dsh", "dsh-tui"}:
+            from dsh_sessions import current_session
+
+            environment = self.environment
+            record = _record_object(pane.record)
+            if record and "dsh_runtime" in record:
+                runtime = self._dsh_runtime(pane, record, record["dsh_runtime"])
+                if runtime:
+                    path = Path(str(record["dsh_runtime"].get("path", "")))
+                    if path.parent.name == "activity" and path.parent.parent.name == "aipane":
+                        environment = {**environment, "DSH_HOME": str(path.parents[2])}
+            session = current_session(
+                pane_id=pane.pane_id, socket_path=pane.socket_path,
+                server_pid=pane.server_pid, pane_tty=pane.pane_tty,
+                environment=environment,
+            )
+            if session:
+                return ActivitySession(
+                    session_id=session["session_id"], tool_key="d",
+                    dsh_home=str(session.get("dsh_home", "")),
+                    session_root=str(session.get("session_root", "")),
+                    cwd=str(session.get("cwd", "")),
+                )
         if is_grok_command(pane.current_command):
             # Grok's /new and /resume replace the active session without changing
             # argv or aipane's launch binding. Its native registry identifies the
@@ -1891,6 +1921,18 @@ class AgentActivity:
                 "id": session_id if isinstance(session_id, str) else "",
                 "kimi_home": str(Path(kimi_home).expanduser().absolute()),
             }
+        if "dsh_runtime" in payload:
+            runtime = self._dsh_runtime(pane, record, payload["dsh_runtime"])
+            if runtime is None:
+                return ActivityReport(state="unknown", record=pane.record,
+                                      accepted=False, wake=False)
+            # A queued report may describe an older turn. The native host's
+            # independently written state is already current at delivery time.
+            state = str(runtime["state"])
+            record["reported"] = state
+            record["dsh_runtime"] = {
+                **payload["dsh_runtime"], "sequence": runtime["sequence"],
+            }
         return ActivityReport(
             state=state,
             record=json.dumps(record, separators=(",", ":")),
@@ -1949,6 +1991,9 @@ class AgentActivity:
                 revision=revision if isinstance(revision, str) else "",
             )
 
+        if "dsh_runtime" in record:
+            return self._resolve_dsh(pane, record)
+
         if not _is_codex_command(pane.current_command):
             if reported_state == "busy":
                 external = self._external_idle_view(
@@ -2002,6 +2047,39 @@ class AgentActivity:
             evidence_turn_id=turn_id,
             repair_record=repair_record,
         )
+
+    def _dsh_runtime(self, pane, record, reference):
+        process = record.get("process")
+        if not isinstance(process, Mapping):
+            return None
+        return read_dsh_activity_runtime(
+            reference, pane_id=pane.pane_id, socket_path=pane.socket_path,
+            server_pid=pane.server_pid, process_id=process.get("pid"),
+        )
+
+    def _resolve_dsh(self, pane: PaneActivity, record: Mapping[str, object]) -> ActivityView:
+        runtime = self._dsh_runtime(pane, record, record.get("dsh_runtime"))
+        revision = str(record.get("revision", ""))
+        if runtime is None:
+            return ActivityView(state="unknown", reported=True,
+                                reason="dsh_runtime_unavailable", revision=revision)
+        state = str(runtime["state"])
+        evidence = f"{runtime['instance']}:{runtime['sequence']}"
+        repair = ""
+        if state != record.get("reported"):
+            repaired = dict(record)
+            repaired["revision"] = uuid.uuid4().hex
+            repaired["reported"] = state
+            repaired["dsh_runtime"] = {
+                **record["dsh_runtime"], "sequence": runtime["sequence"],
+            }
+            repaired["observed"] = {
+                "state": state, "reason": "dsh_runtime", "evidence": evidence,
+            }
+            repair = json.dumps(repaired, separators=(",", ":"))
+        return ActivityView(state=state, reported=True, reason="dsh_runtime",
+                            revision=revision, evidence_turn_id=evidence,
+                            repair_record=repair)
 
     def _external_idle_view(
         self,

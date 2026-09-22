@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import plistlib
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 
@@ -34,6 +38,7 @@ KNOWN_REGISTRATION_LINKS = (
         "integrations/opencode/aipane-bind.js",
     ),
 )
+DSH_PROFILE_AUDITOR = Path(__file__).resolve().parents[1] / "lib/dsh_profile_audit.mjs"
 
 
 class Audit:
@@ -179,6 +184,112 @@ def inspect_activity_registrations(
     )
 
 
+def check_dsh_notifier(audit: Audit, home: Path) -> None:
+    app = Path(os.environ.get("AIPANE_DSH_NOTIFIER_APP") or
+               home / "Applications/dsh Notifier.app").expanduser()
+    executable = app / "Contents/MacOS/dsh-notifier"
+    metadata = app / "Contents/Info.plist"
+    try:
+        with metadata.open("rb") as stream:
+            info = plistlib.load(stream)
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        audit.fail(f"{display_path(app, home)}: missing/invalid notifier App; run bin/build-dsh-notifier")
+        return
+    if (info.get("CFBundleIdentifier") != "com.alfheim.dsh-notifier"
+            or info.get("CFBundleExecutable") != "dsh-notifier"
+            or not executable.is_file() or not os.access(executable, os.X_OK)):
+        audit.fail(f"{display_path(app, home)}: invalid dsh notifier identity or executable; rebuild with bin/build-dsh-notifier")
+        return
+    icon = str(info.get("CFBundleIconFile", ""))
+    if not icon.endswith(".icns"):
+        icon += ".icns"
+    if not (app / "Contents/Resources" / icon).is_file():
+        audit.fail(f"{display_path(app, home)}: notification icon is missing; rebuild with bin/build-dsh-notifier")
+        return
+    audit.ok(f"{display_path(app, home)}: dsh notification sender and icon")
+
+
+def inspect_dsh_registrations(audit: Audit, root: Path, home: Path) -> set[str]:
+    """Read native effective profiles without booting dsh or evaluating !!js."""
+    dsh_home = Path(os.environ.get("DSH_HOME") or home / ".dsh").expanduser()
+    profiles = [dsh_home / "profiles" / name for name in ("dsh-tui", "web")]
+    profiles = [profile for profile in profiles if profile.is_dir()]
+    if not profiles:
+        return set()
+    executable = os.environ.get("AIPANE_DSH_BIN")
+    if not executable:
+        local = home / ".local/bin/dsh"
+        executable = str(local) if is_present(local) else shutil.which("dsh")
+    node = shutil.which("node")
+    if not node or not executable:
+        audit.fail("dsh profiles exist but Node/dsh executable is missing; install dsh or set AIPANE_DSH_BIN")
+        return set()
+    helpers: set[str] = set()
+    notifier = False
+    for profile in profiles:
+        shown = display_path(profile, home)
+        try:
+            completed = subprocess.run(
+                [node, str(DSH_PROFILE_AUDITOR), executable, str(profile),
+                 str(dsh_home), str(root / "integrations/dsh/cordis.patch.yml")],
+                capture_output=True, text=True, check=False, timeout=8,
+            )
+            if completed.returncode:
+                raise ValueError("native profile composition failed")
+            projection = json.loads(completed.stdout)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            audit.fail(f"{shown}: cannot read native dsh profile composition; check package.json, cordis.patch.yml, and installed @deepseek-ai/dsh-app-boot")
+            continue
+        for warning in projection["warnings"]:
+            # Native warnings may embed arbitrary config values. Do not echo.
+            audit.warn(f"{shown}: native loader skipped a patch; check patch target IDs")
+        entries = projection["entries"]
+        expected = {entry["id"]: root / "integrations/dsh" / Path(entry["name"]).name
+                    for entry in projection["expected"]}
+        if not expected:
+            audit.fail(f"{root / 'integrations/dsh/cordis.patch.yml'}: no canonical dsh registrations")
+        for identifier in expected:
+            matches = [entry for entry in entries if entry.get("id") == identifier]
+            if len(matches) != 1:
+                audit.fail(f"{shown}: {identifier} {'missing' if not matches else 'registered more than once'}; merge integrations/dsh/cordis.patch.yml")
+        for entry in entries:
+            identifier = entry.get("id", "aipane plugin")
+            if entry.get("disabled"):
+                audit.fail(f"{shown}: {identifier} is disabled or has a dynamic disabled expression")
+                continue
+            name = entry.get("name")
+            if not isinstance(name, str):
+                audit.fail(f"{shown}: {identifier} has no statically verifiable plugin path")
+                continue
+            source = Path(name)
+            if not source.is_absolute():
+                source = profile / source
+            try:
+                actual = source.resolve(strict=True)
+                canonical = expected.get(identifier)
+                if canonical is not None and actual != canonical.resolve(strict=True):
+                    audit.fail(f"{shown}: {identifier} does not point to this checkout (expected {canonical})")
+                    continue
+                text = actual.read_text(encoding="utf-8")
+            except (OSError, ValueError):
+                audit.fail(f"{shown}: {identifier} source is missing/unreadable or a broken symlink: {source}")
+                continue
+            helpers.update(LOCAL_BIN_ENTRYPOINT.findall(text))
+            if identifier == "aipane-dsh-session" or actual.name in {
+                "aipane-session.mjs", "aipane-dsh-session.mjs",
+            }:
+                # The plugin binds via aipane-bind; restore invokes this CLI
+                # separately, so its dependency is not in the plugin source.
+                helpers.add("aipane-dsh-session")
+            if "aipane-dsh-notify" in text:
+                notifier = True
+                helpers.add("aipane-dsh-focus")
+            audit.ok(f"{shown}: {identifier} -> {actual}")
+    if notifier:
+        check_dsh_notifier(audit, home)
+    return helpers
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="aipane-doctor",
@@ -208,6 +319,7 @@ def main() -> int:
     )
     checked = set(CORE_ENTRYPOINTS)
     checked.update(referenced)
+    checked.update(inspect_dsh_registrations(audit, root, home))
     for name in sorted(checked):
         check_entrypoint(audit, root, home, name)
 

@@ -154,6 +154,11 @@ class WindowWrapCliTests(unittest.TestCase):
             "node /tmp/node_modules/@anthropic-ai/claude-code/cli.js",
             "node /tmp/node_modules/@openai/codex/bin/codex.js",
             "npm exec --yes @openai/codex",
+            "/Users/test/.local/bin/dsh --profile web",
+            "node /Users/test/.local/bin/dsh-tui",
+            "node /tmp/node_modules/@deepseek-ai/dsh/lib/bin.js --profile dsh-tui",
+            "node /tmp/node_modules/@deepseek-harness-tui/dsh-tui/bin/dsh-tui.js",
+            "npx @deepseek-ai/dsh",
         ):
             with self.subTest(command=command):
                 self.assertTrue(runs_agent(command))
@@ -164,6 +169,13 @@ class WindowWrapCliTests(unittest.TestCase):
             "npm install @openai/codex",
             "python3 worker.py --label codex",
             "sleep 30",
+            "echo dsh",
+            "node worker.js --label dsh-tui",
+            "node -e dsh",
+            "node /tmp/node_modules/@deepseek-ai/dsh-tools/lib/bin.js",
+            "node /tmp/node_modules/@deepseek-harness-tui/dsh-tui-utils/bin/main.js",
+            "npm install @deepseek-ai/dsh",
+            "npx echo dsh",
         ):
             with self.subTest(command=command):
                 self.assertFalse(runs_agent(command))

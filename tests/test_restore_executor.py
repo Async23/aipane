@@ -21,6 +21,7 @@ if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
 
 from recovery_plan import seal_plan
+from dsh_sessions import is_dsh_command_line
 
 
 GROK_SID = "94ea9701-d5e6-4c1f-a4ce-f876266e4629"
@@ -297,6 +298,30 @@ class RestoreExecutorTests(unittest.TestCase):
             ["0:4.1"],
         )
         self.assertFalse(self.bind_log.exists())
+
+    def test_dsh_node_process_without_selected_session_never_counts_as_ready(self):
+        plan = {**self.grok_plan(), "tool": "dsh", "command": "dsh-tui --resume exact-session",
+                "sid": "exact-session", "dsh_home": str(self.tmp / "isolated-dsh")}
+        result = self.run_executor([plan], launch_mode="ready", running_command="node", max_attempts=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("pending=1", result.stdout)
+        self.assertIn("did not select the requested session", self.pending_items()[0]["last_error"])
+        self.assertFalse(self.bind_log.exists())
+
+    def test_dsh_restore_never_interrupts_an_unrelated_existing_node_process(self):
+        self.assertFalse(is_dsh_command_line("node /tmp/other.js /Users/test/.local/bin/dsh-tui"))
+        self.assertFalse(is_dsh_command_line("node /tmp/other.js /installed/@deepseek-ai/dsh/lib/worker.js"))
+        for command in ("node -e dsh", "node --eval dsh", "node -p dsh-tui", "node -r dsh other.js"):
+            self.assertFalse(is_dsh_command_line(command))
+        self.assertTrue(is_dsh_command_line("node /Users/test/.local/bin/dsh-tui"))
+        self.runtime_state.write_text("node\n", encoding="utf-8")
+        plan = {**self.grok_plan(), "tool": "dsh", "command": "dsh-tui --resume exact-session",
+                "sid": "exact-session", "dsh_home": str(self.tmp / "isolated-dsh")}
+        result = self.run_executor([plan], launch_mode="ready", running_command="node", max_attempts=2)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.bind_log.exists())
+        self.assertEqual(self.launch_count.read_text().strip(), "0")
+        self.assertFalse(any(row[0] == "send-keys" for row in map(json.loads, self.tmux_log.read_text().splitlines())))
 
     def test_unproven_existing_agent_is_deferred_without_interrupting_it(self):
         self.runtime_state.write_text("grok-1.0.4-maco\n", encoding="utf-8")

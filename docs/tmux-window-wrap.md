@@ -262,25 +262,26 @@ and permission waits remain busy. The pane stays busy while any of the host's
 Agents is running, including background subagents and other open sessions.
 Creating or finishing another idle session does not clear a running Agent.
 
-Merge [the insert fragment](../integrations/dsh/cordis.patch.yml) into
-`${DSH_HOME:-~/.dsh}/profiles/dsh-tui/cordis.patch.yml`, replacing its `name`
-with the absolute path to this checkout's
-`integrations/dsh/aipane-activity.mjs`. Mount it once at the host profile level;
-for another dsh profile, use that profile's patch file. The plugin uses only
-Node built-ins and the injected `agents` service, with no npm installation.
-Keep the Adapter source in aipane so dsh package upgrades do not replace it.
+Register the plugins once at each installed TUI and Web host profile level;
+see [dsh integrations](dsh-integration.md#register-the-profiles). The activity
+plugin uses only Node built-ins and the injected `agents` service. Keep its
+source in aipane so dsh package upgrades do not replace it.
 
 A profile with `patchReload: live` loads the added entry without restarting
 the session. The Adapter reads the existing Agent registry on activation, so
 a turn already running is reported immediately. A profile with
-`patchReload: startup` needs a restart. Changing the Adapter source itself may
-also require a restart; patch watching alone does not guarantee source reload.
+`patchReload: startup` needs a restart. For source upgrades on a live host,
+use the versioned module URL described in the integration guide.
 
 The host inherits `TMUX_PANE` and calls `~/.local/bin/aipane-activity`.
-Reports run asynchronously in order so a late idle write cannot hide a newer
-turn. Unloading the plugin drains its final idle report. Outside tmux the
-Adapter does nothing; a missing or failed activity helper does not interrupt
-dsh. Check the current pane with `aipane-activity inspect --json`.
+Reports run asynchronously in order and failed reports retry. An independent
+private heartbeat records the host's aggregate state. The animation probe can
+repair a missed busy or idle report after two stable observations, with process,
+pane and plugin-instance checks under the write lock. Missing or stale
+evidence remains unknown. Unloading the current plugin drains its final idle
+report; an older instance cannot clear its replacement's state. Outside tmux
+the Adapter does nothing; a failed helper does not interrupt dsh. Check the
+current pane with `aipane-activity inspect --json`.
 
 ### Pi extension
 

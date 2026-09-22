@@ -48,7 +48,10 @@ def inspection_payload(result) -> dict[str, object]:
         "pane_id": result.pane_id,
         "current_command": result.current_command,
         "session": (
-            {"id": session.session_id, "tool": session.tool_key}
+            {"id": session.session_id, "tool": session.tool_key,
+             **({"dsh_home": session.dsh_home} if session.dsh_home else {}),
+             **({"session_root": session.session_root} if session.session_root else {}),
+             **({"cwd": session.cwd} if session.cwd else {})}
             if session is not None
             else None
         ),
@@ -87,8 +90,11 @@ def main() -> int:
     activity = controller(getattr(arguments, "socket_name", None))
     try:
         if arguments.command == "report":
-            activity.report(pane, arguments.state, hook_payload(sys.stdin))
-            return 0
+            payload = hook_payload(sys.stdin)
+            result = activity.report(pane, arguments.state, payload)
+            # dsh retries failed reports. A rejected identity must not look
+            # like a successful delivery to its lifecycle observer.
+            return 3 if "dsh_runtime" in payload and not result.accepted else 0
         if arguments.command == "inspect":
             result = activity.inspect(pane)
             if arguments.json:

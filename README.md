@@ -9,7 +9,6 @@ A zsh toolkit for daily AI CLI workflows: tmux pane orchestration for multiple A
 | Command / surface | Description |
 |---|---|
 | `ai [--new\|-n] [--layout\|-l <layout>] <tools_string> [tool_args...]` | Launch one AI CLI directly or orchestrate multiple CLIs in tmux panes |
-| `killcc [options]` | Clean up detached AI CLI trees and orphaned AI child processes |
 | `killmcp [options]` | Clean up stale detached/orphaned MCP helper processes |
 | `killrod [options]` | Force-clean matching Rod/Leakless browser processes and Playwright `chrome-headless-shell` processes |
 | Optional Ghostty + tmux workstation | Cmd↔tmux key bridge, broadcast, multi-line window list (not loaded by `init.zsh`) |
@@ -203,10 +202,11 @@ Pane IDs, layout, and working directories stay unchanged. Recovery commands are
 cleared of stale terminal input before launch, and SYNC is disabled on affected
 tmux windows so distinct pane commands cannot be broadcast across the window.
 Transient failures are retried, and a pane is rebound only after verification.
-Grok must report the requested `session loaded`; other Agents must remain alive
-for a stability window. Unfinished intent is kept in
+Grok must report the requested `session loaded`; dsh-TUI must select the exact
+session and workspace. Other Agents must remain alive for a stability window.
+Unfinished intent is kept in
 `~/.local/share/aipane/restore-pending.json`, so a later continuum save cannot
-erase a failed recovery. Qoder, Droid, and dsh-TUI are ignored because their session
+erase a failed recovery. Qoder and Droid are ignored because their session
 restore is not implemented.
 
 The full recovery invariants and failure model live in
@@ -214,6 +214,9 @@ The full recovery invariants and failure model live in
 
 The macOS completion-notification adapters and their sound overrides are indexed in
 [`docs/agent-notifications.md`](docs/agent-notifications.md).
+
+dsh-TUI setup for activity, exact session recovery, notifications, and Web
+profile coverage is indexed in [`docs/dsh-integration.md`](docs/dsh-integration.md).
 
 ```bash
 ai-restart --dry-run  # refresh snapshot and preview; does not restart panes
@@ -256,7 +259,6 @@ requires a durable transcript and is left untouched when none exists.
 The wrappers map to the unified cleanup engine as follows:
 
 ```text
-killcc  → aipane-cleanup ai  --verbose
 killmcp → aipane-cleanup mcp --verbose --session-age 18000
 killrod → aipane-cleanup rod --force --verbose
 ```
@@ -264,7 +266,6 @@ killrod → aipane-cleanup rod --force --verbose
 Start with a dry run:
 
 ```bash
-killcc --dry-run
 killmcp --dry-run
 killrod --dry-run
 ```
@@ -272,19 +273,17 @@ killrod --dry-run
 Direct usage:
 
 ```bash
-./bin/aipane-cleanup [all|ai|rod|mcp] \
+./bin/aipane-cleanup [all|rod|mcp] \
   [--all|--force] [--max-age SECONDS] [--orphan-age SECONDS] \
   [--session-age SECONDS] [--dry-run] [--verbose|-v] [--help|-h]
 ```
 
-The `ai` mode recognizes detached Claude, Codex, Droid, Gemini, Grok, OpenCode, and `agent-browser` daemon processes, follows their process trees, and also checks known orphaned AI child processes. `--session-age` additionally enables cleanup of old detached tmux Claude session trees.
+The default `all` mode runs Rod and MCP cleanup. `--session-age` applies to MCP helpers under old AI session trees.
 
 In `rod` mode, `--force` selects all matching Rod/Leakless Chromium processes and every matching `ms-playwright/.../chrome-headless-shell` process, regardless of age.
 
 Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be overridden with:
 
-- `AIPANE_AI_ORPHAN_MAX_AGE` (default `900`)
-- `AIPANE_AI_SESSION_MAX_AGE` (disabled when unset)
 - `AIPANE_ROD_MAX_AGE` (default `300`)
 - `AIPANE_MCP_MAX_AGE` (default `21600`)
 - `AIPANE_MCP_ORPHAN_MAX_AGE` (default `900`)
@@ -337,7 +336,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 └── tests/
     ├── ai-contracts.zsh
     ├── ai-p-launches-pi.zsh
-    ├── aipane-cleanup-ai-protection.sh
+    ├── aipane-cleanup-modes.sh
     ├── aipane-cleanup-contracts.sh
     ├── init-reload.zsh
     ├── test_ai_restart.py
@@ -363,7 +362,7 @@ sh -n bin/aipane-cleanup bin/aipane-claude-activity bin/rod-cleanup bin/tmux-col
 
 zsh -fc '
   source ./init.zsh
-  type ai killcc killmcp killrod
+  type ai killmcp killrod
   for retired in codexx geminii oc; do
     (( $+functions[$retired] || $+aliases[$retired] )) && exit 1
   done
@@ -373,7 +372,7 @@ zsh -fc '
 ./tests/init-reload.zsh
 ./tests/ai-p-launches-pi.zsh
 ./tests/ai-contracts.zsh
-./tests/aipane-cleanup-ai-protection.sh
+./tests/aipane-cleanup-modes.sh
 ./tests/aipane-cleanup-contracts.sh
 
 # optional workstation / window-wrap

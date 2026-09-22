@@ -51,6 +51,7 @@ class DshActivityTmuxTests(unittest.TestCase):
                 if key not in {"TMUX", "TMUX_PANE", "AIPANE_TMUX"}
             }
             environment["HOME"] = str(home)
+            environment["DSH_HOME"] = str(home / ".dsh")
             tmux = ["tmux", "-L", socket_name]
 
             def run(*args):
@@ -72,7 +73,7 @@ class DshActivityTmuxTests(unittest.TestCase):
                         env=environment, capture_output=True, text=True, check=True,
                     )
                     activity = json.loads(result.stdout)
-                    if activity["state"] == state:
+                    if activity["state"] == state and breathing() == ("1" if state == "busy" else "0"):
                         self.assertTrue(activity["reported"])
                         return
                     time.sleep(0.025)
@@ -102,7 +103,9 @@ class DshActivityTmuxTests(unittest.TestCase):
                 send("1 running")
                 wait_for("busy")
                 send("dispose")
-                wait_for("idle")
+                # The marker is cleared, but an unloaded observer is no longer
+                # authoritative evidence that the still-live process is idle.
+                wait_for("unknown")
                 self.assertEqual(breathing(), "0")
             finally:
                 subprocess.run([*tmux, "kill-server"], env=environment,

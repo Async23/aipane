@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import shutil
 import sqlite3
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 import urllib.parse
 import uuid
@@ -125,7 +128,7 @@ class AiRestartTests(unittest.TestCase):
                     for target, command in targets:
                         print(json.dumps({
                             "target": target,
-                            "tool": "claude",
+                            "tool": os.environ.get("TEST_TOOL", "claude"),
                             "kind": (
                                 "invalid"
                                 if os.environ.get("TEST_PLAN_INVALID") == "1"
@@ -138,7 +141,10 @@ class AiRestartTests(unittest.TestCase):
                                 if os.environ.get("TEST_RESTORE_LEAVES_SHELL") == "1"
                                 else command
                             ),
-                            "sid": "",
+                            "sid": os.environ.get("TEST_SID", ""),
+                            **({"dsh_home": os.environ["TEST_DSH_HOME"],
+                                "session_root": os.environ["TEST_DSH_SESSION_ROOT"]}
+                               if "TEST_DSH_HOME" in os.environ else {}),
                         }))
                 else:
                     with open(os.environ["TEST_RESTORE_LOG"], "a", encoding="utf-8") as log:
@@ -199,6 +205,86 @@ class AiRestartTests(unittest.TestCase):
             self.target,
             "#{pane_current_command}",
         ).stdout.strip()
+
+    def configure_dsh_host(self, *, switch_after_sealing=False):
+        """A real Node process with the selected-session protocol, isolated home."""
+        home = self.tmp / "custom-dsh"
+        sessions = self.tmp / "custom-session-store"
+        selection = self.tmp / "selected-id"
+        selection.write_text("session-selected")
+        host = self.tmp / "dsh-host.mjs"
+        host.write_text(textwrap.dedent('''
+            import {mkdirSync,writeFileSync,readFileSync,renameSync} from 'node:fs';
+            import {execFileSync} from 'node:child_process';
+            const root=process.env.DSH_HOME+'/aipane/sessions';mkdirSync(root,{recursive:true});
+            const parts=process.env.TMUX.split(',');
+            const started=execFileSync('ps',['-p',String(process.pid),'-o','lstart='],{encoding:'utf8',env:{...process.env,LC_ALL:'C'}}).trim();
+            const publish=()=>{
+              const record={version:1,pid:process.pid,process_started:started,updated_at:Date.now(),
+                pane_id:process.env.TMUX_PANE,socket:parts.slice(0,-2).join(','),server_pid:parts.at(-2),
+                session_id:readFileSync(process.argv[2],'utf8'),cwd:process.cwd(),
+                dsh_home:process.env.DSH_HOME,session_root:process.env.DSH_TUI_SESSION_ROOT};
+              const file=root+'/'+process.pid+'.json';writeFileSync(file+'.tmp',JSON.stringify(record),{mode:0o600});renameSync(file+'.tmp',file);
+            }; publish();setInterval(publish,20);
+        '''))
+        command = (f"DSH_HOME={shlex.quote(str(home))} DSH_TUI_SESSION_ROOT={shlex.quote(str(sessions))} "
+                   + shlex.join([shutil.which("node"), str(host), str(selection)]))
+        self.tmux("respawn-pane", "-k", "-t", self.target, "-c", str(self.tmp), command)
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            files = list((home / "aipane/sessions").glob("*.json"))
+            if files:
+                self.dsh_original_pid = json.loads(files[0].read_text())["pid"]
+                break
+            time.sleep(.02)
+        else:
+            self.fail("isolated dsh protocol host did not start")
+        captured = self.tmp / "captured-sealed-plan.json"
+        executor = self.tmp / "capture-executor.py"
+        executor.write_text(textwrap.dedent(f'''\
+            #!/usr/bin/env python3
+            import os,sys,shutil,time
+            from pathlib import Path
+            shutil.copyfile(sys.argv[sys.argv.index('--sealed-plan')+1], {str(captured)!r})
+            if {switch_after_sealing!r}:
+                Path({str(selection)!r}).write_text('session-after-confirmation')
+                time.sleep(.15)
+            os.execv({str(ROOT / 'bin/aipane-restore-executor')!r}, [{str(ROOT / 'bin/aipane-restore-executor')!r}, *sys.argv[1:]])
+        '''))
+        executor.chmod(0o755)
+        self.extra_environment = {
+            "TEST_TOOL": "dsh", "TEST_SID": "session-selected", "TEST_AGENT_COMMAND": command,
+            "TEST_DSH_HOME": str(home), "TEST_DSH_SESSION_ROOT": str(sessions),
+            # The test would previously pass if parent inherited this host's home.
+            "DSH_HOME": str(self.tmp / "wrong-default-home"),
+            "DSH_TUI_SESSION_ROOT": str(self.tmp / "wrong-default-store"),
+            "AIPANE_RESTART_EXECUTOR_COMMAND": str(executor),
+            "AI_RESTORE_VERIFY_TIMEOUT": "3", "AIPANE_BIND_COMMAND": str(ROOT / "bin/aipane-bind"),
+        }
+        return home, sessions, captured
+
+    @unittest.skipUnless(shutil.which("node"), "node required")
+    def test_dsh_custom_home_survives_sealed_plan_and_actual_executor_readiness(self):
+        home, sessions, captured = self.configure_dsh_host()
+        result = self.run_restart("--yes", "--force")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("verified 1 AI pane(s) resumed", result.stdout)
+        item = json.loads(captured.read_text())["items"][0]
+        self.assertEqual(item["dsh_home"], str(home))
+        self.assertEqual(item["session_root"], str(sessions))
+        records = [json.loads(path.read_text()) for path in (home / "aipane/sessions").glob("*.json")]
+        self.assertTrue(any(record["pid"] != self.dsh_original_pid and record["session_id"] == "session-selected" for record in records))
+        self.assertEqual(json.loads((self.tmp / "aipane-state/restore-pending.json").read_text())["items"], [])
+
+    @unittest.skipUnless(shutil.which("node"), "node required")
+    def test_dsh_idle_selection_changed_after_sealing_is_not_restarted(self):
+        self.configure_dsh_host(switch_after_sealing=True)
+        result = self.run_restart("--yes", "--force")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dsh selected session changed", result.stderr)
+        self.assertIn("refresh the restart plan", result.stderr)
+        os.kill(self.dsh_original_pid, 0)
+        self.assertFalse((self.tmp / "aipane-state/restore-pending.json").exists())
 
     def test_dry_run_refreshes_snapshot_without_restarting_pane(self):
         result = self.run_restart("--dry-run")

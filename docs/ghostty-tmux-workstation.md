@@ -47,6 +47,8 @@ The rename popup requires `fzf` on `PATH`.
 Run `aipane-doctor` after installation and after pulling changes that add or
 move workstation executables. It is read-only: missing or misdirected required
 symlinks fail the command, while supported compatibility commands are warnings.
+For installed dsh TUI and Web profiles, it also checks the effective plugin
+composition, helper paths and notification App; see [dsh integrations](dsh-integration.md).
 
 ### Ghostty (`~/.config/ghostty/config`)
 

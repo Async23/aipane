@@ -29,36 +29,6 @@ name=${0##*/}
 case "$name" in
   ps)
     case "${AIPANE_TEST_PS_MODE:-}" in
-      ai_false_positive)
-        case "$*" in
-          '-axo pid=,ppid=,tty=,command=')
-            printf '%s\n' '999991 1 ?? /usr/bin/python3 worker.py --label codex'
-            ;;
-          '-axo pid=,ppid=,pgid=,tty=,command=')
-            printf '%s\n' '999991 1 999991 ?? /usr/bin/python3 worker.py --label codex'
-            ;;
-        esac
-        ;;
-      ai_direct)
-        case "$*" in
-          '-axo pid=,ppid=,tty=,command=')
-            printf '%s\n' '999991 1 ?? /opt/homebrew/bin/codex --yolo'
-            ;;
-          '-axo pid=,ppid=,pgid=,tty=,command=')
-            printf '%s\n' '999991 1 999991 ?? /opt/homebrew/bin/codex --yolo'
-            ;;
-        esac
-        ;;
-      ai_node_script)
-        case "$*" in
-          '-axo pid=,ppid=,tty=,command=')
-            printf '%s\n' '999991 1 ?? /opt/homebrew/bin/node /tmp/node_modules/@openai/codex/bin/codex.js'
-            ;;
-          '-axo pid=,ppid=,pgid=,tty=,command=')
-            printf '%s\n' '999991 1 999991 ?? /opt/homebrew/bin/node /tmp/node_modules/@openai/codex/bin/codex.js'
-            ;;
-        esac
-        ;;
       mcp_false_positive)
         case "$*" in
           '-axo pid=,ppid=,tty=,etime=,command=')
@@ -156,24 +126,6 @@ assert_eq() {
     exit 1
   fi
 }
-
-output=$(run_cleanup ai_false_positive ai --force --dry-run --verbose)
-assert_eq \
-  'killcc: no detached AI CLI or old detached tmux Claude session processes found' \
-  "$output" \
-  'AI cleanup must ignore tool names that occur only in unrelated arguments'
-
-output=$(run_cleanup ai_direct ai --force --dry-run --verbose)
-assert_eq \
-  'killcc: ai: would kill 1 detached AI CLI tree process(es): 999991' \
-  "$output" \
-  'AI cleanup must still match a directly executed AI CLI'
-
-output=$(run_cleanup ai_node_script ai --force --dry-run --verbose)
-assert_eq \
-  'killcc: ai: would kill 1 detached AI CLI tree process(es): 999991' \
-  "$output" \
-  'AI cleanup must still match an AI CLI launched through its Node package script'
 
 output=$(run_cleanup mcp_false_positive mcp --force --dry-run --verbose)
 assert_eq \

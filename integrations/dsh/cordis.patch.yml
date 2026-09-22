@@ -5,3 +5,5 @@
       name: /absolute/path/to/aipane/integrations/dsh/aipane-activity.mjs
     - id: aipane-dsh-notify
       name: /absolute/path/to/aipane/integrations/dsh/aipane-notify.mjs
+    - id: aipane-dsh-session
+      name: /absolute/path/to/aipane/integrations/dsh/aipane-session.mjs

@@ -16,7 +16,9 @@
   要求明确确认所有任务已空闲。非交互覆盖必须使用 `--force`。
 - Grok 在进程内 `/new` 或 `/resume` 后，存盘按原生活跃会话表中的存活 PID 与 pane TTY
   记录当前会话；恢复优先使用这份坐标绑定，并校验当前目录的会话文件（见 §19）。
-- Qoder、Droid 与 dsh-TUI 暂不在恢复范围内。
+- dsh-TUI 按当前前台 Channel 的会话 ID 恢复；新建、恢复、分支和后台切换都会更新
+  绑定。落盘校验与实际加载确认见 §20。
+- Qoder、Droid 暂不在恢复范围内。
 
 ## 0. 一个绕不开的前提
 
@@ -45,7 +47,7 @@ tmux pane 里的进程都是 tmux server 的子进程；server 一退出（`kill
 | 6 | claude (`c`) | **首条消息才生成（懒惰）** | `~/.claude/projects/<dash编码cwd>/<uuidv4>.jsonl` |
 | 7 | opencode (`o`) | **首条消息才生成（懒惰）** | `~/.local/share/opencode/`（sqlite + storage/） |
 | 8 | kimi (`k`) | **首条消息才生成（懒惰）** | 启动仅建全局 search-index；单会话 store 位置未定 |
-| 9 | dsh-TUI (`d`) | 尚未接入 aipane 会话恢复 | — |
+| 9 | dsh-TUI (`d`) | 启动即有 ID，首次写入或 flush 后持久化 | `$DSH_HOME/sessions/<project>/<id>/session.vN.jsonl.zstd`；ID 为不透明字符串 |
 
 要点：懒惰派“没发消息就崩溃”时**根本没有会话被创建**，也就没有东西可丢/可恢复。
 
@@ -61,6 +63,7 @@ tmux pane 里的进程都是 tmux server 的子进程；server 一退出（`kill
 | 6 | cursor-agent (`r`) | **plugins**（未见显式 hooks） | 急切派，无需钩子 |
 | 7 | pi (`p`) | **Extensions（会话事件）** | `session_start` 覆盖 startup/reload/new/resume/fork；已用于动态绑定，见 §15 |
 | 8 | kimi (`k`) | ~~无（仅 MCP）~~ → **有原生 `[[hooks]]`（13 事件，stdin JSON 带 `session_id`）** | **订正**：非无钩子；已用 `SessionStart` 钩子落地，见 §14 |
+| 9 | dsh-TUI (`d`) | Cordis 原生插件 + TUI Channel 注册表 | `integrations/dsh/aipane-session.mjs` 读取当前 Channel，见 §20 |
 
 ## 3. 核心决策
 
@@ -562,3 +565,35 @@ shell 和 pending 意图。
 `ai-restart` 的实际快照、计划、重启与重新绑定链路，断言恢复后的进程仍使用 B；
 另覆盖旧 `--resume` 参数、
 未完成首轮、失效 PID、其他 TTY、候选冲突、会话缺失及 cwd 不匹配。
+
+## 20. dsh-TUI 的精确前台会话恢复（2026-09-22）
+
+`aipane-session.mjs` 从已安装 dsh-TUI 的 Channel 注册表订阅 `agentId`，再校验对应
+Agent 确实是当前运行时的根。创建后台 Agent 或尚未提交的 fork 不会覆盖绑定；
+`/new`、`/resume`、workspace 切换、rewind 和前台附着以 Channel 完成切换为准。
+该兼容层集中使用 dsh-TUI `lib/types/adapter/channel/host-registry.js` 的
+`getRegisteredTuiChannel` / `onTuiChannelRegistered`，接口缺失时停止提供恢复身份，
+不猜测最新根或读取全局 `resume.txt`。
+
+- 插件每 2 秒刷新 `$DSH_HOME/aipane/sessions/<pid>.json`，包含所选会话、工作目录、
+  实际 persistence root、tmux pane/socket/server 及进程启动时间；同时通过 `aipane-bind`
+  写入 `d` 绑定。退出删除自己拥有的记录，热更新旧实例不能覆盖或删除新实例记录。
+- `lib/dsh_sessions.py` 拒绝过期、其他 server/TTY、PID 重用、多候选或权限不可信的
+  记录。`aipane-snapshot` 保存经过验证的当前 ID、逻辑 workspace cwd、`DSH_HOME` 与
+  session root。只剩旧的 dsh 注册表绑定时写入不可恢复标记，防止回退到旧启动参数。
+- `ai-restore` 生成 `dsh-tui --resume <exact-id>`；自定义 home/root 随快照恢复。
+  `bin/aipane-dsh-session` 使用本机 dsh 原生 persistence 的只读 handle 完整验证记录、
+  ID 和 cwd，支持压缩与明文格式、版本迁移的只读解析。损坏、未持久化、目录不匹配的
+  当前会话标记为 `invalid`，不会回退到旧 ID 或“上次会话”。缺少 ID 的启动默认跳过。
+- 恢复执行器只有看到新进程的 Channel 已选中计划中的 ID 与 cwd，才将恢复计为成功。
+  单独看到 `node` 或旧注册表记录不足以成功；无关 Node 进程也不会被重试中断。
+  `ai-restart` 继续使用既有活动检查、确认、sealed plan 与 pending 机制；确认后及每个
+  respawn 前再次核对所选 ID、cwd、home 与 root，切换会话后拒绝执行旧计划。
+- Web 服务可能同时持有多根会话，没有单一前台 Channel，因此本节的 pane 会话恢复仅
+  面向 TUI；Web 的聚合活动与通知由各自 Adapter 处理。
+
+本机验证使用隔离 HOME、DSH_HOME、会话目录与 tmux server：启动真实 dsh-TUI，
+创建后台根，执行新建与恢复，再经实际 `aipane-snapshot` / `ai-restart --dry-run` /
+`ai-restart --yes --force` 重启，确认 PID 改变而会话 ID 不变、pending 清空；未调用模型。
+回归测试覆盖原生压缩 persistence、旧 argv、当前会话未落盘、损坏记录、错误 cwd、
+失效进程以及“Node 已启动但尚未选中目标会话”的等待行为。

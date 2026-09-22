@@ -73,7 +73,7 @@ changing the process argv, so this Adapter records the new session id on every
 | Claude Code | `claude/hooks.json` | `~/.claude/settings.json` |
 | Codex | `codex/hooks.json` | `~/.codex/hooks.json` |
 | Cursor Agent | `cursor/hooks.json` | `~/.cursor/hooks.json` |
-| dsh / dsh-TUI | [`dsh/aipane-activity.mjs`](dsh/aipane-activity.mjs), [`dsh/aipane-notify.mjs`](dsh/aipane-notify.mjs) | [activity](../docs/tmux-window-wrap.md#dsh--dsh-tui-plugin) / [notifications](../docs/dsh-notifications.md) |
+| dsh / dsh-TUI | [`dsh/cordis.patch.yml`](dsh/cordis.patch.yml) | [activity, notifications, session binding, and Web setup](../docs/dsh-integration.md) |
 | Grok | `grok/hooks.json` | `~/.grok/hooks/*.json` |
 | Kimi Code | `kimi/hooks.toml` | `~/.kimi-code/config.toml` |
 | OpenCode | `opencode/aipane-bind.js` | `~/.config/opencode/plugins/` |

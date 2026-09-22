@@ -51,10 +51,12 @@ _aipane_registry_record() {
   [[ -n "$pane" ]] || return 0
   mkdir -p "$AIPANE_STATE_DIR" 2>/dev/null || return 1
 
-  local ts jpane jtool jsid jcmd jcwd sock srvpid
+  local ts jpane jtool jsid jcmd jcwd sock srvpid tmux_server
   ts="$(date +%s)"
-  sock="${TMUX%%,*}"
-  srvpid="${${TMUX#*,}%%,*}"
+  # The final two fields are numeric; a socket path itself may contain commas.
+  tmux_server="${TMUX%,*}"
+  sock="${tmux_server%,*}"
+  srvpid="${tmux_server##*,}"
   _aipane_json_escape "$pane"; jpane="$REPLY"
   _aipane_json_escape "$tool"; jtool="$REPLY"
   _aipane_json_escape "$sid";  jsid="$REPLY"

@@ -8,7 +8,7 @@
 #     (pi/grok/claude via --session-id, cursor via a pre-created chat id), and any
 #     `resume`-style launch already carries its id too.
 #   - For tools whose active session still matches their launch argv, the resurrect
-#     dump contains the id directly. Pi/Codex/Grok can replace sessions in-process, so
+#     dump contains the id directly. Pi/Codex/Grok/dsh can replace sessions in-process, so
 #     their current coordinate binding takes precedence over stale launch argv.
 #   - We parse that durable identity into a declarative plan. The adjacent
 #     aipane-restore-executor persists unfinished intent, launches cleanly,
@@ -72,13 +72,16 @@ log() { print -r -- "$(date '+%F %T') $*" >>"$LOG" 2>/dev/null; }
 # Coordinate -> current session id/tool map produced by aipane-snapshot at save
 # time. The tool tag is part of the identity: a stale binding from another tool
 # must never be interpreted as the detected pane's session id.
-typeset -A COORDS_SID COORDS_TOOL
+typeset -A COORDS_SID COORDS_TOOL COORDS_DSH_HOME COORDS_SESSION_ROOT COORDS_CWD
 if [[ -r "$COORDS" ]] && command -v python3 &>/dev/null; then
   local _cl
-  while IFS=$'\t' read -r _cl _sid _tool; do
+  while IFS=$'\x1f' read -r _cl _sid _tool _dsh_home _session_root _cwd; do
     if [[ -n "$_cl" ]]; then
       COORDS_SID[$_cl]="$_sid"
       COORDS_TOOL[$_cl]="$_tool"
+      COORDS_DSH_HOME[$_cl]="$_dsh_home"
+      COORDS_SESSION_ROOT[$_cl]="$_session_root"
+      COORDS_CWD[$_cl]="$_cwd"
     fi
   done < <(python3 -c '
 import json,sys
@@ -89,7 +92,7 @@ except Exception:
 for coord,rec in d.items():
     sid=(rec or {}).get("sid","")
     tool=(rec or {}).get("tool","")
-    if sid: print(f"{coord}\t{sid}\t{tool}")
+    if sid or tool in ("d", "dsh"): print("\x1f".join((coord,sid,tool,str(rec.get("dsh_home","")),str(rec.get("session_root","")),str(rec.get("cwd","")))))
 ' "$COORDS" 2>/dev/null)
 fi
 
@@ -124,6 +127,7 @@ typeset CURSOR_BASE="${AIPANE_CURSOR_LAUNCH_CMD:-cursor-agent --force}"
 typeset CODEX_BASE="${AIPANE_CODEX_LAUNCH_CMD:-codex --yolo}"
 typeset OPENCODE_BASE="${AIPANE_OPENCODE_LAUNCH_CMD:-opencode}"
 typeset KIMI_BASE="${AIPANE_KIMI_LAUNCH_CMD:-kimi --auto}"
+typeset DSH_BASE="${AIPANE_DSH_LAUNCH_CMD:-dsh-tui}"
 
 # Migrate exact retired local overrides that can survive in an already-running
 # Ghostty shell or a restored tmux global environment.
@@ -133,13 +137,25 @@ typeset KIMI_BASE="${AIPANE_KIMI_LAUNCH_CMD:-kimi --auto}"
   CODEX_BASE="codex --yolo --disable plugins"
 typeset CODEX_RESTORE_BASE="$CODEX_BASE -c check_for_update_on_startup=false"
 
-# detect_tool <full_cmd> <cur_cmd> -> REPLY in {pi,grok,claude,cursor,codex,opencode,kimi} or ""
+# detect_tool <full_cmd> <cur_cmd> -> REPLY in {pi,grok,claude,cursor,codex,opencode,kimi,dsh} or ""
 detect_tool() {
   local full="$1" cur="$2" prog
   REPLY=""
   # cursor-agent runs under node with a versioned path; match by substring.
   if [[ "$full" == *cursor-agent* ]]; then REPLY=cursor; return; fi
   prog="${full%% *}"; prog="${prog:t}"      # basename of argv[0]
+  if [[ "$prog" == node ]]; then
+    # tmux-resurrect saves the outer Node launcher, often ~/.local/bin/dsh-tui.
+    # Inspect the script token, not arbitrary later prompt/argument substrings.
+    local -a argv=("${(@Q)${(z)full}}")
+    # Unknown Node options may consume the following word as a value (-e/-r).
+    # Only the plain script position is unambiguous without parsing Node's CLI.
+    local script="${argv[2]:-}"
+    if [[ "$script" != -* && ( "${script:t}" == (dsh|dsh-tui|dsh-tui.js|dst) ||
+          "$script" == */@deepseek-ai/dsh/* || "$script" == */@deepseek-harness-tui/dsh-tui/* ) ]]; then
+      REPLY=dsh; return
+    fi
+  fi
   case "$prog" in
     pi)                REPLY=pi ;;
     grok|grok-*)       REPLY=grok ;;
@@ -148,12 +164,14 @@ detect_tool() {
     codex|codexx|codex-*) REPLY=codex ;;
     opencode|opencode-*) REPLY=opencode ;;   # Mach-O binary, argv0 = opencode
     kimi|kimi-*)         REPLY=kimi ;;        # Mach-O SEA, argv0 = kimi
+    dsh|dsh-tui|dst)     REPLY=dsh ;;
     node|"")
       # node wrapper without cursor-agent: fall back to the (truncated) current command
       case "$cur" in
         grok-*)  REPLY=grok ;;
         codex-*) REPLY=codex ;;
         pi|pi-*) REPLY=pi ;;
+        dsh|dsh-tui|dst) REPLY=dsh ;;
       esac ;;
     *)
       case "$cur" in
@@ -161,6 +179,7 @@ detect_tool() {
         codex-*)    REPLY=codex ;;
         opencode)   REPLY=opencode ;;
         kimi)       REPLY=kimi ;;
+        dsh|dsh-tui|dst) REPLY=dsh ;;
       esac ;;
   esac
 }
@@ -182,6 +201,7 @@ coord_tool_matches() {
     codex) tag=x ;;
     opencode) tag=o ;;
     kimi) tag=k ;;
+    dsh) tag=d ;;
     *) return 1 ;;
   esac
   [[ "$recorded" == "$tag" || "$recorded" == "$detected" ]]
@@ -305,7 +325,7 @@ build_resume() {
   extract_uuid "$full"; id="$REPLY"
   if [[ "$tool" == codex && -n "$coord_sid" ]] && codex_session_exists "$coord_sid"; then
     id="$coord_sid"
-  elif [[ ( "$tool" == pi || "$tool" == grok ) && -n "$coord_sid" ]]; then
+  elif [[ ( "$tool" == pi || "$tool" == grok || "$tool" == dsh ) && -n "$coord_sid" ]]; then
     # The current coordinate binding is authoritative even when that new session
     # is still empty. Check durability below without falling back to stale argv.
     id="$coord_sid"
@@ -313,6 +333,30 @@ build_resume() {
     id="$coord_sid"
   fi
   case "$tool" in
+    dsh)
+      # dsh ids are opaque, not necessarily UUIDs. Only exact --resume ids or
+      # the selected TUI session snapshot are admissible; never use global MRU.
+      id="$coord_sid"
+      if [[ -z "$id" && ( "$coord_tool" == d || "$coord_tool" == dsh ) ]]; then
+        REPLY="$DSH_BASE"; REPLY_KIND=invalid
+        return 0
+      fi
+      if [[ -z "$id" ]]; then
+        local -a argv=("${(@Q)${(z)full}}")
+        local -i argi
+        for (( argi=1; argi <= ${#argv}; argi++ )); do
+          if [[ "${argv[$argi]}" == --resume=* ]]; then
+            id="${argv[$argi]#--resume=}"; break
+          elif [[ "${argv[$argi]}" == --resume && $argi -lt ${#argv} && "${argv[$((argi+1))]}" != -* ]]; then
+            id="${argv[$((argi+1))]}"; break
+          fi
+        done
+      fi
+      if [[ -n "$id" ]]; then
+        REPLY="$DSH_BASE --resume ${(q)id}"
+        if DSH_HOME="${coord_dsh_home:-${DSH_HOME:-$HOME/.dsh}}" DSH_TUI_SESSION_ROOT="${coord_session_root:-${DSH_TUI_SESSION_ROOT:-}}" "$SCRIPT_DIR/aipane-dsh-session" "$id" "$cwd"; then REPLY_KIND=resume
+        else REPLY_KIND=invalid; fi
+      else REPLY="$DSH_BASE"; REPLY_KIND=fresh; fi ;;
     pi)
       if [[ -n "$id" ]]; then
         REPLY="$PI_BASE --session-id $id"
@@ -358,6 +402,10 @@ build_resume() {
       else REPLY="$KIMI_BASE --continue"; REPLY_KIND=resume; fi ;;
   esac
   [[ -n "$id" ]] && REPLY_SID="$id"
+  if [[ "$tool" == dsh ]]; then
+    [[ -n "$coord_session_root" ]] && REPLY="DSH_TUI_SESSION_ROOT=${(q)coord_session_root} $REPLY"
+    [[ -n "$coord_dsh_home" ]] && REPLY="DSH_HOME=${(q)coord_dsh_home} $REPLY"
+  fi
 }
 
 # emit_plan_json <target> <tool> <kind> <restorable 0|1> <cwd> <command> <sid>
@@ -371,6 +419,8 @@ emit_plan_json() {
   AIPANE_PLAN_CWD="$5" \
   AIPANE_PLAN_COMMAND="$6" \
   AIPANE_PLAN_SID="$7" \
+  AIPANE_PLAN_DSH_HOME="${coord_dsh_home:-}" \
+  AIPANE_PLAN_SESSION_ROOT="${coord_session_root:-}" \
     command python3 -c '
 import json, os
 print(json.dumps({
@@ -381,6 +431,8 @@ print(json.dumps({
     "cwd": os.environ["AIPANE_PLAN_CWD"],
     "command": os.environ["AIPANE_PLAN_COMMAND"],
     "sid": os.environ["AIPANE_PLAN_SID"],
+    **({"dsh_home": os.environ["AIPANE_PLAN_DSH_HOME"], "session_root": os.environ["AIPANE_PLAN_SESSION_ROOT"]}
+       if os.environ["AIPANE_PLAN_TOOL"] == "dsh" else {}),
 }, ensure_ascii=False, separators=(",", ":")))
 '
 }
@@ -391,7 +443,7 @@ log "=== ai-restore start (dump=$DUMP dryrun=$DRYRUN) ==="
 
 local line
 local -a f
-local session win pane_idx title cwd cur full tool cmd target coord_sid coord_tool resume_sid
+local session win pane_idx title cwd cur full tool cmd target coord_sid coord_tool resume_sid coord_dsh_home coord_session_root
 while IFS= read -r line; do
   [[ "$line" == pane$'\t'* ]] || continue
   f=("${(@ps:\t:)line}")
@@ -408,9 +460,15 @@ while IFS= read -r line; do
 
   coord_sid="${COORDS_SID[$target]:-}"
   coord_tool="${COORDS_TOOL[$target]:-}"
+  coord_dsh_home="${COORDS_DSH_HOME[$target]:-}"
+  coord_session_root="${COORDS_SESSION_ROOT[$target]:-}"
   if [[ -n "$coord_sid" ]] && ! coord_tool_matches "$tool" "$coord_tool"; then
     log "ignore $target snapshot id: detected=$tool recorded=${coord_tool:-missing}"
     coord_sid=""
+    coord_dsh_home=""; coord_session_root=""
+  fi
+  if [[ "$tool" == dsh && -n "$coord_sid" && -n "${COORDS_CWD[$target]:-}" ]]; then
+    cwd="${COORDS_CWD[$target]}"
   fi
 
   build_resume "$tool" "$full" "$title" "$coord_sid" "$cwd"; cmd="$REPLY"; resume_sid="$REPLY_SID"

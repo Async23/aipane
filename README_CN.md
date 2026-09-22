@@ -9,7 +9,6 @@
 | 命令 / 表面 | 说明 |
 |---|---|
 | `ai [--new\|-n] [--layout\|-l <layout>] <tools_string> [tool_args...]` | 直接启动一个 AI CLI，或在 tmux 窗格中编排多个 CLI |
-| `killcc [options]` | 清理已分离的 AI CLI 进程树和孤立的 AI 子进程 |
 | `killmcp [options]` | 清理过期、已分离或孤立的 MCP 辅助进程 |
 | `killrod [options]` | 强制清理匹配的 Rod/Leakless 浏览器进程和 Playwright `chrome-headless-shell` 进程 |
 | 可选 Ghostty + tmux 工作台 | Cmd↔tmux 键位桥、广播、窗口标签多行（**不会**被 `init.zsh` 加载） |
@@ -196,12 +195,16 @@ ai cc                                     # 重复的键会启动重复的工具
 布局和工作目录保持不变。恢复前会清理残留终端输入，并关闭受影响 tmux window
 的 SYNC，避免不同 pane 的恢复命令被广播。瞬时失败会延迟重试，并且只有验证
 成功后才重新绑定 pane。Grok 必须明确上报目标会话
-`session loaded`，其他 Agent 则必须通过进程稳定期。未完成的恢复意图保存在
+`session loaded`，dsh-TUI 必须选中目标会话与工作目录，其他 Agent 则必须通过
+进程稳定期。未完成的恢复意图保存在
 `~/.local/share/aipane/restore-pending.json`，不会再被后续 continuum 快照抹掉。
-Qoder、Droid 和 dsh-TUI 因尚未接入 aipane 会话恢复而直接忽略。
+Qoder 和 Droid 因尚未接入 aipane 会话恢复而直接忽略。
 
 macOS 完成通知 Adapter 与声音覆盖入口统一记录在
 [`docs/agent-notifications.md`](docs/agent-notifications.md)。
+
+dsh-TUI 的活动状态、精确会话恢复、通知与 Web 配置入口见
+[`docs/dsh-integration.md`](docs/dsh-integration.md)。
 
 ```bash
 ai-restart --dry-run  # 刷新快照并预览，不重启 pane
@@ -236,10 +239,9 @@ Claude 仍要求存在持久 transcript，否则保持原 pane 不动。
 
 ## 进程清理
 
-三个包装命令与统一清理引擎的对应关系：
+包装命令与统一清理引擎的对应关系：
 
 ```text
-killcc  → aipane-cleanup ai  --verbose
 killmcp → aipane-cleanup mcp --verbose --session-age 18000
 killrod → aipane-cleanup rod --force --verbose
 ```
@@ -247,7 +249,6 @@ killrod → aipane-cleanup rod --force --verbose
 建议先执行 dry run：
 
 ```bash
-killcc --dry-run
 killmcp --dry-run
 killrod --dry-run
 ```
@@ -255,19 +256,17 @@ killrod --dry-run
 直接调用方式：
 
 ```bash
-./bin/aipane-cleanup [all|ai|rod|mcp] \
+./bin/aipane-cleanup [all|rod|mcp] \
   [--all|--force] [--max-age SECONDS] [--orphan-age SECONDS] \
   [--session-age SECONDS] [--dry-run] [--verbose|-v] [--help|-h]
 ```
 
-`ai` 模式会识别已分离的 Claude、Codex、Droid、Gemini、Grok、OpenCode 和 `agent-browser` daemon 进程，沿进程树收集相关进程，并检查已知的孤立 AI 子进程。传入 `--session-age` 后，还会清理超过指定时长的已分离 tmux Claude 会话树。
+默认的 `all` 模式执行 Rod 和 MCP 清理。`--session-age` 用于清理旧 AI 会话树下的 MCP 辅助进程。
 
 在 `rod` 模式中，`--force` 会忽略进程年龄，选中所有匹配的 Rod/Leakless Chromium 进程以及所有匹配的 `ms-playwright/.../chrome-headless-shell` 进程。
 
 清理操作记录在 `~/logs/aipane-cleanup.log`。可通过以下环境变量覆盖时间阈值：
 
-- `AIPANE_AI_ORPHAN_MAX_AGE`（默认 `900`）
-- `AIPANE_AI_SESSION_MAX_AGE`（未设置时禁用）
 - `AIPANE_ROD_MAX_AGE`（默认 `300`）
 - `AIPANE_MCP_MAX_AGE`（默认 `21600`）
 - `AIPANE_MCP_ORPHAN_MAX_AGE`（默认 `900`）
@@ -319,7 +318,7 @@ killrod --dry-run
 └── tests/
     ├── ai-contracts.zsh
     ├── ai-p-launches-pi.zsh
-    ├── aipane-cleanup-ai-protection.sh
+    ├── aipane-cleanup-modes.sh
     ├── aipane-cleanup-contracts.sh
     ├── init-reload.zsh
     ├── test_ai_restart.py
@@ -343,7 +342,7 @@ sh -n bin/aipane-cleanup bin/aipane-claude-activity bin/rod-cleanup bin/tmux-col
 
 zsh -fc '
   source ./init.zsh
-  type ai killcc killmcp killrod
+  type ai killmcp killrod
   for retired in codexx geminii oc; do
     (( $+functions[$retired] || $+aliases[$retired] )) && exit 1
   done
@@ -353,7 +352,7 @@ zsh -fc '
 ./tests/init-reload.zsh
 ./tests/ai-p-launches-pi.zsh
 ./tests/ai-contracts.zsh
-./tests/aipane-cleanup-ai-protection.sh
+./tests/aipane-cleanup-modes.sh
 ./tests/aipane-cleanup-contracts.sh
 
 # 可选工作台 / window-wrap

@@ -115,15 +115,34 @@ def main() -> int:
         inspection = activity.inspect(pane_id)
         session = inspection.session
         rec = (
-            {"sid": session.session_id, "tool": session.tool_key}
+            {"sid": session.session_id, "tool": session.tool_key,
+             **({"dsh_home": session.dsh_home, "session_root": session.session_root}
+                if session.tool_key == "d" else {})}
             if session is not None
             else None
         )
         if rec is None:
             rec = by_pane.get(pane_id)
+            known_dsh = bool(rec and rec.get("tool") in {"d", "dsh"})
+            if inspection.guard is not None:
+                try:
+                    activity_record = json.loads(inspection.guard.record or "{}")
+                    known_dsh = known_dsh or (isinstance(activity_record, dict) and "dsh_runtime" in activity_record)
+                except ValueError:
+                    pass
+            if known_dsh:
+                # A dsh launch binding outlives /new, /resume and the process.
+                # Only a verified selected-channel session can authorize resume.
+                coords[coord] = {"sid": "", "tool": "d", "cwd": cwd,
+                                 "binding": "unavailable"}
+                continue
         if not rec or not rec.get("sid"):
             continue  # only useful when we actually have an id (mainly codex)
-        coords[coord] = {"sid": rec["sid"], "tool": rec.get("tool", ""), "cwd": cwd}
+        if session is not None and session.tool_key == "d" and session.cwd:
+            cwd = session.cwd
+        coords[coord] = {"sid": rec["sid"], "tool": rec.get("tool", ""), "cwd": cwd,
+                         **({key: rec[key] for key in ("dsh_home", "session_root") if rec.get(key)}
+                            if rec.get("tool") == "d" else {})}
 
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)

@@ -60,12 +60,10 @@ Register the installed App and request its first notification authorization:
 "$HOME/Applications/dsh Notifier.app/Contents/MacOS/dsh-notifier" -authorize
 ```
 
-Merge the entries in
-[`integrations/dsh/cordis.patch.yml`](../integrations/dsh/cordis.patch.yml)
-into `${DSH_HOME:-~/.dsh}/profiles/dsh-tui/cordis.patch.yml`, using absolute
-paths to this checkout. A `patchReload: live` profile loads a newly inserted
-plugin without restarting. Editing the plugin's source after loading may
-require restarting dsh.
+Register the plugins in each installed TUI and Web profile as described in
+[dsh integrations](dsh-integration.md#register-the-profiles), using this
+checkout's source paths. That guide also covers upgrading a plugin already
+loaded by a live host. Both profiles use the same notification sender.
 
 ## Verify
 

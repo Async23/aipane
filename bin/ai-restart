@@ -20,6 +20,7 @@ if str(LIB_DIR) not in sys.path:
 
 from agent_activity import AgentActivity, TmuxActivityAdapter
 from recovery_plan import GUARD_FIELDS, RecoveryPlanError, seal_plan
+from dsh_sessions import current_session as dsh_current_session, matches_session as dsh_matches_session
 
 
 class RestartError(RuntimeError):
@@ -196,6 +197,17 @@ def live_plan(tmux: Tmux, plan: list[dict[str, object]]) -> list[dict[str, objec
         if state is None:
             continue
         live_guard = state.get("guard")
+        if item.get("tool") == "dsh" and item.get("restorable") is True and isinstance(live_guard, dict):
+            tty = tmux.run("display-message", "-p", "-t", target, "#{pane_tty}").stdout.strip()
+            record = dsh_current_session(
+                pane_id=live_guard["pane_id"], socket_path=live_guard["socket_path"],
+                server_pid=live_guard["server_pid"], pane_tty=tty,
+                environment={**os.environ, **({"DSH_HOME": str(item["dsh_home"])} if item.get("dsh_home") else {})},
+            )
+            if not dsh_matches_session(record, session_id=str(item.get("sid", "")),
+                                       cwd=str(item["cwd"]), dsh_home=str(item.get("dsh_home", "")),
+                                       session_root=str(item.get("session_root", ""))):
+                raise RestartError(f"dsh selected session changed for {target}; refresh the restart plan")
         expected_guard = item.get("guard")
         if isinstance(expected_guard, dict):
             normalized = {
@@ -287,6 +299,8 @@ def exact_plan_items(plan: list[dict[str, object]]) -> list[dict[str, object]]:
         exact.append(
             {
                 **{field_name: item.get(field_name, "") for field_name in fields},
+                **({field_name: item.get(field_name, "") for field_name in ("dsh_home", "session_root")}
+                   if item.get("tool") == "dsh" else {}),
                 "guard": {
                     field_name: str(guard.get(field_name, ""))
                     for field_name in GUARD_FIELDS

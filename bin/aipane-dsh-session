@@ -1,0 +1,40 @@
+#!/usr/bin/env node
+// Validate an exact durable dsh session using the installed native parser.
+// Read handles neither acquire write leases nor migrate/truncate artifacts.
+import { realpathSync, existsSync } from "node:fs"
+import { join } from "node:path"
+import { createRequire } from "node:module"
+import { pathToFileURL } from "node:url"
+
+const [sid, cwd] = process.argv.slice(2)
+const deadline = setTimeout(() => process.exit(1), 10000)
+deadline.unref()
+if (!sid || !cwd) {
+  console.error("usage: aipane-dsh-session SESSION_ID CWD")
+  process.exit(2)
+}
+try {
+  const dsh = (process.env.PATH || "").split(":").map(dir => join(dir, "dsh")).find(existsSync)
+  if (!dsh) throw new Error("dsh executable unavailable")
+  const require = createRequire(realpathSync(dsh))
+  const { Context } = await import(pathToFileURL(require.resolve("@deepseek-ai/cordis")).href)
+  const { default: Persistence } = await import(pathToFileURL(require.resolve("@deepseek-ai/dsh-session-persistence-jsonl")).href)
+  const root = process.env.DSH_TUI_SESSION_ROOT || process.env.DSH_SESSION_ROOT || join(process.env.DSH_HOME || join(process.env.HOME, ".dsh"), "sessions")
+  let valid = false
+  for (const compression of ["zstd", "none"]) {
+    try {
+      const backend = new Persistence(new Context(), { root, compression })
+      const handle = await backend.open(sid, "read")
+      try {
+        await handle.read()
+        valid = handle.header.id === sid && !!handle.header.cwd && realpathSync(handle.header.cwd) === realpathSync(cwd)
+      } finally { await handle.close() }
+      if (valid) break
+    } catch {
+      // The other supported encoding may own this exact session.
+    }
+  }
+  if (!valid) process.exitCode = 1
+} catch {
+  process.exitCode = 1
+} finally { clearTimeout(deadline) }

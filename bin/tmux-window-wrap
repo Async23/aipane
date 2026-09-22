@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -64,6 +65,8 @@ AI_TOOL_EXECUTABLES = frozenset(
         "codexx",
         "cursor-agent",
         "droid",
+        "dsh",
+        "dsh-tui",
         "factory-droid",
         "gemini",
         "gemini-cli",
@@ -724,7 +727,12 @@ def _is_ai_tool_executable(token):
 
 def _is_ai_tool_script(token):
     normalized = token.lower().replace("\\", "/")
-    return _is_ai_tool_executable(token) or any(
+    dsh_package = re.search(
+        r"(?:^|/)(?:@deepseek-ai/dsh|@deepseek-harness-tui/dsh-tui)"
+        r"(?:@[^/\s]+)?(?:/|$)",
+        normalized,
+    )
+    return bool(dsh_package) or _is_ai_tool_executable(token) or any(
         marker in normalized for marker in AI_TOOL_PATH_MARKERS
     )
 
@@ -745,8 +753,14 @@ def command_runs_ai_tool(command):
             if not candidates or candidates[0] not in subcommands:
                 return False
             candidates = candidates[1:]
-        return any(_is_ai_tool_script(token) for token in candidates[:4])
+        candidate = next((token for token in candidates if not token.startswith("-")), "")
+        return bool(candidate) and _is_ai_tool_script(candidate)
     if executable in RUNTIME_EXECUTABLES or executable.startswith("python"):
+        if executable in {"node", "bun", "deno"} and any(
+            token in {"-e", "--eval", "-p", "--print"}
+            for token in arguments[1:]
+        ):
+            return False
         script = next(
             (token for token in arguments[1:] if not token.startswith("-")),
             "",

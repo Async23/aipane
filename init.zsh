@@ -1,11 +1,19 @@
 #!/usr/bin/env zsh
 # aipane entrypoint
 
-if [[ "${_AIPANE_INIT_VERSION:-}" == "4" ]]; then
+if [[ "${_AIPANE_INIT_VERSION:-}" == "5" ]]; then
   return 0
 fi
 typeset -g _AIPANE_INIT_LOADED=1
-typeset -g _AIPANE_INIT_VERSION=4
+typeset -g _AIPANE_INIT_VERSION=5
+
+# Unload the retired cleanup wrapper when an existing shell reloads aipane.
+# Keep unrelated user functions with the same name.
+if (( $+functions[killcc] )) &&
+   [[ "${functions[killcc]}" == *'local script="$AIPANE_ROOT/bin/aipane-cleanup"'* &&
+      "${functions[killcc]}" == *'command "$script" ai --verbose "$@"'* ]]; then
+  unfunction killcc
+fi
 
 # Remove only the public functions owned by the retired multi-account module.
 # A user-defined function with the same short name must remain untouched.
