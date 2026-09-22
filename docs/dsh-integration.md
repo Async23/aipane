@@ -10,6 +10,7 @@ native lifecycle events to aipane without changing the installed dsh package.
 | Foreground TUI session binding | `aipane-session.mjs`, `lib/dsh_sessions.py` |
 | Durable session validation | `bin/aipane-dsh-session`, using the installed native parser |
 | Snapshot, restore, and restart | `aipane-snapshot`, `ai-restore`, `aipane-restore-executor` |
+| Copy a reply to the clipboard | `aipane-copy.mjs` (`/copy`) |
 | Desktop notifications | [dsh-notifications.md](dsh-notifications.md) |
 | Installation audit | `bin/aipane-doctor` |
 
@@ -40,6 +41,29 @@ upgrading a plugin already imported by a live process, use its `file:` URL
 with a new content revision query (for example `?v=<source-hash>`) to load the
 new module, or restart dsh. The URL still references the same tracked source.
 The doctor resolves these URLs to their canonical files.
+
+## Copy command
+
+`aipane-copy.mjs` registers `/copy [n]` on dsh's human-command registry, so
+dsh-TUI merges it into the slash menu and dispatches it against the foreground
+agent; the plugin owns no UI. `n` counts assistant replies back from the newest
+and defaults to `1`. The handler reads the receiving agent's live session log
+the way the TUI's own `/export` does — `assistant/message` text blocks only, so
+reasoning and tool results never reach the clipboard — and reports which path
+settled the write.
+
+Clipboard paths, in the order the TUI itself tries them for a selection: a
+native utility first (`pbcopy`, `clip`, `wl-copy`/`xclip`/`xsel`), then the tmux
+paste buffer with `-w` so the outer terminal follows, then OSC 52 — wrapped in a
+tmux DCS passthrough so an SSH client's terminal can consume it. A native write
+is skipped when `SSH_CONNECTION` is set, where it would target the wrong
+machine. In the Web profile the row is still registered so profile parity holds,
+but the plugin stays inert: the browser owns its own command surface, and a
+write from the host process would target the host.
+
+```sh
+node --test tests/test_dsh_copy.mjs
+```
 
 ## Session recovery
 
