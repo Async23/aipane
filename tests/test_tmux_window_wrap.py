@@ -2437,10 +2437,10 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             time.sleep(0.02)
         self.fail(f"client widths did not become {expected}")
 
-    def source_window_wrap_config(self, animate=True):
+    def source_window_wrap_config(self, animate=True, render_script=SCRIPT):
         config_text = CONFIG.read_text().replace(
             "$HOME/.local/bin/tmux-window-wrap",
-            str(SCRIPT),
+            str(render_script),
         ).replace(
             "$HOME/.local/state/aipane/tmux-window-wrap-animate.log",
             str(self.animation_log_path),
@@ -3628,6 +3628,60 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         rendered = self.wait_for_active_label(master_fd, "1:手册", timeout=0.5)
         self.assertLess(rendered - started, 0.5)
 
+    def test_reordering_across_status_rows_never_loses_or_duplicates_labels(self):
+        names = ("alpha", "beta", "gamma")
+        for index, name in enumerate(names):
+            self.tmux("rename-window", "-t", f"wrap:{index}", name)
+        # Widen the real race between independent format jobs. Delaying the
+        # first row must leave the previous complete layout visible until the
+        # replacement layout is ready, including on a slower machine.
+        delayed_script = Path(self.log_directory.name) / "tmux-window-wrap"
+        delayed_script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys, time\n"
+            "args = sys.argv[1:]\n"
+            "if args[0] == 'render' and ('--line' not in args or "
+            "args[args.index('--line') + 1] == '0'):\n"
+            "    time.sleep(0.08)\n"
+            f"os.execv({str(SCRIPT)!r}, [{str(SCRIPT)!r}, *args])\n"
+        )
+        delayed_script.chmod(0o755)
+        self.source_window_wrap_config(animate=False, render_script=delayed_script)
+        self.tmux("set-option", "-g", "status-right", "")
+        self.tmux("set-option", "-g", "status-style", "bg=default,fg=default")
+        self.tmux("new-session", "-d", "-s", "observer", "-x", "25", "-y", "24", "sleep 120")
+        self.tmux("set-option", "-t", "observer", "status", "off")
+        self.tmux(
+            "respawn-pane", "-k", "-t", "observer:",
+            "env", "-u", "TMUX", "tmux", "-L", self.socket_name,
+            "attach-session", "-t", "wrap",
+        )
+        self.wait_for_client_count(1)
+        self.wait_for_status("2")
+
+        def status_rows():
+            return self.tmux("capture-pane", "-p", "-t", "observer:").stdout.splitlines()[-2:]
+
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if all(name in " ".join(status_rows()) for name in names):
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("initial status rows did not render")
+
+        for key, expected in (("M->", "2:beta"), ("M-<", "1:beta")) * 3:
+            self.tmux("send-keys", "-t", "observer:", key)
+            deadline = time.monotonic() + 0.5
+            updated = False
+            while time.monotonic() < deadline:
+                rows = status_rows()
+                labels = re.findall(r"\d+:(alpha|beta|gamma)", " ".join(rows))
+                self.assertCountEqual(labels, names, f"incomplete status frame: {rows}")
+                updated |= expected in " ".join(rows)
+                time.sleep(0.005)
+            self.assertTrue(updated, f"reordered label {expected} did not render")
+
     def test_closing_background_window_updates_label_before_it_can_be_clicked(self):
         self.source_window_wrap_config()
         self.tmux("move-window", "-r", "-t", "wrap")
@@ -3776,7 +3830,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             ).stdout.strip()
             self.assertEqual(configured, value)
 
-    def test_window_wrap_config_connects_all_status_rows_to_complete_cache_keys(self):
+    def test_window_wrap_config_uses_one_renderer_for_all_status_rows(self):
         self.source_window_wrap_config()
 
         animation_fps = self.tmux(
@@ -3828,10 +3882,10 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             ).stdout.strip()
             self.assertEqual(len(palette.split(",")), 13)
         self.assertIn("#{T;=/#{status-left-length}:status-left}", first_row)
-        self.assertIn("tmux-window-wrap render --line 0", first_row)
+        self.assertIn("tmux-window-wrap render --store-rows", first_row)
         self.assertIn("#{T;=/#{status-right-length}:status-right}", first_row)
-        self.assertIn("tmux-window-wrap render --line 1", second_row)
-        self.assertIn("tmux-window-wrap render --line 2", third_row)
+        self.assertEqual(second_row, "#[align=left]#{E:@tmux-window-wrap-row-1}")
+        self.assertEqual(third_row, "#[align=left]#{E:@tmux-window-wrap-row-2}")
         cache_keys = (
             "TMUX_WINDOW_WRAP_GENERATION=#{TMUX_WINDOW_WRAP_GENERATION}",
             "TMUX_WINDOW_WRAP_WINDOWS=#{W:",
@@ -3855,22 +3909,8 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         )
         for cache_key in cache_keys:
             self.assertIn(cache_key, first_row)
-            self.assertIn(cache_key, second_row)
-            self.assertIn(cache_key, third_row)
         self.assertNotIn("#[align=right", second_row)
         self.assertNotIn("#[align=right", third_row)
-        self.assertIn(
-            "--store-option @tmux-window-wrap-row-0",
-            first_row,
-        )
-        self.assertIn(
-            "--store-option @tmux-window-wrap-row-1",
-            second_row,
-        )
-        self.assertIn(
-            "--store-option @tmux-window-wrap-row-2",
-            third_row,
-        )
         self.assertIn("#{E:@tmux-window-wrap-row-0}", first_row)
         self.assertIn("#{E:@tmux-window-wrap-row-1}", second_row)
         self.assertIn("#{E:@tmux-window-wrap-row-2}", third_row)

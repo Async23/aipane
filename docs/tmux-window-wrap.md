@@ -12,10 +12,17 @@ highlight two different windows. The active-window cache fingerprint still
 updates the layout when a selected window must be brought into the three-row
 visible area.
 
-`render --store-option` always stores these live selection expressions. Plain
-`render` output retains the snapshot's selection for standalone callers.
-Cached rows are written through `source-file -` on standard input so large
-animated window lists do not exceed tmux's command argument size limit.
+The status format starts one `render --store-rows` job, which builds all rows
+from the same window snapshot and publishes them with the status height in one
+tmux command queue. Reordering a window across a row boundary therefore keeps
+the previous complete layout visible until its replacement is ready. Independent
+row jobs could briefly omit or duplicate a label by mixing old and new layouts.
+
+Both `render --store-rows` and the single-row `render --line N --store-option`
+mode store live selection expressions. Plain `render --line N` output retains
+the snapshot's selection for standalone callers. Cached rows are written through
+`source-file -` on standard input so large animated window lists do not exceed
+tmux's command argument size limit.
 
 ## Pane count annotations
 
