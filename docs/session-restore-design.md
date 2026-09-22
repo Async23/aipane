@@ -16,7 +16,7 @@
   要求明确确认所有任务已空闲。非交互覆盖必须使用 `--force`。
 - Grok 在进程内 `/new` 或 `/resume` 后，存盘按原生活跃会话表中的存活 PID 与 pane TTY
   记录当前会话；恢复优先使用这份坐标绑定，并校验当前目录的会话文件（见 §19）。
-- Qoder 与 Droid 暂不在恢复范围内。
+- Qoder、Droid 与 dsh-TUI 暂不在恢复范围内。
 
 ## 0. 一个绕不开的前提
 
@@ -45,7 +45,7 @@ tmux pane 里的进程都是 tmux server 的子进程；server 一退出（`kill
 | 6 | claude (`c`) | **首条消息才生成（懒惰）** | `~/.claude/projects/<dash编码cwd>/<uuidv4>.jsonl` |
 | 7 | opencode (`o`) | **首条消息才生成（懒惰）** | `~/.local/share/opencode/`（sqlite + storage/） |
 | 8 | kimi (`k`) | **首条消息才生成（懒惰）** | 启动仅建全局 search-index；单会话 store 位置未定 |
-| 9 | droid (`d`) | 未安装，未实测 | — |
+| 9 | dsh-TUI (`d`) | 尚未接入 aipane 会话恢复 | — |
 
 要点：懒惰派“没发消息就崩溃”时**根本没有会话被创建**，也就没有东西可丢/可恢复。
 

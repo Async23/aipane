@@ -37,7 +37,7 @@ git -C ~/.aipane pull --ff-only
 - macOS and zsh
 - Claude Code for the `c` tool in `ai` (optional if you never use `c`)
 - tmux for multi-tool `ai` launches, or whenever `--new`/`--layout` is used
-- The corresponding optional CLI for each additional `ai` tool: Codex, Droid, Grok, OpenCode, Cursor CLI, Qoder CLI, Pi (`pi`), or Kimi Code (`kimi`)
+- The corresponding optional CLI for each additional `ai` tool: Codex, dsh-TUI (`dsh-tui`), Grok, OpenCode, Cursor CLI, Qoder CLI, Pi (`pi`), or Kimi Code (`kimi`)
 
 Single-tool calls such as `ai x` run in the current shell and do not require tmux unless `--new` or `--layout` is supplied.
 
@@ -138,7 +138,7 @@ Set overrides before sourcing `init.zsh`:
 ```bash
 export AIPANE_CLAUDE_LAUNCH_CMD="claude --dangerously-skip-permissions"
 export AIPANE_CODEX_LAUNCH_CMD="codex --yolo"
-export AIPANE_DROID_LAUNCH_CMD="droid"
+export AIPANE_DSH_LAUNCH_CMD="dsh-tui"
 export AIPANE_GROK_LAUNCH_CMD="grok --always-approve"
 export AIPANE_OPENCODE_LAUNCH_CMD="opencode"
 export AIPANE_CURSOR_LAUNCH_CMD="cursor-agent --force"
@@ -157,7 +157,7 @@ Tool keys and default commands:
 |---|---|---|
 | `c` | Claude Code | `claude --dangerously-skip-permissions` |
 | `x` | Codex | `codex --yolo` |
-| `d` | Droid | `droid` |
+| `d` | dsh-TUI | `dsh-tui` |
 | `g` | Grok | `grok --always-approve` |
 | `o` | OpenCode | `opencode` |
 | `r` | Cursor | `cursor-agent --force` |
@@ -206,7 +206,7 @@ Transient failures are retried, and a pane is rebound only after verification.
 Grok must report the requested `session loaded`; other Agents must remain alive
 for a stability window. Unfinished intent is kept in
 `~/.local/share/aipane/restore-pending.json`, so a later continuum save cannot
-erase a failed recovery. Qoder and Droid are ignored because their session
+erase a failed recovery. Qoder, Droid, and dsh-TUI are ignored because their session
 restore is not implemented.
 
 The full recovery invariants and failure model live in

@@ -9,7 +9,7 @@ Usage:
 Tools:
   c  Claude Code   (${AIPANE_CLAUDE_LAUNCH_CMD})
   x  Codex         (${AIPANE_CODEX_LAUNCH_CMD})
-  d  Droid         (${AIPANE_DROID_LAUNCH_CMD})
+  d  dsh-TUI       (${AIPANE_DSH_LAUNCH_CMD})
   g  Grok          (${AIPANE_GROK_LAUNCH_CMD})
   o  OpenCode      (${AIPANE_OPENCODE_LAUNCH_CMD})
   r  Cursor        (${AIPANE_CURSOR_LAUNCH_CMD})
@@ -64,7 +64,7 @@ _aipane_tool_command() {
       _aipane_command_with_args "$AIPANE_CODEX_LAUNCH_CMD" "$@"
       ;;
     d)
-      _aipane_command_with_args "$AIPANE_DROID_LAUNCH_CMD" "$@"
+      _aipane_command_with_args "$AIPANE_DSH_LAUNCH_CMD" "$@"
       ;;
     g)
       _aipane_command_with_args "$AIPANE_GROK_LAUNCH_CMD" "$@"

@@ -1,16 +1,16 @@
 #!/usr/bin/env zsh
 # Shared helpers for aipane.
 
-if [[ "${_AIPANE_CORE_VERSION:-}" == "2" ]]; then
+if [[ "${_AIPANE_CORE_VERSION:-}" == "3" ]]; then
   return 0
 fi
 typeset -g _AIPANE_CORE_LOADED=1
-typeset -g _AIPANE_CORE_VERSION=2
+typeset -g _AIPANE_CORE_VERSION=3
 
 # User-configurable values (export before sourcing init.zsh to override).
 typeset -g AIPANE_CLAUDE_LAUNCH_CMD="${AIPANE_CLAUDE_LAUNCH_CMD:-claude --dangerously-skip-permissions}"
 typeset -g AIPANE_CODEX_LAUNCH_CMD="${AIPANE_CODEX_LAUNCH_CMD:-codex --yolo}"
-typeset -g AIPANE_DROID_LAUNCH_CMD="${AIPANE_DROID_LAUNCH_CMD:-droid}"
+typeset -g AIPANE_DSH_LAUNCH_CMD="${AIPANE_DSH_LAUNCH_CMD:-dsh-tui}"
 typeset -g AIPANE_GROK_LAUNCH_CMD="${AIPANE_GROK_LAUNCH_CMD:-grok --always-approve}"
 typeset -g AIPANE_OPENCODE_LAUNCH_CMD="${AIPANE_OPENCODE_LAUNCH_CMD:-opencode}"
 typeset -g AIPANE_CURSOR_LAUNCH_CMD="${AIPANE_CURSOR_LAUNCH_CMD:-cursor-agent --force}"

@@ -67,4 +67,25 @@ if [[ "${aliases[geminii]:-}" != "user-gemini-command" ||
 fi
 ZSH
 
+AIPANE_TEST_ROOT="$ROOT_DIR" zsh -df <<'ZSH'
+set -eu
+typeset -g _AIPANE_INIT_VERSION=3
+typeset -g _AIPANE_CORE_VERSION=2
+typeset -g AIPANE_DROID_LAUNCH_CMD=droid
+unset AIPANE_DSH_LAUNCH_CMD TMUX_PANE
+typeset -ga received=()
+ai() { droid "$@"; }
+droid() { return 99; }
+dsh-tui() { received=("$@"); }
+
+source "$AIPANE_TEST_ROOT/init.zsh"
+ai d -- --version "two words"
+
+if (( ${#received[@]} != 2 )) ||
+   [[ "${received[1]}" != --version || "${received[2]}" != "two words" ]]; then
+  print -u2 "reloaded ai d did not launch dsh-TUI with intact arguments"
+  exit 1
+fi
+ZSH
+
 print "init reload tests passed"

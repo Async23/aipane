@@ -37,7 +37,7 @@ git -C ~/.aipane pull --ff-only
 - macOS 和 zsh
 - Claude Code：供 `ai` 的 `c` 工具使用（不用 `c` 时可省略）
 - tmux：供多工具 `ai` 调用，以及使用 `--new` 或 `--layout` 时使用
-- 其他 `ai` 工具对应的可选 CLI：Codex、Droid、Grok、OpenCode、Cursor CLI、Qoder CLI、Pi（`pi`）或 Kimi Code（`kimi`）
+- 其他 `ai` 工具对应的可选 CLI：Codex、dsh-TUI（`dsh-tui`）、Grok、OpenCode、Cursor CLI、Qoder CLI、Pi（`pi`）或 Kimi Code（`kimi`）
 
 `ai x` 这类单工具调用默认在当前 shell 中运行；未使用 `--new` 或 `--layout` 时不依赖 tmux。
 
@@ -135,7 +135,7 @@ python3 "$AIPANE_ROOT/tests/test_tmux_window_wrap.py"
 ```bash
 export AIPANE_CLAUDE_LAUNCH_CMD="claude --dangerously-skip-permissions"
 export AIPANE_CODEX_LAUNCH_CMD="codex --yolo"
-export AIPANE_DROID_LAUNCH_CMD="droid"
+export AIPANE_DSH_LAUNCH_CMD="dsh-tui"
 export AIPANE_GROK_LAUNCH_CMD="grok --always-approve"
 export AIPANE_OPENCODE_LAUNCH_CMD="opencode"
 export AIPANE_CURSOR_LAUNCH_CMD="cursor-agent --force"
@@ -154,7 +154,7 @@ export AIPANE_KIMI_LAUNCH_CMD="kimi --auto"
 |---|---|---|
 | `c` | Claude Code | `claude --dangerously-skip-permissions` |
 | `x` | Codex | `codex --yolo` |
-| `d` | Droid | `droid` |
+| `d` | dsh-TUI | `dsh-tui` |
 | `g` | Grok | `grok --always-approve` |
 | `o` | OpenCode | `opencode` |
 | `r` | Cursor | `cursor-agent --force` |
@@ -198,7 +198,7 @@ ai cc                                     # 重复的键会启动重复的工具
 成功后才重新绑定 pane。Grok 必须明确上报目标会话
 `session loaded`，其他 Agent 则必须通过进程稳定期。未完成的恢复意图保存在
 `~/.local/share/aipane/restore-pending.json`，不会再被后续 continuum 快照抹掉。
-Qoder 和 Droid 因尚未支持会话恢复而直接忽略。
+Qoder、Droid 和 dsh-TUI 因尚未接入 aipane 会话恢复而直接忽略。
 
 macOS 完成通知 Adapter 与声音覆盖入口统一记录在
 [`docs/agent-notifications.md`](docs/agent-notifications.md)。

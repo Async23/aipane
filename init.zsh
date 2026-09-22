@@ -1,11 +1,11 @@
 #!/usr/bin/env zsh
 # aipane entrypoint
 
-if [[ "${_AIPANE_INIT_VERSION:-}" == "3" ]]; then
+if [[ "${_AIPANE_INIT_VERSION:-}" == "4" ]]; then
   return 0
 fi
 typeset -g _AIPANE_INIT_LOADED=1
-typeset -g _AIPANE_INIT_VERSION=3
+typeset -g _AIPANE_INIT_VERSION=4
 
 # Remove only the public functions owned by the retired multi-account module.
 # A user-defined function with the same short name must remain untouched.
