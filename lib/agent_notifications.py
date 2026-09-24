@@ -1909,6 +1909,20 @@ def _codex_internal_task(payload: Mapping[str, object]) -> str:
         and context.startswith("Recent conversation:\n")
     ):
         return "internal_recap"
+    if instructions == (
+        "Write a brief catch-up for a user returning to this task. "
+        "Return JSON with summary and nullable next_action."
+    ):
+        # Structured recaps put multiple instruction paragraphs before history.
+        recap_instructions, conversation_separator, _ = context.partition(
+            "\n\nConversation:\n"
+        )
+        if (
+            conversation_separator
+            and recap_instructions.startswith("Summary:")
+            and "\n\nNext_action:" in recap_instructions
+        ):
+            return "internal_recap"
     if (
         instructions.startswith(
             "Generate a concise, single-line task title of at most "
