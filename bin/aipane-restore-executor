@@ -572,6 +572,7 @@ class ExecutionReport:
     skipped: int
     deferred: int
     blocked: int = 0
+    invalid: int = 0
     disabled_windows: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -579,7 +580,7 @@ class ExecutionReport:
         return (
             f"ai-restore: verified={self.verified} pending={self.pending} "
             f"skipped={self.skipped} deferred={self.deferred} "
-            f"blocked={self.blocked}"
+            f"blocked={self.blocked} invalid={self.invalid}"
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -589,6 +590,7 @@ class ExecutionReport:
             "skipped": self.skipped,
             "deferred": self.deferred,
             "blocked": self.blocked,
+            "invalid": self.invalid,
             "disabled_windows": self.disabled_windows,
             "errors": self.errors,
         }
@@ -1059,6 +1061,15 @@ class RestoreExecutor:
                 item["pane_id"], item["socket_path"], item["server_pid"] = identity
         self.store.save(list(pending_by_target.values()))
         skipped = sum(item["restorable"] is not True for item in current)
+        invalid = [item for item in current if item["kind"] == "invalid"]
+        invalid_errors = [
+            f"{item['target']} ({item['tool']}): saved session identity is unavailable "
+            "or its durable session is invalid; not restored"
+            for item in invalid
+        ]
+        for error in invalid_errors:
+            self.log(error)
+            print(f"ai-restore: {error}", file=sys.stderr)
         verified, deferred, blocked, errors = self.execute_candidates(
             pending_by_target,
             list(pending_by_target.values()),
@@ -1072,7 +1083,8 @@ class RestoreExecutor:
             skipped=skipped,
             deferred=deferred,
             blocked=blocked,
-            errors=errors,
+            invalid=len(invalid),
+            errors=[*errors, *invalid_errors],
         )
         return self.finish_report(report)
 
@@ -1249,7 +1261,7 @@ def main() -> int:
         print(json.dumps(report.as_dict(), ensure_ascii=False, separators=(",", ":")))
     else:
         print(report.render())
-    return 0 if report.pending == 0 else 1
+    return 0 if report.pending == 0 and report.invalid == 0 else 1
 
 
 if __name__ == "__main__":

@@ -27,7 +27,8 @@ LIB_DIR = Path(__file__).resolve().parents[1] / "lib"
 if str(LIB_DIR) not in sys.path:
     sys.path.insert(0, str(LIB_DIR))
 
-from agent_activity import AgentActivity, TmuxActivityAdapter  # noqa: E402
+from agent_activity import AgentActivity, ActivityReadError, TmuxActivityAdapter  # noqa: E402
+from dsh_sessions import last_reported_session  # noqa: E402
 
 STATE_DIR = Path(
     os.environ.get("AIPANE_STATE_DIR")
@@ -104,6 +105,45 @@ def live_panes() -> list[tuple[str, str, str]]:
     return rows
 
 
+def dsh_recovery_binding(activity: AgentActivity, pane_id: str) -> dict | None:
+    """Snapshot identity independently of the host's heartbeat/Agent Activity."""
+    try:
+        pane = activity.adapter.read(pane_id)
+    except ActivityReadError:
+        return None
+    if pane.current_command not in {"node", "dsh", "dsh-tui", "dst"} or not pane.pane_tty:
+        return None
+    environment = os.environ
+    expected_pid = None
+    try:
+        activity_record = json.loads(pane.record or "{}")
+    except ValueError:
+        return None
+    if isinstance(activity_record, dict) and "dsh_runtime" in activity_record:
+        # This reference only locates a custom DSH_HOME. The selected-session
+        # record below independently proves the process and pane identity; an
+        # activity heartbeat is neither needed nor accepted as that proof.
+        reference = activity_record["dsh_runtime"]
+        if not isinstance(reference, dict) or not isinstance(reference.get("path"), str):
+            return None
+        path = Path(reference["path"])
+        expected_pid = reference.get("pid")
+        if (type(expected_pid) is not int or expected_pid <= 0
+                or not path.is_absolute() or path.name != f"{expected_pid}.json"
+                or path.parent.name != "activity" or path.parent.parent.name != "aipane"):
+            return None
+        environment = {**environment, "DSH_HOME": str(path.parents[2])}
+    record = last_reported_session(
+        pane_id=pane.pane_id, socket_path=pane.socket_path,
+        server_pid=pane.server_pid, pane_tty=pane.pane_tty, environment=environment,
+    )
+    if record is None or (expected_pid is not None and record["pid"] != expected_pid):
+        return None
+    return {"sid": record["session_id"], "tool": "d", "cwd": record["cwd"],
+            "binding": "last_known", "last_confirmed_at": record["updated_at"],
+            **{key: record[key] for key in ("dsh_home", "session_root") if record.get(key)}}
+
+
 def main() -> int:
     server = current_server_identity()
     by_pane = latest_by_pane(*server) if server else {}
@@ -122,6 +162,14 @@ def main() -> int:
             else None
         )
         if rec is None:
+            recovery = (
+                dsh_recovery_binding(activity, pane_id)
+                if inspection.current_command in {"node", "dsh", "dsh-tui", "dst"}
+                else None
+            )
+            if recovery is not None:
+                coords[coord] = recovery
+                continue
             rec = by_pane.get(pane_id)
             known_dsh = bool(rec and rec.get("tool") in {"d", "dsh"})
             if inspection.guard is not None:
@@ -132,7 +180,8 @@ def main() -> int:
                     pass
             if known_dsh:
                 # A dsh launch binding outlives /new, /resume and the process.
-                # Only a verified selected-channel session can authorize resume.
+                # Without a process-verified Channel record, keep blocking old
+                # launch bindings/argv rather than guessing a session to resume.
                 coords[coord] = {"sid": "", "tool": "d", "cwd": cwd,
                                  "binding": "unavailable"}
                 continue

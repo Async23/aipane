@@ -44,6 +44,24 @@ def matches_session(record: dict | None, *, session_id: str, cwd: str,
 
 def current_session(*, pane_id: str, socket_path: str, server_pid: str,
                     pane_tty: str = "", environment=None) -> dict | None:
+    """Require a fresh selection for live inspection and restore verification."""
+    record = last_reported_session(
+        pane_id=pane_id, socket_path=socket_path, server_pid=server_pid,
+        pane_tty=pane_tty, environment=environment,
+    )
+    if record and 0 <= time.time() * 1000 - record["updated_at"] <= 10000:
+        return record
+    return None
+
+
+def last_reported_session(*, pane_id: str, socket_path: str, server_pid: str,
+                          pane_tty: str = "", environment=None) -> dict | None:
+    """Keep a stalled host's last selection for a crash-recovery snapshot.
+
+    Age is not identity: a blocked event loop cannot refresh its heartbeat.
+    Still require the same live process generation, pane, server and foreground
+    TTY, and reject ambiguous hosts. This never establishes live activity/readiness.
+    """
     environment = os.environ if environment is None else environment
     home = Path(environment.get("HOME", str(Path.home())))
     root = Path(environment.get("DSH_HOME") or home / ".dsh") / "aipane/sessions"
@@ -64,7 +82,7 @@ def current_session(*, pane_id: str, socket_path: str, server_pid: str,
                     or record.get("socket") != socket_path
                     or str(record.get("server_pid")) != str(server_pid)
                     or type(record.get("updated_at")) not in (int, float)
-                    or not 0 <= time.time() * 1000 - record["updated_at"] <= 10000
+                    or not 0 < record["updated_at"] <= time.time() * 1000
                     or not isinstance(record.get("session_id"), str)
                     or not record["session_id"]
                     or not isinstance(record.get("cwd"), str)
@@ -72,13 +90,13 @@ def current_session(*, pane_id: str, socket_path: str, server_pid: str,
                 continue
             os.kill(pid, 0)
             process = subprocess.run(
-                ["ps", "-p", str(pid), "-o", "lstart=", "-o", "tty="],
+                ["ps", "-p", str(pid), "-o", "lstart=", "-o", "tty=", "-o", "stat="],
                 capture_output=True, text=True, timeout=2, check=True,
                 env={**os.environ, "LC_ALL": "C"},
-            ).stdout.strip().rsplit(None, 1)
-            if len(process) != 2 or process[0].strip() != record.get("process_started"):
+            ).stdout.strip().rsplit(None, 2)
+            if len(process) != 3 or process[0].strip() != record.get("process_started"):
                 continue
-            if pane_tty and process[1] != pane_tty.removeprefix("/dev/"):
+            if pane_tty and (process[1] != pane_tty.removeprefix("/dev/") or "+" not in process[2]):
                 continue
             matches.append(record)
         except (OSError, ValueError, TypeError, subprocess.SubprocessError):

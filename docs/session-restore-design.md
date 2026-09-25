@@ -578,13 +578,19 @@ Agent 确实是当前运行时的根。创建后台 Agent 或尚未提交的 for
 - 插件每 2 秒刷新 `$DSH_HOME/aipane/sessions/<pid>.json`，包含所选会话、工作目录、
   实际 persistence root、tmux pane/socket/server 及进程启动时间；同时通过 `aipane-bind`
   写入 `d` 绑定。退出删除自己拥有的记录，热更新旧实例不能覆盖或删除新实例记录。
-- `lib/dsh_sessions.py` 拒绝过期、其他 server/TTY、PID 重用、多候选或权限不可信的
-  记录。`aipane-snapshot` 保存经过验证的当前 ID、逻辑 workspace cwd、`DSH_HOME` 与
-  session root。只剩旧的 dsh 注册表绑定时写入不可恢复标记，防止回退到旧启动参数。
+- `lib/dsh_sessions.py` 将实时身份与快照恢复身份分开读取：实时检查和恢复成功验证
+  要求 10 秒内心跳；保存快照允许保留同一进程最后报告的 Channel 身份，即使事件
+  循环卡住、心跳过期，也不会清空 ID。两者均拒绝其他 server/TTY、PID 重用、后台
+  进程、多候选或权限不可信的记录。`aipane-snapshot` 保存 ID、逻辑 workspace cwd、
+  `DSH_HOME` 与 session root；过期记录另标记 `binding: last_known` 和毫秒时间戳
+  `last_confirmed_at`。自定义 home 可通过 activity 引用定位，身份仍由所选会话记录
+  独立校验。只剩旧注册表绑定、没有有效 Channel 记录时，仍写入不可恢复标记。
 - `ai-restore` 生成 `dsh-tui --resume <exact-id>`；自定义 home/root 随快照恢复。
   `bin/aipane-dsh-session` 使用本机 dsh 原生 persistence 的只读 handle 完整验证记录、
   ID 和 cwd，支持压缩与明文格式、版本迁移的只读解析。损坏、未持久化、目录不匹配的
   当前会话标记为 `invalid`，不会回退到旧 ID 或“上次会话”。缺少 ID 的启动默认跳过。
+  自动恢复逐项提示 invalid 的目标与工具，报告单独计数，并返回非零状态；其他有效
+  会话照常恢复，`pending=0` 不再掩盖身份无效造成的遗漏。
 - 恢复执行器只有看到新进程的 Channel 已选中计划中的 ID 与 cwd，才将恢复计为成功。
   单独看到 `node` 或旧注册表记录不足以成功；无关 Node 进程也不会被重试中断。
   `ai-restart` 继续使用既有活动检查、确认、sealed plan 与 pending 机制；确认后及每个
@@ -597,3 +603,8 @@ Agent 确实是当前运行时的根。创建后台 Agent 或尚未提交的 for
 `ai-restart --yes --force` 重启，确认 PID 改变而会话 ID 不变、pending 清空；未调用模型。
 回归测试覆盖原生压缩 persistence、旧 argv、当前会话未落盘、损坏记录、错误 cwd、
 失效进程以及“Node 已启动但尚未选中目标会话”的等待行为。
+
+心跳过期回归：`python3 tests/test_dsh_snapshot.py` 使用隔离的 tmux TTY 与真实存活
+进程，将记录时间设为 122 秒前，经实际 snapshot 和原生 persistence 校验生成精确
+恢复计划；同时检查 Agent Activity 仍为 unknown、实时身份不可用。测试还覆盖
+会话切换、自定义 home、异步注册缺失、进程退出和其他 TTY，且不调用模型。

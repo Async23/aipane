@@ -104,9 +104,21 @@ the restarted channel to select that same session and workspace.
 The selected session and storage namespace are checked again after confirmation
 and immediately before restart; switching sessions invalidates the old plan.
 
-Live session records expire after ten seconds without a heartbeat. Dead
-processes, reused PIDs, another socket/pane, multiple matching hosts, and
-invalid session artifacts do not authorize a guessed resume. See
+Live inspection and restore verification require a heartbeat within ten
+seconds. Snapshotting separately preserves a stalled host's last reported
+selection, marked `binding: last_known` with `last_confirmed_at` in Unix
+milliseconds. The process generation, foreground TTY, pane and tmux server
+must still match. A custom `DSH_HOME` can be located through the activity
+reference without treating its expired heartbeat as live evidence. This
+retained identity cannot establish `idle` or authorize an in-place restart;
+the existing activity and fresh-selection guards still apply.
+
+Dead processes, reused PIDs, another socket/pane/TTY, background hosts,
+multiple matching hosts, and invalid session artifacts do not authorize a
+guessed resume. A missing Channel record still blocks fallback to old launch
+arguments. Invalid recovery entries are listed by target and tool, counted
+as `invalid` in the execution report, and make automatic recovery exit
+nonzero even when `pending=0`; other valid entries can still recover. See
 [session-restore-design.md](session-restore-design.md) for the shared recovery
 contract.
 

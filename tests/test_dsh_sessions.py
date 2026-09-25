@@ -11,7 +11,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
-from dsh_sessions import current_session
+from dsh_sessions import current_session, last_reported_session
 
 
 class DshLiveSessionTests(unittest.TestCase):
@@ -35,6 +35,60 @@ class DshLiveSessionTests(unittest.TestCase):
             self.assertIsNone(read(updated_at=time.time() * 1000 - 11000))
             self.assertIsNone(read(session_id=""))
 
+    def test_stalled_selection_rejects_untrusted_files_and_invalid_timestamps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "aipane/sessions"
+            root.mkdir(parents=True)
+            started = subprocess.check_output(
+                ["ps", "-p", str(os.getpid()), "-o", "lstart="],
+                env={**os.environ, "LC_ALL": "C"}, text=True,
+            ).strip()
+            record = dict(version=1, pid=os.getpid(), process_started=started,
+                          updated_at=time.time() * 1000 - 122_000, pane_id="%8",
+                          socket="/tmp/test-dsh", server_pid="321",
+                          session_id="session-current", cwd=directory)
+            path = root / f"{os.getpid()}.json"
+            def read():
+                return last_reported_session(pane_id="%8", socket_path="/tmp/test-dsh",
+                                             server_pid="321", environment={"DSH_HOME": directory})
+            path.write_text(json.dumps(record))
+            path.chmod(0o600)
+            self.assertEqual(read()["session_id"], "session-current")
+            for updated_at in (True, 0, -1, float("nan"), float("inf"), float("-inf")):
+                with self.subTest(updated_at=updated_at):
+                    path.write_text(json.dumps({**record, "updated_at": updated_at}))
+                    self.assertIsNone(read())
+            path.write_text(json.dumps(record))
+            path.chmod(0o666)
+            self.assertIsNone(read())
+            path.chmod(0o600)
+            target = path.with_suffix(".saved")
+            path.rename(target)
+            path.symlink_to(target)
+            self.assertIsNone(read())
+
+    def test_multiple_live_hosts_remain_ambiguous_even_with_one_fresh_heartbeat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "aipane/sessions"
+            root.mkdir(parents=True)
+            with subprocess.Popen(["sleep", "30"]) as other:
+                try:
+                    for pid in (os.getpid(), other.pid):
+                        started = subprocess.check_output(
+                            ["ps", "-p", str(pid), "-o", "lstart="],
+                            env={**os.environ, "LC_ALL": "C"}, text=True,
+                        ).strip()
+                        record = dict(version=1, pid=pid, process_started=started,
+                                      updated_at=time.time() * 1000 - (122_000 if pid == other.pid else 0),
+                                      pane_id="%8", socket="/tmp/test-dsh", server_pid="321",
+                                      session_id=f"session-{pid}", cwd=directory)
+                        (root / f"{pid}.json").write_text(json.dumps(record))
+                    for reader in (current_session, last_reported_session):
+                        self.assertIsNone(reader(pane_id="%8", socket_path="/tmp/test-dsh",
+                                                 server_pid="321", environment={"DSH_HOME": directory}))
+                finally:
+                    other.terminate()
+
 
 @unittest.skipUnless(shutil.which("dsh") and shutil.which("node"), "installed dsh native persistence required")
 class DshDurableSessionTests(unittest.TestCase):
@@ -45,6 +99,7 @@ class DshDurableSessionTests(unittest.TestCase):
         self.state = self.home / "state"
         self.state.mkdir()
         self.env = {**os.environ, "AIPANE_STATE_DIR": str(self.state),
+                    "AIPANE_DSH_LAUNCH_CMD": "dsh-tui",
                     "DSH_TUI_SESSION_ROOT": str(self.home / "sessions")}
         script = '''
 import { createRequire } from 'node:module';

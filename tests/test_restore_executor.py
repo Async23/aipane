@@ -176,6 +176,7 @@ class RestoreExecutorTests(unittest.TestCase):
         launch_mode: str,
         max_attempts: int = 1,
         plan_json: bool = False,
+        report_json: bool = False,
         pane_id: str = "%42",
         guard_pane_id: str | None = None,
         sealed: bool = False,
@@ -263,6 +264,8 @@ class RestoreExecutorTests(unittest.TestCase):
             ]
         if plan_json:
             arguments.append("--plan-json")
+        if report_json:
+            arguments.append("--report-json")
         if lock_held:
             lock_path = self.state_dir / "restore-executor.lock"
             with lock_path.open("a", encoding="utf-8") as lock:
@@ -287,6 +290,41 @@ class RestoreExecutorTests(unittest.TestCase):
         if not pending.exists():
             return []
         return json.loads(pending.read_text(encoding="utf-8"))["items"]
+
+    def test_invalid_session_is_an_explicit_failure_without_launching(self):
+        plan = {**self.grok_plan(), "tool": "dsh", "kind": "invalid",
+                "restorable": False, "sid": "", "command": "dsh-tui"}
+        result = self.run_executor([plan], launch_mode="ready")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid=1", result.stdout)
+        self.assertIn("0:4.1", result.stderr)
+        self.assertIn("dsh", result.stderr)
+        self.assertEqual(self.launch_count.read_text().strip(), "0")
+        self.assertEqual(self.pending_items(), [])
+
+    def test_invalid_session_is_reported_while_valid_sessions_still_restore(self):
+        invalid = {**self.grok_plan(), "target": "0:9.1", "tool": "dsh",
+                   "kind": "invalid", "restorable": False,
+                   "sid": "", "command": "dsh-tui"}
+        result = self.run_executor([self.grok_plan(), invalid], launch_mode="ready", report_json=True)
+        self.assertEqual(result.returncode, 1)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["verified"], 1)
+        self.assertEqual(report["invalid"], 1)
+        self.assertEqual(report["pending"], 0)
+        self.assertIn("0:9.1", report["errors"][0])
+        self.assertEqual(self.launch_count.read_text().strip(), "1")
+
+    def test_fresh_skips_remain_successful_without_a_missing_session_warning(self):
+        fresh = {**self.grok_plan(), "kind": "fresh", "restorable": False,
+                 "sid": "", "command": "grok"}
+        result = self.run_executor([fresh], launch_mode="ready", report_json=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["invalid"], 0)
+        self.assertEqual(report["skipped"], 1)
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(self.launch_count.read_text().strip(), "0")
 
     def test_running_grok_is_not_verified_before_session_loaded(self):
         result = self.run_executor([self.grok_plan()], launch_mode="running")
