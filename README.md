@@ -194,21 +194,10 @@ Inside tmux, a pane layout reuses the current window only when it has one pane; 
 
 ## Restart AI Panes
 
-`ai-restart` refreshes the tmux-resurrect snapshot, finds AI panes with a
-recoverable session, checks Agent Activity, and confirms one exact target set.
-After confirmation it rechecks the pane/process/activity guard and seals a
-versioned, digest-protected execution plan. `aipane-restore-executor` is the
-single owner of pane replacement and recovery side effects under one lock.
-Pane IDs, layout, and working directories stay unchanged. Recovery commands are
-cleared of stale terminal input before launch, and SYNC is disabled on affected
-tmux windows so distinct pane commands cannot be broadcast across the window.
-Transient failures are retried, and a pane is rebound only after verification.
-Grok must report the requested `session loaded`; dsh-TUI must select the exact
-session and workspace. Other Agents must remain alive for a stability window.
-Unfinished intent is kept in
-`~/.local/share/aipane/restore-pending.json`, so a later continuum save cannot
-erase a failed recovery. Qoder and Droid are ignored because their session
-restore is not implemented.
+`ai-restart` restarts recoverable AI conversations in their existing tmux panes.
+If recovery is unfinished, it retries those conversations before saving another
+snapshot or starting a new restart. `--retry` explicitly requests recovery only.
+Qoder and Droid are ignored because their session restore is not implemented.
 
 The full recovery invariants and failure model live in
 [`docs/session-restore-design.md`](docs/session-restore-design.md).
@@ -220,8 +209,9 @@ dsh-TUI setup for activity, exact session recovery, notifications, and Web
 profile coverage is indexed in [`docs/dsh-integration.md`](docs/dsh-integration.md).
 
 ```bash
-ai-restart --dry-run  # refresh snapshot and preview; does not restart panes
-ai-restart            # preview, confirm, then restart and resume
+ai-restart --dry-run  # preview pending recovery or a new restart
+ai-restart            # retry pending recovery, otherwise confirm a new restart
+ai-restart --retry    # retry only unfinished recovery; never start a new restart
 ai-restart --force    # allow panes currently marked busy
 ```
 
@@ -240,7 +230,7 @@ Run `/reload` in Pi processes that were already open.
 
 The default command aborts the whole operation if any selected Agent Activity
 is effectively busy. It resolves Codex turns from exact lifecycle evidence
-before the plan and again after confirmation; `--dry-run` remains read-only.
+before the plan and again after confirmation.
 Missing, stale, or inconsistent evidence is shown as `unknown` and requires an
 explicit interactive confirmation that all tasks are idle. `--yes` alone never
 accepts `unknown`; `--force` is the non-interactive override. Run the command

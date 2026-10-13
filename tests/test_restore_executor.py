@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -444,7 +445,7 @@ class RestoreExecutorTests(unittest.TestCase):
             any(
                 call[0] == "send-keys"
                 and "-l" in call
-                and self.grok_plan()["command"] in call
+                and f"cd -- {shlex.quote(str(self.tmp))} && {self.grok_plan()['command']}" in call
                 for call in tmux_calls
             )
         )
@@ -468,7 +469,7 @@ class RestoreExecutorTests(unittest.TestCase):
             for call in calls
             if call[0] == "send-keys"
             and "-l" in call
-            and self.grok_plan()["command"] in call
+            and f"cd -- {shlex.quote(str(self.tmp))} && {self.grok_plan()['command']}" in call
         ]
         self.assertEqual(len(literal_launches), 2)
 

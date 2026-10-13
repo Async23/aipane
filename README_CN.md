@@ -191,15 +191,12 @@ ai cc                                     # 重复的键会启动重复的工具
 
 ## 重启 AI Pane
 
-`ai-restart` 会刷新 tmux-resurrect 快照，找出拥有可恢复会话的 AI pane，
-将这些 pane 重生为空闲 shell，再交给 `ai-restore` 续接原会话。pane ID、
-布局和工作目录保持不变。恢复前会清理残留终端输入，并关闭受影响 tmux window
-的 SYNC，避免不同 pane 的恢复命令被广播。瞬时失败会延迟重试，并且只有验证
-成功后才重新绑定 pane。Grok 必须明确上报目标会话
-`session loaded`，dsh-TUI 必须选中目标会话与工作目录，其他 Agent 则必须通过
-进程稳定期。未完成的恢复意图保存在
-`~/.local/share/aipane/restore-pending.json`，不会再被后续 continuum 快照抹掉。
-Qoder 和 Droid 因尚未接入 aipane 会话恢复而直接忽略。
+`ai-restart` 在原 tmux pane 中重启并续接可恢复的 AI 会话。存在未完成的恢复时，
+会先补恢复这些会话；完成前不保存新快照或开始新一轮重启。`--retry` 可明确指定
+只补恢复。Qoder 和 Droid 因尚未接入 aipane 会话恢复而直接忽略。
+
+恢复判断、持久记录及失败处理统一见
+[`docs/session-restore-design.md`](docs/session-restore-design.md)。
 
 macOS 完成通知 Adapter 与声音覆盖入口统一记录在
 [`docs/agent-notifications.md`](docs/agent-notifications.md)。
@@ -208,8 +205,9 @@ dsh-TUI 的活动状态、精确会话恢复、通知与 Web 配置入口见
 [`docs/dsh-integration.md`](docs/dsh-integration.md)。
 
 ```bash
-ai-restart --dry-run  # 刷新快照并预览，不重启 pane
-ai-restart            # 预览、确认，然后重启并恢复
+ai-restart --dry-run  # 预览待恢复会话或新一轮重启
+ai-restart            # 优先补恢复；没有待恢复会话时，确认后重启
+ai-restart --retry    # 只补恢复，不开始新一轮重启
 ai-restart --force    # 允许重启当前标记为 busy 的 pane
 ```
 

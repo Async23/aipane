@@ -9,7 +9,9 @@
 ## 当前使用方式
 
 - tmux-resurrect 保存结构后，`ai-restore` 负责在原 pane 续接 AI 会话。
-- `ai-restart --dry-run` 刷新快照并预览本次可恢复的 pane。
+- `ai-restart` 有 pending 时先补恢复，完成后直接结束；没有 pending 才进入新一轮重启。
+- `ai-restart --retry` 只补恢复，不保存快照或替换 pane；没有 pending 时直接结束。
+- `ai-restart --dry-run` 有 pending 时只预览，否则刷新快照并预览本次可恢复的 pane。
 - 从 tmux 外的独立终端执行 `ai-restart`；确认后由恢复执行器按 sealed plan 批量重生并
   续接这些 pane。
 - 默认检测到任一 `busy` Agent Activity 就整体中止；旧进程显示 `unknown` 时，命令
@@ -494,11 +496,12 @@ session；启动 argv 不变，但 `session_start(reason=new|resume|fork)` 会�
   `aipane-restore-executor` 统一负责副作用，形成一个深模块接口。
 - 所有可执行意图在发送命令**之前**原子写入
   `~/.local/share/aipane/restore-pending.json`；新 dump 未再包含该 pane 时，pending 意图仍
-  会参与下一次执行。成功项才删除，默认保留 6 小时；pending 同时守卫创建时的
+  会参与下一次执行。成功项才删除，默认不自动过期；pending 同时守卫创建时的
   pane id / tmux server identity，坐标被其他 pane 复用时绝不发送命令。
 - 每次启动前先 `C-c` 清空输入，再用 `tmux send-keys -R` 重置终端状态，并以 literal
   send-keys 提交命令，避免鼠标控制序列污染。
-- 普通工具通过进程稳定窗口后才算成功；新启动的 Grok 还必须在
+- Codex 须由当前前台进程持续以可写方式打开目标会话记录；其他普通工具通过进程
+  稳定窗口后才算成功。新启动的 Grok 还必须在
   `~/.grok/logs/unified.jsonl` 中出现目标 sid 的 `session loaded`。默认失败后延迟重试
   一次；仍失败则保留 pending 并返回非零。
 - 只有验证成功后才调用 `aipane-bind`。因此 `sent`、`resumed`、`verified` 不再混为一谈。
@@ -608,3 +611,35 @@ Agent 确实是当前运行时的根。创建后台 Agent 或尚未提交的 for
 进程，将记录时间设为 122 秒前，经实际 snapshot 和原生 persistence 校验生成精确
 恢复计划；同时检查 Agent Activity 仍为 unknown、实时身份不可用。测试还覆盖
 会话切换、自定义 home、异步注册缺失、进程退出和其他 TTY，且不调用模型。
+
+## 21. Codex 启动失败与只补恢复（2026-10-13）
+
+Codex 的账号连接在进程启动后才完成。旧验证在进程存活 1 秒后即清除 pending，
+网络超时退出可能发生在这之后，导致下一份快照只剩 shell，丢失自动恢复依据。
+
+`lib/codex_sessions.py` 现在通过 `lsof` 检查当前前台进程是否以可写方式打开
+`CODEX_HOME/sessions` 或 `archived_sessions` 下的本地 rollout，并核对首条
+`session_meta.payload.id` 等于计划中的会话 ID。账号启动阶段的历史预览只读句柄、
+旧注册表绑定、启动 argv 和其他会话的写句柄均不能证明加载成功。只有这个信号持续
+通过稳定窗口，执行器才重新绑定并清除 pending。本机 Codex 0.162.1 已只读核验；
+缺少 `lsof`、日志格式变化或存储方式不支持时保留 pending，不回退为“进程存活即成功”。
+
+Codex 默认验证期限为 60 秒，可用 `AI_RESTORE_CODEX_VERIFY_TIMEOUT` 调整。
+进程因启动错误退出后仍可自动重试；超时但进程仍在运行时保留现场，不发送中断。
+对执行前已存在的 Agent，验证失败也不会在下一轮重试中中断它。
+
+`ai-restart` 在保存新快照前检查 pending。有未完成恢复时只进入补恢复流程，
+确认后直接读取持久命令，在原 tmux server 内按固定 pane ID 找回当前坐标，
+关闭涉及窗口的同步输入，从空闲 shell 回到保存的工作目录后续接会话；目录不存在
+时保留 pending，不在其他目录启动。已运行的匹配会话只验证，其他
+前台程序不替换。原 dump 即使不存在也可重试。补恢复完成后本次命令结束，
+不会紧接着重新启动已经恢复的全部会话。
+
+`ai-restart --retry` 明确只补恢复；加 `--dry-run` 只预览，`--yes` 跳过确认。
+pending 默认不自动过期；如确有需要，可显式设置 `AI_RESTORE_PENDING_MAX_AGE`
+为正数秒数启用过期，`0` 表示不自动过期。损坏或不认识的 pending 格式会报错，
+不会当成空记录继续覆盖。不存在、被复用或来自其他 server 的 pane 继续保留 pending。
+
+隔离 tmux 回归覆盖延迟启动失败、等待账号连接、只读预览、错误会话、正确加载与
+重新绑定、隔天重试、原快照删除、窗口移动与原坐标复用、工作目录切换、同步输入、保留正在运行的
+进程、空 pending 和损坏记录。测试无需网络或模型调用。

@@ -34,6 +34,7 @@ from agent_activity import (  # noqa: E402
     TmuxActivityAdapter,
 )
 from recovery_plan import GUARD_FIELDS, RecoveryPlanError, load_sealed_plan
+from codex_sessions import session_loaded as codex_session_loaded
 from dsh_sessions import current_session as dsh_current_session, matches_session as dsh_matches_session, is_dsh_command_line
 
 
@@ -284,6 +285,10 @@ class Tmux:
         }
 
     def foreground_command(self, target: str) -> str:
+        process = self.foreground_process(target)
+        return process[1] if process else ""
+
+    def foreground_process(self, target: str) -> tuple[int, str] | None:
         completed = self.run(
             "display-message",
             "-p",
@@ -292,26 +297,26 @@ class Tmux:
             "#{pane_tty}",
         )
         if completed.returncode != 0:
-            return ""
+            return None
         tty = completed.stdout.strip().removeprefix("/dev/")
         if not tty:
-            return ""
+            return None
         try:
             processes = subprocess.run(
-                ["ps", "-t", tty, "-o", "stat=", "-o", "command="],
+                ["ps", "-t", tty, "-o", "pid=", "-o", "stat=", "-o", "command="],
                 check=False,
                 capture_output=True,
                 text=True,
             )
         except OSError:
-            return ""
+            return None
         if processes.returncode != 0:
-            return ""
+            return None
         for line in processes.stdout.splitlines():
-            fields = line.strip().split(maxsplit=1)
-            if len(fields) == 2 and "+" in fields[0]:
-                return fields[1]
-        return ""
+            fields = line.strip().split(maxsplit=2)
+            if len(fields) == 3 and fields[0].isdigit() and "+" in fields[1]:
+                return int(fields[0]), fields[2]
+        return None
 
     def capture_failure(self, target: str) -> str:
         completed = self.run("capture-pane", "-p", "-t", target, "-S", "-40")
@@ -428,28 +433,26 @@ class PendingStore:
             return []
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return []
+        except (OSError, json.JSONDecodeError) as error:
+            raise RestoreExecutionError(f"cannot read pending recovery {self.path}: {error}") from error
         if not isinstance(payload, dict) or payload.get("version") != PENDING_VERSION:
-            return []
+            raise RestoreExecutionError(f"unsupported pending recovery format: {self.path}")
         raw_items = payload.get("items")
         if not isinstance(raw_items, list):
-            return []
+            raise RestoreExecutionError(f"invalid pending recovery items: {self.path}")
         result: list[dict[str, Any]] = []
         for raw in raw_items:
             if not isinstance(raw, dict):
-                continue
+                raise RestoreExecutionError(f"invalid pending recovery item: {self.path}")
             try:
                 created_at = float(raw.get("created_at", 0))
-            except (TypeError, ValueError):
-                continue
-            if created_at <= 0 or now - created_at > self.max_age:
-                continue
-            if raw.get("restorable") is not True:
-                continue
-            if not all(raw.get(field) for field in ("target", "tool", "command")):
-                continue
-            if raw.get("tool") not in TOOL_TAGS:
+            except (TypeError, ValueError) as error:
+                raise RestoreExecutionError(f"invalid pending recovery timestamp: {self.path}") from error
+            if (created_at <= 0 or raw.get("restorable") is not True
+                    or not all(raw.get(field) for field in ("target", "tool", "command", "cwd", "kind"))
+                    or raw.get("tool") not in TOOL_TAGS):
+                raise RestoreExecutionError(f"invalid pending recovery identity: {self.path}")
+            if self.max_age > 0 and now - created_at > self.max_age:
                 continue
             result.append(dict(raw))
         return result
@@ -563,6 +566,7 @@ class Attempt:
     sent: bool
     seen_running: bool = False
     running_since: float | None = None
+    ready_since: float | None = None
 
 
 @dataclass
@@ -610,8 +614,8 @@ class RestoreExecutor:
                 str(self.state_dir / "restore-pending.json"),
             )
         )
-        pending_max_age = positive_float(
-            environment, "AI_RESTORE_PENDING_MAX_AGE", 21_600
+        pending_max_age = nonnegative_float(
+            environment, "AI_RESTORE_PENDING_MAX_AGE", 0
         )
         self.store = PendingStore(pending_path, pending_max_age)
         self.log_path = Path(
@@ -635,6 +639,12 @@ class RestoreExecutor:
         self.verify_timeout = positive_float(
             environment, "AI_RESTORE_VERIFY_TIMEOUT", 10
         )
+        self.codex_verify_timeout = positive_float(
+            environment, "AI_RESTORE_CODEX_VERIFY_TIMEOUT", 60
+        )
+        self.codex_home = Path(
+            environment.get("CODEX_HOME") or Path.home() / ".codex"
+        ).expanduser()
         self.grok_verify_timeout = positive_float(
             environment, "AI_RESTORE_GROK_VERIFY_TIMEOUT", 60
         )
@@ -781,7 +791,10 @@ class RestoreExecutor:
                 return (
                     Attempt(
                         item=item,
-                        verify_timeout=self.verify_timeout,
+                        verify_timeout=(
+                            self.codex_verify_timeout if item["tool"] == "codex"
+                            else self.verify_timeout
+                        ),
                         grok_offset=None,
                         existing_process=True,
                         sent=False,
@@ -801,12 +814,17 @@ class RestoreExecutor:
         if not self.tmux.send("-R", "-t", target):
             return None, "could not reset pane terminal state"
         offset = self.grok_offset() if item["tool"] == "grok" else None
-        if not self.tmux.send("-l", "-t", target, item["command"]):
+        # The shell may have changed directories while recovery was pending.
+        # Fail at cd if the saved workspace vanished; never resume elsewhere.
+        command = f"cd -- {shlex.quote(item['cwd'])} && {item['command']}"
+        if not self.tmux.send("-l", "-t", target, command):
             return None, "could not send recovery command"
         if not self.tmux.send("-t", target, "Enter"):
             return None, "could not submit recovery command"
 
         timeout = self.grok_verify_timeout if item["tool"] == "grok" else self.verify_timeout
+        if item["tool"] == "codex":
+            timeout = self.codex_verify_timeout
         return (
             Attempt(
                 item=item,
@@ -862,6 +880,19 @@ class RestoreExecutor:
                     ready = False
                     if item["tool"] == "dsh":
                         ready = stable_for >= self.verify_stability and self.dsh_ready(item)
+                    elif item["tool"] == "codex":
+                        process = self.tmux.foreground_process(target)
+                        loaded = bool(process and codex_session_loaded(
+                            process[0], item.get("sid", ""), self.codex_home,
+                        ))
+                        if not loaded:
+                            attempt.ready_since = None
+                        elif attempt.ready_since is None:
+                            attempt.ready_since = time.monotonic()
+                        ready = (
+                            attempt.ready_since is not None
+                            and time.monotonic() - attempt.ready_since >= self.verify_stability
+                        )
                     elif attempt.existing_process:
                         ready = stable_for >= self.verify_stability
                     elif item["tool"] == "grok" and item.get("sid") and attempt.grok_offset is not None:
@@ -888,7 +919,14 @@ class RestoreExecutor:
                     continue
 
                 if now >= deadlines[target]:
-                    if item["tool"] == "dsh" and attempt.seen_running:
+                    if item["tool"] == "codex" and attempt.seen_running:
+                        blocked[target] = (
+                            "Codex has not opened the requested conversation for writing; "
+                            "left running, recovery pending"
+                        )
+                        active.pop(target)
+                        continue
+                    elif item["tool"] == "dsh" and attempt.seen_running:
                         failures[target] = "dsh TUI did not select the requested session before timeout"
                     elif item["tool"] == "grok" and attempt.seen_running:
                         failures[target] = "Grok did not report session loaded before timeout"
@@ -1007,9 +1045,14 @@ class RestoreExecutor:
                 item["updated_at"] = time.time()
                 self.log(f"attempt {round_index + 1} failed {target} ({item['tool']}): {error}")
                 current_command = self.tmux.current_command(target)
-                retryable = target not in immediate_failures and current_command is not None and (
-                    current_command.lower() in SHELL_COMMANDS
-                    or command_matches(item["tool"], current_command)
+                existing = any(
+                    attempt.item["target"] == target and attempt.existing_process
+                    for attempt in attempts
+                )
+                retryable = (
+                    not existing and target not in immediate_failures and current_command is not None
+                    and (current_command.lower() in SHELL_COMMANDS
+                         or command_matches(item["tool"], current_command))
                 )
                 if round_index + 1 < self.max_attempts and retryable:
                     retry.append(item)
@@ -1087,6 +1130,32 @@ class RestoreExecutor:
             errors=[*errors, *invalid_errors],
         )
         return self.finish_report(report)
+
+    def execute_pending(self) -> ExecutionReport:
+        """Retry saved intent without a new snapshot or replacing any pane."""
+        pending = self.store.load(time.time())
+        for item in pending:
+            identity = tuple(
+                item.get(key, "") for key in ("pane_id", "socket_path", "server_pid")
+            )
+            if not all(identity):
+                raise RestoreExecutionError(f"pending recovery has no pane identity: {item['target']}")
+            # Window insertion/renumbering can move the original pane. Resolve
+            # its stable ID only on the original server, never reuse a coordinate.
+            if self.tmux.pane_identity(identity[0]) == identity:
+                coordinate = self.tmux.run(
+                    "display-message", "-p", "-t", identity[0],
+                    "#{session_name}:#{window_index}.#{pane_index}",
+                )
+                if coordinate.returncode == 0 and coordinate.stdout.strip():
+                    item["target"] = coordinate.stdout.strip()
+        if len({item["target"] for item in pending}) != len(pending):
+            raise RestoreExecutionError("pending recovery contains conflicting pane targets")
+        self.store.save(pending)
+        self.tmux.disable_synchronized_windows([
+            item for item in pending if self.pane_guard_matches(item)
+        ])
+        return self.execute([], "pending recovery")
 
     def assert_exact_guards(self, items: list[dict[str, Any]]) -> None:
         for item in items:
@@ -1207,6 +1276,7 @@ def main() -> int:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--plan", type=Path)
     source.add_argument("--sealed-plan", type=Path)
+    source.add_argument("--retry-pending", action="store_true")
     parser.add_argument("--dump")
     parser.add_argument("--report-json", action="store_true")
     mode = parser.add_mutually_exclusive_group()
@@ -1218,6 +1288,8 @@ def main() -> int:
         parser.error("--sealed-plan cannot be combined with --dump or preview modes")
     if arguments.plan and not arguments.dump:
         parser.error("--dump is required with --plan")
+    if arguments.retry_pending and arguments.dump:
+        parser.error("--retry-pending cannot be combined with --dump")
 
     environment = os.environ.copy()
     executor = RestoreExecutor(environment)
@@ -1229,6 +1301,9 @@ def main() -> int:
             require_guard=True,
         )
         dump = sealed["dump"]
+    elif arguments.retry_pending:
+        current = []
+        dump = "pending recovery"
     else:
         current = read_plan(arguments.plan)
         dump = arguments.dump
@@ -1255,6 +1330,8 @@ def main() -> int:
             return 3
         if arguments.sealed_plan:
             report = executor.execute_restart(current, dump)
+        elif arguments.retry_pending:
+            report = executor.execute_pending()
         else:
             report = executor.execute(current, dump)
     if arguments.report_json:

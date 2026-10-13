@@ -561,7 +561,7 @@ class SessionRestoreTests(unittest.TestCase):
                 f"-c check_for_update_on_startup=false resume {VALID_CODEX_SID}",
             )
 
-    def test_successful_restore_rebinds_session_to_the_new_pane_id(self):
+    def test_restore_does_not_rebind_codex_without_loaded_session_evidence(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
             home = tmp / "home"
@@ -629,20 +629,22 @@ class SessionRestoreTests(unittest.TestCase):
                     "AI_RESTORE_SETTLE_DELAY": "0",
                     "AI_RESTORE_MAX_ATTEMPTS": "1",
                     "AI_RESTORE_VERIFY_TIMEOUT": "0.3",
+                    "AI_RESTORE_CODEX_VERIFY_TIMEOUT": "0.3",
                     "AI_RESTORE_VERIFY_STABILITY": "0.03",
                     "AI_RESTORE_POLL_INTERVAL": "0.01",
                 },
             )
 
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertIn(
-                "send-keys -l -t 0:4.1 codex --yolo --disable plugins "
+                f"send-keys -l -t 0:4.1 cd -- {tmp} && codex --yolo --disable plugins "
                 f"-c check_for_update_on_startup=false resume {VALID_CODEX_SID}",
                 tmux_log.read_text(),
             )
-            binding = bind_log.read_text()
-            self.assertIn(f"--tool x --sid {VALID_CODEX_SID}", binding)
-            self.assertIn("--pane %42", binding)
+            self.assertFalse(bind_log.exists())
+            pending = json.loads((tmp / "state/restore-pending.json").read_text())["items"]
+            self.assertEqual([(item["sid"], item["pane_id"]) for item in pending],
+                             [(VALID_CODEX_SID, "%42")])
 
     def run_restore(
         self,

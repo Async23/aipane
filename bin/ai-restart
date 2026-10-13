@@ -267,10 +267,11 @@ def print_invalid_plan(plan: list[dict[str, object]]) -> None:
         )
 
 
-def confirm_restart(count: int) -> bool:
+def confirm_restart(count: int, *, retry: bool = False) -> bool:
     if not sys.stdin.isatty():
         raise RestartError("confirmation needs a terminal; rerun with --yes")
-    answer = input(f"\nRestart and resume {count} AI pane(s)? [y/N] ").strip().lower()
+    action = "Retry recovery of" if retry else "Restart and resume"
+    answer = input(f"\n{action} {count} AI pane(s)? [y/N] ").strip().lower()
     return answer in {"y", "yes"}
 
 
@@ -393,13 +394,65 @@ def execute_sealed_plan(
             pass
 
 
+def retry_pending(
+    arguments: argparse.Namespace,
+    environment: dict[str, str],
+    script_dir: Path,
+) -> bool:
+    """Handle unfinished recovery before any snapshot can replace its evidence."""
+    state_dir = Path(
+        environment.get("AIPANE_STATE_DIR")
+        or Path(environment.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "aipane"
+    )
+    pending_path = Path(environment.get(
+        "AIPANE_RESTORE_PENDING", str(state_dir / "restore-pending.json"),
+    ))
+    if not arguments.retry and not pending_path.exists():
+        return False
+    command = recovery_executor_command(script_dir)
+    preview = subprocess.run(
+        [*command, "--retry-pending", "--plan-json"],
+        check=False, capture_output=True, text=True, env=environment,
+    )
+    if preview.returncode != 0:
+        raise RestartError(preview.stderr.strip() or "cannot read pending recovery")
+    try:
+        pending = [json.loads(line) for line in preview.stdout.splitlines() if line.strip()]
+    except json.JSONDecodeError as error:
+        raise RestartError(f"invalid pending recovery plan: {error}") from error
+    if any(not isinstance(item, dict) or not all(item.get(key) for key in ("target", "tool"))
+           for item in pending):
+        raise RestartError("invalid pending recovery plan items")
+    if not pending:
+        if arguments.retry:
+            print("ai-restart: no pending recovery")
+        return arguments.retry
+    print("Pending AI recovery (no new snapshot or pane replacement):")
+    for item in pending:
+        print(f"  {item['target']:<20} {item['tool']:<9} {item.get('sid', '')}")
+    if arguments.dry_run:
+        print("\nDry run: pending recovery only; nothing changed.")
+        return True
+    if not arguments.yes and not confirm_restart(len(pending), retry=True):
+        print("ai-restart: cancelled")
+        return True
+    completed = subprocess.run([*command, "--retry-pending"], check=False, env=environment)
+    if completed.returncode != 0:
+        raise RestartError("recovery remains pending; rerun ai-restart --retry when ready")
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="ai-restart")
     parser.add_argument(
         "--dry-run",
         "-n",
         action="store_true",
-        help="refresh the recovery snapshot and show the restart plan",
+        help="preview pending recovery, or refresh the snapshot and show the restart plan",
+    )
+    parser.add_argument(
+        "--retry", action="store_true",
+        help="retry only unfinished recovery, without saving a snapshot or replacing panes",
     )
     parser.add_argument(
         "--force",
@@ -419,6 +472,9 @@ def main() -> int:
         raise RestartError("no tmux server is available")
 
     script_dir = Path(__file__).resolve().parent
+    environment = state_environment(tmux)
+    if retry_pending(arguments, environment, script_dir):
+        return 0
     restore_command = configured_command(
         "AIPANE_AI_RESTORE_COMMAND",
         script_dir / "ai-restore",

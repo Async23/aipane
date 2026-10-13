@@ -206,6 +206,176 @@ class AiRestartTests(unittest.TestCase):
             "#{pane_current_command}",
         ).stdout.strip()
 
+    def configure_codex_startup(self, *, loaded=False, exits=False, read_only=False):
+        """A real process that can outlive verification before bootstrap fails."""
+        source = self.tmp / "codex.c"
+        source.write_text(textwrap.dedent('''
+            #include <stdio.h>
+            #include <unistd.h>
+            #include <string.h>
+            int main(int argc, char **argv) {
+                const char *mode = argv[1];
+                if (strcmp(mode, "fail") == 0 && access(argv[4], F_OK) != 0) {
+                    usleep(250000);
+                    puts("Error: account/read failed during TUI bootstrap: workspace routing discovery timed out");
+                    return 1;
+                }
+                if (strcmp(mode, "fail") == 0) mode = "a";
+                FILE *rollout = NULL;
+                if (strcmp(mode, "waiting") != 0) {
+                    usleep(100000);
+                    rollout = fopen(argv[2], mode);
+                    if (!rollout) return 2;
+                }
+                for (;;) pause();
+            }
+        '''))
+        codex = self.tmp / "codex"
+        subprocess.run(["cc", str(source), "-o", str(codex)], check=True,
+                       capture_output=True, text=True)
+        home = self.tmp / "codex-home"
+        rollout = home / "sessions" / "rollout-original.jsonl"
+        rollout.parent.mkdir(parents=True)
+        sid = "11111111-1111-4111-8111-111111111111"
+        rollout.write_text(json.dumps({"type": "session_meta", "payload": {
+            "id": sid, "cwd": str(self.tmp),
+        }}) + "\n")
+        mode = "fail" if exits else ("r" if read_only else "a") if loaded else "waiting"
+        self.network_ready = self.tmp / "network-ready"
+        self.extra_environment = {
+            "TEST_TOOL": "codex", "TEST_SID": sid,
+            "TEST_AGENT_COMMAND": shlex.join([str(codex), mode, str(rollout), sid, str(self.network_ready)]),
+            "CODEX_HOME": str(home),
+            "AI_RESTORE_VERIFY_STABILITY": "0.03",
+            "AI_RESTORE_VERIFY_TIMEOUT": "0.7",
+            "AI_RESTORE_CODEX_VERIFY_TIMEOUT": "0.7",
+        }
+        return rollout
+
+    def test_codex_bootstrap_failure_after_stability_keeps_pending(self):
+        self.configure_codex_startup(exits=True)
+        result = self.run_restart("--yes", "--force")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        pending = json.loads((self.tmp / "aipane-state/restore-pending.json").read_text())
+        self.assertEqual(len(pending["items"]), 1)
+        self.assertIn("1 pending", result.stdout)
+
+    def test_codex_waiting_for_account_never_counts_as_loaded(self):
+        self.configure_codex_startup()
+        result = self.run_restart("--yes", "--force")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("1 pending", result.stdout)
+
+    def test_codex_writable_exact_rollout_confirms_recovery(self):
+        self.configure_codex_startup(loaded=True)
+        result = self.run_restart("--yes", "--force")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("verified 1 AI pane(s) resumed", result.stdout)
+        registry = self.tmp / "aipane-state/registry.jsonl"
+        binding = json.loads(registry.read_text().splitlines()[-1])
+        self.assertEqual((binding["pane"], binding["sid"]),
+                         (self.pane_id, self.extra_environment["TEST_SID"]))
+
+    def test_codex_reading_preview_is_not_a_loaded_session(self):
+        self.configure_codex_startup(loaded=True, read_only=True)
+        result = self.run_restart("--yes", "--force")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_codex_writable_other_session_is_not_verified(self):
+        rollout = self.configure_codex_startup(loaded=True)
+        rollout.write_text(json.dumps({"type": "session_meta", "payload": {
+            "id": "22222222-2222-4222-8222-222222222222",
+        }}) + "\n")
+        result = self.run_restart("--yes", "--force")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_restart_retries_pending_before_saving_another_snapshot(self):
+        self.configure_codex_startup(exits=True)
+        failed = self.run_restart("--yes", "--force")
+        self.assertNotEqual(failed.returncode, 0, failed.stdout)
+        # A later save no longer knows this conversation. Retry must use the
+        # persisted command even without its original dump, at its stable pane ID.
+        saved = self.save_log.read_text()
+        snapshot = self.snapshot_log.read_text()
+        pending_path = self.tmp / "aipane-state/restore-pending.json"
+        pending = json.loads(pending_path.read_text())
+        self.network_ready.touch()
+        pending["items"][0]["created_at"] = time.time() - 86400
+        pending_path.write_text(json.dumps(pending))
+        elsewhere = self.tmp / "another workspace"
+        elsewhere.mkdir()
+        self.tmux("send-keys", "-l", "-t", self.pane_id, f"cd {shlex.quote(str(elsewhere))}")
+        self.tmux("send-keys", "-t", self.pane_id, "Enter")
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            cwd = self.tmux("display-message", "-p", "-t", self.pane_id,
+                            "#{pane_current_path}").stdout.strip()
+            if Path(cwd).resolve() == elsewhere.resolve():
+                break
+            time.sleep(.01)
+        self.assertEqual(Path(cwd).resolve(), elsewhere.resolve())
+        shutil.rmtree(self.resurrect_dir)
+        self.plan_invalid = True
+        self.tmux("move-window", "-s", self.target.split(":")[0] + ":0", "-t", "restart:5")
+        unrelated = self.tmux("new-window", "-d", "-P", "-F", "#{pane_id}",
+                              "-t", "restart:0", "sleep 120").stdout.strip()
+        sibling = self.tmux("split-window", "-d", "-P", "-F", "#{pane_id}",
+                            "-t", self.pane_id, "sleep 120").stdout.strip()
+        self.tmux("set-window-option", "-t", self.pane_id, "synchronize-panes", "on")
+
+        preview = self.run_restart("--dry-run")
+        self.assertEqual(preview.returncode, 0, preview.stderr)
+        self.assertIn("pending", preview.stdout)
+        result = self.run_restart("--yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.save_log.read_text(), saved)
+        self.assertEqual(self.snapshot_log.read_text(), snapshot)
+        self.assertEqual(json.loads(pending_path.read_text())["items"], [])
+        self.assertEqual(self.tmux("display-message", "-p", "-t", self.pane_id,
+                                   "#{pane_current_command}").stdout.strip(), "codex")
+        self.assertEqual(self.tmux("display-message", "-p", "-t", unrelated,
+                                   "#{pane_current_command}").stdout.strip(), "sleep")
+        self.assertEqual(self.tmux("display-message", "-p", "-t", sibling,
+                                   "#{pane_current_command}").stdout.strip(), "sleep")
+        self.assertEqual(self.tmux("display-message", "-p", "-t", self.pane_id,
+                                   "#{synchronize-panes}").stdout.strip(), "0")
+        restored_cwd = self.tmux("display-message", "-p", "-t", self.pane_id,
+                                 "#{pane_current_path}").stdout.strip()
+        self.assertEqual(Path(restored_cwd).resolve(), self.tmp.resolve())
+
+    def test_retry_keeps_an_unverified_existing_codex_process_running(self):
+        self.configure_codex_startup()
+        self.assertNotEqual(self.run_restart("--yes", "--force").returncode, 0)
+        tty = self.tmux("display-message", "-p", "-t", self.pane_id, "#{pane_tty}").stdout.strip()
+        def codex_processes():
+            rows = subprocess.check_output(["ps", "-t", tty.removeprefix("/dev/"),
+                                            "-o", "pid=,command="], text=True)
+            return [row.strip() for row in rows.splitlines() if str(self.tmp / "codex") in row]
+        before = codex_processes()
+        self.assertTrue(before)
+        saved = self.save_log.read_text()
+        self.extra_environment["AI_RESTORE_MAX_ATTEMPTS"] = "2"
+        result = self.run_restart("--retry", "--yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(codex_processes(), before)
+        self.assertEqual(self.save_log.read_text(), saved)
+
+    def test_retry_without_pending_does_not_start_a_new_restart(self):
+        result = self.run_restart("--retry", "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.save_log.exists())
+        self.assertEqual(self.current_command(), "sleep")
+
+    def test_corrupt_pending_stops_before_overwriting_snapshot(self):
+        pending = self.tmp / "aipane-state/restore-pending.json"
+        pending.parent.mkdir()
+        pending.write_text('{"version": 1, "items": [')
+        result = self.run_restart("--yes", "--force")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(self.save_log.exists())
+        self.assertIn("cannot read pending recovery", result.stderr)
+        self.assertEqual(pending.read_text(), '{"version": 1, "items": [')
+
     def configure_dsh_host(self, *, switch_after_sealing=False):
         """A real Node process with the selected-session protocol, isolated home."""
         home = self.tmp / "custom-dsh"
