@@ -159,6 +159,12 @@ marks a teammate busy from `SessionStart(agent_type=...)`, refreshes busy at
 already-running turn. This preserves one activity cell per actually busy
 teammate pane without reading terminal titles.
 
+The Claude Adapter ignores desktop entrypoints (`claude-desktop` and
+`claude-desktop-*`). A desktop app launched from a terminal can inherit
+`TMUX_PANE`, but its sessions and subagents do not own that pane. Forwarding
+their lifecycle hooks would change the launching Agent's activity, including
+marking an already-completed Codex turn busy again.
+
 Codex also reports `busy` from `PreToolUse`. This is a deliberate fallback for
 `/goal`: goal work can start as an internal `thread_goal_updated -> task_started`
 sequence without an ordinary user-message event, so `UserPromptSubmit` does not

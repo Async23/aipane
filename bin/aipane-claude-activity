@@ -10,6 +10,12 @@
 # This adapter must never block or fail Claude Code. Invalid/unknown payloads
 # are ignored and all Agent Activity failures are swallowed.
 
+# Desktop sessions can inherit TMUX_PANE from the terminal that launched the
+# app. Their hooks do not describe that pane, including subagent tool calls.
+case "${CLAUDE_CODE_ENTRYPOINT:-}" in
+  claude-desktop|claude-desktop-*) exit 0 ;;
+esac
+
 PAYLOAD=$(cat 2>/dev/null)
 PYTHON="${AIPANE_PYTHON:-/opt/homebrew/bin/python3}"
 ACTIVITY="$HOME/.local/bin/aipane-activity"

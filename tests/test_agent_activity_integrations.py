@@ -166,6 +166,7 @@ class AgentActivityIntegrationTests(unittest.TestCase):
                     "HOME": str(home),
                     "AIPANE_PYTHON": sys.executable,
                     "TMUX_PANE": "%7",
+                    "CLAUDE_CODE_ENTRYPOINT": "cli",
                 }
             )
 
@@ -221,6 +222,53 @@ class AgentActivityIntegrationTests(unittest.TestCase):
                     )
                 ),
             )
+
+    def test_claude_desktop_hooks_ignore_inherited_tmux_pane(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            home = Path(raw_tmp)
+            local_bin = home / ".local" / "bin"
+            local_bin.mkdir(parents=True)
+            activity_log = home / "activity.log"
+            (local_bin / "aipane-activity").write_text(
+                "#!/bin/sh\n"
+                f"printf '%s|' \"$*\" >> {activity_log}\n"
+                f"cat >> {activity_log}\n",
+                encoding="utf-8",
+            )
+            (local_bin / "aipane-activity").chmod(0o755)
+            environment = {
+                **os.environ,
+                "HOME": str(home),
+                "AIPANE_PYTHON": sys.executable,
+                # A desktop app launched by a terminal agent inherits these.
+                "TMUX_PANE": "%115",
+                "CODEX_THREAD_ID": "unrelated-terminal-session",
+            }
+            for entrypoint in ("claude-desktop", "claude-desktop-3p"):
+                with self.subTest(entrypoint=entrypoint):
+                    activity_log.unlink(missing_ok=True)
+                    for event in (
+                        "SessionStart", "UserPromptSubmit", "PreToolUse",
+                        "Stop", "StopFailure", "TeammateIdle", "SessionEnd",
+                    ):
+                        result = subprocess.run(
+                            [str(CLAUDE_ACTIVITY)],
+                            input=json.dumps({
+                                "hook_event_name": event,
+                                "session_id": "desktop-session",
+                                "agent_id": "desktop-child",
+                                "agent_type": "general-purpose",
+                                "tool_name": "WebFetch",
+                            }),
+                            capture_output=True,
+                            text=True,
+                            env={**environment, "CLAUDE_CODE_ENTRYPOINT": entrypoint},
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(
+                        activity_log.exists(),
+                        "Desktop hooks must not change the launching pane's activity",
+                    )
 
     def test_standard_hook_fragments_implement_turn_level_contract(self):
         for tool in ("grok", "qoder"):
