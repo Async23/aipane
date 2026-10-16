@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import sqlite3
 import subprocess
@@ -2524,6 +2525,14 @@ def _is_codex_command(command: str) -> bool:
 
 
 def _agent_commands_compatible(left: str, right: str) -> bool:
+    # Native Claude may appear as "claude" in ps but its version in tmux.
+    # Require the named process on one side; different versions stay distinct.
+    if left == "claude" or right == "claude":
+        other = right if left == "claude" else left
+        return (
+            other == "claude"
+            or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", other) is not None
+        )
     return (
         left == right
         or (_is_codex_command(left) and _is_codex_command(right))

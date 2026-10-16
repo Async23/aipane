@@ -214,6 +214,10 @@ such as a context-limit rejection that can return Claude to its prompt without
 delivering the expected completion hook. A live record must match the pane's
 tmux target, TTY, and Claude version, and its idle timestamp must be at least as
 new as the busy marker; stale records therefore cannot clear a later turn.
+Native Claude process identity accepts `claude` from `ps` and its numeric
+version from tmux (for example, `2.1.301`) as the same command. Reports still
+bind to the exact PID and process start time, so the resolver can validate
+both ordinary hook transitions and the live-session fallback.
 
 Grok skips both `Stop` and `StopFailure` when a turn is interrupted, refused,
 or stopped by its turn limit. The animation probe therefore reconciles a

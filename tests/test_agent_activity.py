@@ -1009,6 +1009,64 @@ class AgentActivityTests(unittest.TestCase):
         self.assertEqual(ended.state, "busy")
         self.assertEqual(adapter.read(pane.pane_id).record, busy_record)
 
+    def test_claude_native_name_binds_reports_to_the_live_process(self):
+        started_at = "Fri Oct 16 09:15:30 2026"
+        for pane_command, process_command, matches in (
+            ("2.1.301", "claude", True),
+            ("claude", "2.1.301", True),
+            ("2.1.301", "node", False),
+            ("2.1.301", "2.1.300", False),
+            ("codex", "claude", False),
+            ("2.1", "claude", False),
+        ):
+            with self.subTest(pane=pane_command, process=process_command):
+                pane = PaneActivity(
+                    pane_id="%7",
+                    current_command=pane_command,
+                    pane_tty="/dev/ttys003",
+                    socket_path="/private/tmp/tmux/default",
+                    server_pid="30402",
+                )
+
+                def ps_result(arguments, **_kwargs):
+                    columns = arguments[-1]
+                    if columns == "ppid=,lstart=,comm=":
+                        output = f"1 {started_at} /opt/bin/{process_command}\n"
+                    elif columns == "lstart=,tty=":
+                        output = f"{started_at} ttys003\n"
+                    else:
+                        output = ""
+                    return subprocess.CompletedProcess(
+                        arguments, 0, stdout=output, stderr="",
+                    )
+
+                with (
+                    mock.patch("agent_activity.os.getppid", return_value=6322),
+                    mock.patch("agent_activity.os.kill"),
+                    mock.patch("agent_activity.subprocess.run", side_effect=ps_result),
+                ):
+                    activity, adapter = self.activity_for(pane)
+                    activity.report(
+                        pane.pane_id, "busy",
+                        {"hook_event_name": "UserPromptSubmit"}, now_ms=1_000,
+                    )
+                    record = json.loads(adapter.read(pane.pane_id).record)
+                    self.assertEqual(
+                        record["process"],
+                        {"pid": 6322, "started_at": started_at} if matches else {},
+                    )
+                    self.assertEqual(
+                        activity.inspect(pane.pane_id).state,
+                        "busy" if matches else "unknown",
+                    )
+                    if matches:
+                        activity.report(
+                            pane.pane_id, "idle",
+                            {"hook_event_name": "Stop"}, now_ms=2_000,
+                        )
+                        self.assertEqual(activity.inspect(pane.pane_id).state, "idle")
+                        self.assertEqual(adapter.read(pane.pane_id).marker, "")
+
     def test_claude_idle_registry_resolves_stale_busy_through_same_interface(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             config = Path(raw_tmp) / ".claude"
