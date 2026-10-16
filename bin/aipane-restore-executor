@@ -704,12 +704,25 @@ class RestoreExecutor:
             time.sleep(self.poll_interval)
         return False
 
+    def tool_running(self, item: dict[str, Any], current_command: str) -> bool:
+        if command_matches(item["tool"], current_command):
+            return True
+        if item["tool"] != "claude":
+            return False
+        # Native Claude can expose its version (e.g. 2.1.300) as tmux's short
+        # process name. Check the actual foreground executable, not the number.
+        try:
+            arguments = shlex.split(self.tmux.foreground_command(item["target"]))
+        except ValueError:
+            return False
+        return bool(arguments) and Path(arguments[0]).name in {"claude", "claude-guard"}
+
     def existing_tool_matches(
         self,
         item: dict[str, Any],
         current_command: str,
     ) -> bool:
-        if not command_matches(item["tool"], current_command):
+        if not self.tool_running(item, current_command):
             return False
         if item["tool"] == "dsh":
             return self.dsh_ready(item)
@@ -779,7 +792,7 @@ class RestoreExecutor:
         if current is None:
             return None, "pane disappeared"
         matches_existing = self.existing_tool_matches(item, current)
-        if interrupt_running and command_matches(item["tool"], current):
+        if interrupt_running and self.tool_running(item, current):
             if item["tool"] == "dsh" and current == "node":
                 # A retry may see another Node program occupying this pane.
                 # Missing readiness is not authority to interrupt arbitrary node.
@@ -861,7 +874,7 @@ class RestoreExecutor:
                     failures[target] = "pane disappeared"
                     active.pop(target)
                     continue
-                if command_matches(item["tool"], current):
+                if self.tool_running(item, current):
                     if item["tool"] == "codex":
                         visible = self.tmux.capture_visible(target).lower()
                         if (
@@ -1052,7 +1065,7 @@ class RestoreExecutor:
                 retryable = (
                     not existing and target not in immediate_failures and current_command is not None
                     and (current_command.lower() in SHELL_COMMANDS
-                         or command_matches(item["tool"], current_command))
+                         or self.tool_running(item, current_command))
                 )
                 if round_index + 1 < self.max_attempts and retryable:
                     retry.append(item)

@@ -9,9 +9,12 @@
 ## 当前使用方式
 
 - tmux-resurrect 保存结构后，`ai-restore` 负责在原 pane 续接 AI 会话。
-- `ai-restart` 有 pending 时先补恢复，完成后直接结束；没有 pending 才进入新一轮重启。
+- `ai-restart` 有 pending 时先补恢复，完成后直接结束；列表只包含上次未完成的恢复记录，
+  并非当前全部 AI pane。提示会显示上次失败原因；补恢复成功后再运行一次才进入新一轮重启。
 - `ai-restart --retry` 只补恢复，不保存快照或替换 pane；没有 pending 时直接结束。
 - `ai-restart --dry-run` 有 pending 时只预览，否则刷新快照并预览本次可恢复的 pane。
+- 确认提示处按 Ctrl+C 只显示取消信息并以 130 退出；Ctrl+D 按取消处理，以 0 退出。
+  两者均不替换 pane，也不改写 pending。
 - 从 tmux 外的独立终端执行 `ai-restart`；确认后由恢复执行器按 sealed plan 批量重生并
   续接这些 pane。
 - 默认检测到任一 `busy` Agent Activity 就整体中止；旧进程显示 `unknown` 时，命令
@@ -643,3 +646,14 @@ pending 默认不自动过期；如确有需要，可显式设置 `AI_RESTORE_PE
 隔离 tmux 回归覆盖延迟启动失败、等待账号连接、只读预览、错误会话、正确加载与
 重新绑定、隔天重试、原快照删除、窗口移动与原坐标复用、工作目录切换、同步输入、保留正在运行的
 进程、空 pending 和损坏记录。测试无需网络或模型调用。
+
+## 22. Claude 版本号进程名与遗留恢复提示（2026-10-16）
+
+macOS 上 Claude 2.1.300 的 tmux `pane_current_command` 可能为 `2.1.300`，
+而 `ps` 的前台命令仍是 `claude --resume <id>`。旧执行器只接受 `claude` /
+`claude-guard` 短名，因而将正常运行的恢复误报为失败，并持续留下 pending。
+执行器现在在短名不匹配时核对前台命令的可执行文件名；版本号本身、其他程序参数中
+出现的 `claude` 均不构成识别依据。已有进程仍须匹配恢复会话身份，才进入验证。
+
+回归测试在隔离的真实 tmux 中覆盖新启动验证、已有进程只验证不重启、版本号误匹配，
+以及普通重启、unknown 确认和补恢复三个提示处的 Ctrl+C / Ctrl+D 取消。

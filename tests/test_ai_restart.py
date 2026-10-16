@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import pty
+import select
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
@@ -205,6 +209,147 @@ class AiRestartTests(unittest.TestCase):
             self.target,
             "#{pane_current_command}",
         ).stdout.strip()
+
+    def write_pending(self, *, sid="pending-session", error="previous verification failed"):
+        pending = self.tmp / "aipane-state/restore-pending.json"
+        pending.parent.mkdir(exist_ok=True)
+        identity = self.tmux("display-message", "-p", "-t", self.target,
+                             "#{socket_path}|#{pid}").stdout.strip().split("|")
+        pending.write_text(json.dumps({"version": 1, "items": [{
+            "target": self.target, "tool": "claude", "kind": "resume",
+            "restorable": True, "cwd": str(self.tmp), "sid": sid,
+            "command": shlex.join([str(self.fake_agent), "--resume", sid]),
+            "pane_id": self.pane_id, "socket_path": identity[0],
+            "server_pid": identity[1], "created_at": time.time(),
+            "last_error": error,
+        }]}))
+        return pending
+
+    def run_restart_at_prompt(self, key, *arguments):
+        environment = self.environment()
+        pid, master = pty.fork()
+        if pid == 0:
+            os.execve(str(RESTART), [str(RESTART), *arguments], environment)
+        output = b""
+        sent = False
+        status = None
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.1)[0]:
+                    try:
+                        chunk = os.read(master, 65536)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    output += chunk
+                    if b"[y/N]" in output and not sent:
+                        os.write(master, key)
+                        sent = True
+                if status is None:
+                    exited, child_status = os.waitpid(pid, os.WNOHANG)
+                    if exited:
+                        status = child_status
+        finally:
+            if status is None:
+                exited, child_status = os.waitpid(pid, os.WNOHANG)
+                if exited:
+                    status = child_status
+                else:
+                    os.kill(pid, signal.SIGKILL)
+                    _, status = os.waitpid(pid, 0)
+            os.close(master)
+        self.assertTrue(sent, output.decode(errors="replace"))
+        return os.waitstatus_to_exitcode(status), output.decode(errors="replace")
+
+    def test_cancel_confirmation_without_traceback_or_replacing_panes(self):
+        for mode in ("restart", "unknown", "retry"):
+            for key, expected_status in ((b"\x03", 130), (b"\x04", 0)):
+                with self.subTest(mode=mode, key=key):
+                    arguments = ("--force",) if mode == "restart" else ()
+                    pending = None
+                    if mode == "retry":
+                        pending = self.write_pending()
+                        before = pending.read_bytes()
+                    code, output = self.run_restart_at_prompt(key, *arguments)
+                    self.assertIn("ai-restart: cancelled", output)
+                    self.assertNotIn("Traceback", output)
+                    self.assertNotIn("KeyboardInterrupt", output)
+                    self.assertEqual(code, expected_status, output)
+                    self.assertEqual(self.current_command(), "sleep")
+                    self.assertFalse(self.restore_log.exists())
+                    if pending:
+                        self.assertEqual(pending.read_bytes(), before)
+
+    def test_pending_preview_explains_recovery_scope_and_last_failure(self):
+        pending = self.write_pending()
+        before = pending.read_bytes()
+        result = self.run_restart("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not the full set of running AI panes", result.stdout)
+        self.assertIn("previous verification failed", result.stdout)
+        self.assertIn("run ai-restart again", result.stdout)
+        self.assertFalse(self.save_log.exists())
+        self.assertEqual(pending.read_bytes(), before)
+
+    def configure_version_named_claude(self):
+        # Reproduce macOS tmux reporting Claude's version as its short name,
+        # while ps still exposes the actual foreground executable and argv.
+        proxy = self.tmp / "tmux-version.py"
+        proxy.write_text(textwrap.dedent(f'''\
+            import subprocess, sys
+            result = subprocess.run(["tmux", "-L", {self.socket!r}, *sys.argv[1:]],
+                                    capture_output=True, text=True)
+            output = result.stdout
+            if "#{{pane_current_command}}" in sys.argv[-1]:
+                output = output.replace("claude", "2.1.300")
+            sys.stdout.write(output)
+            sys.stderr.write(result.stderr)
+            raise SystemExit(result.returncode)
+        '''))
+        self.extra_environment = {
+            "AIPANE_TMUX": shlex.join([sys.executable, str(proxy)]),
+            "TEST_SID": "version-named-session",
+            "TEST_AGENT_COMMAND": shlex.join([
+                str(self.fake_agent), "--resume", "version-named-session",
+            ]),
+        }
+
+    def test_version_named_claude_is_verified_after_restart(self):
+        self.configure_version_named_claude()
+        result = self.run_restart("--yes", "--force")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("verified 1 AI pane(s) resumed", result.stdout)
+        self.assertEqual(json.loads((self.tmp / "aipane-state/restore-pending.json").read_text())["items"], [])
+
+    def test_version_named_claude_pending_is_verified_without_relaunch(self):
+        self.configure_version_named_claude()
+        self.tmux("respawn-pane", "-k", "-t", self.target,
+                  self.extra_environment["TEST_AGENT_COMMAND"])
+        pending = self.write_pending(sid="version-named-session")
+        before = self.tmux("display-message", "-p", "-t", self.target,
+                           "#{pane_pid}").stdout
+        result = self.run_restart("--retry", "--yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("verified=1 pending=0", result.stdout)
+        self.assertEqual(json.loads(pending.read_text())["items"], [])
+        self.assertEqual(self.tmux("display-message", "-p", "-t", self.target,
+                                   "#{pane_pid}").stdout, before)
+        self.assertFalse(self.save_log.exists())
+
+    def test_version_number_alone_does_not_identify_claude(self):
+        unrelated = self.tmp / "2.1.300"
+        shutil.copyfile(self.fake_agent, unrelated)
+        unrelated.chmod(0o755)
+        self.tmux("respawn-pane", "-k", "-t", self.target,
+                  shlex.join([str(unrelated), "claude", "--resume", "pending-session"]))
+        pending = self.write_pending()
+        result = self.run_restart("--retry", "--yes")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.current_command(), "2.1.300")
+        self.assertEqual(len(json.loads(pending.read_text())["items"]), 1)
+        self.assertFalse(self.save_log.exists())
 
     def configure_codex_startup(self, *, loaded=False, exits=False, read_only=False):
         """A real process that can outlive verification before bootstrap fails."""

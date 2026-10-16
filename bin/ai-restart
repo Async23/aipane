@@ -427,9 +427,17 @@ def retry_pending(
         if arguments.retry:
             print("ai-restart: no pending recovery")
         return arguments.retry
+    print(f"ai-restart: {len(pending)} unfinished recovery record(s) from a previous run.")
+    print("Recovery-only mode: this list is not the full set of running AI panes.")
     print("Pending AI recovery (no new snapshot or pane replacement):")
     for item in pending:
         print(f"  {item['target']:<20} {item['tool']:<9} {item.get('sid', '')}")
+        if item.get("last_error"):
+            print(f"    Last failure: {item['last_error']}")
+    print(
+        "\nAfter recovery succeeds, run ai-restart again to preview and confirm a full restart.",
+        flush=True,
+    )
     if arguments.dry_run:
         print("\nDry run: pending recovery only; nothing changed.")
         return True
@@ -563,6 +571,12 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\nai-restart: cancelled", file=sys.stderr)
+        raise SystemExit(130)
+    except EOFError:
+        print("\nai-restart: cancelled", file=sys.stderr)
+        raise SystemExit(0)
     except (
         RecoveryPlanError,
         RestartError,
