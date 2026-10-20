@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+self_dir="$(cd "$(dirname "$0")" && pwd)"
+repo_root="$(cd "$self_dir/.." && pwd)"
+icon_file="$repo_root/native/icons/codex-cli.svg"
+source_app="$HOME/Applications/Codex Notifier.app"
+output=""
+bundle_id="com.alfheim.codex-cli-notifier.v2"
+version="1.0.0"
+build="1"
+
+while (( $# > 0 )); do
+  case "$1" in
+    --source) shift; source_app="${1:-}" ;;
+    --output) shift; output="${1:-}" ;;
+    --bundle-id) shift; bundle_id="${1:-}" ;;
+    --version) shift; version="${1:-}" ;;
+    --build) shift; build="${1:-}" ;;
+    -h|--help)
+      printf 'usage: build-codex-notifier --output APP [--source APP] [--bundle-id ID] [--version V] [--build N]\n'
+      exit 0
+      ;;
+    *) printf 'build-codex-notifier: unknown argument: %s\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if [[ -z "$output" || -e "$output" || "$output" == "$source_app" ]]; then
+  printf 'build-codex-notifier: output must be a new App path distinct from source\n' >&2
+  exit 2
+fi
+if [[ "$(basename "$output")" != 'Codex Notifier.app' ]]; then
+  printf 'build-codex-notifier: output App must be named Codex Notifier.app\n' >&2
+  exit 2
+fi
+if [[ -z "$bundle_id" || -z "$version" || -z "$build" || ! -r "$icon_file" || ! -f "$source_app/Contents/Info.plist" ]]; then
+  printf 'build-codex-notifier: missing Bundle ID, version, build, icon, or source App\n' >&2
+  exit 2
+fi
+source_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$source_app/Contents/Info.plist")"
+if [[ "$source_id" != 'com.alfheim.codex-ghostty-notifier.clean' && "$source_id" != 'com.alfheim.codex-cli-notifier.v2' ]]; then
+  printf 'build-codex-notifier: unexpected source Bundle ID: %s\n' "$source_id" >&2
+  exit 2
+fi
+
+build_root="$(mktemp -d "${TMPDIR:-/tmp}/codex-notifier-icon.XXXXXX")"
+trap 'rm -rf "$build_root"' EXIT
+stage_app="$build_root/Codex Notifier.app"
+iconset="$build_root/CodexGhostty.iconset"
+resources="$stage_app/Contents/Resources"
+plist="$stage_app/Contents/Info.plist"
+mkdir -p "$iconset" "$(dirname "$output")"
+/usr/bin/ditto "$source_app" "$stage_app"
+
+/opt/homebrew/bin/rsvg-convert -w 1024 -h 1024 "$icon_file" >"$build_root/codex-icon-1024.png"
+for icon_spec in \
+  '16 icon_16x16.png' \
+  '32 icon_16x16@2x.png' \
+  '32 icon_32x32.png' \
+  '64 icon_32x32@2x.png' \
+  '128 icon_128x128.png' \
+  '256 icon_128x128@2x.png' \
+  '256 icon_256x256.png' \
+  '512 icon_256x256@2x.png' \
+  '512 icon_512x512.png' \
+  '1024 icon_512x512@2x.png'; do
+  read -r pixels filename <<<"$icon_spec"
+  /usr/bin/sips -z "$pixels" "$pixels" "$build_root/codex-icon-1024.png" \
+    --out "$iconset/$filename" >/dev/null
+done
+/usr/bin/iconutil --convert icns --output "$resources/CodexGhostty.icns" "$iconset"
+/usr/bin/ditto "$resources/CodexGhostty.icns" "$resources/Codex.icns"
+
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $bundle_id" "$plist"
+/usr/libexec/PlistBuddy -c 'Set :CFBundleName Codex Notifier' "$plist"
+/usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Codex Notifier' "$plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $build" "$plist"
+/usr/libexec/PlistBuddy -c 'Set :CFBundleIconFile CodexGhostty' "$plist"
+/usr/bin/codesign --force --deep --sign - "$stage_app"
+/usr/bin/codesign --verify --deep --strict "$stage_app"
+/usr/bin/ditto "$stage_app" "$output"
+printf '%s\n' "$output"

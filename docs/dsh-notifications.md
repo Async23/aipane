@@ -1,8 +1,9 @@
 # dsh desktop notifications
 
-dsh uses a dedicated macOS sender with the selected **04 / 鲸鱼描线** icon.
-The tracked [SVG](../native/icons/dsh.svg) is the icon source; the
-[design sheet](design/dsh-notification-icons.html) is a visual reference.
+dsh uses a dedicated macOS sender with the selected **01 / 原生黑鲸** icon.
+The tracked [SVG](../native/icons/dsh.svg) is the installed icon source. The
+[design sheet](design/dsh-notification-icons.html) shows the selected design
+and other black-whale concepts.
 
 ## Wiring
 
@@ -16,7 +17,7 @@ The tracked [SVG](../native/icons/dsh.svg) is the icon source; the
 | Click action | `bin/aipane-dsh-focus` |
 
 The App is `~/Applications/dsh Notifier.app`, with stable Bundle ID
-`com.alfheim.dsh-notifier`. It uses `UNUserNotificationCenter` and its bundle
+`com.alfheim.dsh-notifier.v2`. It uses `UNUserNotificationCenter` and its bundle
 icon. It does not impersonate another Agent or use a legacy notifier fallback.
 macOS supplies the surrounding notification presentation.
 

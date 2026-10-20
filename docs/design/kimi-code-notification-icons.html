@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Kimi Code 官方通知图标的 10 种实色底。原始图形不变，离线比较横幅和小尺寸。">
+  <title>Kimi Code · 官方图标底色方案</title>
+  <style>
+    :root {
+      --page:#f5f7f9; --paper:#fff; --ink:#1b2838; --muted:#718093;
+      --line:#dbe3eb; --accent:#345de0; --accent-soft:#eaf0ff;
+      --desk:#e5edf5; --banner:#ffffffeb; --shadow:0 18px 45px #0000001a;
+    }
+    * { box-sizing:border-box; }
+    html { overflow-y:auto; scroll-behavior:smooth; }
+    body { min-height:100vh; margin:0; background:var(--page); color:var(--ink); font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","PingFang SC","Hiragino Sans GB",sans-serif; -webkit-font-smoothing:antialiased; }
+    button,a { -webkit-tap-highlight-color:transparent; }
+    button { font:inherit; color:inherit; cursor:pointer; }
+    button:focus-visible,a:focus-visible { outline:3px solid var(--accent); outline-offset:4px; }
+    svg { display:block; width:100%; height:100%; }
+    .shell { width:min(100% - 80px,1440px); margin:auto; }
+    header { min-height:82px; display:flex; align-items:center; justify-content:space-between; gap:20px; border-bottom:1px solid var(--line); }
+    .brand { display:flex; align-items:center; gap:12px; font-size:17px; font-weight:700; letter-spacing:-.35px; }
+    .brand-mark { width:34px; height:34px; border-radius:11px; background:#192b4d; color:#edf3ff; display:grid; place-items:center; }
+    .brand-mark svg { width:25px; height:25px; }
+    .brand-note { font-size:10px; font-weight:650; letter-spacing:1.8px; color:var(--muted); border-left:1px solid var(--line); padding-left:17px; margin-left:5px; }
+    .segmented { display:inline-flex; align-items:center; gap:3px; padding:4px; border:1px solid var(--line); border-radius:11px; background:var(--paper); }
+    .segmented button { border:0; border-radius:7px; background:transparent; padding:7px 12px; color:var(--muted); font-size:11px; white-space:nowrap; }
+    .segmented button[aria-pressed="true"] { color:var(--ink); background:var(--accent-soft); box-shadow:0 1px 4px #00000014; }
+    .hero { display:grid; grid-template-columns:minmax(0,1fr) minmax(370px,.94fr); align-items:center; gap:56px; padding:54px 0 43px; }
+    .eyebrow { margin:0 0 13px; color:var(--accent); font:650 10px ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:2.1px; }
+    h1 { max-width:650px; margin:0 0 17px; font-size:clamp(33px,3.3vw,49px); line-height:1.18; letter-spacing:-2.2px; font-weight:720; }
+    h1 span { color:var(--accent); }
+    .lead { max-width:565px; margin:0; color:var(--muted); font-size:14px; line-height:1.85; }
+    .jump { display:inline-flex; align-items:center; gap:8px; margin-top:23px; font-size:12px; font-weight:650; color:var(--accent); text-decoration:none; }
+    .jump:hover { text-decoration:underline; }
+    .preview { border:1px solid var(--line); border-radius:20px; overflow:hidden; background:var(--desk); }
+    .preview-bar { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:14px 17px 0; }
+    .preview-kicker { color:var(--muted); font-size:10px; font-weight:650; letter-spacing:1px; white-space:nowrap; }
+    .preview .segmented { border:0; background:transparent; padding:1px; }
+    .preview .segmented button { padding:5px 8px; font-size:10px; }
+    .preview-space { min-height:166px; display:grid; place-items:center; padding:25px; background:linear-gradient(135deg,#edf4fa,#e3ebf4); }
+    .notification { width:min(100%,440px); display:flex; align-items:center; gap:12px; padding:15px; border:1px solid #ffffff9c; border-radius:19px; background:var(--banner); box-shadow:var(--shadow); backdrop-filter:blur(20px); }
+    .notification-icon { width:47px; height:47px; flex:0 0 47px; border-radius:13px; filter:drop-shadow(0 2px 2px #00000020); }
+    .notification-icon.current { background:#fff; padding:3px; }
+    .notification-body { flex:1; min-width:0; }
+    .notification-head { display:flex; justify-content:space-between; gap:10px; font-size:12px; }
+    .notification-head strong { font-weight:700; }
+    .notification-head time { color:var(--muted); font-size:10px; }
+    .notification-title { margin:3px 0 2px; font-size:12px; font-weight:650; }
+    .notification-detail { margin:0; color:var(--muted); font-size:11px; line-height:1.5; }
+    .reference { display:flex; align-items:center; gap:18px; padding:18px 21px; margin-bottom:30px; border:1px solid var(--line); border-radius:16px; background:var(--paper); }
+    .reference-art { width:62px; height:62px; flex:0 0 62px; padding:5px; border:1px solid var(--line); border-radius:16px; background:#fff; }
+    .reference-copy { flex:1; min-width:0; }
+    .reference-copy strong { display:block; font-size:13px; margin-bottom:4px; }
+    .reference-copy p { margin:0; color:var(--muted); font-size:11px; line-height:1.6; }
+    .reference button { border:1px solid var(--line); background:var(--paper); padding:9px 12px; border-radius:9px; color:var(--accent); font-size:11px; white-space:nowrap; }
+    .reference button:hover { border-color:var(--accent); }
+    .reference button[aria-pressed="true"] { background:var(--accent-soft); border-color:var(--accent); }
+    .section-title { display:flex; justify-content:space-between; align-items:flex-end; gap:18px; margin-bottom:18px; }
+    .section-title h2 { margin:0; font-size:16px; letter-spacing:-.3px; }
+    .section-title h2 small { display:inline; margin-left:11px; color:var(--muted); font-size:11px; font-weight:450; letter-spacing:0; }
+    .selection-indicator { color:var(--accent); font-size:11px; white-space:nowrap; }
+    .grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:14px; }
+    .card { min-width:0; padding:15px; border:1px solid var(--line); border-radius:16px; background:var(--paper); text-align:left; transition:transform .18s,border-color .18s,box-shadow .18s; }
+    .card:hover { transform:translateY(-3px); border-color:#9bb2db; box-shadow:0 8px 22px #00000012; }
+    .card[aria-checked="true"] { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+    .card-top { display:flex; justify-content:space-between; align-items:center; }
+    .number { color:var(--muted); font:11px ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:1.3px; }
+    .choice-mark { width:17px; height:17px; display:grid; place-items:center; border:1px solid var(--line); border-radius:50%; color:#fff; }
+    .choice-mark svg { width:12px; height:12px; visibility:hidden; }
+    .card[aria-checked="true"] .choice-mark { background:var(--accent); border-color:var(--accent); }
+    .card[aria-checked="true"] .choice-mark svg { visibility:visible; }
+    .icon-stage { display:grid; place-items:center; height:124px; }
+    .icon-stage svg { width:83px; height:83px; filter:drop-shadow(0 4px 5px #1d31441c); }
+    .card:hover .icon-stage svg { transform:scale(1.055); }
+    .card-title { display:flex; align-items:center; justify-content:space-between; gap:4px; }
+    .card-title strong { font-size:12px; font-weight:680; }
+    .tag { padding:3px 5px; border-radius:5px; background:var(--page); color:var(--muted); font-size:9px; white-space:nowrap; }
+    .card-desc { display:block; min-height:35px; margin-top:6px; color:var(--muted); font-size:10px; line-height:1.7; }
+    .selection { display:grid; grid-template-columns:minmax(180px,1fr) auto minmax(240px,1fr); align-items:center; gap:23px; margin-top:28px; padding:24px 0; border-top:1px solid var(--line); }
+    .chosen { display:flex; align-items:center; gap:12px; }
+    .chosen-art { width:47px; height:47px; flex:0 0 47px; }
+    .chosen small { display:block; color:var(--muted); font-size:10px; margin-bottom:5px; }
+    .chosen strong { font-size:13px; }
+    .sizes { display:flex; align-items:flex-end; gap:17px; }
+    .sample { min-width:25px; text-align:center; }
+    .sample-art { height:45px; display:flex; align-items:center; justify-content:center; }
+    .sample-art svg { flex:0 0 auto; }
+    .sample span { display:block; margin-top:6px; color:var(--muted); font:9px ui-monospace,monospace; }
+    .actions { display:flex; justify-content:flex-end; gap:8px; flex-wrap:wrap; }
+    .action { padding:10px 12px; border:1px solid var(--line); border-radius:9px; background:var(--paper); font-size:11px; white-space:nowrap; }
+    .action:hover { border-color:var(--accent); }
+    .action.primary { border-color:var(--accent); background:var(--accent); color:#fff; }
+    footer { display:flex; justify-content:space-between; gap:20px; padding:8px 0 27px; color:var(--muted); font-size:10px; line-height:1.6; }
+    footer span:last-child { white-space:nowrap; font:10px ui-monospace,monospace; letter-spacing:.7px; }
+    .toast { position:fixed; left:50%; bottom:20px; transform:translate(-50%,12px); padding:10px 16px; border-radius:9px; background:var(--ink); color:var(--paper); box-shadow:var(--shadow); font-size:11px; opacity:0; pointer-events:none; transition:opacity .2s,transform .2s; }
+    .toast.visible { opacity:1; transform:translate(-50%,0); }
+    [data-theme="dark"] { --page:#151c29; --paper:#202b3a; --ink:#eff4fc; --muted:#a7b4c5; --line:#354254; --accent:#9eb7ff; --accent-soft:#34466a; --desk:#25364a; --banner:#293545ee; --shadow:0 18px 45px #00000070; }
+    [data-theme="dark"] .preview-space { background:linear-gradient(135deg,#253447,#1e2d40); }
+    [data-theme="dark"] .notification { border-color:#ffffff20; }
+    [data-theme="dark"] .action.primary { color:#172238; }
+    [data-theme="dark"] .reference-art { border-color:#8b9aab; }
+    @media(max-width:1100px) {
+      .hero { gap:28px; } .grid { grid-template-columns:repeat(3,minmax(0,1fr)); }
+      .selection { grid-template-columns:1fr auto; } .actions { grid-column:1/-1; justify-content:flex-start; }
+    }
+    @media(max-width:740px) {
+      .shell { width:min(100% - 36px,640px); } header { min-height:70px; }
+      .brand-note { display:none; } .hero { grid-template-columns:1fr; gap:23px; padding:32px 0 25px; }
+      h1 { font-size:36px; letter-spacing:-1.6px; } .grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+      .card { padding:12px; } .icon-stage { height:100px; } .icon-stage svg { width:72px; height:72px; }
+      .selection { gap:20px; } .section-title { align-items:flex-start; flex-direction:column; gap:7px; }
+    }
+    @media(max-width:490px) {
+      .reference { gap:12px; padding:13px; flex-wrap:wrap; } .reference-art { width:52px; height:52px; flex-basis:52px; }
+      .reference button { margin-left:64px; } .section-title h2 small { display:block; margin:5px 0 0; }
+      .card-title { align-items:flex-start; flex-direction:column; } .card-desc { min-height:52px; }
+      .selection { grid-template-columns:1fr; } .actions { grid-column:auto; }
+      footer { flex-direction:column; gap:7px; } .preview-space { padding:17px; }
+    }
+    @media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } *,*::before,*::after { transition:none!important; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="4.5" width="18" height="13" rx="2.2" stroke="currentColor" stroke-width="1.6"/><rect x="9.6" y="8" width="1.4" height="2.6" rx=".45" fill="currentColor"/><rect x="15.6" y="8" width="1.4" height="2.6" rx=".45" fill="currentColor"/></svg></span>
+        Kimi Code <span class="brand-note">NOTIFIER ICON STUDY</span>
+      </div>
+      <div class="segmented" aria-label="页面主题">
+        <button type="button" data-theme-choice="light" aria-pressed="true">浅色</button>
+        <button type="button" data-theme-choice="dark" aria-pressed="false">深色</button>
+      </div>
+    </header>
+    <main>
+      <section class="hero" aria-labelledby="page-title">
+        <div>
+          <p class="eyebrow">KIMI CODE / LOCAL NOTIFICATION ICONS</p>
+          <h1>官方图标不变，<br><span>选一块合适的底色。</span></h1>
+          <p class="lead">10 个方案都使用本机 Kimi Code 的官方线框与双眼，尺寸和笔画保持一致。只比较实色背景，以及浅底深色、深底白色两种单色显示。</p>
+          <a class="jump" href="#collection">查看 10 种底色 <span aria-hidden="true">↓</span></a>
+        </div>
+        <div class="preview" aria-label="通知横幅示意">
+          <div class="preview-bar">
+            <span class="preview-kicker">通知横幅预览 · 示意</span>
+            <div class="segmented" aria-label="通知内容">
+              <button type="button" data-event="done" aria-pressed="true">完成</button>
+              <button type="button" data-event="waiting" aria-pressed="false">等待输入</button>
+              <button type="button" data-event="error" aria-pressed="false">出错</button>
+            </div>
+          </div>
+          <div class="preview-space">
+            <div class="notification">
+              <div class="notification-icon" id="notification-icon" aria-hidden="true"></div>
+              <div class="notification-body">
+                <div class="notification-head"><strong>Kimi Code</strong><time>现在</time></div>
+                <p class="notification-title" id="notification-title">任务已完成</p>
+                <p class="notification-detail" id="notification-detail">本轮修改已完成，可以查看结果。</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section class="reference" aria-label="更换前的图标对照">
+        <div class="reference-art" id="current-art" aria-hidden="true"></div>
+        <div class="reference-copy">
+          <strong>更换前 · 官方图标透明底</strong>
+          <p>图形取自本机 kimi-code@0.38.0 的 apps/vscode/resources/kimi-icon.svg。旧版资源没有底色，横幅里的灰色由 macOS 合成；现在使用 04 雾蓝色。</p>
+        </div>
+        <button type="button" id="preview-current" aria-pressed="false">放入横幅对照</button>
+      </section>
+      <section id="collection" aria-labelledby="collection-title">
+        <div class="section-title">
+          <h2 id="collection-title">10 种底色<small>同一个官方图标；点击比较横幅和小尺寸</small></h2>
+          <span class="selection-indicator" id="selection-indicator" aria-live="polite"></span>
+        </div>
+        <div class="grid" id="icon-grid" role="radiogroup" aria-label="Kimi Code 官方图标底色方案"></div>
+      </section>
+      <section class="selection" aria-label="已选图标和导出">
+        <div class="chosen"><div class="chosen-art" id="chosen-art" aria-hidden="true"></div><div><small>当前预览</small><strong id="chosen-name"></strong></div></div>
+        <div class="sizes" id="sizes" aria-label="16、24、32、48 像素预览"></div>
+        <div class="actions">
+          <button type="button" class="action" id="download-svg">下载 SVG</button>
+          <button type="button" class="action" id="download-png">导出 PNG</button>
+          <button type="button" class="action primary" id="copy-choice">复制方案编号</button>
+        </div>
+      </section>
+    </main>
+    <footer>
+      <span>单文件 · 离线可用 · 选择保存在当前浏览器。横幅是视觉示意，最终以 macOS 新通知为准。<br>所有候选只含官方图形和实色底；此页不会修改本机通知 App。</span>
+      <span>AIPANE / KIMI CODE 02</span>
+    </footer>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <noscript><p style="padding:24px">请启用 JavaScript 以比较图标。页面资源均已内嵌，无需联网。</p></noscript>
+  <script>
+    // Exact 24x24 geometry from the pinned local kimi-icon.svg; only currentColor changes.
+    const officialBody = '<rect x="3" y="4.5" width="18" height="13" rx="2.2" fill="none" stroke="currentColor" stroke-width="1.6"/><rect x="9.6" y="8.0" width="1.4" height="2.6" rx="0.45" fill="currentColor"/><rect x="15.6" y="8.0" width="1.4" height="2.6" rx="0.45" fill="currentColor"/>';
+    const currentSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" color="#000000">' + officialBody + '</svg>';
+    const tile = (background, foreground) => '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="128" height="128" rx="29" fill="' + background + '"/><svg x="0" y="0" width="128" height="128" viewBox="0 0 24 24" color="' + foreground + '">' + officialBody + '</svg></svg>';
+    const concepts = [
+      {id:'01', name:'瓷白', tag:'#FFFFFF', description:'纯白底，最大程度保留现用图标的感觉。', art:tile('#FFFFFF','#000000')},
+      {id:'02', name:'米白', tag:'#F8F7F2', description:'柔和米白，与 dsh 黑鲸的底色一致。', art:tile('#F8F7F2','#000000')},
+      {id:'03', name:'云灰', tag:'#E9EBEF', description:'浅冷灰，压低纯白的亮度。', art:tile('#E9EBEF','#000000')},
+      {id:'04', name:'雾蓝', tag:'#E9F0FA', description:'极浅蓝色，保留干净的线框感。', art:tile('#E9F0FA','#000000')},
+      {id:'05', name:'冰青', tag:'#E4F3F2', description:'浅青底，与灰色通知横幅拉开距离。', art:tile('#E4F3F2','#000000')},
+      {id:'06', name:'淡紫', tag:'#EEEAF7', description:'低饱和紫色，轻微区别于其他 Agent。', art:tile('#EEEAF7','#000000')},
+      {id:'07', name:'杏仁', tag:'#F8EAD9', description:'偏暖的杏色，柔和但更醒目。', art:tile('#F8EAD9','#000000')},
+      {id:'08', name:'深海蓝', tag:'#172B50', description:'深蓝底、官方图形反白，高对比。', art:tile('#172B50','#FFFFFF')},
+      {id:'09', name:'石墨', tag:'#20252C', description:'近黑灰底、白色线框，视觉克制。', art:tile('#20252C','#FFFFFF')},
+      {id:'10', name:'夜紫', tag:'#302947', description:'深紫底、白色线框，保留夜色气质。', art:tile('#302947','#FFFFFF')}
+    ];
+    const events = {
+      done:{title:'任务已完成',detail:'本轮修改已完成，可以查看结果。'},
+      waiting:{title:'等待你的输入',detail:'Kimi Code 正在等待下一步指示。'},
+      error:{title:'任务遇到问题',detail:'打开终端查看本轮的详细信息。'}
+    };
+    const storageKey = 'aipane.kimi-notification-icon-study.v3';
+    let selected = '04', theme = 'light', eventType = 'done', showCurrent = false, toastTimer;
+    try {
+      const saved = JSON.parse(localStorage.getItem(storageKey) || '{}');
+      if (concepts.some(item => item.id === saved.selected)) selected = saved.selected;
+      if (saved.theme === 'dark') theme = 'dark';
+    } catch {}
+    const grid = document.getElementById('icon-grid');
+    const check = '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m3.6 8.1 2.6 2.6 6.1-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    const itemFor = id => concepts.find(item => item.id === id);
+    const art = (item,size) => item.art.replace('<svg ', '<svg aria-hidden="true" focusable="false" ' + (size ? 'style="width:' + size + 'px;height:' + size + 'px" ' : ''));
+    function persist() { try { localStorage.setItem(storageKey,JSON.stringify({selected,theme})); } catch {} }
+    for (const item of concepts) {
+      const card = document.createElement('button');
+      card.type = 'button'; card.className = 'card'; card.dataset.id = item.id;
+      card.setAttribute('role','radio');
+      card.setAttribute('aria-label',item.id + ' ' + item.name + '，' + item.description);
+      card.innerHTML = '<span class="card-top"><span class="number">' + item.id + '</span><span class="choice-mark">' + check + '</span></span><span class="icon-stage">' + art(item) + '</span><span class="card-title"><strong>' + item.name + '</strong><span class="tag">' + item.tag + '</span></span><span class="card-desc">' + item.description + '</span>';
+      card.addEventListener('click',()=>select(item.id));
+      grid.append(card);
+    }
+    function renderPreview() {
+      const icon = document.getElementById('notification-icon');
+      icon.innerHTML = showCurrent ? currentSvg : art(itemFor(selected));
+      icon.classList.toggle('current',showCurrent);
+      document.getElementById('preview-current').setAttribute('aria-pressed',String(showCurrent));
+      document.getElementById('preview-current').textContent = showCurrent ? '返回所选方案' : '放入横幅对照';
+      document.getElementById('notification-title').textContent = events[eventType].title;
+      document.getElementById('notification-detail').textContent = events[eventType].detail;
+    }
+    function select(id) {
+      const item = itemFor(id);
+      if (!item) return;
+      selected = id; showCurrent = false;
+      for (const card of grid.children) {
+        const active = card.dataset.id === id;
+        card.setAttribute('aria-checked',String(active));
+        card.tabIndex = active ? 0 : -1;
+      }
+      document.getElementById('chosen-art').innerHTML = art(item);
+      document.getElementById('chosen-name').textContent = item.id + ' / ' + item.name;
+      document.getElementById('selection-indicator').textContent = '当前预览 ' + item.id + ' · ' + item.name;
+      document.getElementById('sizes').innerHTML = [16,24,32,48].map(size => '<div class="sample"><div class="sample-art">' + art(item,size) + '</div><span>' + size + 'px</span></div>').join('');
+      renderPreview(); persist();
+    }
+    grid.addEventListener('keydown',event=>{
+      const columns = getComputedStyle(grid).gridTemplateColumns.split(' ').length;
+      let index = concepts.findIndex(item => item.id === selected);
+      const shifts = {ArrowRight:1,ArrowLeft:-1,ArrowDown:columns,ArrowUp:-columns};
+      if (event.key in shifts) index = (index + shifts[event.key] + concepts.length) % concepts.length;
+      else if (event.key === 'Home') index = 0;
+      else if (event.key === 'End') index = concepts.length - 1;
+      else return;
+      event.preventDefault(); select(concepts[index].id); grid.children[index].focus();
+    });
+    function setTheme(value) {
+      theme = value; document.documentElement.dataset.theme = value;
+      document.querySelectorAll('[data-theme-choice]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.themeChoice === value)));
+      persist();
+    }
+    document.querySelectorAll('[data-theme-choice]').forEach(button=>button.addEventListener('click',()=>setTheme(button.dataset.themeChoice)));
+    document.querySelectorAll('[data-event]').forEach(button=>button.addEventListener('click',()=>{
+      eventType = button.dataset.event;
+      document.querySelectorAll('[data-event]').forEach(choice=>choice.setAttribute('aria-pressed',String(choice.dataset.event === eventType)));
+      renderPreview();
+    }));
+    document.getElementById('current-art').innerHTML = currentSvg;
+    document.getElementById('preview-current').addEventListener('click',()=>{ showCurrent = !showCurrent; renderPreview(); });
+    function toast(message) {
+      const element = document.getElementById('toast'); element.textContent = message; element.classList.add('visible');
+      clearTimeout(toastTimer); toastTimer = setTimeout(()=>element.classList.remove('visible'),2300);
+    }
+    function download(blob,filename) {
+      const url = URL.createObjectURL(blob), link = document.createElement('a');
+      link.href = url; link.download = filename; document.body.append(link); link.click(); link.remove();
+      setTimeout(()=>URL.revokeObjectURL(url),1500);
+    }
+    document.getElementById('download-svg').addEventListener('click',()=>{
+      const item = itemFor(selected);
+      download(new Blob([item.art],{type:'image/svg+xml;charset=utf-8'}),'kimi-code-icon-' + item.id + '.svg');
+      toast('已导出 ' + item.id + ' · ' + item.name + ' SVG');
+    });
+    document.getElementById('download-png').addEventListener('click',()=>{
+      const item = itemFor(selected);
+      const url = URL.createObjectURL(new Blob([item.art],{type:'image/svg+xml;charset=utf-8'}));
+      const image = new Image();
+      image.onload = ()=>{
+        const canvas = document.createElement('canvas'); canvas.width = canvas.height = 1024;
+        canvas.getContext('2d').drawImage(image,0,0,1024,1024); URL.revokeObjectURL(url);
+        canvas.toBlob(blob=>blob ? (download(blob,'kimi-code-icon-' + item.id + '-1024.png'),toast('已导出 1024 × 1024 PNG')) : toast('导出失败，请下载 SVG'),'image/png');
+      };
+      image.onerror = ()=>{ URL.revokeObjectURL(url); toast('导出失败，请下载 SVG'); };
+      image.src = url;
+    });
+    document.getElementById('copy-choice').addEventListener('click',async()=>{
+      const item = itemFor(selected), value = 'Kimi Code 图标：' + item.id + ' · ' + item.name;
+      try { await navigator.clipboard.writeText(value); toast('已复制：' + value); }
+      catch {
+        const field = document.createElement('textarea'); field.value = value; field.style.cssText = 'position:fixed;opacity:0';
+        document.body.append(field); field.select();
+        const copied = document.execCommand('copy'); field.remove();
+        toast(copied ? '已复制：' + value : '请回复：' + value);
+      }
+    });
+    select(selected); setTheme(theme);
+  </script>
+</body>
+</html>

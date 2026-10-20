@@ -29,6 +29,14 @@ fallback delivery paths use the same sound.
 | 5 | Kimi Code | `bin/aipane-kimi-notify` | — |
 | 6 | dsh-TUI / dsh Web | [`bin/aipane-dsh-notify`](../bin/aipane-dsh-notify) ([installation](dsh-notifications.md)) | — |
 
+Kimi Code's selected notification icon is **04 / 雾蓝**. Its tracked
+[SVG](../native/icons/kimi-code.svg) keeps the official Kimi geometry and adds
+the `#E9F0FA` background; [`bin/build-kimi-notifier`](../bin/build-kimi-notifier)
+builds the App from this local source. The [design sheet](design/kimi-code-notification-icons.html)
+retains the other background options. The active App is
+`~/Applications/Kimi Code Notifier.app` with Bundle ID
+`com.alfheim.kimi-code-notifier.v2`.
+
 For adapters with an override, leave it unset for random selection. Set it to a
 macOS sound name when one stable sound is preferred.
 

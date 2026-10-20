@@ -313,13 +313,13 @@ class AipaneDoctorTests(unittest.TestCase):
         executable.write_text("#!/bin/sh\nexit 0\n")
         executable.chmod(0o755)
         with (app / "Info.plist").open("wb") as stream:
-            plistlib.dump({"CFBundleIdentifier": "com.alfheim.dsh-notifier",
+            plistlib.dump({"CFBundleIdentifier": "com.alfheim.dsh-notifier.v2",
                           "CFBundleExecutable": "dsh-notifier",
-                          "CFBundleIconFile": "Dsh.icns"}, stream)
+                          "CFBundleIconFile": "DshBlackWhale.icns"}, stream)
         result = self.run_doctor(**environment)
         self.assertEqual(result.returncode, 1)
         self.assertIn("notification icon is missing", result.stdout)
-        (app / "Resources/Dsh.icns").write_bytes(b"fixture")
+        (app / "Resources/DshBlackWhale.icns").write_bytes(b"fixture")
         self.assertEqual(self.run_doctor(**environment).returncode, 0)
 
 

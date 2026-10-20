@@ -5,10 +5,10 @@ self_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$self_dir/.." && pwd)"
 source_file="$repo_root/native/agent-notifier.m"
 icon_file="$repo_root/native/icons/dsh.svg"
-bundle_id="com.alfheim.dsh-notifier"
+bundle_id="com.alfheim.dsh-notifier.v2"
 output="$HOME/Applications/dsh Notifier.app"
-version="1.0.0"
-build="1"
+version="1.0.3"
+build="4"
 
 while (( $# > 0 )); do
   case "$1" in
@@ -83,7 +83,7 @@ for icon_spec in \
   /usr/bin/sips -z "$pixels" "$pixels" "$build_root/dsh-icon-1024.png" \
     --out "$iconset/$filename" >/dev/null
 done
-/usr/bin/iconutil --convert icns --output "$resources/Dsh.icns" "$iconset"
+/usr/bin/iconutil --convert icns --output "$resources/DshBlackWhale.icns" "$iconset"
 
 /usr/bin/plutil -create xml1 "$plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $bundle_id" "$plist"
@@ -93,7 +93,7 @@ done
 /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string APPL" "$plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $version" "$plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $build" "$plist"
-/usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string Dsh" "$plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string DshBlackWhale" "$plist"
 /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$plist"
 /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$plist"
 /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string 13.0" "$plist"
