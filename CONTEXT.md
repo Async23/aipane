@@ -24,6 +24,10 @@ _Avoid_: partial support, incomplete integration (without saying what is in vs o
 The Moonshot Kimi Code CLI product, started by the binary `kimi`, exposed in aipane as tool key `k`.
 _Avoid_: Kimi CLI (legacy product line naming), Moonshot, kimi-code home directory
 
+**Qwen Code**:
+The Qwen Code CLI product, started by the binary `qwen`, exposed in aipane as tool key `q`.
+_Avoid_: Qoder (the retired tool that formerly held `q`), qwencli, bare "Qwen" for the CLI
+
 **Permission Mode**:
 Kimi Code's session approval policy: `manual` (prompt), `yolo` (auto-approve regular tools, may still ask), or `auto` (fully unattended).
 _Avoid_: AFK (legacy/alternate naming), approval flag as a synonym for the whole mode set

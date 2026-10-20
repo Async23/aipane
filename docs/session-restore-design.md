@@ -23,7 +23,9 @@
   记录当前会话；恢复优先使用这份坐标绑定，并校验当前目录的会话文件（见 §19）。
 - dsh-TUI 按当前前台 Channel 的会话 ID 恢复；新建、恢复、分支和后台切换都会更新
   绑定。落盘校验与实际加载确认见 §20。
-- Qoder、Droid 暂不在恢复范围内。
+- Qwen Code 走 gold-case：启动即由 aipane 预指定 `--session-id <uuid>`，恢复用
+  `--resume <id>`，并要求 `~/.qwen/projects/<编码cwd>/chats/<id>.jsonl` 已落盘。
+- Droid 暂不在恢复范围内。
 
 ## 0. 一个绕不开的前提
 
@@ -46,7 +48,7 @@ tmux pane 里的进程都是 tmux server 的子进程；server 一退出（`kill
 |---|---|---|---|
 | 1 | cursor-agent (`r`) | **启动即生成（急切）** | `~/.cursor/chats/<工程hash>/<chat-uuid>/meta.json` |
 | 2 | pi (`p`) | **启动即生成（急切）** | `~/.pi/agent/sessions/<编码cwd>/` |
-| 3 | qodercli (`q`) | **启动即生成（急切）** | `~/.qoder/projects/<编码cwd>/<uuid>/state.json` |
+| 3 | qwen (`q`) | **启动即指定（aipane 预分配 `--session-id`）** | `~/.qwen/projects/<编码cwd>/chats/<uuidv4>.jsonl`（首条消息后落盘） |
 | 4 | codex (`x`) | **首条消息才生成（懒惰）** | `~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<uuidv7>.jsonl` |
 | 5 | grok (`g`) | **首条消息才生成（懒惰）** | `~/.grok/sessions/<urlencode cwd>/<uuidv7>/` |
 | 6 | claude (`c`) | **首条消息才生成（懒惰）** | `~/.claude/projects/<dash编码cwd>/<uuidv4>.jsonl` |
@@ -62,7 +64,7 @@ tmux pane 里的进程都是 tmux server 的子进程；server 一退出（`kill
 |---|---|---|---|
 | 1 | claude (`c`) | **原生 hooks + plugins** | `--include-hook-events`、`--bare` 跳过 hooks/LSP/plugin |
 | 2 | codex (`x`) | **原生 hooks + plugins** | 带信任模型（`--dangerously-bypass-hook-trust`） |
-| 3 | qodercli (`q`) | **原生 hooks + plugins** | `hooks|hook`、`plugins|plugin` 子命令 |
+| 3 | qwen (`q`) | **原生 hooks（`hooks` 子命令 + `/hooks`）** | 事件带 matcher；`SessionStart` 可按 source 过滤 |
 | 4 | opencode (`o`) | **plugins（JS 事件插件）** | `opencode plugin`、`--pure` 关闭外部插件；**已用 `chat.message` 插件落地，见 §14** |
 | 5 | grok (`g`) | **plugins + 市场**（未见显式 hooks） | 需查插件能否订阅会话生命周期 |
 | 6 | cursor-agent (`r`) | **plugins**（未见显式 hooks） | 急切派，无需钩子 |
@@ -92,7 +94,7 @@ tmux pane 里的进程都是 tmux server 的子进程；server 一退出（`kill
 | 5 | kimi (`k`) | 懒惰 + 无钩子 → **回落**（cwd+时间解析，未纳入本轮核实） |
 | 6 | cursor (`r`) | **半 gold-case**：无旗标，但 `create-chat` 回吐 uuid → 先建后 `--resume`（见 §12） |
 | 7 | pi (`p`) | **初始 gold-case + 动态 Adapter**：启动预指定 id；new/resume/fork 后由 `session_start` 覆盖绑定（见 §15） |
-| 8 | qoder (`q`) | 急切（虽有 hook）→ **store 探测，不用钩子**（未纳入本轮核实） |
+| 8 | qwen (`q`) | **gold-case**：启动 `--session-id <uuid>`（严格 UUID v1–5，小写）；`--resume <id>` 续接；transcript 落 `~/.qwen/projects/<编码cwd>/chats/<uuid>.jsonl` |
 
 `ai x resume <id>` 这类 **resume 启动是最省事的一档**：id 在命令里，启动即可直接绑定，
 无需 store 探测/钩子。gold-case（§12）把这一档从「resume 时」提前到「首次启动时」；
@@ -191,7 +193,8 @@ set -g @resurrect-hook-post-restore-all '$HOME/.local/bin/ai-restore'
 4. ~~codex 支路~~ **已落地**（见 §13「codex 支路」）：codex `notify` 包装器记 `thread-id` +
    `aipane-snapshot` 坐标快照 + ai-restore 三级 id 优先级。
 5. ~~余下非核心工具按 §3.1 补齐：opencode（插件）/ qoder（探测）/ kimi（回落）~~
-   → **opencode / kimi 已落地，见 §14**（均走钩子支路，非回落）；qoder 待补。
+   → **opencode / kimi 已落地，见 §14**（均走钩子支路，非回落）；
+   `q` 已由 Qoder 换为 Qwen Code，走 gold-case（启动预指定 `--session-id`），已落地。
 
 ## 9. 决策定案（2026-08-08）
 

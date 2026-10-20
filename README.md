@@ -36,7 +36,7 @@ git -C ~/.aipane pull --ff-only
 - macOS and zsh
 - Claude Code for the `c` tool in `ai` (optional if you never use `c`)
 - tmux for multi-tool `ai` launches, or whenever `--new`/`--layout` is used
-- The corresponding optional CLI for each additional `ai` tool: Codex, dsh-TUI (`dsh-tui`), Grok, OpenCode, Cursor CLI, Qoder CLI, Pi (`pi`), or Kimi Code (`kimi`)
+- The corresponding optional CLI for each additional `ai` tool: Codex, dsh-TUI (`dsh-tui`), Grok, OpenCode, Cursor CLI, Qwen Code (`qwen`), Pi (`pi`), or Kimi Code (`kimi`)
 
 Single-tool calls such as `ai x` run in the current shell and do not require tmux unless `--new` or `--layout` is supplied.
 
@@ -142,7 +142,7 @@ export AIPANE_DSH_LAUNCH_CMD="dsh-tui"
 export AIPANE_GROK_LAUNCH_CMD="grok --always-approve"
 export AIPANE_OPENCODE_LAUNCH_CMD="opencode"
 export AIPANE_CURSOR_LAUNCH_CMD="cursor-agent --force"
-export AIPANE_QODER_LAUNCH_CMD="qodercli"
+export AIPANE_QWEN_LAUNCH_CMD="qwen --yolo"
 export AIPANE_PI_LAUNCH_CMD="pi"
 export AIPANE_KIMI_LAUNCH_CMD="kimi --auto"
 ```
@@ -161,7 +161,7 @@ Tool keys and default commands:
 | `g` | Grok | `grok --always-approve` |
 | `o` | OpenCode | `opencode` |
 | `r` | Cursor | `cursor-agent --force` |
-| `q` | Qoder | `qodercli` |
+| `q` | Qwen Code | `qwen --yolo` |
 | `p` | Pi | `pi` |
 | `k` | Kimi Code | `kimi --auto` |
 
@@ -197,7 +197,7 @@ Inside tmux, a pane layout reuses the current window only when it has one pane; 
 `ai-restart` restarts recoverable AI conversations in their existing tmux panes.
 If recovery is unfinished, it retries those conversations before saving another
 snapshot or starting a new restart. `--retry` explicitly requests recovery only.
-Qoder and Droid are ignored because their session restore is not implemented.
+Droid is ignored because its session restore is not implemented.
 
 The full recovery invariants and failure model live in
 [`docs/session-restore-design.md`](docs/session-restore-design.md).
@@ -239,11 +239,13 @@ AI pane. This requires
 tmux-resurrect and the session-restore hooks described in
 [`docs/session-restore-design.md`](docs/session-restore-design.md).
 
-Pi and Claude can own a preassigned `--session-id` without having created a
-durable conversation yet. An empty Pi session is reopened as an empty TUI and
+Pi, Claude, and Qwen Code can own a preassigned `--session-id` without having
+created a durable conversation yet. An empty Pi session is reopened as an empty
+TUI and
 reported as `recreated`, never as a resumed conversation. A Pi ID that exists
-under another project (or has a damaged record) remains `invalid`. Claude still
-requires a durable transcript and is left untouched when none exists.
+under another project (or has a damaged record) remains `invalid`. Claude and
+Qwen Code still require a durable transcript and are left untouched when none
+exists.
 
 ## Process Cleanup
 
@@ -318,7 +320,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 │   ├── kimi/
 │   ├── opencode/
 │   ├── pi/
-│   └── qoder/
+│   └── qwen/
 ├── docs/
 │   ├── agent-notifications.md
 │   ├── cheatsheet.md

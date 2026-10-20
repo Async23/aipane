@@ -128,6 +128,7 @@ typeset CODEX_BASE="${AIPANE_CODEX_LAUNCH_CMD:-codex --yolo}"
 typeset OPENCODE_BASE="${AIPANE_OPENCODE_LAUNCH_CMD:-opencode}"
 typeset KIMI_BASE="${AIPANE_KIMI_LAUNCH_CMD:-kimi --auto}"
 typeset DSH_BASE="${AIPANE_DSH_LAUNCH_CMD:-dsh-tui}"
+typeset QWEN_BASE="${AIPANE_QWEN_LAUNCH_CMD:-qwen --yolo}"
 
 # Migrate exact retired local overrides that can survive in an already-running
 # Ghostty shell or a restored tmux global environment.
@@ -137,7 +138,7 @@ typeset DSH_BASE="${AIPANE_DSH_LAUNCH_CMD:-dsh-tui}"
   CODEX_BASE="codex --yolo --disable plugins"
 typeset CODEX_RESTORE_BASE="$CODEX_BASE -c check_for_update_on_startup=false"
 
-# detect_tool <full_cmd> <cur_cmd> -> REPLY in {pi,grok,claude,cursor,codex,opencode,kimi,dsh} or ""
+# detect_tool <full_cmd> <cur_cmd> -> REPLY in {pi,grok,claude,cursor,codex,opencode,kimi,dsh,qwen} or ""
 detect_tool() {
   local full="$1" cur="$2" prog
   REPLY=""
@@ -155,6 +156,11 @@ detect_tool() {
           "$script" == */@deepseek-ai/dsh/* || "$script" == */@deepseek-harness-tui/dsh-tui/* ) ]]; then
       REPLY=dsh; return
     fi
+    # qwen is an `env node` script too: ~/.local/bin/qwen -> @qwen-code/qwen-code.
+    if [[ "$script" != -* && ( "${script:t}" == qwen ||
+          "$script" == */@qwen-code/qwen-code/* ) ]]; then
+      REPLY=qwen; return
+    fi
   fi
   case "$prog" in
     pi)                REPLY=pi ;;
@@ -165,6 +171,7 @@ detect_tool() {
     opencode|opencode-*) REPLY=opencode ;;   # Mach-O binary, argv0 = opencode
     kimi|kimi-*)         REPLY=kimi ;;        # Mach-O SEA, argv0 = kimi
     dsh|dsh-tui|dst)     REPLY=dsh ;;
+    qwen)                REPLY=qwen ;;      # direct argv0 when not node-wrapped
     node|"")
       # node wrapper without cursor-agent: fall back to the (truncated) current command
       case "$cur" in
@@ -172,6 +179,7 @@ detect_tool() {
         codex-*) REPLY=codex ;;
         pi|pi-*) REPLY=pi ;;
         dsh|dsh-tui|dst) REPLY=dsh ;;
+        qwen)    REPLY=qwen ;;
       esac ;;
     *)
       case "$cur" in
@@ -180,6 +188,7 @@ detect_tool() {
         opencode)   REPLY=opencode ;;
         kimi)       REPLY=kimi ;;
         dsh|dsh-tui|dst) REPLY=dsh ;;
+        qwen)       REPLY=qwen ;;
       esac ;;
   esac
 }
@@ -202,6 +211,7 @@ coord_tool_matches() {
     opencode) tag=o ;;
     kimi) tag=k ;;
     dsh) tag=d ;;
+    qwen) tag=q ;;
     *) return 1 ;;
   esac
   [[ "$recorded" == "$tag" || "$recorded" == "$detected" ]]
@@ -227,6 +237,16 @@ claude_session_exists() {
   local sid="$1" root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
   local -a matches
   matches=("$root"/projects/*/"$sid".jsonl(N))
+  (( ${#matches[@]} > 0 ))
+}
+
+# Qwen Code persists a conversation as <qwenHome>/projects/<encoded-cwd>/chats/
+# <session-id>.jsonl. Requiring that file keeps an aipane-assigned --session-id
+# that never took a real turn from being replayed as a resume.
+qwen_session_exists() {
+  local sid="$1" root="${QWEN_HOME:-$HOME/.qwen}"
+  local -a matches
+  matches=("$root"/projects/*/chats/"$sid".jsonl(N))
   (( ${#matches[@]} > 0 ))
 }
 
@@ -379,6 +399,15 @@ build_resume() {
         if claude_session_exists "$id"; then REPLY_KIND=resume
         else REPLY_KIND=invalid; fi
       else REPLY="$CLAUDE_BASE"; REPLY_KIND=fresh; fi ;;
+    qwen)
+      # Gold case: aipane put --session-id in argv at launch, so the id survives
+      # in the resurrect dump. An id that never took a real turn has no chat
+      # transcript and is not resumable.
+      if [[ -n "$id" ]]; then
+        REPLY="$QWEN_BASE --resume $id"
+        if qwen_session_exists "$id"; then REPLY_KIND=resume
+        else REPLY_KIND=invalid; fi
+      else REPLY="$QWEN_BASE"; REPLY_KIND=fresh; fi ;;
     codex)
       # codex id is not in argv on a bare launch, but its pane title is usually the
       # session uuid — use that as a fallback.

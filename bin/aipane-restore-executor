@@ -58,6 +58,7 @@ TOOL_TAGS = {
     "opencode": "o",
     "kimi": "k",
     "dsh": "d",
+    "qwen": "q",
 }
 PENDING_VERSION = 1
 FIELD_SEPARATOR = "\x1f"
@@ -208,6 +209,10 @@ def command_matches(
         return command == "kimi" or command.startswith("kimi-")
     if tool == "dsh":
         return command in {"dsh", "dsh-tui", "dst"} or (
+            allow_ambiguous_node and command == "node"
+        )
+    if tool == "qwen":
+        return command == "qwen" or (
             allow_ambiguous_node and command == "node"
         )
     return False

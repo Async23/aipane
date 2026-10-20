@@ -75,8 +75,7 @@ AI_TOOL_EXECUTABLES = frozenset(
         "kimi-code",
         "opencode",
         "pi",
-        "qoder",
-        "qodercli",
+        "qwen",
     }
 )
 AI_TOOL_EXECUTABLE_PREFIXES = ("codex-", "grok-", "kimi-", "opencode-", "pi-")
@@ -85,6 +84,7 @@ AI_TOOL_PATH_MARKERS = (
     "/@openai/codex",
     "/cursor-agent/",
     "/pi-coding-agent/",
+    "/@qwen-code/qwen-code",
 )
 RUNTIME_EXECUTABLES = frozenset(
     {

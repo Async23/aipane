@@ -36,7 +36,7 @@ git -C ~/.aipane pull --ff-only
 - macOS 和 zsh
 - Claude Code：供 `ai` 的 `c` 工具使用（不用 `c` 时可省略）
 - tmux：供多工具 `ai` 调用，以及使用 `--new` 或 `--layout` 时使用
-- 其他 `ai` 工具对应的可选 CLI：Codex、dsh-TUI（`dsh-tui`）、Grok、OpenCode、Cursor CLI、Qoder CLI、Pi（`pi`）或 Kimi Code（`kimi`）
+- 其他 `ai` 工具对应的可选 CLI：Codex、dsh-TUI（`dsh-tui`）、Grok、OpenCode、Cursor CLI、Qwen Code（`qwen`）、Pi（`pi`）或 Kimi Code（`kimi`）
 
 `ai x` 这类单工具调用默认在当前 shell 中运行；未使用 `--new` 或 `--layout` 时不依赖 tmux。
 
@@ -139,7 +139,7 @@ export AIPANE_DSH_LAUNCH_CMD="dsh-tui"
 export AIPANE_GROK_LAUNCH_CMD="grok --always-approve"
 export AIPANE_OPENCODE_LAUNCH_CMD="opencode"
 export AIPANE_CURSOR_LAUNCH_CMD="cursor-agent --force"
-export AIPANE_QODER_LAUNCH_CMD="qodercli"
+export AIPANE_QWEN_LAUNCH_CMD="qwen --yolo"
 export AIPANE_PI_LAUNCH_CMD="pi"
 export AIPANE_KIMI_LAUNCH_CMD="kimi --auto"
 ```
@@ -158,7 +158,7 @@ export AIPANE_KIMI_LAUNCH_CMD="kimi --auto"
 | `g` | Grok | `grok --always-approve` |
 | `o` | OpenCode | `opencode` |
 | `r` | Cursor | `cursor-agent --force` |
-| `q` | Qoder | `qodercli` |
+| `q` | Qwen Code | `qwen --yolo` |
 | `p` | Pi | `pi` |
 | `k` | Kimi Code | `kimi --auto` |
 
@@ -193,7 +193,7 @@ ai cc                                     # 重复的键会启动重复的工具
 
 `ai-restart` 在原 tmux pane 中重启并续接可恢复的 AI 会话。存在未完成的恢复时，
 会先补恢复这些会话；完成前不保存新快照或开始新一轮重启。`--retry` 可明确指定
-只补恢复。Qoder 和 Droid 因尚未接入 aipane 会话恢复而直接忽略。
+只补恢复。Droid 因尚未接入 aipane 会话恢复而直接忽略。
 
 恢复判断、持久记录及失败处理统一见
 [`docs/session-restore-design.md`](docs/session-restore-design.md)。
@@ -231,10 +231,10 @@ ln -sf "$AIPANE_ROOT/bin/aipane-bind" ~/.local/bin/aipane-bind
 tmux-resurrect 以及
 [`docs/session-restore-design.md`](docs/session-restore-design.md) 中的会话恢复 hooks。
 
-Pi 与 Claude 都可能已拥有预分配的 `--session-id`，但还没创建可持久恢复的
+Pi、Claude 与 Qwen Code 都可能已拥有预分配的 `--session-id`，但还没创建可持久恢复的
 conversation。空 Pi 会话会重新打开空 TUI，并明确标为 `recreated`，绝不冒充已续接
 的历史对话；若同一 Pi ID 实际属于其他项目或记录已损坏，仍标为 `invalid`。
-Claude 仍要求存在持久 transcript，否则保持原 pane 不动。
+Claude 与 Qwen Code 仍要求存在持久 transcript，否则保持原 pane 不动。
 
 ## 进程清理
 
@@ -308,7 +308,7 @@ killrod --dry-run
 │   ├── kimi/
 │   ├── opencode/
 │   ├── pi/
-│   └── qoder/
+│   └── qwen/
 ├── docs/
 │   ├── agent-notifications.md
 │   ├── cheatsheet.md

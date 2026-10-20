@@ -25,7 +25,7 @@ CONFIG_PATHS = (
     ".claude/settings.json",
     ".cursor/hooks.json",
     ".kimi-code/config.toml",
-    ".qoder/settings.json",
+    ".qwen/settings.json",
     ".config/opencode/plugins/aipane-bind.js",
 )
 KNOWN_REGISTRATION_LINKS = (
@@ -195,7 +195,7 @@ def check_dsh_notifier(audit: Audit, home: Path) -> None:
     except (OSError, plistlib.InvalidFileException, ValueError):
         audit.fail(f"{display_path(app, home)}: missing/invalid notifier App; run bin/build-dsh-notifier")
         return
-    if (info.get("CFBundleIdentifier") != "com.alfheim.dsh-notifier"
+    if (info.get("CFBundleIdentifier") != "com.alfheim.dsh-notifier.v2"
             or info.get("CFBundleExecutable") != "dsh-notifier"
             or not executable.is_file() or not os.access(executable, os.X_OK)):
         audit.fail(f"{display_path(app, home)}: invalid dsh notifier identity or executable; rebuild with bin/build-dsh-notifier")

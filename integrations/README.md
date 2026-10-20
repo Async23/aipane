@@ -78,6 +78,6 @@ changing the process argv, so this Adapter records the new session id on every
 | Kimi Code | `kimi/hooks.toml` | `~/.kimi-code/config.toml` |
 | OpenCode | `opencode/aipane-bind.js` | `~/.config/opencode/plugins/` |
 | Pi | `pi/aipane-bind.ts` | `~/.pi/agent/extensions/` |
-| Qoder | `qoder/hooks.json` | `~/.qoder/settings.json` |
+| Qwen Code | `qwen/hooks.json` | `~/.qwen/settings.json` |
 
 Pi uses `@async23/pi-tmux-window-wrap` separately for Agent Activity.

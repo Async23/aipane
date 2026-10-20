@@ -13,7 +13,7 @@ Tools:
   g  Grok          (${AIPANE_GROK_LAUNCH_CMD})
   o  OpenCode      (${AIPANE_OPENCODE_LAUNCH_CMD})
   r  Cursor        (${AIPANE_CURSOR_LAUNCH_CMD})
-  q  Qoder         (${AIPANE_QODER_LAUNCH_CMD})
+  q  Qwen Code     (${AIPANE_QWEN_LAUNCH_CMD})
   p  Pi             (${AIPANE_PI_LAUNCH_CMD})
   k  Kimi Code     (${AIPANE_KIMI_LAUNCH_CMD})
 
@@ -76,7 +76,7 @@ _aipane_tool_command() {
       _aipane_command_with_args "$AIPANE_CURSOR_LAUNCH_CMD" "$@"
       ;;
     q)
-      _aipane_command_with_args "$AIPANE_QODER_LAUNCH_CMD" "$@"
+      _aipane_command_with_args "$AIPANE_QWEN_LAUNCH_CMD" "$@"
       ;;
     p)
       _aipane_command_with_args "$AIPANE_PI_LAUNCH_CMD" "$@"

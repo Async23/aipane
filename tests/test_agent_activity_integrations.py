@@ -271,14 +271,14 @@ class AgentActivityIntegrationTests(unittest.TestCase):
                     )
 
     def test_standard_hook_fragments_implement_turn_level_contract(self):
-        for tool in ("grok", "qoder"):
+        for tool in ("grok", "qwen"):
             with self.subTest(tool=tool):
                 hooks = self.load_json_hooks(tool)
                 self.assert_nested_event(hooks, "UserPromptSubmit", BUSY_COMMAND)
                 for event in ("SessionStart", "Stop", "SessionEnd"):
                     self.assert_nested_event(hooks, event, IDLE_COMMAND)
 
-        for tool in ("grok", "qoder"):
+        for tool in ("grok", "qwen"):
             with self.subTest(tool=tool, event="StopFailure"):
                 hooks = self.load_json_hooks(tool)
                 self.assert_nested_event(hooks, "StopFailure", IDLE_COMMAND)

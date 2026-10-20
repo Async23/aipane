@@ -339,6 +339,72 @@ class SessionRestoreTests(unittest.TestCase):
             self.assertEqual(plan["kind"], "resume")
             self.assertTrue(plan["restorable"])
 
+    def qwen_home(self, tmp: Path, *, transcript_exists: bool) -> Path:
+        home = tmp / "qwen"
+        chats = home / "projects" / "-Users-test-project" / "chats"
+        chats.mkdir(parents=True)
+        if transcript_exists:
+            (chats / f"{FOREIGN_SID}.jsonl").touch()
+        return home
+
+    def test_restore_resumes_qwen_through_its_node_launcher(self):
+        # `qwen` is an `env node` script, so the pane's foreground program is
+        # "node" and only the script token identifies the Agent. Recognizing it
+        # by argv[0] alone would silently skip every Qwen pane.
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            qwen_home = self.qwen_home(tmp, transcript_exists=True)
+            result = self.run_restore(
+                tmp,
+                coord={"sid": FOREIGN_SID, "tool": "q"},
+                title="qwen",
+                saved_codex_ids=set(),
+                plan_json=True,
+                current_command="node",
+                full_command=(
+                    f"node {tmp}/.local/bin/qwen --yolo --session-id {FOREIGN_SID}"
+                ),
+                extra_env={
+                    "QWEN_HOME": str(qwen_home),
+                    "AIPANE_QWEN_LAUNCH_CMD": "qwen --yolo",
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(result.stdout)
+            self.assertEqual(plan["tool"], "qwen")
+            self.assertEqual(plan["kind"], "resume")
+            self.assertTrue(plan["restorable"])
+            self.assertEqual(plan["command"], f"qwen --yolo --resume {FOREIGN_SID}")
+
+    def test_restore_leaves_qwen_pane_untouched_without_a_transcript(self):
+        # An aipane-assigned --session-id that never took a real turn has no
+        # chat transcript, so replaying it is not a genuine resume.
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            qwen_home = self.qwen_home(tmp, transcript_exists=False)
+            result = self.run_restore(
+                tmp,
+                coord={"sid": FOREIGN_SID, "tool": "q"},
+                title="qwen",
+                saved_codex_ids=set(),
+                plan_json=True,
+                current_command="node",
+                full_command=(
+                    f"node {tmp}/.local/bin/qwen --yolo --session-id {FOREIGN_SID}"
+                ),
+                extra_env={
+                    "QWEN_HOME": str(qwen_home),
+                    "AIPANE_QWEN_LAUNCH_CMD": "qwen --yolo",
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(result.stdout)
+            self.assertEqual(plan["tool"], "qwen")
+            self.assertEqual(plan["kind"], "invalid")
+            self.assertFalse(plan["restorable"])
+
     def test_restore_recreates_empty_pi_session_without_claiming_resume(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)

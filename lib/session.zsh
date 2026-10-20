@@ -21,9 +21,9 @@ typeset -g AIPANE_STATE_DIR="${AIPANE_STATE_DIR:-${XDG_DATA_HOME:-$HOME/.local/s
 typeset -g AIPANE_REGISTRY="${AIPANE_REGISTRY:-$AIPANE_STATE_DIR/registry.jsonl}"
 
 # Tools whose session id aipane can fix at launch time (gold-case).
-#   p/g/c : accept --session-id <uuid>
+#   p/g/c/q : accept --session-id <uuid>
 #   r     : no flag, but `cursor-agent create-chat` returns a usable id
-typeset -gA _AIPANE_GOLDCASE=( p 1 g 1 c 1 r 1 )
+typeset -gA _AIPANE_GOLDCASE=( p 1 g 1 c 1 r 1 q 1 )
 
 # REPLY <- lowercase UUID (tools validate lowercase).
 _aipane_uuid() {
@@ -109,7 +109,7 @@ _aipane_prepare_launch() {
 
   local sid
   case "$tool" in
-    p|g|c)
+    p|g|c|q)
       if _aipane_uuid; then
         sid="$REPLY"
         REPLY="$base --session-id $sid"
