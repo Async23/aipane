@@ -36,6 +36,7 @@ from agent_activity import (  # noqa: E402
 from recovery_plan import GUARD_FIELDS, RecoveryPlanError, load_sealed_plan
 from codex_sessions import session_loaded as codex_session_loaded
 from dsh_sessions import current_session as dsh_current_session, matches_session as dsh_matches_session, is_dsh_command_line
+from qwen_sessions import current_session as qwen_current_session, session_loaded as qwen_session_loaded
 
 
 SHELL_COMMANDS = {
@@ -125,6 +126,9 @@ def normalize_plan(
         }
         if item["tool"] == "dsh":
             for key in ("dsh_home", "session_root"):
+                item[key] = str(raw.get(key, ""))
+        if item["tool"] == "qwen":
+            for key in ("qwen_home", "qwen_runtime_dir"):
                 item[key] = str(raw.get(key, ""))
         if (
             not item["target"]
@@ -731,6 +735,8 @@ class RestoreExecutor:
             return False
         if item["tool"] == "dsh":
             return self.dsh_ready(item)
+        if item["tool"] == "qwen":
+            return self.qwen_ready(item)
         foreground = self.tmux.foreground_command(item["target"])
         sid = item.get("sid", "")
         if sid and sid in foreground:
@@ -779,6 +785,25 @@ class RestoreExecutor:
             cwd=item["cwd"], dsh_home=item.get("dsh_home", ""), session_root=item.get("session_root", ""),
         )
 
+    def qwen_ready(self, item: dict[str, Any]) -> bool:
+        tty = self.tmux.run("display-message", "-p", "-t", item["target"], "#{pane_tty}")
+        if tty.returncode:
+            return False
+        environment = self.environment.copy()
+        for key, variable in (("qwen_home", "QWEN_HOME"), ("qwen_runtime_dir", "QWEN_RUNTIME_DIR")):
+            if item.get(key):
+                environment[variable] = item[key]
+        sid = item.get("sid", "")
+        if not sid and item["kind"] == "fresh":
+            # AI_RESTORE_FRESH explicitly opts into opening a new session.
+            # It still needs native identity, but has no saved ID to match.
+            current = qwen_current_session(pane_tty=tty.stdout.strip(), environment=environment)
+            sid = (current or {}).get("session_id", "")
+        return qwen_session_loaded(
+            pane_tty=tty.stdout.strip(), sid=sid,
+            cwd=item["cwd"], environment=environment,
+        )
+
     def pane_guard_matches(self, item: dict[str, Any]) -> bool:
         expected = (
             item.get("pane_id"),
@@ -798,7 +823,9 @@ class RestoreExecutor:
             return None, "pane disappeared"
         matches_existing = self.existing_tool_matches(item, current)
         if interrupt_running and self.tool_running(item, current):
-            if item["tool"] == "dsh" and current == "node":
+            if item["tool"] == "qwen":
+                return None, "Qwen process left running; recovery pending"
+            elif item["tool"] == "dsh" and current == "node":
                 # A retry may see another Node program occupying this pane.
                 # Missing readiness is not authority to interrupt arbitrary node.
                 matches_existing = matches_existing or is_dsh_command_line(self.tmux.foreground_command(target))
@@ -898,6 +925,15 @@ class RestoreExecutor:
                     ready = False
                     if item["tool"] == "dsh":
                         ready = stable_for >= self.verify_stability and self.dsh_ready(item)
+                    elif item["tool"] == "qwen":
+                        if not self.qwen_ready(item):
+                            attempt.ready_since = None
+                        elif attempt.ready_since is None:
+                            attempt.ready_since = time.monotonic()
+                        ready = (
+                            attempt.ready_since is not None
+                            and time.monotonic() - attempt.ready_since >= self.verify_stability
+                        )
                     elif item["tool"] == "codex":
                         process = self.tmux.foreground_process(target)
                         loaded = bool(process and codex_session_loaded(
@@ -937,7 +973,14 @@ class RestoreExecutor:
                     continue
 
                 if now >= deadlines[target]:
-                    if item["tool"] == "codex" and attempt.seen_running:
+                    if item["tool"] == "qwen" and attempt.seen_running:
+                        blocked[target] = (
+                            "Qwen has not confirmed the requested session in its runtime records; "
+                            "left running, recovery pending"
+                        )
+                        active.pop(target)
+                        continue
+                    elif item["tool"] == "codex" and attempt.seen_running:
                         blocked[target] = (
                             "Codex has not opened the requested conversation for writing; "
                             "left running, recovery pending"
@@ -1185,6 +1228,10 @@ class RestoreExecutor:
                 raise RestoreExecutionError(
                     f"dsh selected session changed for {item['target']}; refresh the restart plan"
                 )
+            if item["tool"] == "qwen" and not self.qwen_ready(item):
+                raise RestoreExecutionError(
+                    f"Qwen selected session changed for {item['target']}; refresh the restart plan"
+                )
 
     def execute_restart(
         self,
@@ -1225,6 +1272,8 @@ class RestoreExecutor:
                 error = "pane guard changed immediately before respawn"
             elif planned["tool"] == "dsh" and not self.dsh_ready(planned):
                 error = "dsh selected session changed immediately before respawn; refresh the restart plan"
+            elif planned["tool"] == "qwen" and not self.qwen_ready(planned):
+                error = "Qwen selected session changed immediately before respawn; refresh the restart plan"
             else:
                 error = self.tmux.respawn(target, item["cwd"], shell)
                 if error:

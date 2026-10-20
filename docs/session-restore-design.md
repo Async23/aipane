@@ -23,8 +23,9 @@
   记录当前会话；恢复优先使用这份坐标绑定，并校验当前目录的会话文件（见 §19）。
 - dsh-TUI 按当前前台 Channel 的会话 ID 恢复；新建、恢复、分支和后台切换都会更新
   绑定。落盘校验与实际加载确认见 §20。
-- Qwen Code 走 gold-case：启动即由 aipane 预指定 `--session-id <uuid>`，恢复用
-  `--resume <id>`，并要求 `~/.qwen/projects/<编码cwd>/chats/<id>.jsonl` 已落盘。
+- Qwen Code 存盘时按前台进程的原生登记读取当前会话，覆盖启动 ID；恢复前校验
+  当前项目的聊天记录，恢复后核对运行时身份。`/clear`、`/resume` 与带参数启动均
+  使用同一条链路（见 §23）。
 - Droid 暂不在恢复范围内。
 
 ## 0. 一个绕不开的前提
@@ -48,7 +49,7 @@ tmux pane 里的进程都是 tmux server 的子进程；server 一退出（`kill
 |---|---|---|---|
 | 1 | cursor-agent (`r`) | **启动即生成（急切）** | `~/.cursor/chats/<工程hash>/<chat-uuid>/meta.json` |
 | 2 | pi (`p`) | **启动即生成（急切）** | `~/.pi/agent/sessions/<编码cwd>/` |
-| 3 | qwen (`q`) | **启动即指定（aipane 预分配 `--session-id`）** | `~/.qwen/projects/<编码cwd>/chats/<uuidv4>.jsonl`（首条消息后落盘） |
+| 3 | qwen (`q`) | 启动即有 ID；裸 `ai q` 预分配，带参数时由 Qwen 决定；原生登记跟踪后续切换 | `~/.qwen/projects/<编码cwd>/chats/<uuidv4>.jsonl`；非空有效对话才可恢复 |
 | 4 | codex (`x`) | **首条消息才生成（懒惰）** | `~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<uuidv7>.jsonl` |
 | 5 | grok (`g`) | **首条消息才生成（懒惰）** | `~/.grok/sessions/<urlencode cwd>/<uuidv7>/` |
 | 6 | claude (`c`) | **首条消息才生成（懒惰）** | `~/.claude/projects/<dash编码cwd>/<uuidv4>.jsonl` |
@@ -94,11 +95,11 @@ tmux pane 里的进程都是 tmux server 的子进程；server 一退出（`kill
 | 5 | kimi (`k`) | 懒惰 + 无钩子 → **回落**（cwd+时间解析，未纳入本轮核实） |
 | 6 | cursor (`r`) | **半 gold-case**：无旗标，但 `create-chat` 回吐 uuid → 先建后 `--resume`（见 §12） |
 | 7 | pi (`p`) | **初始 gold-case + 动态 Adapter**：启动预指定 id；new/resume/fork 后由 `session_start` 覆盖绑定（见 §15） |
-| 8 | qwen (`q`) | **gold-case**：启动 `--session-id <uuid>`（严格 UUID v1–5，小写）；`--resume <id>` 续接；transcript 落 `~/.qwen/projects/<编码cwd>/chats/<uuid>.jsonl` |
+| 8 | qwen (`q`) | **初始 gold-case + 存盘时动态绑定**：原生 PID 登记跟踪当前 ID，`--resume <id>` 续接，按项目校验 transcript 并核对运行时身份（见 §23） |
 
 `ai x resume <id>` 这类 **resume 启动是最省事的一档**：id 在命令里，启动即可直接绑定，
 无需 store 探测/钩子。gold-case（§12）把这一档从「resume 时」提前到「首次启动时」；
-它只确定初始身份，Pi、Codex、Grok 的进程内会话切换仍需在存盘时取当前身份。
+它只确定初始身份，Pi、Codex、Grok、Qwen Code 的进程内会话切换仍需在存盘时取当前身份。
 
 ### 3.2 绑定机制：aipane 注入关联令牌 + 统一接收脚本
 
@@ -194,7 +195,7 @@ set -g @resurrect-hook-post-restore-all '$HOME/.local/bin/ai-restore'
    `aipane-snapshot` 坐标快照 + ai-restore 三级 id 优先级。
 5. ~~余下非核心工具按 §3.1 补齐：opencode（插件）/ qoder（探测）/ kimi（回落）~~
    → **opencode / kimi 已落地，见 §14**（均走钩子支路，非回落）；
-   `q` 已由 Qoder 换为 Qwen Code，走 gold-case（启动预指定 `--session-id`），已落地。
+   `q` 已由 Qoder 换为 Qwen Code；初始 ID 与存盘时动态绑定均已落地，见 §23。
 
 ## 9. 决策定案（2026-08-08）
 
@@ -660,3 +661,33 @@ macOS 上 Claude 2.1.300 的 tmux `pane_current_command` 可能为 `2.1.300`，
 
 回归测试在隔离的真实 tmux 中覆盖新启动验证、已有进程只验证不重启、版本号误匹配，
 以及普通重启、unknown 确认和补恢复三个提示处的 Ctrl+C / Ctrl+D 取消。
+
+## 23. Qwen Code 当前会话与恢复核验（2026-10-20）
+
+Qwen Code 的 `/clear`、`/resume` 会在同一进程内替换当前 ID，启动 argv 和 aipane 的
+初始绑定不会随之变化。`lib/qwen_sessions.py` 读取 `$QWEN_HOME/sessions/<pid>.json`，
+核对 pane TTY 的唯一前台 Qwen 进程、PID、进程出生时间及登记 schema；Linux 还核对
+原生进程启动令牌与 PID namespace。普通 Node 程序、过期 PID、其他 TTY 和歧义记录
+都不能提供会话身份。此机制独立于 Activity hooks，也覆盖 `ai q --model ...` 等启动。
+
+快照保存当前 ID、cwd、`QWEN_HOME` 和 `QWEN_RUNTIME_DIR`。已经识别为 Qwen 的 pane
+若缺少有效原生登记，会保存 `binding: unavailable`，阻止恢复时退回旧 argv。
+新会话尚未落盘时也保留其当前 ID，不能改为恢复先前已保存的会话。
+
+恢复预检只读取指定 cwd 对应的 active chats 目录，检查 JSONL、会话 ID、项目身份与
+对话内容；空文件、损坏内容、仅元数据以及其他项目的同名文件均不可恢复。
+这是保守预检，最终仍由 Qwen 原生加载器读取历史。执行器随后要求原生 PID 登记和
+该会话的 `.runtime.json` 同时指向目标 ID、cwd 与当前进程，并连续通过稳定窗口，
+才重新绑定并清除 pending。已有进程同样核验；启动 argv 或旧绑定不能代替运行时证据。
+存活但证据不足时保留 pending 和进程，重试不发送中断。原地重启执行前也重新核对
+当前会话，避免确认期间切换会话后仍按旧计划替换进程。
+
+已对照本机 Qwen Code 0.25.3 的原生格式。自定义目录须通过快照进程可见的
+`QWEN_HOME` / `QWEN_RUNTIME_DIR` 提供；仅写在 Qwen 私有配置中的 runtimeOutputDir
+不会被猜测。缺少这些原生记录、未知 schema 或其他无法核验的布局会阻止自动恢复，
+不降级为仅凭进程存活报告成功。
+
+`tests/test_qwen_sessions.py` 使用隔离 tmux 和不联网的 Node 占位进程，覆盖当前 ID
+优先、无初始绑定、未落盘会话、PID 复用、错误运行时记录、自定义目录以及重启前
+会话变化。`test_session_restore.py` 和 `test_restore_executor.py` 覆盖计划生成与
+“Node 已运行但目标会话未确认”仍保持 pending 的回归。

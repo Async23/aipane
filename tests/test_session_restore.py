@@ -341,11 +341,65 @@ class SessionRestoreTests(unittest.TestCase):
 
     def qwen_home(self, tmp: Path, *, transcript_exists: bool) -> Path:
         home = tmp / "qwen"
-        chats = home / "projects" / "-Users-test-project" / "chats"
+        import re
+        chats = home / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", str(tmp)) / "chats"
         chats.mkdir(parents=True)
         if transcript_exists:
-            (chats / f"{FOREIGN_SID}.jsonl").touch()
+            (chats / f"{FOREIGN_SID}.jsonl").write_text(json.dumps({
+                "uuid": "message-1", "parentUuid": None, "type": "user",
+                "sessionId": FOREIGN_SID, "cwd": str(tmp),
+                "message": {"role": "user", "parts": [{"text": "Saved turn"}]},
+            }) + "\n")
         return home
+
+    def test_qwen_current_binding_supersedes_launch_id(self):
+        for argv in (f"qwen --session-id {VALID_PI_SID}", "qwen --model custom"):
+            with self.subTest(argv=argv), tempfile.TemporaryDirectory() as raw:
+                tmp = Path(raw)
+                home = self.qwen_home(tmp, transcript_exists=True)
+                result = self.run_restore(
+                    tmp, coord={"sid": FOREIGN_SID, "tool": "q"},
+                    title="qwen", saved_codex_ids=set(), plan_json=True,
+                    current_command="node", full_command=f"node {argv}",
+                    extra_env={"QWEN_HOME": str(home)},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                plan = json.loads(result.stdout)
+                self.assertTrue(plan["restorable"])
+                self.assertEqual(plan["sid"], FOREIGN_SID)
+
+    def test_qwen_unavailable_current_binding_blocks_stale_argv(self):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            home = self.qwen_home(tmp, transcript_exists=True)
+            result = self.run_restore(
+                tmp, coord={"sid": "", "tool": "q", "binding": "unavailable"},
+                title="qwen", saved_codex_ids=set(), plan_json=True,
+                current_command="node",
+                full_command=f"node qwen --session-id {FOREIGN_SID}",
+                extra_env={"QWEN_HOME": str(home)},
+            )
+            self.assertFalse(json.loads(result.stdout)["restorable"])
+
+    def test_qwen_rejects_empty_corrupt_and_foreign_transcripts(self):
+        for contents in ("", "{broken\n", json.dumps({
+            "uuid": "1", "type": "user", "sessionId": FOREIGN_SID,
+            "cwd": "/another/project",
+            "message": {"role": "user", "parts": [{"text": "Foreign turn"}]},
+        }) + "\n"):
+            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as raw:
+                tmp = Path(raw)
+                home = self.qwen_home(tmp, transcript_exists=True)
+                transcript = next(home.glob("projects/*/chats/*.jsonl"))
+                transcript.write_text(contents)
+                result = self.run_restore(
+                    tmp, coord={"sid": FOREIGN_SID, "tool": "q"},
+                    title="qwen", saved_codex_ids=set(), plan_json=True,
+                    current_command="node",
+                    full_command=f"node qwen --session-id {FOREIGN_SID}",
+                    extra_env={"QWEN_HOME": str(home)},
+                )
+                self.assertFalse(json.loads(result.stdout)["restorable"])
 
     def test_restore_resumes_qwen_through_its_node_launcher(self):
         # `qwen` is an `env node` script, so the pane's foreground program is

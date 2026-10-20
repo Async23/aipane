@@ -167,6 +167,8 @@ class ActivitySession:
     dsh_home: str = ""
     session_root: str = ""
     cwd: str = ""
+    qwen_home: str = ""
+    qwen_runtime_dir: str = ""
 
 
 @dataclass(frozen=True)
@@ -1495,6 +1497,18 @@ class AgentActivity:
         )
 
     def _validated_session(self, pane: PaneActivity) -> ActivitySession | None:
+        if pane.current_command in {"node", "qwen"}:
+            from qwen_sessions import current_session as qwen_current_session
+
+            session = qwen_current_session(
+                pane_tty=pane.pane_tty, environment=self.environment,
+            )
+            if session:
+                return ActivitySession(
+                    session_id=session["session_id"], tool_key="q",
+                    cwd=session["cwd"], qwen_home=session["qwen_home"],
+                    qwen_runtime_dir=session["qwen_runtime_dir"],
+                )
         if pane.current_command in {"node", "dsh", "dsh-tui"}:
             from dsh_sessions import current_session
 

@@ -3,8 +3,8 @@
 session id, at the same instant tmux-resurrect writes its dump.
 
 Why: launch commands only identify the initial session. Pi can resume/fork,
-Codex can fork threads, and Grok can /new or /resume in-process. Their current
-ids come from lifecycle Adapters or Grok's live process/TTY session registry,
+Codex can fork threads, and Grok/Qwen can switch sessions in-process. Their current
+ids come from lifecycle Adapters or native live process/TTY session registries,
 keyed by the pane's unique id (%N). But %N does not survive a server restart,
 and the dump stores coordinates, not %N. So at save time we resolve %N ->
 coordinate here and emit a coordinate -> sid map that ai-restore can consult.
@@ -29,6 +29,7 @@ if str(LIB_DIR) not in sys.path:
 
 from agent_activity import AgentActivity, ActivityReadError, TmuxActivityAdapter  # noqa: E402
 from dsh_sessions import last_reported_session  # noqa: E402
+from qwen_sessions import foreground_processes as qwen_processes  # noqa: E402
 
 STATE_DIR = Path(
     os.environ.get("AIPANE_STATE_DIR")
@@ -157,7 +158,9 @@ def main() -> int:
         rec = (
             {"sid": session.session_id, "tool": session.tool_key,
              **({"dsh_home": session.dsh_home, "session_root": session.session_root}
-                if session.tool_key == "d" else {})}
+                if session.tool_key == "d" else {}),
+             **({"qwen_home": session.qwen_home, "qwen_runtime_dir": session.qwen_runtime_dir}
+                if session.tool_key == "q" else {})}
             if session is not None
             else None
         )
@@ -171,6 +174,18 @@ def main() -> int:
                 coords[coord] = recovery
                 continue
             rec = by_pane.get(pane_id)
+            known_qwen = bool(rec and rec.get("tool") in {"q", "qwen"})
+            if not known_qwen and inspection.current_command in {"node", "qwen"}:
+                try:
+                    known_qwen = bool(qwen_processes(activity.adapter.read(pane_id).pane_tty))
+                except ActivityReadError:
+                    pass
+            if known_qwen:
+                # An absent native binding must not resurrect the original
+                # launch ID after /clear, /resume, or a failed metadata read.
+                coords[coord] = {"sid": "", "tool": "q", "cwd": cwd,
+                                 "binding": "unavailable"}
+                continue
             known_dsh = bool(rec and rec.get("tool") in {"d", "dsh"})
             if inspection.guard is not None:
                 try:
@@ -187,11 +202,13 @@ def main() -> int:
                 continue
         if not rec or not rec.get("sid"):
             continue  # only useful when we actually have an id (mainly codex)
-        if session is not None and session.tool_key == "d" and session.cwd:
+        if session is not None and session.tool_key in {"d", "q"} and session.cwd:
             cwd = session.cwd
         coords[coord] = {"sid": rec["sid"], "tool": rec.get("tool", ""), "cwd": cwd,
                          **({key: rec[key] for key in ("dsh_home", "session_root") if rec.get(key)}
-                            if rec.get("tool") == "d" else {})}
+                            if rec.get("tool") == "d" else {}),
+                         **({key: rec[key] for key in ("qwen_home", "qwen_runtime_dir") if rec.get(key)}
+                            if rec.get("tool") == "q" else {})}
 
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)

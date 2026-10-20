@@ -170,6 +170,19 @@ class RestoreExecutorTests(unittest.TestCase):
             "sid": GROK_SID,
         }
 
+    def test_qwen_node_without_loaded_session_remains_pending(self):
+        plan = {**self.grok_plan(), "tool": "qwen",
+                "command": f"qwen --yolo --resume {GROK_SID}"}
+        result = self.run_executor(
+            [plan], launch_mode="running", running_command="node",
+            capture_text="Select authentication method", report_json=True,
+        )
+        report = json.loads(result.stdout)
+        self.assertEqual(report["verified"], 0)
+        self.assertEqual(report["pending"], 1)
+        self.assertFalse(self.bind_log.exists())
+        self.assertEqual(self.launch_count.read_text().strip(), "1")
+
     def run_executor(
         self,
         plan: list[dict[str, object]],

@@ -72,16 +72,18 @@ log() { print -r -- "$(date '+%F %T') $*" >>"$LOG" 2>/dev/null; }
 # Coordinate -> current session id/tool map produced by aipane-snapshot at save
 # time. The tool tag is part of the identity: a stale binding from another tool
 # must never be interpreted as the detected pane's session id.
-typeset -A COORDS_SID COORDS_TOOL COORDS_DSH_HOME COORDS_SESSION_ROOT COORDS_CWD
+typeset -A COORDS_SID COORDS_TOOL COORDS_DSH_HOME COORDS_SESSION_ROOT COORDS_CWD COORDS_QWEN_HOME COORDS_QWEN_RUNTIME
 if [[ -r "$COORDS" ]] && command -v python3 &>/dev/null; then
   local _cl
-  while IFS=$'\x1f' read -r _cl _sid _tool _dsh_home _session_root _cwd; do
+  while IFS=$'\x1f' read -r _cl _sid _tool _dsh_home _session_root _cwd _qwen_home _qwen_runtime; do
     if [[ -n "$_cl" ]]; then
       COORDS_SID[$_cl]="$_sid"
       COORDS_TOOL[$_cl]="$_tool"
       COORDS_DSH_HOME[$_cl]="$_dsh_home"
       COORDS_SESSION_ROOT[$_cl]="$_session_root"
       COORDS_CWD[$_cl]="$_cwd"
+      COORDS_QWEN_HOME[$_cl]="$_qwen_home"
+      COORDS_QWEN_RUNTIME[$_cl]="$_qwen_runtime"
     fi
   done < <(python3 -c '
 import json,sys
@@ -92,7 +94,9 @@ except Exception:
 for coord,rec in d.items():
     sid=(rec or {}).get("sid","")
     tool=(rec or {}).get("tool","")
-    if sid or tool in ("d", "dsh"): print("\x1f".join((coord,sid,tool,str(rec.get("dsh_home","")),str(rec.get("session_root","")),str(rec.get("cwd","")))))
+    if sid or tool in ("d", "dsh", "q", "qwen"):
+        print("\x1f".join((coord,sid,tool,*(str(rec.get(key,"")) for key in
+              ("dsh_home","session_root","cwd","qwen_home","qwen_runtime_dir")))))
 ' "$COORDS" 2>/dev/null)
 fi
 
@@ -240,14 +244,11 @@ claude_session_exists() {
   (( ${#matches[@]} > 0 ))
 }
 
-# Qwen Code persists a conversation as <qwenHome>/projects/<encoded-cwd>/chats/
-# <session-id>.jsonl. Requiring that file keeps an aipane-assigned --session-id
-# that never took a real turn from being replayed as a resume.
+# Validate content and project identity, not merely a matching filename.
 qwen_session_exists() {
-  local sid="$1" root="${QWEN_HOME:-$HOME/.qwen}"
-  local -a matches
-  matches=("$root"/projects/*/chats/"$sid".jsonl(N))
-  (( ${#matches[@]} > 0 ))
+  QWEN_HOME="${coord_qwen_home:-${QWEN_HOME:-$HOME/.qwen}}" \
+  QWEN_RUNTIME_DIR="${coord_qwen_runtime:-${QWEN_RUNTIME_DIR:-}}" \
+    command python3 "$SCRIPT_DIR/../lib/qwen_sessions.py" "$1" "$2"
 }
 
 # Grok's native active-session registry can name a newly opened, unsaved session.
@@ -334,7 +335,7 @@ pi_session_id_exists() {
 
 # build_resume <tool> <full_cmd> <title> <coord_sid> <cwd>
 # -> REPLY = command to send, or ""
-# Gold-case tools begin with their session id in argv. Codex, Pi and Grok can change:
+# Gold-case tools begin with their session id in argv. Tools can change sessions:
 # an in-process resume/fork changes the current session without changing the launch
 # argv, so a durable current coordinate binding must supersede that stale id.
 # opencode/kimi ids are not UUIDs and only come from the coordinate snapshot.
@@ -345,7 +346,7 @@ build_resume() {
   extract_uuid "$full"; id="$REPLY"
   if [[ "$tool" == codex && -n "$coord_sid" ]] && codex_session_exists "$coord_sid"; then
     id="$coord_sid"
-  elif [[ ( "$tool" == pi || "$tool" == grok || "$tool" == dsh ) && -n "$coord_sid" ]]; then
+  elif [[ ( "$tool" == pi || "$tool" == grok || "$tool" == dsh || "$tool" == qwen ) && -n "$coord_sid" ]]; then
     # The current coordinate binding is authoritative even when that new session
     # is still empty. Check durability below without falling back to stale argv.
     id="$coord_sid"
@@ -400,12 +401,15 @@ build_resume() {
         else REPLY_KIND=invalid; fi
       else REPLY="$CLAUDE_BASE"; REPLY_KIND=fresh; fi ;;
     qwen)
-      # Gold case: aipane put --session-id in argv at launch, so the id survives
-      # in the resurrect dump. An id that never took a real turn has no chat
-      # transcript and is not resumable.
+      # /clear and /resume change Qwen's session without changing argv.
+      # An explicitly unavailable current binding must block the stale launch.
+      if [[ -z "$coord_sid" && ( "$coord_tool" == q || "$coord_tool" == qwen ) ]]; then
+        REPLY="$QWEN_BASE"; REPLY_KIND=invalid
+        return 0
+      fi
       if [[ -n "$id" ]]; then
         REPLY="$QWEN_BASE --resume $id"
-        if qwen_session_exists "$id"; then REPLY_KIND=resume
+        if qwen_session_exists "$id" "$cwd"; then REPLY_KIND=resume
         else REPLY_KIND=invalid; fi
       else REPLY="$QWEN_BASE"; REPLY_KIND=fresh; fi ;;
     codex)
@@ -434,6 +438,9 @@ build_resume() {
   if [[ "$tool" == dsh ]]; then
     [[ -n "$coord_session_root" ]] && REPLY="DSH_TUI_SESSION_ROOT=${(q)coord_session_root} $REPLY"
     [[ -n "$coord_dsh_home" ]] && REPLY="DSH_HOME=${(q)coord_dsh_home} $REPLY"
+  elif [[ "$tool" == qwen ]]; then
+    [[ -n "$coord_qwen_runtime" ]] && REPLY="QWEN_RUNTIME_DIR=${(q)coord_qwen_runtime} $REPLY"
+    [[ -n "$coord_qwen_home" ]] && REPLY="QWEN_HOME=${(q)coord_qwen_home} $REPLY"
   fi
 }
 
@@ -450,6 +457,8 @@ emit_plan_json() {
   AIPANE_PLAN_SID="$7" \
   AIPANE_PLAN_DSH_HOME="${coord_dsh_home:-}" \
   AIPANE_PLAN_SESSION_ROOT="${coord_session_root:-}" \
+  AIPANE_PLAN_QWEN_HOME="${coord_qwen_home:-}" \
+  AIPANE_PLAN_QWEN_RUNTIME="${coord_qwen_runtime:-}" \
     command python3 -c '
 import json, os
 print(json.dumps({
@@ -462,6 +471,8 @@ print(json.dumps({
     "sid": os.environ["AIPANE_PLAN_SID"],
     **({"dsh_home": os.environ["AIPANE_PLAN_DSH_HOME"], "session_root": os.environ["AIPANE_PLAN_SESSION_ROOT"]}
        if os.environ["AIPANE_PLAN_TOOL"] == "dsh" else {}),
+    **({"qwen_home": os.environ["AIPANE_PLAN_QWEN_HOME"], "qwen_runtime_dir": os.environ["AIPANE_PLAN_QWEN_RUNTIME"]}
+       if os.environ["AIPANE_PLAN_TOOL"] == "qwen" else {}),
 }, ensure_ascii=False, separators=(",", ":")))
 '
 }
@@ -472,7 +483,7 @@ log "=== ai-restore start (dump=$DUMP dryrun=$DRYRUN) ==="
 
 local line
 local -a f
-local session win pane_idx title cwd cur full tool cmd target coord_sid coord_tool resume_sid coord_dsh_home coord_session_root
+local session win pane_idx title cwd cur full tool cmd target coord_sid coord_tool resume_sid coord_dsh_home coord_session_root coord_qwen_home coord_qwen_runtime
 while IFS= read -r line; do
   [[ "$line" == pane$'\t'* ]] || continue
   f=("${(@ps:\t:)line}")
@@ -491,12 +502,15 @@ while IFS= read -r line; do
   coord_tool="${COORDS_TOOL[$target]:-}"
   coord_dsh_home="${COORDS_DSH_HOME[$target]:-}"
   coord_session_root="${COORDS_SESSION_ROOT[$target]:-}"
+  coord_qwen_home="${COORDS_QWEN_HOME[$target]:-}"
+  coord_qwen_runtime="${COORDS_QWEN_RUNTIME[$target]:-}"
   if [[ -n "$coord_sid" ]] && ! coord_tool_matches "$tool" "$coord_tool"; then
     log "ignore $target snapshot id: detected=$tool recorded=${coord_tool:-missing}"
     coord_sid=""
     coord_dsh_home=""; coord_session_root=""
+    coord_qwen_home=""; coord_qwen_runtime=""
   fi
-  if [[ "$tool" == dsh && -n "$coord_sid" && -n "${COORDS_CWD[$target]:-}" ]]; then
+  if [[ ( "$tool" == dsh || "$tool" == qwen ) && -n "$coord_sid" && -n "${COORDS_CWD[$target]:-}" ]]; then
     cwd="${COORDS_CWD[$target]}"
   fi
 
