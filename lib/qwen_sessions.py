@@ -14,7 +14,6 @@ import os
 from pathlib import Path
 import re
 import shlex
-import socket
 import stat
 import subprocess
 import sys
@@ -197,11 +196,13 @@ def session_loaded(*, pane_tty: str, sid: str, cwd: str, environment=None) -> bo
     if not current or current["session_id"] != sid or current["cwd"] != cwd:
         return False
     record = _read_record(chats_dir(cwd, environment) / f"{sid}.runtime.json")
+    # The foreground TTY and native registry establish local process identity.
+    # A hostname captured at session start can change while that process lives.
     return bool(
         record and type(record.get("schema_version")) is int and record["schema_version"] == 1
         and type(record.get("pid")) is int and record["pid"] == current["pid"]
         and record.get("session_id") == sid and record.get("work_dir") == cwd
-        and record.get("hostname") == socket.gethostname()
+        and isinstance(record.get("hostname"), str) and bool(record["hostname"])
         and _timestamp(record.get("started_at"), current["started_at"])
     )
 

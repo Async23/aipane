@@ -220,7 +220,8 @@ class QwenSessionTests(unittest.TestCase):
     def test_readiness_requires_matching_runtime_sidecar(self):
         self.assertTrue(self.loaded())
         for changes in ({"pid": self.pid + 1}, {"session_id": OLD_SID},
-                        {"work_dir": "/foreign"}, {"hostname": "other-host"},
+                        {"work_dir": "/foreign"}, {"hostname": None},
+                        {"hostname": ""}, {"hostname": 123},
                         {"started_at": self.process["started_at"] - 1},
                         {"schema_version": 2}):
             with self.subTest(changes=changes):
@@ -228,6 +229,30 @@ class QwenSessionTests(unittest.TestCase):
                 self.assertFalse(self.loaded())
         self.sidecar.unlink()
         self.assertFalse(self.loaded())
+
+    def test_restart_and_recovery_accept_hostname_changes_for_same_live_session(self):
+        runner = executor.RestoreExecutor(self.env)
+        planned = {**self.plan, "guard": runner.tmux.recovery_guard(self.coord)}
+        for saved_hostname in ("Alfheim.local", "previous-computer-name"):
+            with self.subTest(saved_hostname=saved_hostname):
+                self.sidecar.write_text(json.dumps({
+                    **self.runtime_record, "hostname": saved_hostname,
+                }))
+                with patch.object(socket, "gethostname", return_value="Alfheim"):
+                    runner.assert_exact_guards([planned])
+                    self.assertTrue(runner.existing_tool_matches(self.plan, "node"))
+                    attempt = executor.Attempt(self.plan, 0.5, None, True, False)
+                    verified, failures, blocked = runner.verify_round([attempt])
+                self.assertEqual(verified, [self.plan])
+                self.assertEqual((failures, blocked), ({}, {}))
+
+    def test_restart_reports_unverifiable_runtime_without_claiming_session_changed(self):
+        runner = executor.RestoreExecutor(self.env)
+        planned = {**self.plan, "guard": runner.tmux.recovery_guard(self.coord)}
+        self.sidecar.unlink()
+        with self.assertRaisesRegex(executor.RestoreExecutionError,
+                                    "Qwen runtime identity could not be verified"):
+            runner.assert_exact_guards([planned])
 
     def test_executor_verifies_current_session_but_not_old_argv(self):
         runner = executor.RestoreExecutor(self.env)
@@ -256,7 +281,8 @@ class QwenSessionTests(unittest.TestCase):
         with patch.object(runner.tmux, "guard_matches", return_value=True):
             runner.assert_exact_guards([{**self.plan, "guard": {}}])
             self.write_registry(sessionId=OLD_SID)
-            with self.assertRaisesRegex(executor.RestoreExecutionError, "selected session changed"):
+            with self.assertRaisesRegex(executor.RestoreExecutionError,
+                                        "Qwen runtime identity could not be verified"):
                 runner.assert_exact_guards([{**self.plan, "guard": {}}])
 
 

@@ -1230,7 +1230,7 @@ class RestoreExecutor:
                 )
             if item["tool"] == "qwen" and not self.qwen_ready(item):
                 raise RestoreExecutionError(
-                    f"Qwen selected session changed for {item['target']}; refresh the restart plan"
+                    f"Qwen runtime identity could not be verified for {item['target']}; refresh the restart plan"
                 )
 
     def execute_restart(
@@ -1273,7 +1273,7 @@ class RestoreExecutor:
             elif planned["tool"] == "dsh" and not self.dsh_ready(planned):
                 error = "dsh selected session changed immediately before respawn; refresh the restart plan"
             elif planned["tool"] == "qwen" and not self.qwen_ready(planned):
-                error = "Qwen selected session changed immediately before respawn; refresh the restart plan"
+                error = "Qwen runtime identity could not be verified immediately before respawn; refresh the restart plan"
             else:
                 error = self.tmux.respawn(target, item["cwd"], shell)
                 if error:
