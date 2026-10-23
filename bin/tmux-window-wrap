@@ -47,9 +47,11 @@ ACTIVITY_LEVEL_SEQUENCE = (
 )
 DEFAULT_ACTIVITY_FPS = 20
 _ACTIVITY_CONTROLLERS = {}
-ANIMATION_TICK_OPTION = "@tmux-window-wrap-animation-tick"
+ANIMATION_TICK_ENVIRONMENT = "TMUX_WINDOW_WRAP_ANIMATION_TICK"
+REFRESH_CLIENTS_COMMAND = "#{L:refresh-client -S -t #{q:client_name};}"
 RENDER_REQUEST_OPTION = "@tmux-window-wrap-render-request"
 RENDERED_REQUEST_OPTION = "@tmux-window-wrap-rendered-request"
+RENDER_KEY_ENVIRONMENT = "TMUX_WINDOW_WRAP_RENDER_KEY"
 COLOR_SCHEME_OPTION = "@tmux-window-wrap-color-scheme"
 DEFAULT_PANE_COUNT_STYLE = "subscript"
 PANE_COUNT_STYLES = ("subscript", "plain", "off")
@@ -308,7 +310,7 @@ def activity_indicator(phase_offsets, animation_tick, palette):
 
 def animated_activity_indicator(
     phase_offsets,
-    animation_option,
+    animation_variable,
     palette,
 ):
     indicators = [
@@ -318,14 +320,14 @@ def animated_activity_indicator(
     if not any(indicators):
         return ""
 
-    option_reference = "#{" + animation_option + "}"
+    variable_reference = "#{" + animation_variable + "}"
 
     def balanced_lookup(start, end):
         if end - start == 1:
             return indicators[start]
         midpoint = (start + end) // 2
         condition = (
-            "#{e|<:" + option_reference + f",{midpoint}" + "}"
+            "#{e|<:" + variable_reference + f",{midpoint}" + "}"
         )
         return (
             "#{?"
@@ -338,7 +340,7 @@ def animated_activity_indicator(
         )
 
     valid_tick = (
-        "#{m/r:^([0-9]|1[0-9]|2[0-3])$," + option_reference + "}"
+        "#{m/r:^([0-9]|1[0-9]|2[0-3])$," + variable_reference + "}"
     )
     return (
         "#{?"
@@ -361,14 +363,14 @@ def color_scheme_reference(option):
 
 def activity_indicator_format(
     phase_offsets,
-    animation_option,
+    animation_variable,
     color_scheme_option,
     light_palette,
     dark_palette,
 ):
     light_indicator = animated_activity_indicator(
         phase_offsets,
-        animation_option,
+        animation_variable,
         light_palette,
     )
     if not light_indicator:
@@ -378,7 +380,7 @@ def activity_indicator_format(
 
     dark_indicator = animated_activity_indicator(
         phase_offsets,
-        animation_option,
+        animation_variable,
         dark_palette,
     )
     scheme_reference = color_scheme_reference(color_scheme_option)
@@ -519,7 +521,7 @@ def render_window(
     activity_phase_offsets,
     activity_palettes,
     color_scheme,
-    animation_option=None,
+    animation_variable=None,
     color_scheme_option=None,
     pane_count_style=DEFAULT_PANE_COUNT_STYLE,
     pane_count_text_style="",
@@ -533,7 +535,7 @@ def render_window(
         appearances = [
             render_window(
                 window, selected_id, animation_tick, activity_phase_offsets,
-                activity_palettes, color_scheme, animation_option,
+                activity_palettes, color_scheme, animation_variable,
                 color_scheme_option, pane_count_style, pane_count_text_style,
                 pane_count_active_text_style,
             )
@@ -548,18 +550,18 @@ def render_window(
     synchronized = window.get("synchronized", False)
     active = window["id"] == active_id
     palette_role = "active" if active else "inactive"
-    if animation_option and color_scheme_option:
+    if animation_variable and color_scheme_option:
         pane_activity = activity_indicator_format(
             activity_phase_offsets,
-            animation_option,
+            animation_variable,
             color_scheme_option,
             activity_palettes["light"][palette_role],
             activity_palettes["dark"][palette_role],
         )
-    elif animation_option:
+    elif animation_variable:
         pane_activity = animated_activity_indicator(
             activity_phase_offsets,
-            animation_option,
+            animation_variable,
             activity_palettes[color_scheme][palette_role],
         )
     else:
@@ -638,7 +640,7 @@ def render(payload, line):
         return ""
 
     animation_tick = payload.get("animation_tick", 0)
-    animation_option = payload.get("animation_option")
+    animation_variable = payload.get("animation_variable", payload.get("animation_option"))
     color_scheme = payload.get("color_scheme", "light")
     color_scheme_option = payload.get("color_scheme_option")
     count_text_style = payload.get("pane_count_text_style", "")
@@ -682,7 +684,7 @@ def render(payload, line):
             activity_phases_by_window[window_id],
             activity_palettes,
             color_scheme,
-            animation_option,
+            animation_variable,
             color_scheme_option,
             pane_count_style,
             count_text_style,
@@ -858,21 +860,9 @@ def narrowest_client_width(session_id, socket_name, fallback):
 
 
 def refresh_clients(socket_name):
-    completed = run_tmux(
-        socket_name,
-        "list-clients",
-        "-F",
-        "#{client_name}",
-    )
-    for client_name in completed.stdout.splitlines():
-        if client_name:
-            run_tmux(
-                socket_name,
-                "refresh-client",
-                "-S",
-                "-t",
-                client_name,
-            )
+    # Expand the current clients inside tmux, without a Python snapshot or
+    # one subprocess per client. -C runs tmux commands, not a shell.
+    run_tmux(socket_name, "run-shell", "-C", REFRESH_CLIENTS_COMMAND)
 
 
 def global_environment_value(socket_name, name):
@@ -1050,12 +1040,18 @@ def animate_status(socket_name, fps, log=None):
             if last_tick is None or frame_now >= next_tick_at:
                 tick = next_animation_tick(last_tick)
                 stage("frame_update")
+                # User option updates request a full client redraw in tmux.
+                # Keep the frame in hidden state and redraw only status rows.
                 run_tmux(
                     socket_name,
-                    "set-option",
-                    "-g",
-                    ANIMATION_TICK_OPTION,
+                    "set-environment",
+                    "-gh",
+                    ANIMATION_TICK_ENVIRONMENT,
                     str(tick),
+                    ";",
+                    "run-shell",
+                    "-C",
+                    REFRESH_CLIENTS_COMMAND,
                 )
                 last_tick = tick
                 # Schedule from the frame actually rendered. If another
@@ -1291,7 +1287,7 @@ def load_tmux_payload(arguments):
                 )
             )
         ),
-        "animation_option": getattr(arguments, "animation_option", None),
+        "animation_variable": getattr(arguments, "animation_variable", None),
         "client_theme": getattr(arguments, "client_theme", False),
         "color_scheme": getattr(arguments, "color_scheme", "light"),
         "color_scheme_option": getattr(
@@ -1428,12 +1424,16 @@ def main():
     render_parser.add_argument("--left-width", type=int)
     render_parser.add_argument("--right-width", type=int)
     render_parser.add_argument("--animation-tick", type=int)
+    render_parser.add_argument("--render-key")
     render_parser.add_argument(
         "--animation-fps",
         type=float,
         default=DEFAULT_ACTIVITY_FPS,
     )
-    render_parser.add_argument("--animation-option")
+    render_parser.add_argument(
+        "--animation-variable", "--animation-option",
+        help="tmux format variable for live frames (hidden environment variable or @option)",
+    )
     render_parser.add_argument(
         "--color-scheme",
         choices=("light", "dark"),
@@ -1606,7 +1606,8 @@ def main():
         # change the height. Rows, height and request number form one update.
         commands.extend((
             [
-                "if-shell", "-F", "-t", arguments.session_id, "#{!=:#{status},off}",
+                "if-shell", "-F", "-t", arguments.session_id,
+                "#{&&:#{!=:#{status},off},#{!=:#{status}," + desired + "}}",
                 shlex.join(["set-option", "-t", arguments.session_id, "status", desired]),
             ],
             [
@@ -1614,6 +1615,11 @@ def main():
                 RENDERED_REQUEST_OPTION, str(arguments.request_id),
             ],
         ))
+        if arguments.render_key is not None:
+            commands.append([
+                "set-environment", "-h", "-t", arguments.session_id,
+                RENDER_KEY_ENVIRONMENT, arguments.render_key,
+            ])
     # One command queue publishes the complete layout before tmux redraws.
     # Stream through stdin because animated rows can exceed the IPC argument
     # limit; quoting also preserves literal window names and format expressions.

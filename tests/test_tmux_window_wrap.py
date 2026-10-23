@@ -496,7 +496,7 @@ class WindowWrapCliTests(unittest.TestCase):
         def run_tmux(_socket, *arguments):
             if arguments[0] == "set-environment":
                 owner["value"] = arguments[-1]
-            if "@tmux-window-wrap-animation-tick" in arguments:
+            if "TMUX_WINDOW_WRAP_ANIMATION_TICK" in arguments:
                 raise subprocess.CalledProcessError(
                     1, ["tmux", *arguments], stderr="server exited"
                 )
@@ -534,8 +534,8 @@ class WindowWrapCliTests(unittest.TestCase):
                 cls.now += max(seconds, 0.01)
 
         def run_tmux(_socket, *arguments):
-            if "@tmux-window-wrap-animation-tick" in arguments:
-                ticks.append(int(arguments[-1]))
+            if "TMUX_WINDOW_WRAP_ANIMATION_TICK" in arguments:
+                ticks.append(int(arguments[arguments.index("TMUX_WINDOW_WRAP_ANIMATION_TICK") + 1]))
 
         script_globals["time"] = FakeTime
         script_globals["run_tmux"] = run_tmux
@@ -2913,10 +2913,8 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         deadline = time.monotonic() + 1.5
         while time.monotonic() < deadline and len(seen_ticks) < 8:
             tick = self.tmux(
-                "show-options",
-                "-g",
-                "-v",
-                "@tmux-window-wrap-animation-tick",
+                "display-message", "-p", "-t", self.session_id,
+                "#{TMUX_WINDOW_WRAP_ANIMATION_TICK}",
             ).stdout.strip()
             seen_ticks.add(tick)
             time.sleep(0.01)
@@ -2981,10 +2979,8 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         deadline = time.monotonic() + 1.5
         while time.monotonic() < deadline and len(seen_ticks) < 8:
             tick = self.tmux(
-                "show-options",
-                "-g",
-                "-v",
-                "@tmux-window-wrap-animation-tick",
+                "display-message", "-p", "-t", self.session_id,
+                "#{TMUX_WINDOW_WRAP_ANIMATION_TICK}",
             ).stdout.strip()
             seen_ticks.add(tick)
             time.sleep(0.01)
@@ -2994,6 +2990,64 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             8,
             f"expected at least eight 20 FPS ticks, saw {seen_ticks!r}",
         )
+
+    def test_animation_redraws_status_without_repainting_panes_on_all_clients(self):
+        marker = "STATIC_PANE_CONTENT_6c2b40"
+        pane = self.tmux(
+            "display-message", "-p", "-t", "wrap:1", "#{pane_id}",
+        ).stdout.strip()
+        self.tmux(
+            "respawn-pane", "-k", "-t", pane,
+            "python3", "-c",
+            f"import time; print({marker!r}, flush=True); time.sleep(120)",
+        )
+        self.set_pane_activity(pane, "busy")
+        self.source_window_wrap_config()
+        clients = [self.attach_client(width=80)[1] for _ in range(2)]
+        self.wait_for_client_count(2)
+        for fd in clients:
+            self.wait_for_status_text(fd, marker, timeout=2)
+            self.wait_for_status_text(fd, "▓", timeout=2)
+        # Consume startup redraws while attachment/layout work settles. Leaving
+        # a PTY unread fills its buffer, which itself makes tmux redraw the pane
+        # after the client catches up (unrelated to the animation).
+        deadline = time.monotonic() + 0.3
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select(clients, [], [], 0.02)
+            for fd in readable:
+                os.read(fd, 65536)
+        output = {fd: bytearray() for fd in clients}
+        deadline = time.monotonic() + 1.2
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select(clients, [], [], 0.02)
+            for fd in readable:
+                output[fd].extend(os.read(fd, 65536))
+        for fd in clients:
+            with self.subTest(client=fd):
+                self.assertGreaterEqual(output[fd].count("▓".encode()), 10)
+                self.assertEqual(
+                    output[fd].count(marker.encode()), 0,
+                    "animation updates repainted the static pane body",
+                )
+
+    def test_config_upgrade_preserves_existing_render_request_order(self):
+        # A running installation can launch the updated script before its old
+        # status-format is reloaded. Its existing request IDs must stay ordered.
+        self.tmux(
+            "set-option", "-t", self.session_id,
+            "@tmux-window-wrap-render-request", "100000",
+        )
+        subprocess.run(
+            [str(SCRIPT), "render", "--store-rows", "--request-id", "100000",
+             "--session-id", self.session_id, "--socket-name", self.socket_name,
+             "--width", "80", "--left-width", "0", "--right-width", "0",
+             "--animation-option", "@tmux-window-wrap-animation-tick"],
+            text=True, capture_output=True, check=True,
+        )
+        self.tmux("rename-window", "-t", "wrap:1", "upgraded-layout")
+        self.source_window_wrap_config(animate=False)
+        _, master_fd = self.attach_client(width=80)
+        self.wait_for_status_text(master_fd, "upgraded-layout", timeout=2)
 
     def wait_for_badge_colour(self, master_fd, colour, timeout=0.5):
         deadline = time.monotonic() + timeout
@@ -3752,7 +3806,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         ).stdout
         self.assertIn("2:手册", rows)
         self.assertNotIn("1:手册", rows)
-        self.assertEqual(self.tmux("show-options", "-v", "-t", "wrap", "status").stdout.strip(), "on")
+        self.assertEqual(self.tmux("show-options", "-Av", "-t", "wrap", "status").stdout.strip(), "on")
 
     def test_reordering_across_status_rows_never_loses_or_duplicates_labels(self):
         names = ("alpha", "beta", "gamma")
@@ -3989,6 +4043,9 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         third_row = self.tmux(
             "show-options", "-g", "-v", "status-format[2]"
         ).stdout.strip()
+        render_job = self.tmux(
+            "show-options", "-g", "-v", "@tmux-window-wrap-render-job"
+        ).stdout.strip()
 
         self.assertEqual(animation_fps, "20")
         self.assertEqual(status_interval, "15")
@@ -4008,7 +4065,10 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             ).stdout.strip()
             self.assertEqual(len(palette.split(",")), 13)
         self.assertIn("#{T;=/#{status-left-length}:status-left}", first_row)
-        self.assertIn("tmux-window-wrap render --store-rows", first_row)
+        self.assertIn("tmux-window-wrap render --store-rows", render_job)
+        self.assertIn("#{E:@tmux-window-wrap-layout-key}", first_row)
+        self.assertIn("#{TMUX_WINDOW_WRAP_RENDER_KEY}", first_row)
+        self.assertIn("#{E:@tmux-window-wrap-render-job}", first_row)
         self.assertIn("#{T;=/#{status-right-length}:status-right}", first_row)
         self.assertEqual(second_row, "#[align=left]#{E:@tmux-window-wrap-row-1}")
         self.assertEqual(third_row, "#[align=left]#{E:@tmux-window-wrap-row-2}")
@@ -4021,7 +4081,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "TMUX_WINDOW_WRAP_CLIENTS=#{L:",
             "#{q:client_name}_#{client_width}",
             "TMUX_WINDOW_WRAP_ACTIVE=#{q:window_id}:#{window_index}",
-            "--animation-option @tmux-window-wrap-animation-tick",
+            "--animation-variable TMUX_WINDOW_WRAP_ANIMATION_TICK",
             "--client-theme",
             "--pane-count-style #{@tmux-window-wrap-pane-count-style}",
             "--light-inactive-palette "
@@ -4034,7 +4094,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "#{@tmux-window-wrap-activity-dark-active}",
         )
         for cache_key in cache_keys:
-            self.assertIn(cache_key, first_row)
+            self.assertIn(cache_key, render_job.replace("##", "#"))
         self.assertNotIn("#[align=right", second_row)
         self.assertNotIn("#[align=right", third_row)
         self.assertIn("#{E:@tmux-window-wrap-row-0}", first_row)

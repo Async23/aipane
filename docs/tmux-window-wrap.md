@@ -12,21 +12,33 @@ highlight two different windows. The active-window cache fingerprint still
 updates the layout when a selected window must be brought into the three-row
 visible area.
 
-The first status row starts one lightweight launcher, which assigns a
-session-local request number and schedules `render --store-rows` through
-`run-shell -b`. tmux cancels a running `#()` job when its expanded command
-changes; keeping Python outside that job lets rendering finish during held
-`Option+Shift+</>` movement. The launcher captures window IDs and indexes for
-each request, so Python startup does not collapse successive moves into the
-same later position. If windows were created or closed meanwhile, the renderer
-uses the complete current list.
+The first status row starts one lightweight launcher only when its layout
+inputs differ from the last committed render. The key includes window order,
+names, activity, client sizes, chrome widths, palettes, and cache generation;
+animation frames do not change it. This guard also prevents `refresh-client -S`
+from restarting the layout job on every frame, since that command forces `#()`
+jobs even when their command text has not changed.
+
+The launcher assigns a session-local request number and schedules
+`render --store-rows` through `run-shell -b`. tmux cancels a running `#()` job when
+its expanded command changes; keeping Python outside that job lets rendering
+finish during held `Option+Shift+</>` movement. The launcher captures the key,
+window IDs, and indexes in its tmux command queue before starting Python, so
+Python startup does not collapse successive moves into the same later position.
+If windows were created or closed meanwhile, the renderer uses the complete
+current list.
 
 Each render builds all rows from one snapshot and publishes them with the
 status height in one tmux command queue. Only a request newer than the last
 published request can commit, so a slow earlier job cannot restore an old
-order or height. Reordering a window across a row boundary keeps the previous
-complete layout visible until its replacement is ready. Independent row jobs
-could briefly omit or duplicate a label by mixing old and new layouts.
+order or height. The captured layout key is published in the same commit, so a
+failed render remains eligible for retry. It uses a hidden session environment
+variable. The existing request counters remain intact across configuration
+reloads; they advance only when the layout needs rendering, not on animation
+frames.
+Reordering a window across a row boundary keeps the previous complete layout
+visible until its replacement is ready. Independent row jobs could briefly omit
+or duplicate a label by mixing old and new layouts.
 
 Both `render --store-rows` and the single-row `render --line N --store-option`
 mode store live selection expressions. Plain `render --line N` output retains
@@ -330,9 +342,14 @@ column each.
 
 Agent Activity depends on each AI Tool's lifecycle hooks or plugin Adapter. The
 indicator width is included in wrapping calculations, and a
-lightweight driver advances a tmux animation option every approximately
+lightweight driver advances the hidden global environment variable
+`TMUX_WINDOW_WRAP_ANIMATION_TICK` every approximately
 `50ms` (`20 FPS`) while any busy agent pane exists. One full loop takes
-`1.2s`. Window layout stays cached, so each frame is expanded by tmux without
+`1.2s`. Each frame updates that variable and issues `refresh-client -S` for all
+attached clients in one tmux command queue. Updating a user option with
+`set-option` requests a full client redraw in tmux 3.7b; hidden environment
+state avoids that redraw and is not exported to child programs.
+Window layout stays cached, so each frame is expanded by tmux without
 rerunning the Python layout renderer. The cached 24-frame colour lookup uses a
 balanced format tree, keeping per-frame expansion depth logarithmic without
 changing the frame sequence. The driver advances exactly one palette level per
@@ -341,6 +358,13 @@ skipping a level, which keeps the breathing transition continuous. Only the
 current light or dark palette is cached;
 a system appearance change updates the cache key and reruns the renderer once.
 The fragment does not lower tmux's global `status-interval`.
+
+`render --animation-variable NAME` selects the tmux format variable used by
+cached rows. The older `--animation-option` spelling and JSON
+`animation_option` field remain accepted for standalone callers using their
+own user options. The public configuration uses the hidden environment
+variable. Reload `conf/tmux-window-wrap.conf` after upgrading to switch both
+the cached rows and animation driver together.
 
 The animator writes JSON Lines to
 `~/.local/state/aipane/tmux-window-wrap-animate.log`, including when launched
