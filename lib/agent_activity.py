@@ -1744,6 +1744,20 @@ class AgentActivity:
         session_id = payload.get("session_id") or payload.get("thread-id")
         turn_id = payload.get("turn_id") or payload.get("turn-id")
 
+        if (existing is not None and "dsh_runtime" in existing
+                and "dsh_runtime" not in payload):
+            # A tool-launched CLI (for example `pi -p`) inherits TMUX_PANE.
+            # Its startup/settled hooks must not replace the live host's
+            # aggregate state or erase the runtime reference used for repair.
+            current = self._resolve(pane)
+            if current.reason == "dsh_runtime":
+                return ActivityReport(
+                    state=current.state,
+                    record=pane.record,
+                    accepted=False,
+                    wake=False,
+                )
+
         if (
             existing is None
             and _is_codex_command(pane.current_command)

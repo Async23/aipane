@@ -63,6 +63,31 @@ class DshRecoveryTests(unittest.TestCase):
         self.assertTrue(self.activity.reconcile().changed)
         self.assertEqual(self.adapter.read("%7").marker, "node")
 
+    def test_nested_cli_reports_cannot_replace_a_live_dsh_owner(self):
+        for state in ("busy", "idle"):
+            with self.subTest(dsh_state=state):
+                self.report(state)
+                original = self.adapter.read("%7").record
+                for nested_state in ("idle", "busy", "idle"):
+                    result = self.activity.report("%7", nested_state)
+                    self.assertFalse(result.accepted)
+                    self.assertEqual(self.adapter.read("%7").record, original)
+                    self.assertEqual(self.activity.inspect("%7").state, state)
+                    self.assertEqual(self.adapter.read("%7").marker,
+                                     "node" if state == "busy" else "")
+                # The native owner still controls the next lifecycle boundary.
+                self.report("idle" if state == "busy" else "busy")
+                self.assertEqual(self.activity.inspect("%7").state,
+                                 "idle" if state == "busy" else "busy")
+
+    def test_a_replacement_cli_can_report_after_the_dsh_process_exits(self):
+        self.report("busy")
+        self.activity.process_matches = lambda process, pane: process.get("pid") == 67890
+        self.activity.process_identity = lambda pane: {"pid": 67890, "started_at": "replacement"}
+        self.assertTrue(self.activity.report("%7", "idle").accepted)
+        self.assertNotIn("dsh_runtime", json.loads(self.adapter.read("%7").record))
+        self.assertEqual(self.activity.inspect("%7").state, "idle")
+
     def test_stale_or_foreign_evidence_is_unknown_and_never_clears_busy(self):
         cases = [
             {"instance": "previous-plugin"}, {"pid": 12}, {"pane_id": "%8"},

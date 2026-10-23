@@ -293,6 +293,12 @@ report; an older instance cannot clear its replacement's state. Outside tmux
 the Adapter does nothing; a failed helper does not interrupt dsh. Check the
 current pane with `aipane-activity inspect --json`.
 
+While an identity-verified, fresh dsh runtime owns the pane, reports without
+that native runtime reference cannot replace its aggregate state. This includes
+startup and completion hooks from a tool-launched CLI such as `pi -p`, which
+inherits `TMUX_PANE`. Once the dsh process exits, a replacement CLI can claim
+the pane normally.
+
 ### Pi extension
 
 Pi can report its lifecycle through the installable

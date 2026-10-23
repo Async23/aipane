@@ -27,6 +27,7 @@ class DshActivityTmuxTests(unittest.TestCase):
             host = home / "host.mjs"
             host.write_text(
                 "import { createInterface } from 'node:readline'\n"
+                "import { spawnSync } from 'node:child_process'\n"
                 f"import {{ apply }} from {json.dumps(adapter_url)}\n"
                 "const handlers = new Map()\n"
                 "const agents = [{ status: 'idle' }, { status: 'idle' }]\n"
@@ -38,6 +39,13 @@ class DshActivityTmuxTests(unittest.TestCase):
                 "})\n"
                 "createInterface({ input: process.stdin }).on('line', async (line) => {\n"
                 "  if (line === 'dispose') { await dispose(); return }\n"
+                "  if (line === 'nested') {\n"
+                "    const script = `const { spawnSync } = require('node:child_process');\n"
+                f"      for (const state of ['idle', 'busy', 'idle']) spawnSync({json.dumps(str(ROOT / 'bin/tmux-window-wrap'))},\n"
+                "        ['activity', state, '--pane', process.env.TMUX_PANE], { stdio: 'ignore' });`;\n"
+                "    spawnSync(process.execPath, ['-e', script], { stdio: 'ignore' });\n"
+                "    console.log('nested-finished'); return;\n"
+                "  }\n"
                 "  const [index, status] = line.split(' ')\n"
                 "  const agent = agents[Number(index)]\n"
                 "  agent.status = status\n"
@@ -95,6 +103,15 @@ class DshActivityTmuxTests(unittest.TestCase):
                 send("0 running")
                 wait_for("busy")
                 self.assertEqual(breathing(), "1")
+                # Like `pi -p` called by DSH, a child Node CLI inherits TMUX_PANE
+                # and sends session_start / agent_start / agent_settled reports.
+                send("nested")
+                deadline = time.monotonic() + 5
+                while "nested-finished" not in run("capture-pane", "-p", "-t", "%0"):
+                    if time.monotonic() >= deadline:
+                        self.fail("nested CLI did not finish")
+                    time.sleep(0.025)
+                self.assertEqual(breathing(), "1", "nested CLI cleared DSH's busy marker")
                 send("1 running")
                 send("0 idle")
                 send("1 idle")
