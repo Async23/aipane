@@ -1,15 +1,22 @@
 #!/usr/bin/env zsh
 # Shared helpers for aipane.
 
-if [[ "${_AIPANE_CORE_VERSION:-}" == "3" ]]; then
+if [[ "${_AIPANE_CORE_VERSION:-}" == "4" ]]; then
   return 0
 fi
+# Migrate the previous built-in default when an existing shell reloads.
+if [[ "${_AIPANE_CORE_VERSION:-}" == "3" &&
+      "${AIPANE_CODEX_LAUNCH_CMD:-}" == "codex --yolo" ]]; then
+  unset AIPANE_CODEX_LAUNCH_CMD
+fi
 typeset -g _AIPANE_CORE_LOADED=1
-typeset -g _AIPANE_CORE_VERSION=3
+typeset -g _AIPANE_CORE_VERSION=4
 
 # User-configurable values (export before sourcing init.zsh to override).
 typeset -g AIPANE_CLAUDE_LAUNCH_CMD="${AIPANE_CLAUDE_LAUNCH_CMD:-claude --dangerously-skip-permissions}"
-typeset -g AIPANE_CODEX_LAUNCH_CMD="${AIPANE_CODEX_LAUNCH_CMD:-codex --yolo}"
+# A CLI config override keeps Codex 0.164's hooks in this pane's process;
+# its implicit shared daemon inherits the daemon launcher's TMUX_PANE.
+typeset -g AIPANE_CODEX_LAUNCH_CMD="${AIPANE_CODEX_LAUNCH_CMD:-codex --yolo -c check_for_update_on_startup=false}"
 typeset -g AIPANE_DSH_LAUNCH_CMD="${AIPANE_DSH_LAUNCH_CMD:-dsh-tui}"
 typeset -g AIPANE_GROK_LAUNCH_CMD="${AIPANE_GROK_LAUNCH_CMD:-grok --always-approve}"
 typeset -g AIPANE_OPENCODE_LAUNCH_CMD="${AIPANE_OPENCODE_LAUNCH_CMD:-opencode}"

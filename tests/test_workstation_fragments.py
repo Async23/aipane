@@ -1066,14 +1066,14 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                     time.sleep(0.02)
                 self.assertEqual(current_window, "1")
             finally:
+                if master_fd is not None:
+                    os.close(master_fd)
                 if child_pid is not None:
                     try:
                         os.kill(child_pid, signal.SIGHUP)
                     except ProcessLookupError:
                         pass
                     os.waitpid(child_pid, 0)
-                if master_fd is not None:
-                    os.close(master_fd)
                 tmux("kill-server", check=False)
 
 

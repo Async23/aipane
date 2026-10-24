@@ -137,7 +137,7 @@ Set overrides before sourcing `init.zsh`:
 
 ```bash
 export AIPANE_CLAUDE_LAUNCH_CMD="claude --dangerously-skip-permissions"
-export AIPANE_CODEX_LAUNCH_CMD="codex --yolo"
+export AIPANE_CODEX_LAUNCH_CMD="codex --yolo -c check_for_update_on_startup=false"
 export AIPANE_DSH_LAUNCH_CMD="dsh-tui"
 export AIPANE_GROK_LAUNCH_CMD="grok --always-approve"
 export AIPANE_OPENCODE_LAUNCH_CMD="opencode"
@@ -148,6 +148,8 @@ export AIPANE_KIMI_LAUNCH_CMD="kimi --auto"
 ```
 
 `ai --help` displays the effective launcher commands after these overrides are loaded.
+Keep the Codex CLI config override when customizing its launcher; see
+[Codex activity reporting](docs/tmux-window-wrap.md#codex-launcher-and-activity).
 
 ## `ai` Launcher
 
@@ -156,7 +158,7 @@ Tool keys and default commands:
 | Key | Tool | Default command |
 |---|---|---|
 | `c` | Claude Code | `claude --dangerously-skip-permissions` |
-| `x` | Codex | `codex --yolo` |
+| `x` | Codex | `codex --yolo -c check_for_update_on_startup=false` |
 | `d` | dsh-TUI | `dsh-tui` |
 | `g` | Grok | `grok --always-approve` |
 | `o` | OpenCode | `opencode` |
@@ -373,6 +375,7 @@ python3 tests/test_ai_restart.py
 python3 tests/test_aipane_doctor.py
 python3 tests/test_agent_activity.py
 python3 tests/test_agent_activity_integrations.py
+python3 tests/test_codex_tmux_launch.py
 python3 tests/test_agent_notification_sounds.py
 python3 tests/test_agent_notifications.py
 python3 tests/test_kimi_notify.py

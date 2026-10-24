@@ -403,12 +403,14 @@ class TmuxWindowJumpTests(unittest.TestCase):
             )
             self.assertEqual(messages.count("Window 19 does not exist"), 1)
         finally:
+            # Close the PTY before waiting: terminal teardown can otherwise
+            # block in macOS while the unread master is still open.
+            os.close(master_fd)
             try:
                 os.kill(child_pid, signal.SIGHUP)
             except ProcessLookupError:
                 pass
             os.waitpid(child_pid, 0)
-            os.close(master_fd)
 
     def test_end_selects_last_window_and_resets_digit_chain(self):
         first = self.run_jump(1)

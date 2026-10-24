@@ -177,6 +177,29 @@ The Claude Adapter ignores desktop entrypoints (`claude-desktop` and
 their lifecycle hooks would change the launching Agent's activity, including
 marking an already-completed Codex turn busy again.
 
+### Codex launcher and activity
+
+The default Codex launcher includes `-c check_for_update_on_startup=false`.
+Besides suppressing the startup update prompt, this explicit CLI config
+override makes Codex 0.164 use its embedded app-server. Each pane then owns
+the process that executes its lifecycle hooks and supplies `TMUX_PANE`.
+Without a CLI config override, Codex may reuse a shared app-server daemon;
+that daemon runs hooks with its own inherited tmux environment. After a tmux
+restart, it can report to a nonexistent old pane and leave new Codex panes
+without activity markers. Even a surviving daemon pane is not the current
+TUI's pane, so restarting the shared daemon alone does not fix the binding.
+
+Keep the override in `AIPANE_CODEX_LAUNCH_CMD` customizations. Setting the same
+value only in Codex's config file does not prevent daemon reuse. Existing
+daemon-backed TUI sessions need to exit after their turns finish and release
+the daemon's session writer before resuming through the corrected launcher;
+reloading tmux cannot move them. A daemon that retains an idle session can
+release it through `thread/archive` followed by `thread/unarchive`, preserving
+the session ID and history. The
+local-only integration test `tests/test_codex_tmux_launch.py` starts a shared
+server with a stale pane, exercises the actual default launcher, and blocks
+the prompt in a hook before any model request.
+
 Codex also reports `busy` from `PreToolUse`. This is a deliberate fallback for
 `/goal`: goal work can start as an internal `thread_goal_updated -> task_started`
 sequence without an ordinary user-message event, so `UserPromptSubmit` does not

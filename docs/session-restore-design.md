@@ -534,7 +534,10 @@ session；启动 argv 不变，但 `session_start(reason=new|resume|fork)` 会�
 4. sealed plan 只执行本次确认的目标。pending store 中其他未完成意图继续保留，但不会
    被这次 restart 顺带启动；执行器不会再次解析 resurrect dump 或扩大目标集。
 5. Codex 恢复专用 Launch Command 强制追加
-   `-c check_for_update_on_startup=false`，不改变日常 Codex 启动配置。验证阶段仍把可见的
+   `-c check_for_update_on_startup=false`。日常默认启动也保留该参数，以使活动钩子在当前
+   pane 的进程内执行，详见
+   [Codex launcher and activity](tmux-window-wrap.md#codex-launcher-and-activity)。
+   验证阶段仍把可见的
    `Update available!` / `Skip until next version` 选择页标为 `blocked`，保留 pending、
    不绑定 session，并返回非零，作为配置失效或未来行为变化时的第二道防线。
 

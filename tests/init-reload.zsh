@@ -108,4 +108,39 @@ if (( ${#received[@]} != 2 )) ||
 fi
 ZSH
 
+AIPANE_TEST_ROOT="$ROOT_DIR" zsh -df <<'ZSH'
+set -eu
+typeset -g _AIPANE_INIT_VERSION=5
+typeset -g _AIPANE_CORE_VERSION=3
+typeset -g AIPANE_CODEX_LAUNCH_CMD="codex --yolo"
+unset TMUX_PANE
+typeset -ga received=()
+codex() { received=("$@"); }
+
+source "$AIPANE_TEST_ROOT/init.zsh"
+ai x resume "session with spaces"
+if [[ "${(j:|:)received}" != \
+      '--yolo|-c|check_for_update_on_startup=false|resume|session with spaces' ]]; then
+  print -u2 "reload did not migrate the Codex default with intact resume arguments"
+  exit 1
+fi
+ZSH
+
+AIPANE_TEST_ROOT="$ROOT_DIR" zsh -df <<'ZSH'
+set -eu
+typeset -g _AIPANE_INIT_VERSION=5
+typeset -g _AIPANE_CORE_VERSION=3
+typeset -g AIPANE_CODEX_LAUNCH_CMD="custom-codex --custom"
+unset TMUX_PANE
+typeset -ga received=()
+custom-codex() { received=("$@"); }
+
+source "$AIPANE_TEST_ROOT/init.zsh"
+ai x "two words"
+if [[ "${(j:|:)received}" != '--custom|two words' ]]; then
+  print -u2 "reload changed the user-owned Codex launcher"
+  exit 1
+fi
+ZSH
+
 print "init reload tests passed"
