@@ -18,12 +18,7 @@ LIB_DIR = Path(__file__).resolve().parents[1] / "lib"
 if str(LIB_DIR) not in sys.path:
     sys.path.insert(0, str(LIB_DIR))
 
-from agent_activity import (
-    ACTIVITY_MARKER_OPTION,
-    ActivityError,
-    AgentActivity,
-    TmuxActivityAdapter,
-)
+from agent_activity_contract import ACTIVITY_MARKER_OPTION, ActivityError
 from tmux_animation_log import AnimationLog, DEFAULT_LOG
 
 
@@ -842,23 +837,6 @@ def pane_agent_status(socket_name, pane_id):
     return "agent" if any(map(command_runs_ai_tool, commands)) else "none"
 
 
-def narrowest_client_width(session_id, socket_name, fallback):
-    completed = run_tmux(
-        socket_name,
-        "list-clients",
-        "-t",
-        session_id,
-        "-F",
-        "#{client_width}",
-    )
-    widths = [
-        int(value)
-        for value in completed.stdout.splitlines()
-        if value.isdecimal() and int(value) > 0
-    ]
-    return min(widths) if widths else fallback
-
-
 def refresh_clients(socket_name):
     # Expand the current clients inside tmux, without a Python snapshot or
     # one subprocess per client. -C runs tmux commands, not a shell.
@@ -891,6 +869,8 @@ def tmux_has_sessions(socket_name):
 
 def activity_controller(socket_name, environment=None):
     """Return the long-lived protocol owner for one animator process."""
+
+    from agent_activity import AgentActivity, TmuxActivityAdapter
 
     if environment is not None:
         adapter = TmuxActivityAdapter(
@@ -1209,6 +1189,8 @@ def reconcile_status_heights(socket_name):
 
 
 def load_tmux_payload(arguments):
+    # Read the windows and their attached client widths in one tmux command
+    # queue. A window record starts with @ID, so width records are unambiguous.
     completed = run_tmux(
         arguments.socket_name,
         "list-windows",
@@ -1216,10 +1198,19 @@ def load_tmux_payload(arguments):
         arguments.session_id,
         "-F",
         WINDOW_FORMAT,
+        ";",
+        "list-clients", "-t", arguments.session_id,
+        "-F", "client-width=#{client_width}",
     )
     windows = []
+    client_widths = []
     active_id = None
     for record in completed.stdout.removesuffix("\n").split("\n"):
+        if record.startswith("client-width="):
+            value = record.removeprefix("client-width=")
+            if value.isdecimal() and int(value) > 0:
+                client_widths.append(int(value))
+            continue
         (
             window_id,
             index,
@@ -1268,11 +1259,7 @@ def load_tmux_payload(arguments):
                 window["index"] = index
 
     return {
-        "width": narrowest_client_width(
-            arguments.session_id,
-            arguments.socket_name,
-            arguments.width,
-        ),
+        "width": min(client_widths) if client_widths else arguments.width,
         "left_width": arguments.left_width,
         "right_width": arguments.right_width,
         "animation_tick": (

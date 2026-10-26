@@ -28,6 +28,14 @@ Python startup does not collapse successive moves into the same later position.
 If windows were created or closed meanwhile, the renderer uses the complete
 current list.
 
+The renderer imports the shared activity projection names without loading the
+activity evidence detectors. Window records and attached client widths are
+read in one tmux command queue; detached sessions still use the supplied width,
+and attached sessions use their narrowest client. Both launcher shells use
+`exec` to avoid retaining an extra shell process. These changes reduce the
+per-movement startup cost without introducing a resident renderer or changing
+the layout and request-ordering rules.
+
 Each render builds all rows from one snapshot and publishes them with the
 status height in one tmux command queue. Only a request newer than the last
 published request can commit, so a slow earlier job cannot restore an old

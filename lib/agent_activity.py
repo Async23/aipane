@@ -26,6 +26,15 @@ from typing import Callable, Iterable, Mapping, Protocol
 
 import fcntl
 
+from agent_activity_contract import (
+    ACTIVITY_FIELD_SEPARATOR,
+    ACTIVITY_MARKER_OPTION,
+    ACTIVITY_OPTIONS,
+    ACTIVITY_RECORD_OPTION,
+    ACTIVITY_REPORTER_OPTION,
+    ACTIVITY_UPDATED_AT_OPTION,
+    ActivityError,
+)
 from dsh_activity import read_runtime as read_dsh_activity_runtime
 
 
@@ -49,21 +58,6 @@ TERMINAL_CODEX_STATUSES = frozenset({"completed", "failed", "interrupted"})
 TERMINAL_KIMI_REASONS = frozenset(
     {"completed", "cancelled", "failed", "blocked"}
 )
-ACTIVITY_MARKER_OPTION = "@tmux-window-wrap-activity"
-ACTIVITY_REPORTER_OPTION = "@tmux-window-wrap-activity-reporter"
-ACTIVITY_UPDATED_AT_OPTION = "@tmux-window-wrap-activity-updated-at"
-ACTIVITY_RECORD_OPTION = "@tmux-window-wrap-activity-record"
-ACTIVITY_OPTIONS = (
-    ACTIVITY_MARKER_OPTION,
-    ACTIVITY_REPORTER_OPTION,
-    ACTIVITY_UPDATED_AT_OPTION,
-    ACTIVITY_RECORD_OPTION,
-)
-ACTIVITY_FIELD_SEPARATOR = "\x1f"
-
-
-class ActivityError(RuntimeError):
-    """Base error for the Agent Activity interface."""
 
 
 class ActivityReadError(ActivityError):

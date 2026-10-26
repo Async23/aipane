@@ -8,8 +8,10 @@ import runpy
 import select
 import signal
 import sqlite3
+import statistics
 import struct
 import subprocess
+import sys
 import termios
 import tempfile
 import threading
@@ -93,6 +95,11 @@ TEST_ACTIVITY_PALETTES = {
 
 
 class WindowWrapCliTests(unittest.TestCase):
+    def patch_activity_factory(self, factory):
+        patcher = mock.patch("agent_activity.AgentActivity", factory)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     @staticmethod
     def maximum_tmux_format_depth(value):
         depth = 0
@@ -126,6 +133,31 @@ class WindowWrapCliTests(unittest.TestCase):
 
     def run_render(self, payload, line):
         return self.run_cli(["render", "--line", str(line)], payload).rstrip("\n")
+
+    def test_render_does_not_load_activity_evidence_detectors(self):
+        # Exercise a fresh CLI process: cached imports in the test runner hide
+        # the startup cost paid on every window movement.
+        program = (
+            "import builtins, runpy, sys\n"
+            "original_import = builtins.__import__\n"
+            "def import_without_detectors(name, *args, **kwargs):\n"
+            "    if name in {'agent_activity', 'sqlite3', 'dsh_activity'}:\n"
+            "        raise AssertionError('render loaded evidence detector: ' + name)\n"
+            "    return original_import(name, *args, **kwargs)\n"
+            "builtins.__import__ = import_without_detectors\n"
+            "sys.argv = [sys.argv[1], 'render', '--line', '0']\n"
+            "runpy.run_path(sys.argv[0], run_name='__main__')\n"
+        )
+        payload = {
+            "width": 80, "left_width": 0, "right_width": 0, "active": "@1",
+            "windows": [{"id": "@1", "index": "1", "name": "手册", "label": " 1:手册 "}],
+        }
+        completed = subprocess.run(
+            [sys.executable, "-c", program, str(SCRIPT)],
+            input=json.dumps(payload), text=True, capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("1:手册", completed.stdout)
 
     def test_activity_without_tmux_pane_is_a_silent_noop(self):
         environment = os.environ.copy()
@@ -283,7 +315,7 @@ class WindowWrapCliTests(unittest.TestCase):
         namespace = runpy.run_path(str(SCRIPT))
         update_pane_activity = namespace["update_pane_activity"]
         script_globals = update_pane_activity.__globals__
-        activity_class = namespace.get("AgentActivity")
+        from agent_activity import AgentActivity as activity_class
         events = []
 
         def fake_run_tmux(_socket_name, *arguments):
@@ -321,14 +353,14 @@ class WindowWrapCliTests(unittest.TestCase):
         script_globals["invalidate_cache"] = lambda socket: events.append(
             ("invalidate-cache", socket)
         )
-        script_globals["AgentActivity"] = lambda **kwargs: activity_class(
+        self.patch_activity_factory(lambda **kwargs: activity_class(
             adapter=kwargs.get("adapter"),
             environment={"CODEX_HOME": "/tmp/codex"},
             process_identity=lambda _pane: {
                 "pid": 6322,
                 "started_at": "Fri Aug 14 19:00:41 2026",
             },
-        )
+        ))
 
         update_pane_activity(
             "test-socket",
@@ -761,12 +793,12 @@ class WindowWrapCliTests(unittest.TestCase):
                 )
 
             script_globals["run_tmux"] = fake_run_tmux
-            activity_class = namespace["AgentActivity"]
-            script_globals["AgentActivity"] = lambda **kwargs: activity_class(
+            from agent_activity import AgentActivity as activity_class
+            self.patch_activity_factory(lambda **kwargs: activity_class(
                 adapter=kwargs.get("adapter"),
                 process_exists=lambda _pid: True,
                 process_tty=lambda _pid: "ttys007",
-            )
+            ))
             script_globals["invalidate_cache"] = lambda socket: events.append(
                 ("invalidate-cache", socket)
             )
@@ -913,12 +945,12 @@ class WindowWrapCliTests(unittest.TestCase):
                 )
 
             script_globals["run_tmux"] = fake_run_tmux
-            activity_class = namespace["AgentActivity"]
-            script_globals["AgentActivity"] = lambda **kwargs: activity_class(
+            from agent_activity import AgentActivity as activity_class
+            self.patch_activity_factory(lambda **kwargs: activity_class(
                 adapter=kwargs.get("adapter"),
                 process_exists=lambda _pid: True,
                 process_tty=lambda _pid: "ttys023",
-            )
+            ))
             script_globals["invalidate_cache"] = lambda socket: events.append(
                 ("invalidate-cache", socket)
             )
@@ -945,7 +977,7 @@ class WindowWrapCliTests(unittest.TestCase):
         namespace = runpy.run_path(str(SCRIPT))
         animation_probe = namespace["animation_probe"]
         script_globals = animation_probe.__globals__
-        activity_class = namespace["AgentActivity"]
+        from agent_activity import AgentActivity as activity_class
         separator = namespace["WINDOW_SEPARATOR"]
         events = []
 
@@ -1084,10 +1116,10 @@ class WindowWrapCliTests(unittest.TestCase):
                 )
 
             script_globals["run_tmux"] = fake_run_tmux
-            script_globals["AgentActivity"] = lambda **kwargs: activity_class(
+            self.patch_activity_factory(lambda **kwargs: activity_class(
                 adapter=kwargs.get("adapter"),
                 process_matches=lambda _process, _pane: True,
-            )
+            ))
             script_globals["invalidate_cache"] = lambda socket: events.append(
                 ("invalidate-cache", socket)
             )
@@ -1111,7 +1143,7 @@ class WindowWrapCliTests(unittest.TestCase):
         namespace = runpy.run_path(str(SCRIPT))
         animation_probe = namespace["animation_probe"]
         script_globals = animation_probe.__globals__
-        activity_class = namespace["AgentActivity"]
+        from agent_activity import AgentActivity as activity_class
         separator = namespace["WINDOW_SEPARATOR"]
         events = []
 
@@ -1246,10 +1278,10 @@ class WindowWrapCliTests(unittest.TestCase):
                 )
 
             script_globals["run_tmux"] = fake_run_tmux
-            script_globals["AgentActivity"] = lambda **kwargs: activity_class(
+            self.patch_activity_factory(lambda **kwargs: activity_class(
                 adapter=kwargs.get("adapter"),
                 process_matches=lambda _process, _pane: True,
-            )
+            ))
             script_globals["invalidate_cache"] = lambda socket: events.append(
                 ("invalidate-cache", socket)
             )
@@ -1277,7 +1309,7 @@ class WindowWrapCliTests(unittest.TestCase):
         namespace = runpy.run_path(str(SCRIPT))
         animation_probe = namespace["animation_probe"]
         script_globals = animation_probe.__globals__
-        activity_class = namespace["AgentActivity"]
+        from agent_activity import AgentActivity as activity_class
         separator = namespace["WINDOW_SEPARATOR"]
         events = []
 
@@ -1412,10 +1444,10 @@ class WindowWrapCliTests(unittest.TestCase):
                 )
 
             script_globals["run_tmux"] = fake_run_tmux
-            script_globals["AgentActivity"] = lambda **kwargs: activity_class(
+            self.patch_activity_factory(lambda **kwargs: activity_class(
                 adapter=kwargs.get("adapter"),
                 process_matches=lambda _process, _pane: True,
-            )
+            ))
             script_globals["invalidate_cache"] = lambda socket: events.append(
                 ("invalidate-cache", socket)
             )
@@ -2500,6 +2532,32 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
                 return time.monotonic()
             time.sleep(0.02)
         self.fail(f"status did not become {expected}")
+
+    def test_runtime_snapshot_batches_window_and_client_queries(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        load_payload = namespace["load_tmux_payload"]
+        arguments = namespace["argparse"].Namespace(
+            session_id=self.session_id, socket_name=self.socket_name,
+            width=144, left_width=4, right_width=0,
+        )
+        # A label resembling the width record must remain a window name.
+        self.tmux("rename-window", "-t", "wrap:2", "client-width=1")
+        for widths, expected in (((), 144), ((80, 37), 37)):
+            with self.subTest(widths=widths):
+                for width in widths:
+                    self.attach_client(width)
+                if widths:
+                    self.wait_for_client_count(len(widths))
+                runner = mock.Mock(wraps=namespace["run_tmux"])
+                with mock.patch.dict(load_payload.__globals__, {"run_tmux": runner}):
+                    payload = load_payload(arguments)
+                self.assertEqual(payload["width"], expected)
+                self.assertEqual(len(payload["windows"]), 3)
+                self.assertEqual(payload["windows"][-1]["name"], "client-width=1")
+                self.assertEqual(
+                    runner.call_count, 1,
+                    "a render snapshot spawned multiple tmux processes",
+                )
 
     def test_runtime_switches_between_one_two_and_three_status_lines(self):
         three_line_first = self.render_runtime(line=0, width=12)
@@ -3656,44 +3714,31 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
                 time.sleep(0.01)
 
     def test_alt_shift_arrows_refresh_reordered_window_without_cached_delay(self):
+        # Match a busy workstation's window count and terminal width. Measure
+        # multiple isolated presses so scheduler noise cannot decide the test.
+        for index in range(3, 22):
+            self.tmux("new-window", "-d", "-t", "wrap", "-n", f"window{index:02}", "sleep 120")
         self.source_window_wrap_config()
-        _, master_fd = self.attach_client(width=80, height=24)
+        self.tmux("set-option", "-s", "escape-time", "0")
+        _, master_fd = self.attach_client(width=158, height=41)
         self.wait_for_client_count(1)
         self.wait_for_active_label(master_fd, "1:手册", timeout=3)
-        self.drain_client_output(master_fd)
-
-        started = time.monotonic()
-        os.write(master_fd, b"\x1b>")
-        deadline = time.monotonic() + 0.5
-        while time.monotonic() < deadline:
-            active_index = self.tmux(
-                "display-message", "-p", "-t", "wrap", "#{window_index}"
-            ).stdout.strip()
-            if active_index == "2":
-                break
-            time.sleep(0.01)
-        else:
-            self.fail("M-> did not move the active window to index 2")
-
-        rendered = self.wait_for_active_label(master_fd, "2:手册", timeout=0.5)
-        self.assertLess(rendered - started, 0.5)
-
-        self.drain_client_output(master_fd)
-        started = time.monotonic()
-        os.write(master_fd, b"\x1b<")
-        deadline = time.monotonic() + 0.5
-        while time.monotonic() < deadline:
-            active_index = self.tmux(
-                "display-message", "-p", "-t", "wrap", "#{window_index}"
-            ).stdout.strip()
-            if active_index == "1":
-                break
-            time.sleep(0.01)
-        else:
-            self.fail("M-< did not move the active window back to index 1")
-
-        rendered = self.wait_for_active_label(master_fd, "1:手册", timeout=0.5)
-        self.assertLess(rendered - started, 0.5)
+        timings = []
+        for key, target in ((b"\x1b>", "2"), (b"\x1b<", "1")) * 5:
+            time.sleep(0.12)
+            self.drain_client_output(master_fd)
+            started = time.monotonic()
+            os.write(master_fd, key)
+            rendered = self.wait_for_active_label(master_fd, f"{target}:手册", timeout=0.5)
+            timings.append(rendered - started)
+            self.assertEqual(
+                self.tmux("display-message", "-p", "-t", "wrap", "#{window_index}").stdout.strip(),
+                target,
+            )
+        self.assertLess(
+            statistics.median(timings), 0.12,
+            f"window movement latency in ms: {[round(value * 1000, 1) for value in timings]}",
+        )
 
     def test_held_move_key_renders_each_position_across_status_rows(self):
         for index in range(3, 17):
