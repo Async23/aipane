@@ -19,7 +19,7 @@ also send complete prefix+key chords.
 | `Cmd+Shift+I` | rename session |
 | `Cmd+Shift+Enter` | zoom pane |
 | `Cmd+1…9` | select exact index; repeat within 700ms to add 10 |
-| `Cmd+0` | select 0; repeat within 700ms → 10 → 20… |
+| `Cmd+0` | select 0 if present, otherwise 10; repeat within 700ms to add 10 |
 | `Cmd+Opt+I` | broadcast on/off (window) |
 | `Cmd+Opt+Shift+I` | this pane join/leave broadcast |
 | `Shift+Enter` | newline for AI CLIs (→ Ctrl+J) |
@@ -43,19 +43,20 @@ also send complete prefix+key chords.
 | Key | Action |
 |-----|--------|
 | `prefix 1-9` | select exact index; repeat within 700ms to add 10 |
-| `prefix 0` / `Cmd+0` | select 0; repeat within 700ms → 10 → 20… |
+| `prefix 0` / `Cmd+0` | select 0 if present, otherwise 10; repeat within 700ms to add 10 |
 | `prefix p` / `n` | prev / next window |
 | `prefix ,` / `Cmd+I` | centered popup rename current window |
 | `Option+,` / `Option+.` (`M-</>`) | reorder window left / right |
 | `prefix w` | window list (tmux default) |
 
-Window numbering starts at 0. The `Cmd` bindings use the main number row.
+Window numbering starts at 1. The `Cmd` bindings use the main number row.
 Repeated presses are handled by `tmux-window-jump` with a sliding 700ms timeout:
 
 ```text
 Cmd+1 → 1 → 11 → 21
 Cmd+9 → 9 → 19 → 29
-Cmd+0 → 0 → 10 → 20
+Cmd+0 → 10 → 20 → 30   (window 0 absent)
+Cmd+0 → 0 → 10 → 20    (window 0 present)
 ```
 
 Each repeated digit must still include `Cmd` (or the tmux prefix). A different
@@ -63,6 +64,11 @@ digit starts a new chain. Ordinary terminal input does not reset the chain,
 but switching to another window does. A missing target leaves the current
 window selected, reports the failure once, and waits for 700ms of silence
 before restarting.
+
+Window `0` is checked only when starting a new chain. Creating or removing it
+during a chain does not change the next target: repeats add 10 to the last
+selected index. Without the helper, `Cmd+0` still selects `0` if present,
+otherwise `10`, but does not advance on repeats.
 
 ## Sessions
 

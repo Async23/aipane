@@ -152,6 +152,7 @@ class TmuxWindowJumpTests(unittest.TestCase):
         self.assertEqual(self.current_window(), 11)
 
     def test_zero_presses_start_at_zero_and_advance_by_ten(self):
+        self.tmux("set-option", "-g", "base-index", "1")
         self.add_windows_through(20)
         self.tmux("select-window", "-t", f"{self.session}:5")
 
@@ -160,6 +161,66 @@ class TmuxWindowJumpTests(unittest.TestCase):
                 result = self.run_jump(0)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.current_window(), expected_index)
+
+    def test_zero_without_window_zero_starts_at_ten(self):
+        self.add_windows_through(30)
+        self.tmux("set-option", "-g", "base-index", "1")
+        self.tmux("kill-window", "-t", f"{self.session}:0")
+        self.tmux("select-window", "-t", f"{self.session}:5")
+
+        for expected_index in (10, 20, 30):
+            with self.subTest(expected_index=expected_index):
+                result = self.run_jump(0)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.current_window(), expected_index)
+
+    def test_zero_appearing_during_a_chain_does_not_repeat_a_target(self):
+        self.add_windows_through(20)
+        self.tmux("set-option", "-g", "base-index", "1")
+        self.tmux("kill-window", "-t", f"{self.session}:0")
+
+        first = self.run_jump(0)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(self.current_window(), 10)
+        self.tmux(
+            "new-window", "-d", "-t", f"{self.session}:0", "sleep 30"
+        )
+        second = self.run_jump(0)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.current_window(), 20)
+
+        self.run_end()
+        restarted = self.run_jump(0)
+        self.assertEqual(restarted.returncode, 0, restarted.stderr)
+        self.assertEqual(self.current_window(), 0)
+
+    def test_zero_disappearing_during_a_chain_does_not_skip_a_target(self):
+        self.add_windows_through(20)
+        self.tmux("set-option", "-g", "base-index", "1")
+
+        for expected_index in (0, 10):
+            result = self.run_jump(0)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.current_window(), expected_index)
+        self.tmux("kill-window", "-t", f"{self.session}:0")
+        result = self.run_jump(0)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.current_window(), 20)
+
+    def test_zero_without_window_ten_does_not_skip_to_twenty(self):
+        self.add_windows_through(20)
+        self.tmux("set-option", "-g", "renumber-windows", "off")
+        self.tmux("kill-window", "-t", f"{self.session}:0")
+        self.tmux("kill-window", "-t", f"{self.session}:10")
+        self.tmux("select-window", "-t", f"{self.session}:5")
+
+        first = self.run_jump(0)
+        repeated = self.run_jump(0)
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertEqual(self.current_window(), 5)
 
     def test_zero_missing_target_stays_put_and_blocks_until_silence(self):
         self.tmux(

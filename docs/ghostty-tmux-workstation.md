@@ -124,17 +124,21 @@ set -g @aipane-agent-status-command '/absolute/path/to/tmux-window-wrap'
 
 ### Repeated-digit window jump
 
-The workstation sets window `base-index` to `0`. `Cmd+0…9` on the main number
-row and direct `prefix 0…9` select the exact tmux window index on the first
-press. Repeating the same shortcut within 700ms adds ten each time:
-`0 → 10 → 20`, `1 → 11 → 21`, and `9 → 19 → 29`. The timeout slides after
-every accepted press. A different digit or an external window change starts
-a new chain.
+The workstation sets window `base-index` to `1`. `Cmd+1…9` on the main number
+row and direct `prefix 1…9` select the exact tmux window index on the first
+press. `Cmd+0` / `prefix 0` selects window `0` if it exists in the current
+session, otherwise window `10`. Repeating the same shortcut within 700ms adds
+ten to the last selected index: normally `10 → 20 → 30`, or `0 → 10 → 20`
+when window `0` exists; the other digits follow `1 → 11 → 21` and `9 → 19 → 29`.
+The presence of window `0` is checked only at the start of a chain, so creating
+or removing it during repeats does not repeat or skip a target. The timeout
+slides after every accepted press. A different digit or an external window
+change starts a new chain.
 
 If a target does not exist, tmux stays on the last valid window, displays one
 message, and ignores repeats of that digit until 700ms of silence. If
-`tmux-window-jump` is not installed, every digit falls back to one-shot `:=N`,
-including `0` → `:=0`.
+`tmux-window-jump` is not installed, digits `1…9` fall back to one-shot `:=N`;
+`0` selects `:=0` if it exists, otherwise `:=10`, without repeat handling.
 
 Override the timeout before sourcing `tmux-workstation.conf`:
 

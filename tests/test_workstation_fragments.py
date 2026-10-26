@@ -731,7 +731,7 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
         self.assertIn("display-menu", text)
         self.assertIn("-x C -y C", text)
         self.assertNotIn('confirm-before -p "Close last pane', text)
-        self.assertEqual(text.count("#{q:session_id}"), 20)
+        self.assertNotIn("#{session_id}", text)
         self.assertTrue(WINDOW_JUMP_BIN.is_file())
         self.assertTrue(os.access(WINDOW_JUMP_BIN, os.X_OK))
         self.assertTrue(RENAME_BIN.is_file())
@@ -792,7 +792,17 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             ).stdout.strip()
-            self.assertEqual(base_index, "0")
+            self.assertEqual(base_index, "1")
+            first_window = subprocess.run(
+                [
+                    "tmux", "-L", socket, "new-session", "-d", "-P",
+                    "-F", "#{window_index}", "-s", "from-one", "sleep 5",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(first_window, "1")
             jump_timeout = subprocess.run(
                 [
                     "tmux",
@@ -982,7 +992,7 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                     "sleep 30",
                 )
                 tmux("source-file", str(TMUX_WS))
-                for index in (1, 2):
+                for index in range(1, 21):
                     tmux(
                         "new-window",
                         "-d",
@@ -1023,10 +1033,30 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 self.assertTrue(client_pid)
                 self.assertTrue(client_target)
 
-                for digit, helper_installed in ((0, True), (1, True), (0, False)):
-                    with self.subTest(digit=digit, helper=helper_installed):
-                        if not helper_installed:
-                            (helper_dir / "tmux-window-jump").unlink()
+                zero_present = True
+                cases = (
+                    (0, True, True, 0),
+                    (1, True, True, 1),
+                    (0, False, True, 0),
+                    (1, False, True, 1),
+                    (0, False, False, 10),
+                    (1, False, False, 1),
+                    (0, True, False, 10),
+                    (0, True, False, 20),
+                )
+                for digit, helper_installed, has_zero, target in cases:
+                    with self.subTest(
+                        digit=digit, helper=helper_installed, zero=has_zero,
+                        target=target,
+                    ):
+                        helper = helper_dir / "tmux-window-jump"
+                        if helper_installed and not helper.exists():
+                            helper.symlink_to(WINDOW_JUMP_BIN)
+                        elif not helper_installed and helper.exists():
+                            helper.unlink()
+                        if zero_present and not has_zero:
+                            tmux("kill-window", "-t", "jump-binding:0")
+                            zero_present = False
                         # Replay the bytes Ghostty sends for Cmd + digit.
                         os.write(master_fd, b"\x00" + str(digit).encode())
                         current_window = ""
@@ -1044,10 +1074,10 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                                 "jump-binding",
                                 "#{window_index}",
                             ).stdout.strip()
-                            if current_window == str(digit):
+                            if current_window == str(target):
                                 break
                             time.sleep(0.02)
-                        self.assertEqual(current_window, str(digit))
+                        self.assertEqual(current_window, str(target))
             finally:
                 if master_fd is not None:
                     os.close(master_fd)

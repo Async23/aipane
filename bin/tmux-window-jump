@@ -61,6 +61,16 @@ save_state() {
 
 state=$(tmux show-option -gqv "$state_option")
 current_index=$(tmux display-message -p -t "$session_id" '#{window_index}')
+window_indexes=$(tmux list-windows -t "$session_id" -F '#{window_index}')
+
+window_exists() {
+  for window_index in $window_indexes; do
+    if [ "$window_index" = "$1" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
 
 last_digit=
 press_count=0
@@ -78,22 +88,17 @@ if [ "$last_digit" = "$digit" ] && [ "$current_index" = "$last_target" ]; then
     exit 0
   fi
   press_count=$((press_count + 1))
+  target=$((last_target + 10))
 else
   press_count=1
+  target=$digit
+  # Zero is exceptional in a one-based session; otherwise start at ten.
+  if [ "$digit" = 0 ] && ! window_exists 0; then
+    target=10
+  fi
 fi
 
-# Every digit starts at its own index: 0→10→20… / 9→19→29…
-target=$((digit + (press_count - 1) * 10))
-target_exists=false
-window_indexes=$(tmux list-windows -t "$session_id" -F '#{window_index}')
-for window_index in $window_indexes; do
-  if [ "$window_index" = "$target" ]; then
-    target_exists=true
-    break
-  fi
-done
-
-if [ "$target_exists" = false ]; then
+if ! window_exists "$target"; then
   save_state "$digit" "$press_count" "$current_index" blocked
   tmux display-message -c "$client_key" \
     "Window ${target} does not exist" 2>/dev/null ||
