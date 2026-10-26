@@ -786,6 +786,13 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 text=True,
             ).stdout.strip()
             self.assertEqual(prefix, "C-Space")
+            base_index = subprocess.run(
+                ["tmux", "-L", socket, "show-options", "-gqv", "base-index"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(base_index, "0")
             jump_timeout = subprocess.run(
                 [
                     "tmux",
@@ -816,7 +823,7 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 ),
             )
             self.assertRegex(keys, re.compile(r"prefix\s+Q\s+.*display-popup"))
-            for digit in range(1, 10):
+            for digit in range(10):
                 self.assertRegex(
                     keys,
                     re.compile(
@@ -825,14 +832,6 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                         rf".*select-window.*:={digit}"
                     ),
                 )
-            self.assertRegex(
-                keys,
-                re.compile(
-                    r"prefix\s+0\s+.*run-shell"
-                    r".*tmux-window-jump.*select 0"
-                    r".*select-window.*:=10"
-                ),
-            )
             self.assertRegex(
                 keys,
                 re.compile(
@@ -983,20 +982,14 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                     "sleep 30",
                 )
                 tmux("source-file", str(TMUX_WS))
-                tmux(
-                    "move-window",
-                    "-s",
-                    "jump-binding:0",
-                    "-t",
-                    "jump-binding:1",
-                )
-                tmux(
-                    "new-window",
-                    "-d",
-                    "-t",
-                    "jump-binding:2",
-                    "sleep 30",
-                )
+                for index in (1, 2):
+                    tmux(
+                        "new-window",
+                        "-d",
+                        "-t",
+                        f"jump-binding:{index}",
+                        "sleep 30",
+                    )
                 tmux("select-window", "-t", "jump-binding:2")
 
                 child_pid, master_fd = pty.fork()
@@ -1013,6 +1006,7 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                         ],
                         tmux_environment,
                     )
+                os.set_blocking(master_fd, False)
 
                 client_line = ""
                 for _ in range(50):
@@ -1029,42 +1023,31 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 self.assertTrue(client_pid)
                 self.assertTrue(client_target)
 
-                tmux(
-                    "switch-client",
-                    "-c",
-                    client_target,
-                    "-T",
-                    "prefix",
-                )
-                key_table = tmux(
-                    "display-message",
-                    "-p",
-                    "-c",
-                    client_target,
-                    "#{client_key_table}",
-                ).stdout.strip()
-                self.assertEqual(key_table, "prefix")
-                tmux(
-                    "send-keys",
-                    "-K",
-                    "-c",
-                    client_target,
-                    "1",
-                )
-
-                current_window = ""
-                for _ in range(50):
-                    current_window = tmux(
-                        "display-message",
-                        "-p",
-                        "-t",
-                        "jump-binding",
-                        "#{window_index}",
-                    ).stdout.strip()
-                    if current_window == "1":
-                        break
-                    time.sleep(0.02)
-                self.assertEqual(current_window, "1")
+                for digit, helper_installed in ((0, True), (1, True), (0, False)):
+                    with self.subTest(digit=digit, helper=helper_installed):
+                        if not helper_installed:
+                            (helper_dir / "tmux-window-jump").unlink()
+                        # Replay the bytes Ghostty sends for Cmd + digit.
+                        os.write(master_fd, b"\x00" + str(digit).encode())
+                        current_window = ""
+                        for _ in range(50):
+                            while True:
+                                try:
+                                    if not os.read(master_fd, 65536):
+                                        break
+                                except BlockingIOError:
+                                    break
+                            current_window = tmux(
+                                "display-message",
+                                "-p",
+                                "-t",
+                                "jump-binding",
+                                "#{window_index}",
+                            ).stdout.strip()
+                            if current_window == str(digit):
+                                break
+                            time.sleep(0.02)
+                        self.assertEqual(current_window, str(digit))
             finally:
                 if master_fd is not None:
                     os.close(master_fd)
@@ -1390,6 +1373,7 @@ class DocsPointerTests(unittest.TestCase):
         for text in (readme, readme_cn, workstation, cheatsheet):
             self.assertIn("tmux-window-jump", text)
         self.assertIn("@tmux-window-jump-timeout-ms", workstation)
+        self.assertIn("0 → 10 → 20", cheatsheet)
         self.assertIn("1 → 11 → 21", cheatsheet)
         self.assertIn("9 → 19 → 29", cheatsheet)
 

@@ -20,17 +20,19 @@ class TmuxWindowJumpTests(unittest.TestCase):
         self.socket = f"window-jump-{os.getpid()}-{id(self)}"
         self.session = "jump"
         self.tmux(
+            "-f",
+            "/dev/null",
             "new-session",
             "-d",
             "-s",
             self.session,
             "-n",
-            "one",
+            "zero",
             "sleep 30",
         )
-        self.tmux("set-option", "-g", "base-index", "1")
+        self.tmux("set-option", "-g", "base-index", "0")
         self.tmux("set-option", "-g", "renumber-windows", "on")
-        for index in range(2, 12):
+        for index in range(1, 12):
             self.tmux(
                 "new-window",
                 "-d",
@@ -120,7 +122,7 @@ class TmuxWindowJumpTests(unittest.TestCase):
                 "list-windows", "-t", self.session, "-F", "#{window_index}"
             ).splitlines()
         }
-        for index in range(1, last_index + 1):
+        for index in range(last_index + 1):
             if index in existing:
                 continue
             self.tmux(
@@ -149,35 +151,46 @@ class TmuxWindowJumpTests(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(self.current_window(), 11)
 
-    def test_zero_presses_select_decades(self):
+    def test_zero_presses_start_at_zero_and_advance_by_ten(self):
         self.add_windows_through(20)
+        self.tmux("select-window", "-t", f"{self.session}:5")
 
-        first = self.run_jump(0)
-        second = self.run_jump(0)
-
-        self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(self.current_window(), 20)
+        for expected_index in (0, 10, 20):
+            with self.subTest(expected_index=expected_index):
+                result = self.run_jump(0)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.current_window(), expected_index)
 
     def test_zero_missing_target_stays_put_and_blocks_until_silence(self):
         self.tmux(
-            "set-option", "-g", "@tmux-window-jump-timeout-ms", "80"
+            "set-option", "-g", "@tmux-window-jump-timeout-ms", "2000"
         )
 
-        # setUp has windows 1-11, so 10 exists but 20 does not yet.
+        # setUp has windows 0-11, so 0 and 10 exist but 20 does not yet.
         first = self.run_jump(0)
+        second = self.run_jump(0)
         missing = self.run_jump(0)
+        self.assertEqual(self.current_window(), 10)
         self.add_windows_through(20)
+        self.tmux(
+            "set-option", "-g", "@tmux-window-jump-timeout-ms", "80"
+        )
         blocked = self.run_jump(0)
+        self.assertEqual(self.current_window(), 10)
         time.sleep(0.15)
         restarted = self.run_jump(0)
+        self.assertEqual(self.current_window(), 0)
         advanced = self.run_jump(0)
+        self.assertEqual(self.current_window(), 10)
+        advanced_again = self.run_jump(0)
 
         self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(missing.returncode, 0, missing.stderr)
         self.assertEqual(blocked.returncode, 0, blocked.stderr)
         self.assertEqual(restarted.returncode, 0, restarted.stderr)
         self.assertEqual(advanced.returncode, 0, advanced.stderr)
+        self.assertEqual(advanced_again.returncode, 0, advanced_again.stderr)
         self.assertEqual(self.current_window(), 20)
 
     def test_press_after_timeout_starts_again_at_base_index(self):
@@ -285,10 +298,10 @@ class TmuxWindowJumpTests(unittest.TestCase):
             "-s",
             other_session,
             "-n",
-            "one",
+            "zero",
             "sleep 30",
         )
-        for index in range(2, 12):
+        for index in range(1, 12):
             self.tmux(
                 "new-window",
                 "-d",

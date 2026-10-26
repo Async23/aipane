@@ -82,13 +82,8 @@ else
   press_count=1
 fi
 
-# 1-9: 1→11→21… / 9→19→29…
-# 0:   10→20→30… (no window 0 with base-index 1)
-if [ "$digit" = "0" ]; then
-  target=$((press_count * 10))
-else
-  target=$((digit + (press_count - 1) * 10))
-fi
+# Every digit starts at its own index: 0→10→20… / 9→19→29…
+target=$((digit + (press_count - 1) * 10))
 target_exists=false
 window_indexes=$(tmux list-windows -t "$session_id" -F '#{window_index}')
 for window_index in $window_indexes; do
