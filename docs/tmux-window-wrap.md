@@ -28,6 +28,14 @@ Python startup does not collapse successive moves into the same later position.
 If windows were created or closed meanwhile, the renderer uses the complete
 current list.
 
+The render shell stages its arguments with `set --`. A final nested tmux
+format expansion checks the deadline again before emitting the `exec`. If tmux
+hits its format-expansion deadline, the shell exits after staging the partial
+arguments. The renderer does not start, the cached rows remain visible, and
+the uncommitted layout key allows the next redraw to retry. This adds no
+processes or tmux queries and keeps the captured window order and request
+number intact.
+
 The renderer imports the shared activity projection names without loading the
 activity evidence detectors. Window records and attached client widths are
 read in one tmux command queue; detached sessions still use the supplied width,

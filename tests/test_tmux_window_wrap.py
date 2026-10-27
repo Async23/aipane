@@ -3107,6 +3107,87 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         _, master_fd = self.attach_client(width=80)
         self.wait_for_status_text(master_fd, "upgraded-layout", timeout=2)
 
+    def test_format_timeout_keeps_previous_rows_without_opening_error_view(self):
+        # Capture the actual run-shell argument after the status launcher has
+        # expanded its formats and the outer shell has removed its quoting.
+        # Replaying that argument also tests both shell-quoting layers.
+        captured_path = Path(self.log_directory.name) / "render-command.json"
+        launcher = Path(self.log_directory.name) / "capture-launcher"
+        launcher.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            f"Path({str(captured_path)!r}).write_text(json.dumps(sys.argv[-1]))\n"
+            "os.execvp('tmux', ['tmux', *sys.argv[1:]])\n"
+        )
+        launcher.chmod(0o755)
+        self.source_window_wrap_config(animate=False)
+        render_job = self.tmux(
+            "show-options", "-gqv", "@tmux-window-wrap-render-job",
+        ).stdout.strip()
+        self.tmux(
+            "set-option", "-g", "@tmux-window-wrap-render-job",
+            render_job.replace("exec tmux ", f"exec {launcher} ", 1),
+        )
+        _, master_fd = self.attach_client(width=100)
+        self.wait_for_active_label(master_fd, "1:手册", timeout=3)
+        command = json.loads(captured_path.read_text())
+        # Stop automatic redraw jobs so each replay has an exact before/after.
+        self.tmux("set-option", "-t", self.session_id, "status", "off")
+        pane = self.tmux(
+            "display-message", "-p", "-t", "wrap:1", "#{pane_id}",
+        ).stdout.strip()
+
+        def state():
+            return self.tmux(
+                "display-message", "-p", "-t", pane,
+                "#{pane_in_mode}|#{@tmux-window-wrap-rendered-request}|"
+                "#{TMUX_WINDOW_WRAP_RENDER_KEY}|#{@tmux-window-wrap-row-0}|"
+                "#{@tmux-window-wrap-row-1}|#{@tmux-window-wrap-row-2}",
+            ).stdout
+
+        # This always expands to empty text, but exceeds tmux 3.7b's 100 ms
+        # budget even without verbose logging. It changes no renderer input.
+        burn = "#{@unused}" * 1000000
+        subprocess.run(
+            ["tmux", "-L", self.socket_name, "source-file", "-"],
+            input="set -g @test-format-work '" + burn + "'\n",
+            text=True, capture_output=True, check=True,
+        )
+        work = "#{E:@test-format-work}"
+        timed_out = [
+            command.replace("--request-id ", work + "--request-id ", 1),
+            command.replace("--pane-count-style ", work + "--pane-count-style ", 1),
+            # A timeout inside the last value can return an empty/partial value
+            # while the caller still appends a literal suffix. Execution must
+            # itself require a final successful format expansion.
+            command.replace("#{@tmux-window-wrap-activity-dark-active}", work, 1),
+        ]
+        for request, partial in enumerate(timed_out, start=1000):
+            with self.subTest(request=request):
+                self.tmux(
+                    "set-option", "-t", self.session_id,
+                    "@tmux-window-wrap-render-request", str(request),
+                )
+                before = state()
+                completed = self.tmux(
+                    "run-shell", "-t", pane, partial, check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(
+                    state(), before,
+                    "incomplete render changed rows or opened an error view",
+                )
+
+        # The next complete request still renders normally and advances the
+        # committed number; a skipped request did not poison the render cache.
+        self.tmux("run-shell", "-t", pane, command)
+        committed = self.tmux(
+            "display-message", "-p", "-t", pane,
+            "#{pane_in_mode}|#{@tmux-window-wrap-rendered-request}",
+        ).stdout.strip()
+        self.assertEqual(committed, "0|1002")
+
     def wait_for_badge_colour(self, master_fd, colour, timeout=0.5):
         deadline = time.monotonic() + timeout
         output = b""
