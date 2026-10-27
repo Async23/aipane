@@ -30,6 +30,7 @@ __all__ = (
 
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 _CURSOR_TRANSCRIPT_TAIL_BYTES = 8 * 1024 * 1024
+_CLAUDE_TRANSCRIPT_TAIL_BYTES = 8 * 1024 * 1024
 _GROK_TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024
 COMPLETION_SOUNDS = ("Glass", "Ping", "Pop", "Purr", "Submarine", "Tink")
 _CODEX_TITLE_SPINNER_FRAMES = frozenset(
@@ -923,31 +924,22 @@ class AgentNotifications:
             return None
 
         cwd = str(payload.get("cwd") or self.environment.get("PWD") or "")
-        title = self.environment.get("CLAUDE_NOTIFY_TITLE", "Claude Code")
-        if cwd:
+        thread_title, prompt = _claude_transcript_content(payload)
+        title = thread_title or self.environment.get("CLAUDE_NOTIFY_TITLE", "Claude Code")
+        if not thread_title and cwd:
             title = _project_title(cwd, title)
+        title = _short_display_text(_first_plain_line(title), 48)
+        coordinate = _tmux_coordinate(self.environment)
+        if coordinate:
+            title = f"{coordinate} · {title}"
+        if event.lower() != "stop":
+            title = f"{title} · {label}"
 
-        subtitle = ""
+        subtitle = _notification_subtitle(_first_plain_line(prompt)) or label
+        body = _short_text(
+            _first_plain_line(message) or _first_plain_line(fallback), 140, "..."
+        )
         session_id = _compact(payload.get("session_id"))
-        if session_id:
-            safe_session_id = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)
-            home = Path(
-                self.environment.get("HOME", str(Path.home()))
-            ).expanduser()
-            state_path = home / ".claude" / "hooks" / "state" / f"{safe_session_id}.json"
-            try:
-                state = json.loads(state_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                state = {}
-            if isinstance(state, dict):
-                subtitle = _short_text(
-                    _first_compact_line(state.get("prompt")),
-                    80,
-                    "...",
-                )
-
-        subtitle = f"{label} · {subtitle}" if subtitle else label
-        body = _short_text(_first_compact_line(message) or str(fallback), 140, "...")
         if session_id:
             # Other panes must not replace this session's notification.
             group += "-" + hashlib.sha256(session_id.encode()).hexdigest()[:16]
@@ -1819,6 +1811,58 @@ def _reverse_jsonl(path: Path, byte_limit: int):
             continue
         if isinstance(item, dict):
             yield item
+
+
+def _claude_transcript_content(payload: Mapping[str, object]) -> tuple[str, str]:
+    value = payload.get("transcript_path")
+    if not isinstance(value, str) or not value.strip():
+        return "", ""
+    session_id = _compact(payload.get("session_id"))
+    prompt_id = _compact(payload.get("prompt_id"))
+    custom_title = ""
+    generated_title = ""
+    prompt = ""
+    found_prompt = False
+    for item in _reverse_jsonl(Path(value).expanduser(), _CLAUDE_TRANSCRIPT_TAIL_BYTES):
+        item_session = _compact(_pick(item, "sessionId", "session_id"))
+        if session_id and item_session and item_session != session_id:
+            continue
+        if item.get("isSidechain"):
+            continue
+        kind = item.get("type")
+        if kind == "custom-title" and not custom_title:
+            custom_title = _compact(item.get("customTitle"))
+        elif kind == "ai-title" and not generated_title:
+            generated_title = _compact(item.get("aiTitle"))
+        elif kind == "user" and not found_prompt:
+            if item.get("isMeta") or item.get("isCompactSummary"):
+                continue
+            item_prompt = _compact(item.get("promptId"))
+            if prompt_id and item_prompt and item_prompt != prompt_id:
+                continue
+            message = item.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, str):
+                prompt = content
+            elif isinstance(content, list):
+                # Claude also stores tool results as user messages. Only text
+                # and images at the top level represent the user's request.
+                blocks = [block for block in content if isinstance(block, dict)]
+                if any(block.get("type") == "tool_result" for block in blocks):
+                    continue
+                prompt = "\n".join(
+                    str(block["text"]) for block in blocks
+                    if block.get("type") == "text" and isinstance(block.get("text"), str)
+                )
+                if not prompt.strip() and any(block.get("type") == "image" for block in blocks):
+                    prompt = "图片请求"
+            else:
+                continue
+            # An empty current request must not fall back to an older turn.
+            found_prompt = True
+        if custom_title and found_prompt:
+            break
+    return custom_title or generated_title, _clean_user_prompt(prompt)
 
 
 def _grok_transcript_messages(

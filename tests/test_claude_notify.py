@@ -46,6 +46,118 @@ class ClaudeNotificationTests(unittest.TestCase):
             **fields,
         }
 
+    def transcript(self, *records):
+        path = self.home / "session-one.jsonl"
+        path.write_text("".join(json.dumps({
+            "sessionId": "session-one", **record,
+        }, ensure_ascii=False) + "\n" for record in records))
+        return str(path)
+
+    def test_completion_reads_current_prompt_and_title_without_legacy_cache(self):
+        transcript = self.transcript(
+            {"type": "ai-title", "aiTitle": "北海道旅行"},
+            {"type": "user", "promptId": "prompt-old",
+             "message": {"content": "旧问题"}},
+            {"type": "user", "promptId": "prompt-one",
+             "message": {"content": [
+                 {"type": "text", "text": "**这是什么会话？**"},
+             ]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "content": "这是工具输出，不是问题"},
+            ]}},
+            {"type": "user", "isSidechain": True,
+             "message": {"content": "子代理的问题"}},
+            {"type": "user", "isMeta": True,
+             "message": {"content": "系统注入的指令"}},
+            {"type": "user", "isCompactSummary": True,
+             "message": {"content": "压缩后的上下文"}},
+            {"type": "user", "sessionId": "another-session",
+             "message": {"content": "其他会话的问题"}},
+            {"type": "user", "promptId": "next-prompt",
+             "message": {"content": "下一轮问题"}},
+        )
+        result = self.notifications.handle("claude", self.payload(
+            "Stop", transcript_path=transcript,
+            last_assistant_message="## 这是 **北海道旅行** 会话。\n更多内容。",
+        ), preview=True)
+        self.assertEqual(result.notification.title, "北海道旅行")
+        self.assertEqual(result.notification.subtitle, "这是什么会话？")
+        self.assertEqual(result.notification.body, "这是 北海道旅行 会话。")
+        self.assertEqual(self.delivery.deliveries, [])
+        self.assertFalse((self.home / ".claude").exists())
+
+    def test_custom_title_takes_precedence_over_generated_titles(self):
+        transcript = self.transcript(
+            {"type": "custom-title", "customTitle": "我的旅行计划"},
+            {"type": "ai-title", "aiTitle": "自动生成的标题"},
+            {"type": "user", "message": {"content": "安排路线"}},
+        )
+        result = self.notifications.handle("claude", self.payload(
+            "Stop", transcript_path=transcript,
+        ), preview=True)
+        self.assertEqual(result.notification.title, "我的旅行计划")
+        self.assertEqual(result.notification.subtitle, "安排路线")
+
+    def test_transcript_prompt_replaces_stale_record_prompt_cache(self):
+        state = self.home / ".claude/hooks/state/session-one.json"
+        state.parent.mkdir(parents=True)
+        state.write_text(json.dumps({"prompt": "过期的问题"}))
+        transcript = self.transcript(
+            {"type": "user", "message": {"content": "最新的问题"}},
+        )
+        result = self.notifications.handle("claude", self.payload(
+            "Stop", transcript_path=transcript,
+        ), preview=True)
+        self.assertEqual(result.notification.subtitle, "最新的问题")
+
+    def test_noncompletion_events_keep_status_visible_with_prompt_subtitles(self):
+        transcript = self.transcript(
+            {"type": "ai-title", "aiTitle": "发布应用"},
+            {"type": "user", "message": {"content": "部署到测试环境"}},
+        )
+        cases = [
+            ("StopFailure", {"error_details": "连接失败"}, "任务失败", "连接失败"),
+            ("PermissionRequest", {"tool_name": "Bash"}, "需要批准",
+             "Claude Code 请求执行 Bash"),
+            ("PreToolUse", {"tool_name": "AskUserQuestion", "tool_input": {
+                "questions": [{"question": "选择 **哪个环境**？"}],
+            }}, "等待回答", "选择 哪个环境？"),
+            ("Notification", {"notification_type": "agent_needs_input",
+                              "message": "请填写版本号"}, "等待输入", "请填写版本号"),
+        ]
+        for event, fields, label, body in cases:
+            with self.subTest(event=event):
+                result = self.notifications.handle("claude", self.payload(
+                    event, transcript_path=transcript, **fields,
+                ), preview=True)
+                self.assertEqual(result.notification.title, f"发布应用 · {label}")
+                self.assertEqual(result.notification.subtitle, "部署到测试环境")
+                self.assertEqual(result.notification.body, body)
+
+    def test_image_only_prompt_does_not_reuse_previous_text_prompt(self):
+        transcript = self.transcript(
+            {"type": "user", "message": {"content": "之前的问题"}},
+            {"type": "user", "message": {"content": [{"type": "image"}]}},
+        )
+        result = self.notifications.handle("claude", self.payload(
+            "Stop", transcript_path=transcript,
+        ), preview=True)
+        self.assertEqual(result.notification.subtitle, "图片请求")
+
+    def test_missing_or_partial_transcript_still_has_useful_content(self):
+        for transcript in (
+            str(self.home / "missing.jsonl"),
+            self.transcript({"type": "assistant", "message": {"content": []}}),
+        ):
+            with self.subTest(transcript=transcript):
+                result = self.notifications.handle("claude", self.payload(
+                    "Stop", cwd=str(self.home / "demo"), transcript_path=transcript,
+                    last_assistant_message="已更新 [配置](https://example.com) 和 `脚本`。",
+                ), preview=True)
+                self.assertEqual(result.notification.title, "demo")
+                self.assertEqual(result.notification.subtitle, "任务完成")
+                self.assertEqual(result.notification.body, "已更新 配置 和 脚本。")
+
     def test_completion_failure_approval_and_questions_have_distinct_content(self):
         cases = [
             (self.payload("Stop", last_assistant_message="已修复。\n测试通过。"),
@@ -153,11 +265,22 @@ class ClaudeNotificationTests(unittest.TestCase):
         focus.write_text("#!/bin/sh\nexit 0\n")
         focus.chmod(0o755)
         tmux = self.home / "fake-tmux"
-        tmux.write_text("#!/bin/sh\nprintf 'work\\t@2\\t%%3\\t1\\n'\n")
+        tmux.write_text(
+            "#!/bin/sh\ncase \"$5\" in\n"
+            "  *session_id*) printf '$0\\t2\\t1\\n' ;;\n"
+            "  *) printf 'work\\t@2\\t%%3\\t2\\n' ;;\nesac\n"
+        )
         tmux.chmod(0o755)
+        transcript = self.transcript(
+            {"type": "ai-title", "aiTitle": "北海道旅行"},
+            {"type": "user", "message": {"content": "这是什么会话？"}},
+        )
         result = subprocess.run(
             [str(ROOT / "bin/aipane-claude-notify")],
-            input=json.dumps(self.payload("Stop", last_assistant_message="完成")),
+            input=json.dumps(self.payload(
+                "Stop", transcript_path=transcript,
+                last_assistant_message="简单说，这是 **北海道旅行** 会话。",
+            )),
             text=True, capture_output=True, timeout=10,
             env={**self.environment, "CLAUDE_NOTIFY_DRY_RUN": "1",
                  "TMUX_PANE": "%3", "AIPANE_TMUX": str(tmux)},
@@ -165,7 +288,10 @@ class ClaudeNotificationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         preview = json.loads(result.stdout)
         self.assertEqual(preview["outcome"], "previewed")
-        self.assertEqual(shlex.split(preview["action"]), [str(focus), "work", "@2", "%3", "1"])
+        self.assertEqual(preview["title"], "0:2:1 · 北海道旅行")
+        self.assertEqual(preview["subtitle"], "这是什么会话？")
+        self.assertEqual(preview["body"], "简单说，这是 北海道旅行 会话。")
+        self.assertEqual(shlex.split(preview["action"]), [str(focus), "work", "@2", "%3", "2"])
         self.assertFalse((focus.parent / "notify.jsonl").exists())
 
     def test_configured_hooks_have_one_canonical_trigger_per_alert(self):

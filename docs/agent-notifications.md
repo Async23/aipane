@@ -72,11 +72,24 @@ disable `Notification` hooks. See the [Claude hooks reference](https://code.clau
 Notifications run asynchronously, including when the terminal is focused.
 They retain `Claude Code Notifier.app` and the existing focus script at
 `~/.claude/hooks/focus-tmux.sh`; clicking targets the original session/window/pane
-and activates Ghostty. The title identifies the project, the subtitle identifies
-the event, and each session has separate notification groups. Imported Cursor/Grok
-hooks, Claude Desktop sessions, and events identified as subagents are ignored.
+and activates Ghostty. Each session has separate notification groups. Imported
+Cursor/Grok hooks, Claude Desktop sessions, and events identified as subagents
+are ignored.
 The existing sender uses `NSUserNotificationCenter`; this integration does not
 migrate its Bundle ID or API generation.
+
+Claude notifications use `<session>:<window>:<pane> · <session title>` as the
+title, the current user prompt as the subtitle, and the first plain-text line of
+the response as the body. Failure, approval, and input notifications append their
+status to the title. Title and prompt text use the same display-width limits as
+Codex; common Markdown headings, links, emphasis, and code markers are removed.
+
+The hook's `transcript_path` supplies the session title and current user prompt.
+Explicitly renamed sessions take precedence over generated `ai-title` records.
+The reader scans at most the last 8 MiB, filters by session and available prompt
+IDs, and skips tool results, subagent messages, and injected context. It does not
+depend on the old `record-prompt.sh` cache. Missing transcript content falls back
+to the project name and event label; outside tmux, the coordinate is omitted.
 
 The old `~/.claude/hooks/notify-complete.sh` and `notify-waiting-input.sh` paths can
 both symlink to `bin/aipane-claude-notify` for compatibility. Register only the
