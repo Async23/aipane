@@ -19,20 +19,22 @@ from agent_notifications import (  # noqa: E402
 )
 
 
-def read_payload() -> dict[str, object]:
+def read_payload() -> dict[str, object] | None:
     raw = "" if sys.stdin.isatty() else sys.stdin.read().strip()
     if not raw:
         return {}
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
-        return {}
-    return payload if isinstance(payload, dict) else {}
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def main() -> int:
     environment = os.environ.copy()
     payload = read_payload()
+    if payload is None:
+        return 0
     payload["_fallback_message"] = (
         sys.argv[1]
         if len(sys.argv) > 1
@@ -47,15 +49,19 @@ def main() -> int:
         adapter=MacOSNotificationAdapter(environment=environment),
         environment=environment,
     )
-    result = notifications.handle("claude", payload, preview=preview)
-    if preview and result.notification is not None:
+    try:
+        result = notifications.handle("claude", payload, preview=preview)
+    except Exception as error:
+        # Notification errors cannot reject a tool request or stop the agent.
         print(
-            json.dumps(
-                {"sound": result.notification.sound},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+            json.dumps({"event": "notify_error", "error": type(error).__name__}),
+            file=sys.stderr,
         )
+        return 0
+    if preview:
+        output = result.notification.as_dict() if result.notification else {}
+        output.update(outcome=result.outcome, reason=result.reason)
+        print(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
     return 0
 
 

@@ -44,6 +44,56 @@ The adapters expect the corresponding dedicated notifier apps and focus scripts
 to remain in each agent's configured home paths. Install them through symlinks so
 the tracked adapter remains the single source of truth.
 
+## Claude Code
+
+Merge [`integrations/claude/hooks.json`](../integrations/claude/hooks.json) into
+`~/.claude/settings.json`, preserving unrelated settings and hooks. The fragment
+includes both Agent Activity and desktop notifications. Install its notification
+entrypoint alongside `aipane-claude-activity`:
+
+```bash
+ln -s /path/to/aipane/bin/aipane-claude-notify ~/.local/bin/aipane-claude-notify
+```
+
+| No. | Trigger | Notification |
+| ---: | --- | --- |
+| 1 | `Stop` | Turn completed; first line of the final response |
+| 2 | `StopFailure` | API failure; available error details |
+| 3 | `PermissionRequest`, except `AskUserQuestion` | Tool approval requested |
+| 4 | `PreToolUse` for `AskUserQuestion` | First question, before the tool waits |
+| 5 | `Notification`: `elicitation_dialog`, `elicitation_url_dialog`, `agent_needs_input` | MCP input or teammate input requested |
+
+Each event has one notification trigger. Delayed `permission_prompt` and
+`idle_prompt` notifications are omitted because approval and completion already
+have direct hooks. Set `preferredNotifChannel` to `notifications_disabled` in the
+local Claude settings to use only these custom notifications; this does not
+disable `Notification` hooks. See the [Claude hooks reference](https://code.claude.com/docs/en/hooks#notification).
+
+Notifications run asynchronously, including when the terminal is focused.
+They retain `Claude Code Notifier.app` and the existing focus script at
+`~/.claude/hooks/focus-tmux.sh`; clicking targets the original session/window/pane
+and activates Ghostty. The title identifies the project, the subtitle identifies
+the event, and each session has separate notification groups. Imported Cursor/Grok
+hooks, Claude Desktop sessions, and events identified as subagents are ignored.
+The existing sender uses `NSUserNotificationCenter`; this integration does not
+migrate its Bundle ID or API generation.
+
+The old `~/.claude/hooks/notify-complete.sh` and `notify-waiting-input.sh` paths can
+both symlink to `bin/aipane-claude-notify` for compatibility. Register only the
+canonical `~/.local/bin/aipane-claude-notify` command in settings.
+
+`~/.claude/hooks/notify.jsonl` records event/session identifiers and the delivery
+channel, without conversation text. A `custom-app` result records successful
+sender execution; actual macOS delivery still requires `usernoted` or notification
+database evidence. `CLAUDE_NOTIFY_DRY_RUN=1` prints the normalized notification,
+including its focus action, without sending or writing logs:
+
+```bash
+printf '%s\n' '{"hook_event_name":"Stop","session_id":"preview","last_assistant_message":"Preview only"}' |
+  CLAUDE_NOTIFY_DRY_RUN=1 ~/.local/bin/aipane-claude-notify
+python3 tests/test_claude_notify.py
+```
+
 Codex TUI's temporary task-title and catch-up recap requests inherit the legacy
 `notify` program. They can finish after the visible task has ended, each with a
 new thread/turn ID. The module suppresses these internal completions by matching
@@ -61,6 +111,7 @@ Run the Interface and compatibility contracts with:
 
 ```bash
 python3 tests/test_agent_notifications.py
+python3 tests/test_claude_notify.py
 python3 tests/test_agent_notification_sounds.py
 python3 tests/test_kimi_notify.py
 ```

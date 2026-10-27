@@ -144,7 +144,9 @@ class AgentActivityIntegrationTests(unittest.TestCase):
             "SessionEnd",
         ):
             self.assert_nested_event(hooks, event, CLAUDE_ACTIVITY_COMMAND)
-        self.assertNotIn("PermissionRequest", hooks)
+        self.assertNotIn(
+            CLAUDE_ACTIVITY_COMMAND, nested_commands(hooks.get("PermissionRequest", []))
+        )
 
     def test_claude_activity_adapter_tracks_teammate_lifecycle(self):
         with tempfile.TemporaryDirectory() as raw_tmp:

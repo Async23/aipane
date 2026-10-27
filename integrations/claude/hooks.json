@@ -31,6 +31,17 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "^AskUserQuestion$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/aipane-claude-notify",
+            "timeout": 20,
+            "async": true
+          }
+        ]
       }
     ],
     "Stop": [
@@ -40,6 +51,12 @@
             "type": "command",
             "command": "$HOME/.local/bin/aipane-claude-activity",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/aipane-claude-notify",
+            "timeout": 20,
+            "async": true
           }
         ]
       }
@@ -51,6 +68,38 @@
             "type": "command",
             "command": "$HOME/.local/bin/aipane-claude-activity",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/aipane-claude-notify",
+            "timeout": 20,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "^(?!AskUserQuestion$).*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/aipane-claude-notify",
+            "timeout": 20,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "^(elicitation_dialog|elicitation_url_dialog|agent_needs_input)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/aipane-claude-notify",
+            "timeout": 20,
+            "async": true
           }
         ]
       }

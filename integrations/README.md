@@ -16,6 +16,10 @@ become observable at `PreToolUse`. `TeammateIdle` clears their pane when the
 delegated turn finishes. An in-turn `SessionStart(source=compact)` preserves
 the existing marker.
 
+The Claude Code fragment also registers desktop notification hooks. Install
+the notification entrypoint as described in
+[Agent Notifications](../docs/agent-notifications.md#claude-code).
+
 If a hard Claude failure returns to the prompt without delivering its terminal
 hook, the Agent Activity module reconciles the marker with Claude Code's live
 session registry. The registry target, process, version, status, and status

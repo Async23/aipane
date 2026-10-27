@@ -299,7 +299,7 @@ class AgentNotificationsTests(unittest.TestCase):
             result.notification.as_dict(),
             {
                 "title": "cursor-project",
-                "subtitle": "",
+                "subtitle": "任务完成",
                 "body": "Implemented Claude notifications.",
                 "sound": "Tink",
                 "event": "stop",
@@ -371,6 +371,8 @@ class AgentNotificationsTests(unittest.TestCase):
             [
                 "-title",
                 "cursor-project",
+                "-subtitle",
+                "任务完成",
                 "-message",
                 "Claude finished.",
                 "-group",

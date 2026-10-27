@@ -480,7 +480,15 @@ class AgentNotifications:
                     outcome="ignored",
                     reason="compatibility_hook",
                 )
+            if self.environment.get("CLAUDE_CODE_ENTRYPOINT", "").startswith(
+                "claude-desktop"
+            ):
+                return NotificationResult(outcome="ignored", reason="desktop_session")
+            if normalized.get("agent_id"):
+                return NotificationResult(outcome="ignored", reason="subagent")
             notification = self._claude_notification(normalized)
+            if notification is None:
+                return NotificationResult(outcome="ignored", reason="unsupported_event")
         elif agent == "grok":
             event = _compact(
                 _pick(
@@ -579,6 +587,8 @@ class AgentNotifications:
         channel = self.adapter.deliver(agent, notification)
         if agent == "cursor":
             self._write_cursor_log(normalized, notification, channel)
+        elif agent == "claude":
+            self._write_claude_log(normalized, notification, channel)
         elif agent == "kimi":
             self._write_kimi_log(notification, channel)
         elif agent == "dsh":
@@ -838,7 +848,80 @@ class AgentNotifications:
         except OSError:
             pass
 
-    def _claude_notification(self, payload: dict[str, object]) -> Notification:
+    def _write_claude_log(
+        self,
+        payload: Mapping[str, object],
+        notification: Notification,
+        channel: str,
+    ) -> None:
+        home = Path(self.environment.get("HOME", str(Path.home()))).expanduser()
+        path = home / ".claude" / "hooks" / "notify.jsonl"
+        record = {
+            "ts": time.time(),
+            "event": notification.event,
+            "notification_type": payload.get("notification_type"),
+            "session_id": payload.get("session_id"),
+            "prompt_id": payload.get("prompt_id"),
+            "group": notification.group,
+            "channel": channel,
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+    def _claude_notification(
+        self, payload: dict[str, object]
+    ) -> Notification | None:
+        event = str(payload.get("hook_event_name") or "stop")
+        tool_name = payload.get("tool_name")
+        group = "claude-code-waiting-input"
+        if event.lower() == "stop":
+            label = "任务完成"
+            group = "claude-code-task-complete"
+            message = payload.get("last_assistant_message")
+            fallback = (
+                payload.get("_fallback_message")
+                or self.environment.get("CLAUDE_NOTIFY_MESSAGE")
+                or "任务已完成"
+            )
+        elif event == "StopFailure":
+            label = "任务失败"
+            group = "claude-code-task-failed"
+            message = (
+                payload.get("error_details")
+                or payload.get("last_assistant_message")
+                or payload.get("error")
+            )
+            fallback = "Claude Code 遇到错误，请返回会话查看"
+        elif event == "PermissionRequest" and tool_name != "AskUserQuestion":
+            label = "需要批准"
+            message = f"Claude Code 请求执行 {tool_name}" if tool_name else ""
+            fallback = "Claude Code 正在等待你的批准"
+        elif event == "PreToolUse" and tool_name == "AskUserQuestion":
+            label = "等待回答"
+            tool_input = payload.get("tool_input")
+            questions = (
+                tool_input.get("questions") if isinstance(tool_input, dict) else None
+            )
+            question = questions[0] if isinstance(questions, list) and questions else None
+            message = question.get("question") if isinstance(question, dict) else ""
+            fallback = "Claude Code 正在等待你选择或输入"
+        elif event == "Notification" and payload.get("notification_type") in {
+            "elicitation_dialog",
+            "elicitation_url_dialog",
+            "agent_needs_input",
+        }:
+            label = "等待输入"
+            message = payload.get("message")
+            fallback = "Claude Code 正在等待你选择或输入"
+        else:
+            # Completion already has Stop; permission and questions have their
+            # immediate hooks. Delayed idle/permission notifications would repeat them.
+            return None
+
         cwd = str(payload.get("cwd") or self.environment.get("PWD") or "")
         title = self.environment.get("CLAUDE_NOTIFY_TITLE", "Claude Code")
         if cwd:
@@ -863,16 +946,11 @@ class AgentNotifications:
                     "...",
                 )
 
-        assistant = _short_text(
-            _first_compact_line(payload.get("last_assistant_message")),
-            140,
-            "...",
-        )
-        fallback = str(
-            payload.get("_fallback_message")
-            or self.environment.get("CLAUDE_NOTIFY_MESSAGE")
-            or "任务已完成"
-        )
+        subtitle = f"{label} · {subtitle}" if subtitle else label
+        body = _short_text(_first_compact_line(message) or str(fallback), 140, "...")
+        if session_id:
+            # Other panes must not replace this session's notification.
+            group += "-" + hashlib.sha256(session_id.encode()).hexdigest()[:16]
         action = ""
         home = Path(
             self.environment.get("HOME", str(Path.home()))
@@ -885,11 +963,11 @@ class AgentNotifications:
         return Notification(
             title=title,
             subtitle=subtitle,
-            body=assistant or fallback,
+            body=body,
             sound=self.environment.get("CLAUDE_NOTIFY_SOUND", "").strip()
             or self.choose_sound(COMPLETION_SOUNDS),
-            event=str(payload.get("hook_event_name") or "stop"),
-            group="claude-code-task-complete",
+            event=event,
+            group=group,
             action=action,
         )
 
