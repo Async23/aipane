@@ -263,6 +263,15 @@ class Tmux:
     def send(self, *arguments: str) -> bool:
         return self.run("send-keys", *arguments).returncode == 0
 
+    def server_identity(self) -> tuple[str, str] | None:
+        completed = self.run("display-message", "-p", "#{socket_path}\t#{pid}")
+        if completed.returncode != 0:
+            return None
+        fields = completed.stdout.rstrip("\n").split("\t")
+        if len(fields) != 2 or not all(fields):
+            return None
+        return fields[0], fields[1]
+
     def pane_identity(self, target: str) -> tuple[str, str, str] | None:
         completed = self.run(
             "display-message",
@@ -433,11 +442,18 @@ class Tmux:
 
 
 class PendingStore:
-    def __init__(self, path: Path, max_age: float) -> None:
+    """A server's view of a shared file; foreign intent survives every write.
+
+    Mutating callers must hold the executor lock across load/merge/save. A pane
+    coordinate is unique only inside this exact socket and server incarnation.
+    """
+
+    def __init__(self, path: Path, max_age: float, server: tuple[str, str] | None) -> None:
         self.path = path
         self.max_age = max_age
+        self.server = server
 
-    def load(self, now: float) -> list[dict[str, Any]]:
+    def read_all(self) -> list[dict[str, Any]]:
         if not self.path.is_file():
             return []
         try:
@@ -461,10 +477,25 @@ class PendingStore:
                     or not all(raw.get(field) for field in ("target", "tool", "command", "cwd", "kind"))
                     or raw.get("tool") not in TOOL_TAGS):
                 raise RestoreExecutionError(f"invalid pending recovery identity: {self.path}")
-            if self.max_age > 0 and now - created_at > self.max_age:
-                continue
             result.append(dict(raw))
         return result
+
+    def owns(self, item: dict[str, Any]) -> bool:
+        return self.server is not None and (
+            item.get("socket_path"), item.get("server_pid")
+        ) == self.server
+
+    def load(self, now: float) -> list[dict[str, Any]]:
+        return [
+            item for item in self.read_all()
+            if self.owns(item)
+            and (self.max_age == 0 or now - float(item["created_at"]) <= self.max_age)
+        ]
+
+    def foreign_items(self) -> list[dict[str, Any]]:
+        # Unscoped legacy records cannot authorize recovery on an arbitrary
+        # server. Retain them too, without treating them as current intent.
+        return [item for item in self.read_all() if not self.owns(item)]
 
     def merge(
         self,
@@ -474,6 +505,8 @@ class PendingStore:
         now: float,
         preserve_identity: bool = True,
     ) -> list[dict[str, Any]]:
+        if self.server is None:
+            raise RestoreExecutionError("cannot identify the current tmux server")
         previous = {item["target"]: item for item in self.load(now)}
         merged = dict(previous)
         for item in current:
@@ -497,6 +530,7 @@ class PendingStore:
                 and prior.get("command") == item["command"]
             )
             merged_item = dict(item)
+            merged_item["socket_path"], merged_item["server_pid"] = self.server
             # A sealed plan's full process/activity guard authorizes only that
             # one destructive execution. Pending intent retains the durable
             # pane/server identity, never the now-stale confirmation snapshot.
@@ -551,11 +585,14 @@ class PendingStore:
         return result
 
     def save(self, items: list[dict[str, Any]]) -> None:
+        if self.server is None or any(not self.owns(item) for item in items):
+            raise RestoreExecutionError("cannot save recovery intent outside the current tmux server")
+        foreign = self.foreign_items()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": PENDING_VERSION,
             "updated_at": time.time(),
-            "items": items,
+            "items": [*foreign, *items],
         }
         temporary = self.path.with_name(f"{self.path.name}.tmp.{os.getpid()}")
         temporary.write_text(
@@ -626,18 +663,19 @@ class RestoreExecutor:
         pending_max_age = nonnegative_float(
             environment, "AI_RESTORE_PENDING_MAX_AGE", 0
         )
-        self.store = PendingStore(pending_path, pending_max_age)
+        self.tmux = Tmux(environment)
+        self.store = PendingStore(pending_path, pending_max_age, None)
         self.log_path = Path(
             environment.get("AIPANE_RESTORE_LOG", str(self.state_dir / "ai-restore.log"))
         )
-        self.lock_path = self.state_dir / "restore-executor.lock"
+        # Overrides may share a pending file even with different state dirs.
+        self.lock_path = pending_path.parent / "restore-executor.lock"
         self.registry_path = Path(
             environment.get(
                 "AIPANE_REGISTRY",
                 str(self.state_dir / "registry.jsonl"),
             )
         )
-        self.tmux = Tmux(environment)
         self.bind_command = shlex.split(
             environment.get("AIPANE_BIND_COMMAND", "aipane-bind")
         )
@@ -676,6 +714,19 @@ class RestoreExecutor:
             positive_float(environment, "AI_RESTORE_POLL_INTERVAL", 0.1),
             self.verify_stability,
         )
+
+    def scope_pending(self) -> None:
+        self.store.server = self.tmux.server_identity()
+        foreign_count = len(self.store.foreign_items())
+        if self.store.server is None and foreign_count:
+            raise RestoreExecutionError("cannot identify the current tmux server; pending recovery retained")
+        if foreign_count:
+            print(
+                f"aipane-restore-executor: retained {foreign_count} recovery record(s) "
+                "outside the current tmux server; not retried "
+                f"({self.store.path})",
+                file=sys.stderr,
+            )
 
     def log(self, message: str) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1155,13 +1206,7 @@ class RestoreExecutor:
                 item.get(field_name)
                 for field_name in ("pane_id", "socket_path", "server_pid")
             )
-            new_server = bool(
-                guarded
-                and identity is not None
-                and (item.get("socket_path"), item.get("server_pid"))
-                != (identity[1], identity[2])
-            )
-            if item is not None and identity is not None and (not guarded or new_server):
+            if item is not None and identity is not None and not guarded:
                 item["pane_id"], item["socket_path"], item["server_pid"] = identity
         self.store.save(list(pending_by_target.values()))
         skipped = sum(item["restorable"] is not True for item in current)
@@ -1376,16 +1421,19 @@ def main() -> int:
         dump = arguments.dump
 
     if arguments.plan_json:
+        executor.scope_pending()
         display_items = executor.store.display_plan(current, now=time.time())
         for item in display_items:
             print(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
         return 0
     if arguments.dry_run:
+        executor.scope_pending()
         display_items = executor.store.display_plan(current, now=time.time())
         print_plan(display_items, dump)
         return 0
 
     executor.state_dir.mkdir(parents=True, exist_ok=True)
+    executor.lock_path.parent.mkdir(parents=True, exist_ok=True)
     with executor.lock_path.open("a", encoding="utf-8") as lock:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1395,6 +1443,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 3
+        executor.scope_pending()
         if arguments.sealed_plan:
             report = executor.execute_restart(current, dump)
         elif arguments.retry_pending:

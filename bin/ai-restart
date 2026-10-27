@@ -416,6 +416,8 @@ def retry_pending(
     )
     if preview.returncode != 0:
         raise RestartError(preview.stderr.strip() or "cannot read pending recovery")
+    if preview.stderr.strip():
+        print(preview.stderr.strip(), file=sys.stderr)
     try:
         pending = [json.loads(line) for line in preview.stdout.splitlines() if line.strip()]
     except json.JSONDecodeError as error:

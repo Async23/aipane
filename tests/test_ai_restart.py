@@ -293,6 +293,110 @@ class AiRestartTests(unittest.TestCase):
         self.assertFalse(self.save_log.exists())
         self.assertEqual(pending.read_bytes(), before)
 
+    def other_server(self):
+        command = ["tmux", "-L", f"{self.socket}-other"]
+        subprocess.run(
+            [*command, "-f", "/dev/null", "new-session", "-d", "-s", "restart",
+             "-c", str(self.tmp), "sleep 120"],
+            check=True, capture_output=True,
+        )
+        self.addCleanup(subprocess.run, [*command, "kill-server"], capture_output=True)
+        identity = subprocess.check_output(
+            [*command, "display-message", "-p", "#{pane_id}\t#{socket_path}\t#{pid}"],
+            text=True,
+        ).strip().split("\t")
+        return command, dict(zip(("pane_id", "socket_path", "server_pid"), identity))
+
+    def test_foreign_server_pending_does_not_block_restart_preview(self):
+        _, other_identity = self.other_server()
+        pending = self.write_pending()
+        payload = json.loads(pending.read_text())
+        payload["items"][0].update(other_identity)
+        pending.write_text(json.dumps(payload))
+        before = pending.read_bytes()
+
+        result = self.run_restart("--dry-run")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("snapshot refreshed", result.stdout)
+        self.assertNotIn("Recovery-only mode", result.stdout)
+        self.assertIn("outside the current tmux server", result.stderr)
+        self.assertEqual(pending.read_bytes(), before)
+        self.assertEqual(self.current_command(), "sleep")
+
+    def test_retry_does_not_adopt_previous_server_or_unscoped_pending(self):
+        for obsolete_fields in ({"server_pid": "0"}, {"socket_path": "", "server_pid": ""}):
+            with self.subTest(obsolete_fields=obsolete_fields):
+                pending = self.write_pending()
+                payload = json.loads(pending.read_text())
+                payload["items"][0].update(obsolete_fields)
+                pending.write_text(json.dumps(payload))
+                before = pending.read_bytes()
+
+                result = self.run_restart("--retry", "--yes")
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("no pending recovery", result.stdout)
+                self.assertFalse(self.save_log.exists())
+                self.assertEqual(pending.read_bytes(), before)
+                self.assertEqual(self.current_command(), "sleep")
+
+    def test_unavailable_server_identity_does_not_skip_pending(self):
+        pending = self.write_pending()
+        before = pending.read_bytes()
+        proxy = self.tmp / "tmux-unknown-server.py"
+        proxy.write_text(textwrap.dedent(f'''\
+            #!/usr/bin/env python3
+            import subprocess, sys
+            if sys.argv[-1] == "#{{socket_path}}\\t#{{pid}}":
+                raise SystemExit(1)
+            raise SystemExit(subprocess.run(["tmux", "-L", {self.socket!r}, *sys.argv[1:]]).returncode)
+        '''))
+        proxy.chmod(0o755)
+        self.extra_environment = {"AIPANE_TMUX": str(proxy)}
+
+        result = self.run_restart("--dry-run")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("cannot identify the current tmux server", result.stderr)
+        self.assertFalse(self.save_log.exists())
+        self.assertEqual(pending.read_bytes(), before)
+
+    def test_servers_retry_same_coordinate_without_losing_each_others_records(self):
+        other_command, other_identity = self.other_server()
+        pending = self.write_pending()
+        payload = json.loads(pending.read_text())
+        local = payload["items"][0]
+        foreign = {**local, **other_identity}
+        payload["items"].append(foreign)
+        pending.write_text(json.dumps(payload))
+        for command in (["tmux", "-L", self.socket], other_command):
+            subprocess.run(
+                [*command, "respawn-pane", "-k", "-t", self.target, local["command"]],
+                check=True, capture_output=True,
+            )
+        before = {
+            tuple(command): subprocess.check_output(
+                [*command, "display-message", "-p", "-t", self.target, "#{pane_pid}"], text=True,
+            ) for command in (["tmux", "-L", self.socket], other_command)
+        }
+
+        first = self.run_restart("--retry", "--yes")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertIn("verified=1 pending=0", first.stdout)
+        self.assertEqual(json.loads(pending.read_text())["items"], [foreign])
+
+        self.extra_environment = {"AIPANE_TMUX": shlex.join(other_command)}
+        second = self.run_restart("--retry", "--yes")
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn("verified=1 pending=0", second.stdout)
+        self.assertEqual(json.loads(pending.read_text())["items"], [])
+        for command, pid in before.items():
+            self.assertEqual(subprocess.check_output(
+                [*command, "display-message", "-p", "-t", self.target, "#{pane_pid}"], text=True,
+            ), pid)
+        self.assertFalse(self.save_log.exists())
+
     def configure_version_named_claude(self):
         # Reproduce macOS tmux reporting Claude's version as its short name,
         # while ps still exposes the actual foreground executable and argv.

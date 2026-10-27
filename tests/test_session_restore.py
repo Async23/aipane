@@ -705,6 +705,7 @@ class SessionRestoreTests(unittest.TestCase):
                         case "$*" in
                           *pane_current_command*) cat "$PANE_COMMAND" ;;
                           *pane_id*socket_path*pid*) printf '%%42\\t/private/tmp/tmux-test\\t4242\\n' ;;
+                          *socket_path*pid*) printf '/private/tmp/tmux-test\\t4242\\n' ;;
                           *pane_id*) printf '%%42\\n' ;;
                           *socket_path*) printf '/private/tmp/tmux-test\\n' ;;
                           *"#{pid}"*) printf '4242\\n' ;;

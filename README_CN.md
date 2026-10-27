@@ -191,7 +191,7 @@ ai cc                                     # 重复的键会启动重复的工具
 
 ## 重启 AI Pane
 
-`ai-restart` 在原 tmux pane 中重启并续接可恢复的 AI 会话。存在未完成的恢复时，
+`ai-restart` 在原 tmux pane 中重启并续接可恢复的 AI 会话。当前 tmux 服务存在未完成的恢复时，
 会先补恢复这些会话；完成前不保存新快照或开始新一轮重启。`--retry` 可明确指定
 只补恢复。Droid 因尚未接入 aipane 会话恢复而直接忽略。
 

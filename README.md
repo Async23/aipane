@@ -197,8 +197,9 @@ Inside tmux, a pane layout reuses the current window only when it has one pane; 
 ## Restart AI Panes
 
 `ai-restart` restarts recoverable AI conversations in their existing tmux panes.
-If recovery is unfinished, it retries those conversations before saving another
-snapshot or starting a new restart. `--retry` explicitly requests recovery only.
+If recovery is unfinished on the current tmux server, it retries those conversations
+before saving another snapshot or starting a new restart. `--retry` explicitly
+requests recovery only.
 Droid is ignored because its session restore is not implemented.
 
 The full recovery invariants and failure model live in

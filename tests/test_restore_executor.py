@@ -201,6 +201,7 @@ class RestoreExecutorTests(unittest.TestCase):
         guard_overrides: dict[str, str] | None = None,
         launch_delay: float = 0,
         per_pane_state: bool = False,
+        extra_environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         dump = self.tmp / "resurrect.txt"
         dump.touch()
@@ -262,6 +263,7 @@ class RestoreExecutorTests(unittest.TestCase):
         )
         if capture_text is not None:
             env["FAKE_CAPTURE_TEXT"] = capture_text
+        env.update(extra_environment or {})
         if sealed:
             arguments = [
                 str(EXECUTOR),
@@ -415,6 +417,70 @@ class RestoreExecutorTests(unittest.TestCase):
         )
         self.assertEqual(sends_after, sends_before)
         self.assertEqual(len(self.pending_items()), 1)
+
+    def test_restoring_same_coordinate_preserves_foreign_server_intent(self):
+        for sealed in (False, True):
+            with self.subTest(sealed=sealed):
+                foreign = {
+                    **self.grok_plan(), "created_at": time.time() - 86400,
+                    "updated_at": time.time() - 3600, "attempts": 7,
+                    "last_error": "foreign failure", "source_dump": "foreign-dump",
+                    "pane_id": "%9", "socket_path": "/private/tmp/another-server",
+                    "server_pid": "4343",
+                }
+                (self.state_dir / "restore-pending.json").write_text(json.dumps({
+                    "version": 1, "items": [foreign],
+                }))
+                self.runtime_state.write_text("zsh\n")
+
+                result = self.run_executor([self.grok_plan()], launch_mode="ready", sealed=sealed)
+
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("verified=1 pending=0", result.stdout)
+                self.assertEqual(self.pending_items(), [foreign])
+
+    def test_failed_restore_keeps_server_records_distinct(self):
+        foreign = {
+            **self.grok_plan(), "created_at": time.time() - 86400,
+            "updated_at": time.time() - 3600, "attempts": 7,
+            "last_error": "foreign failure", "source_dump": "foreign-dump",
+            "pane_id": "%42", "socket_path": "/private/tmp/another-server",
+            "server_pid": "4343",
+        }
+        (self.state_dir / "restore-pending.json").write_text(json.dumps({
+            "version": 1, "items": [foreign],
+        }))
+
+        result = self.run_executor(
+            [self.grok_plan()], launch_mode="fail",
+            extra_environment={"AI_RESTORE_PENDING_MAX_AGE": "3600"},
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("pending=1", result.stdout)
+        records = self.pending_items()
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0], foreign)
+        local = records[1]
+        self.assertEqual(local["target"], foreign["target"])
+        self.assertEqual(local["socket_path"], "/private/tmp/tmux-test")
+        self.assertEqual(local["server_pid"], "4242")
+        self.assertEqual(local["attempts"], 1)
+        self.assertGreater(local["created_at"], foreign["created_at"])
+        preview = self.run_executor([], launch_mode="ready", plan_json=True)
+        self.assertEqual(json.loads(preview.stdout)["socket_path"], local["socket_path"])
+
+    def test_shared_pending_file_uses_shared_lock_with_another_state_directory(self):
+        result = self.run_executor(
+            [self.grok_plan()], launch_mode="ready", lock_held=True,
+            extra_environment={
+                "AIPANE_STATE_DIR": str(self.tmp / "other-state"),
+                "AIPANE_RESTORE_PENDING": str(self.state_dir / "restore-pending.json"),
+            },
+        )
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertFalse(self.tmux_log.exists())
+        self.assertEqual(self.pending_items(), [])
 
     def test_pending_plan_retries_cleanly_when_new_snapshot_lost_the_pane(self):
         failed = self.run_executor([self.grok_plan()], launch_mode="fail")
