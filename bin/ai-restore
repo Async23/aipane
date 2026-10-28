@@ -9,14 +9,14 @@
 #     `resume`-style launch already carries its id too.
 #   - For tools whose active session still matches their launch argv, the resurrect
 #     dump contains the id directly. Pi/Codex/Grok/dsh can replace sessions in-process, so
-#     their current coordinate binding takes precedence over stale launch argv.
+#     their binding captured in this same dump takes precedence over launch argv.
 #   - We parse that durable identity into a declarative plan. The adjacent
 #     aipane-restore-executor persists unfinished intent, launches cleanly,
 #     verifies readiness, retries transient failures, and only then rebinds.
 #
 # Trigger: @resurrect-hook-post-restore-all 'ai-restore'  (runs after restore settles).
 # Manual : ai-restore            (act) | ai-restore --dry-run (print plan only)
-# Machine: ai-restore --plan-json (JSON Lines recovery plan; no panes touched)
+# Machine: ai-restore --plan-json (this dump's plan only; no pending intent merged)
 #
 # Safety: a pane is launched only from an idle shell. An already-running matching
 # Agent is verified without replacement; any different foreground program is left
@@ -49,7 +49,6 @@ done
 
 typeset STATE_DIR="${AIPANE_STATE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/aipane}"
 typeset LOG="$STATE_DIR/ai-restore.log"
-typeset COORDS="$STATE_DIR/coords-last.json"
 typeset PI_SESSION_ROOT="${PI_CODING_AGENT_SESSION_DIR:-${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/sessions}"
 mkdir -p "$STATE_DIR" 2>/dev/null
 
@@ -69,37 +68,6 @@ trap cleanup_plan EXIT
 
 log() { print -r -- "$(date '+%F %T') $*" >>"$LOG" 2>/dev/null; }
 
-# Coordinate -> current session id/tool map produced by aipane-snapshot at save
-# time. The tool tag is part of the identity: a stale binding from another tool
-# must never be interpreted as the detected pane's session id.
-typeset -A COORDS_SID COORDS_TOOL COORDS_DSH_HOME COORDS_SESSION_ROOT COORDS_CWD COORDS_QWEN_HOME COORDS_QWEN_RUNTIME
-if [[ -r "$COORDS" ]] && command -v python3 &>/dev/null; then
-  local _cl
-  while IFS=$'\x1f' read -r _cl _sid _tool _dsh_home _session_root _cwd _qwen_home _qwen_runtime; do
-    if [[ -n "$_cl" ]]; then
-      COORDS_SID[$_cl]="$_sid"
-      COORDS_TOOL[$_cl]="$_tool"
-      COORDS_DSH_HOME[$_cl]="$_dsh_home"
-      COORDS_SESSION_ROOT[$_cl]="$_session_root"
-      COORDS_CWD[$_cl]="$_cwd"
-      COORDS_QWEN_HOME[$_cl]="$_qwen_home"
-      COORDS_QWEN_RUNTIME[$_cl]="$_qwen_runtime"
-    fi
-  done < <(python3 -c '
-import json,sys
-try:
-    d=json.load(open(sys.argv[1]))
-except Exception:
-    sys.exit(0)
-for coord,rec in d.items():
-    sid=(rec or {}).get("sid","")
-    tool=(rec or {}).get("tool","")
-    if sid or tool in ("d", "dsh", "q", "qwen"):
-        print("\x1f".join((coord,sid,tool,*(str(rec.get(key,"")) for key in
-              ("dsh_home","session_root","cwd","qwen_home","qwen_runtime_dir")))))
-' "$COORDS" 2>/dev/null)
-fi
-
 # ---- resolve the dump ----------------------------------------------------
 if [[ -z "$DUMP" ]]; then
   local dir
@@ -112,6 +80,23 @@ if [[ ! -e "$DUMP" ]]; then
   print -u2 "ai-restore: no resurrect dump at $DUMP"
   return 1 2>/dev/null || exit 1
 fi
+
+# Session identities belong to this exact dump, never the global latest map.
+typeset -A COORDS_SID COORDS_TOOL COORDS_DSH_HOME COORDS_SESSION_ROOT COORDS_CWD COORDS_QWEN_HOME COORDS_QWEN_RUNTIME COORDS_CODEX_HOME
+typeset paired_rows
+paired_rows="$(command python3 "$SCRIPT_DIR/../lib/recovery_snapshot.py" "$DUMP")" || exit 1
+while IFS=$'\x1f' read -r _cl _sid _tool _dsh_home _session_root _cwd _qwen_home _qwen_runtime _codex_home; do
+  if [[ -n "$_cl" ]]; then
+    COORDS_SID[$_cl]="$_sid"
+    COORDS_TOOL[$_cl]="$_tool"
+    COORDS_DSH_HOME[$_cl]="$_dsh_home"
+    COORDS_SESSION_ROOT[$_cl]="$_session_root"
+    COORDS_CWD[$_cl]="$_cwd"
+    COORDS_QWEN_HOME[$_cl]="$_qwen_home"
+    COORDS_QWEN_RUNTIME[$_cl]="$_qwen_runtime"
+    COORDS_CODEX_HOME[$_cl]="$_codex_home"
+  fi
+done <<< "$paired_rows"
 
 # lowercase-hex UUID matcher (matches both v4 and codex/grok's uuidv7)
 typeset UUID_RE='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
@@ -224,13 +209,8 @@ coord_tool_matches() {
 # codex_session_exists <uuid> — a resume id is safe only when Codex has a local
 # rollout for it. This turns corrupt/stale registry data into a visible skip.
 codex_session_exists() {
-  local sid="$1" root="${CODEX_HOME:-$HOME/.codex}"
-  local -a matches
-  matches=(
-    "$root"/sessions/**/*-"$sid".jsonl(N)
-    "$root"/archived_sessions/**/*-"$sid".jsonl(N)
-  )
-  (( ${#matches[@]} > 0 ))
+  command python3 "$SCRIPT_DIR/../lib/codex_sessions.py" \
+    "$1" "${coord_codex_home:-${CODEX_HOME:-$HOME/.codex}}"
 }
 
 # Claude accepts an aipane-assigned --session-id before the first real model
@@ -438,6 +418,8 @@ build_resume() {
   if [[ "$tool" == dsh ]]; then
     [[ -n "$coord_session_root" ]] && REPLY="DSH_TUI_SESSION_ROOT=${(q)coord_session_root} $REPLY"
     [[ -n "$coord_dsh_home" ]] && REPLY="DSH_HOME=${(q)coord_dsh_home} $REPLY"
+  elif [[ "$tool" == codex && -n "$coord_codex_home" ]]; then
+    REPLY="CODEX_HOME=${(q)coord_codex_home} $REPLY"
   elif [[ "$tool" == qwen ]]; then
     [[ -n "$coord_qwen_runtime" ]] && REPLY="QWEN_RUNTIME_DIR=${(q)coord_qwen_runtime} $REPLY"
     [[ -n "$coord_qwen_home" ]] && REPLY="QWEN_HOME=${(q)coord_qwen_home} $REPLY"
@@ -459,6 +441,7 @@ emit_plan_json() {
   AIPANE_PLAN_SESSION_ROOT="${coord_session_root:-}" \
   AIPANE_PLAN_QWEN_HOME="${coord_qwen_home:-}" \
   AIPANE_PLAN_QWEN_RUNTIME="${coord_qwen_runtime:-}" \
+  AIPANE_PLAN_CODEX_HOME="${coord_codex_home:-${CODEX_HOME:-$HOME/.codex}}" \
     command python3 -c '
 import json, os
 print(json.dumps({
@@ -469,6 +452,7 @@ print(json.dumps({
     "cwd": os.environ["AIPANE_PLAN_CWD"],
     "command": os.environ["AIPANE_PLAN_COMMAND"],
     "sid": os.environ["AIPANE_PLAN_SID"],
+    **({"codex_home": os.environ["AIPANE_PLAN_CODEX_HOME"]} if os.environ["AIPANE_PLAN_TOOL"] == "codex" else {}),
     **({"dsh_home": os.environ["AIPANE_PLAN_DSH_HOME"], "session_root": os.environ["AIPANE_PLAN_SESSION_ROOT"]}
        if os.environ["AIPANE_PLAN_TOOL"] == "dsh" else {}),
     **({"qwen_home": os.environ["AIPANE_PLAN_QWEN_HOME"], "qwen_runtime_dir": os.environ["AIPANE_PLAN_QWEN_RUNTIME"]}
@@ -499,6 +483,7 @@ while IFS= read -r line; do
   target="${session}:${win}.${pane_idx}"
 
   coord_sid="${COORDS_SID[$target]:-}"
+  coord_codex_home="${COORDS_CODEX_HOME[$target]:-}"
   coord_tool="${COORDS_TOOL[$target]:-}"
   coord_dsh_home="${COORDS_DSH_HOME[$target]:-}"
   coord_session_root="${COORDS_SESSION_ROOT[$target]:-}"

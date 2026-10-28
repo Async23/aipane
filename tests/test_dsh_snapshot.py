@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 from agent_activity import AgentActivity, TmuxActivityAdapter
 from dsh_sessions import current_session, last_reported_session
+from recovery_snapshot import capture_snapshot
 
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux required for process/TTY identity")
@@ -179,12 +180,16 @@ import { pathToFileURL } from 'node:url';
 const require = createRequire(realpathSync(process.argv[1]));
 const load = async name => import(pathToFileURL(require.resolve(name)).href);
 const { Context } = await load('@deepseek-ai/cordis');
-const { default: Persistence } = await load('@deepseek-ai/dsh-session-persistence-jsonl');
+const persistence = await load('@deepseek-ai/dsh-session-persistence-jsonl');
 const { SESSION_FORMAT_VERSION } = await load('@deepseek-ai/dsh-session');
-const backend = new Persistence(new Context(), { root: process.env.DSH_TUI_SESSION_ROOT });
+const ctx = new Context();
+await ctx.plugin(persistence.default ?? persistence, { root: process.env.DSH_TUI_SESSION_ROOT }).await();
+const backend = ctx.sessionPersistence;
+try {
 const handle = await backend.create({version:SESSION_FORMAT_VERSION,id:'session-selected',
     createdAt:Date.now(),cwd:process.cwd(),isSeeded:false,delegationDepth:0});
 await handle.flush(); await handle.close();
+} finally { await ctx.fiber.dispose(); }
 '''
         subprocess.run(["node", "--input-type=module", "-e", script, shutil.which("dsh")],
                        cwd=self.home, env=self.env, check=True, capture_output=True, text=True)
@@ -192,6 +197,7 @@ await handle.flush(); await handle.close();
         self.snapshot()
         dump = self.home / "dump"
         dump.write_text(f"pane\t0\t1\t:window\t1\t0\t:title\t:{self.home}\t1\tnode\t:node /test/dsh-tui --resume session-launch\n")
+        capture_snapshot(dump, json.loads((self.state / "coords-last.json").read_text()), ("fixture", "1"))
         result = subprocess.run([str(ROOT / "bin/ai-restore"), "--plan-json", "--dump", str(dump)],
                                 env=self.env, check=True, capture_output=True, text=True)
         plan = json.loads(result.stdout)

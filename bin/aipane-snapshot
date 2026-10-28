@@ -30,6 +30,8 @@ if str(LIB_DIR) not in sys.path:
 from agent_activity import AgentActivity, ActivityReadError, TmuxActivityAdapter  # noqa: E402
 from dsh_sessions import last_reported_session  # noqa: E402
 from qwen_sessions import foreground_processes as qwen_processes  # noqa: E402
+from recovery_snapshot import capture_snapshot, SnapshotError, atomic_json  # noqa: E402
+from codex_sessions import current_session as codex_current_session  # noqa: E402
 
 STATE_DIR = Path(
     os.environ.get("AIPANE_STATE_DIR")
@@ -164,6 +166,11 @@ def main() -> int:
             if session is not None
             else None
         )
+        if inspection.current_command in {"codex", "codexx"} or inspection.current_command.startswith("codex-"):
+            pane = activity.adapter.read(pane_id)
+            current = codex_current_session(pane.pane_tty, (rec or {}).get("sid", ""))
+            if current:
+                rec = {"sid": current["sid"], "tool": "x", "codex_home": current["codex_home"]}
         if rec is None:
             recovery = (
                 dsh_recovery_binding(activity, pane_id)
@@ -205,17 +212,19 @@ def main() -> int:
         if session is not None and session.tool_key in {"d", "q"} and session.cwd:
             cwd = session.cwd
         coords[coord] = {"sid": rec["sid"], "tool": rec.get("tool", ""), "cwd": cwd,
+                         **({"codex_home": rec["codex_home"]} if rec.get("codex_home") else {}),
                          **({key: rec[key] for key in ("dsh_home", "session_root") if rec.get(key)}
                             if rec.get("tool") == "d" else {}),
                          **({key: rec[key] for key in ("qwen_home", "qwen_runtime_dir") if rec.get(key)}
                             if rec.get("tool") == "q" else {})}
 
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = OUT.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(coords, ensure_ascii=False, indent=0), encoding="utf-8")
-        tmp.replace(OUT)
-    except OSError as exc:
+        dump = Path(sys.argv[1]) if len(sys.argv) > 1 else None
+        if dump is not None:
+            capture_snapshot(dump, coords, server or ("", ""))
+        # Retained as a diagnostic projection; restore never reads this file.
+        atomic_json(OUT, coords)
+    except (OSError, SnapshotError) as exc:
         print(f"aipane-snapshot: {exc}", file=sys.stderr)
         return 1
     return 0

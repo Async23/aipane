@@ -12,6 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 from dsh_sessions import current_session, last_reported_session
+from recovery_snapshot import capture_snapshot
 
 
 class DshLiveSessionTests(unittest.TestCase):
@@ -108,21 +109,26 @@ import { pathToFileURL } from 'node:url';
 const require = createRequire(realpathSync(process.argv[1]));
 const load = async name => import(pathToFileURL(require.resolve(name)).href);
 const { Context } = await load('@deepseek-ai/cordis');
-const { default: Persistence } = await load('@deepseek-ai/dsh-session-persistence-jsonl');
+const persistence = await load('@deepseek-ai/dsh-session-persistence-jsonl');
 const { SESSION_FORMAT_VERSION } = await load('@deepseek-ai/dsh-session');
-const backend = new Persistence(new Context(), { root: process.env.DSH_TUI_SESSION_ROOT });
+const ctx = new Context();
+await ctx.plugin(persistence.default ?? persistence, { root: process.env.DSH_TUI_SESSION_ROOT }).await();
+const backend = ctx.sessionPersistence;
+try {
 for (const id of ['session-launch', 'session-selected']) {
  const handle = await backend.create({version:SESSION_FORMAT_VERSION,id,createdAt:Date.now(),cwd:process.cwd(),isSeeded:false,delegationDepth:0});
  await handle.flush(); await handle.close();
 }
+} finally { await ctx.fiber.dispose(); }
 '''
         subprocess.run(["node", "--input-type=module", "-e", script, shutil.which("dsh")],
                        cwd=self.home, env=self.env, check=True, capture_output=True, text=True)
 
     def plan(self, sid, full="node /Users/test/.local/bin/dsh-tui --resume session-launch", **env):
         (self.state / "coords-last.json").write_text(json.dumps({"0:1.0": {"sid": sid, "tool": "d"}} if sid is not None else {}))
-        dump = self.home / "dump"
+        dump = self.home / f"dump-{time.time_ns()}"
         dump.write_text(f"pane\t0\t1\t:window\t1\t0\t:title\t:{self.home}\t1\tnode\t:{full}\n")
+        capture_snapshot(dump, json.loads((self.state / "coords-last.json").read_text()), ("fixture", "1"))
         result = subprocess.run([str(ROOT / "bin/ai-restore"), "--plan-json", "--dump", str(dump)],
                                 env={**self.env, **env}, text=True, capture_output=True, check=True)
         return json.loads(result.stdout) if result.stdout.strip() else None
@@ -172,6 +178,20 @@ for (const id of ['session-launch', 'session-selected']) {
         self.assertEqual(len(files), 1)
         files[0].write_bytes(b"corrupt generation")
         self.assertEqual(subprocess.run([*command, str(self.home)], env=self.env).returncode, 1)
+
+    def test_native_validator_accepts_durable_session_without_modifying_files(self):
+        root = self.home / "sessions"
+        def contents():
+            return {str(path.relative_to(root)): (path.read_bytes(), path.stat().st_mtime_ns)
+                    for path in root.rglob("*") if path.is_file()}
+        before = contents()
+        self.assertTrue(before)
+        result = subprocess.run(
+            [str(ROOT / "bin/aipane-dsh-session"), "session-selected", str(self.home)],
+            env=self.env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(contents(), before)
 
 
 if __name__ == "__main__":

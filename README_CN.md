@@ -191,12 +191,9 @@ ai cc                                     # 重复的键会启动重复的工具
 
 ## 重启 AI Pane
 
-`ai-restart` 在原 tmux pane 中重启并续接可恢复的 AI 会话。当前 tmux 服务存在未完成的恢复时，
-会先补恢复这些会话；完成前不保存新快照或开始新一轮重启。`--retry` 可明确指定
-只补恢复。Droid 因尚未接入 aipane 会话恢复而直接忽略。
-
-恢复判断、持久记录及失败处理统一见
-[`docs/session-restore-design.md`](docs/session-restore-design.md)。
+`ai-restart` 在原 tmux pane 中重启并续接可恢复的 AI 会话。
+完整预览、失败记录处理和固定运行版本的安装统一见
+[`会话恢复与稳定运行版本`](docs/recovery-runtime.md)。
 
 macOS 完成通知 Adapter 与声音覆盖入口统一记录在
 [`docs/agent-notifications.md`](docs/agent-notifications.md)。
@@ -204,37 +201,6 @@ macOS 完成通知 Adapter 与声音覆盖入口统一记录在
 dsh-TUI 的活动状态、精确会话恢复、通知与 Web 配置入口见
 [`docs/dsh-integration.md`](docs/dsh-integration.md)。
 
-```bash
-ai-restart --dry-run  # 预览待恢复会话或新一轮重启
-ai-restart            # 优先补恢复；没有待恢复会话时，确认后重启
-ai-restart --retry    # 只补恢复，不开始新一轮重启
-ai-restart --force    # 允许重启当前标记为 busy 的 pane
-```
-
-Pi 可以在不重启进程的情况下切换会话。安装 aipane 的 Pi 会话绑定 Adapter，
-确保 `/new`、`/resume`、`/fork` 之后仍能恢复当前会话：
-
-```bash
-AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
-mkdir -p ~/.pi/agent/extensions ~/.local/bin
-ln -sf "$AIPANE_ROOT/integrations/pi/aipane-bind.ts" \
-  ~/.pi/agent/extensions/aipane-bind.ts
-ln -sf "$AIPANE_ROOT/bin/aipane-bind" ~/.local/bin/aipane-bind
-```
-
-已经运行的 Pi 进程执行一次 `/reload` 即可加载。
-
-默认情况下，只要选中的 Agent Activity 中有一个为 `busy`，整次操作就会中止。
-旧 Agent 进程尚未上报状态时会显示 `unknown`，交互命令要求你明确确认所有任务均已
-空闲。单独使用 `--yes` 不会接受 `unknown`；非交互场景必须显式使用 `--force`。
-请从 tmux 外的独立终端运行该命令，以便安全替换所有选中的 AI pane。该功能依赖
-tmux-resurrect 以及
-[`docs/session-restore-design.md`](docs/session-restore-design.md) 中的会话恢复 hooks。
-
-Pi、Claude 与 Qwen Code 都可能已拥有预分配的 `--session-id`，但还没创建可持久恢复的
-conversation。空 Pi 会话会重新打开空 TUI，并明确标为 `recreated`，绝不冒充已续接
-的历史对话；若同一 Pi ID 实际属于其他项目或记录已损坏，仍标为 `invalid`。
-Claude 与 Qwen Code 仍要求存在持久 transcript，否则保持原 pane 不动。
 
 ## 进程清理
 

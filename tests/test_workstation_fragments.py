@@ -1316,13 +1316,17 @@ class ColourPalettePopupTests(unittest.TestCase):
                 text=True,
             )
             try:
-                time.sleep(0.1)
-                first_screen = subprocess.run(
-                    ["tmux", "-L", socket, "capture-pane", "-p", "-t", session],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                ).stdout
+                deadline = time.monotonic() + 3
+                while True:
+                    first_screen = subprocess.run(
+                        ["tmux", "-L", socket, "capture-pane", "-p", "-t", session],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout
+                    if "tmux 256-colour palette" in first_screen or time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.02)
                 self.assertEqual(
                     first_screen.splitlines()[0],
                     "tmux 256-colour palette",

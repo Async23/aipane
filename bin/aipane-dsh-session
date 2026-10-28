@@ -18,13 +18,16 @@ try {
   if (!dsh) throw new Error("dsh executable unavailable")
   const require = createRequire(realpathSync(dsh))
   const { Context } = await import(pathToFileURL(require.resolve("@deepseek-ai/cordis")).href)
-  const { default: Persistence } = await import(pathToFileURL(require.resolve("@deepseek-ai/dsh-session-persistence-jsonl")).href)
+  const persistence = await import(pathToFileURL(require.resolve("@deepseek-ai/dsh-session-persistence-jsonl")).href)
   const root = process.env.DSH_TUI_SESSION_ROOT || process.env.DSH_SESSION_ROOT || join(process.env.DSH_HOME || join(process.env.HOME, ".dsh"), "sessions")
   let valid = false
   for (const compression of ["zstd", "none"]) {
+    const ctx = new Context()
     try {
-      const backend = new Persistence(new Context(), { root, compression })
-      const handle = await backend.open(sid, "read")
+      // Current dsh exports a provider plugin, while older releases exported
+      // the service class. Cordis mounts both through the same public API.
+      await ctx.plugin(persistence.default ?? persistence, { root, compression }).await()
+      const handle = await ctx.sessionPersistence.open(sid, "read")
       try {
         await handle.read()
         valid = handle.header.id === sid && !!handle.header.cwd && realpathSync(handle.header.cwd) === realpathSync(cwd)
@@ -32,7 +35,7 @@ try {
       if (valid) break
     } catch {
       // The other supported encoding may own this exact session.
-    }
+    } finally { await ctx.fiber.dispose() }
   }
   if (!valid) process.exitCode = 1
 } catch {

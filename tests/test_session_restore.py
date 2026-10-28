@@ -14,6 +14,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "lib"))
+from recovery_snapshot import capture_snapshot
 SNAPSHOT = ROOT / "bin" / "aipane-snapshot"
 RESTORE = ROOT / "bin" / "ai-restore"
 
@@ -24,6 +26,17 @@ VALID_GROK_SID = "11111111-2222-4333-8444-555555555555"
 
 
 class SessionRestoreTests(unittest.TestCase):
+    def test_unbound_coordinates_cannot_override_an_older_dump(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            result = self.run_restore(
+                Path(raw_tmp), coord={"sid": FOREIGN_SID, "tool": "x"},
+                title="custom-title", saved_codex_ids={VALID_CODEX_SID, FOREIGN_SID},
+                full_command=f"codex resume {VALID_CODEX_SID}", plan_json=True,
+                bind_snapshot=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["sid"], VALID_CODEX_SID)
+
     def test_snapshot_uses_codex_activity_record_before_first_notify(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
@@ -291,6 +304,74 @@ class SessionRestoreTests(unittest.TestCase):
                 line for line in result.stdout.splitlines() if "0:4.1" in line
             )
             self.assertIn("invalid", matching_line)
+
+    def test_restore_keeps_codex_session_with_suffixed_rollout(self):
+        for root in ("sessions/2026/08/09", "archived_sessions"):
+            with self.subTest(root=root), tempfile.TemporaryDirectory() as raw_tmp:
+                result = self.run_restore(
+                    Path(raw_tmp),
+                    coord={},
+                    title="custom-title",
+                    saved_codex_ids=set(),
+                    saved_codex_records={
+                        f"{root}/rollout-2026-08-09T00-00-00-{VALID_CODEX_SID}_{FOREIGN_SID}.jsonl":
+                            json.dumps({"type": "session_meta", "payload": {"id": VALID_CODEX_SID}}),
+                    },
+                    plan_json=True,
+                    full_command=f"codex --yolo resume {VALID_CODEX_SID}",
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                plan = json.loads(result.stdout)
+                self.assertTrue(plan["restorable"])
+                self.assertEqual(plan["kind"], "resume")
+                self.assertEqual(plan["sid"], VALID_CODEX_SID)
+
+    def test_restore_prefers_suffixed_codex_binding_over_stale_resume_argv(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            result = self.run_restore(
+                Path(raw_tmp),
+                coord={"sid": VALID_CODEX_SID, "tool": "x"},
+                title="custom-title",
+                saved_codex_ids={FOREIGN_SID},
+                saved_codex_records={
+                    f"sessions/rollout-2026-08-09T00-00-00-{VALID_CODEX_SID}_{FOREIGN_SID}.jsonl":
+                        json.dumps({"type": "session_meta", "payload": {"id": VALID_CODEX_SID}}),
+                },
+                plan_json=True,
+                full_command=f"codex --yolo resume {FOREIGN_SID}",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(result.stdout)
+            self.assertTrue(plan["restorable"])
+            self.assertEqual(plan["sid"], VALID_CODEX_SID)
+            self.assertTrue(plan["command"].endswith(f"resume {VALID_CODEX_SID}"))
+
+    def test_restore_rejects_codex_rollout_with_invalid_metadata(self):
+        for suffix in ("", f"_{FOREIGN_SID}"):
+            for content in (
+                "not json",
+                json.dumps({"type": "session_meta", "payload": {"id": FOREIGN_SID}}),
+                json.dumps({"type": "event_msg", "payload": {"id": VALID_CODEX_SID}}),
+            ):
+                with self.subTest(suffix=suffix, content=content), tempfile.TemporaryDirectory() as raw_tmp:
+                    result = self.run_restore(
+                        Path(raw_tmp),
+                        coord={},
+                        title="custom-title",
+                        saved_codex_ids=set(),
+                        saved_codex_records={
+                            f"sessions/rollout-2026-08-09T00-00-00-{VALID_CODEX_SID}{suffix}.jsonl": content,
+                        },
+                        plan_json=True,
+                        full_command=f"codex --yolo resume {VALID_CODEX_SID}",
+                    )
+
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    plan = json.loads(result.stdout)
+                    self.assertEqual(plan["kind"], "invalid")
+                    self.assertFalse(plan["restorable"])
 
     def test_restore_marks_claude_id_without_a_conversation_invalid(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -758,7 +839,7 @@ class SessionRestoreTests(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertIn(
-                f"send-keys -l -t 0:4.1 cd -- {tmp} && codex --yolo --disable plugins "
+                f"send-keys -l -t 0:4.1 cd -- {tmp} && CODEX_HOME={tmp.resolve() / 'codex'} codex --yolo --disable plugins "
                 f"-c check_for_update_on_startup=false resume {VALID_CODEX_SID}",
                 tmux_log.read_text(),
             )
@@ -774,11 +855,13 @@ class SessionRestoreTests(unittest.TestCase):
         coord: dict[str, str],
         title: str,
         saved_codex_ids: set[str],
+        saved_codex_records: dict[str, str] | None = None,
         dry_run: bool = True,
         plan_json: bool = False,
         extra_env: dict[str, str] | None = None,
         current_command: str = "codex",
         full_command: str = "codex --yolo",
+        bind_snapshot: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         state_dir = tmp / "state"
         state_dir.mkdir()
@@ -791,7 +874,14 @@ class SessionRestoreTests(unittest.TestCase):
         sessions_dir = codex_home / "sessions" / "2026" / "08" / "09"
         sessions_dir.mkdir(parents=True)
         for sid in saved_codex_ids:
-            (sessions_dir / f"rollout-2026-08-09T00-00-00-{sid}.jsonl").touch()
+            (sessions_dir / f"rollout-2026-08-09T00-00-00-{sid}.jsonl").write_text(
+                json.dumps({"type": "session_meta", "payload": {"id": sid}}) + "\n",
+                encoding="utf-8",
+            )
+        for relative_path, content in (saved_codex_records or {}).items():
+            rollout = codex_home / relative_path
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(content + "\n", encoding="utf-8")
 
         dump = tmp / "resurrect.txt"
         dump.write_text(
@@ -824,6 +914,8 @@ class SessionRestoreTests(unittest.TestCase):
         )
         if extra_env:
             env.update(extra_env)
+        if bind_snapshot:
+            capture_snapshot(dump, {"0:4.1": coord}, ("/tmp/test", "123"))
         args = ["zsh", str(RESTORE)]
         if plan_json:
             args.append("--plan-json")

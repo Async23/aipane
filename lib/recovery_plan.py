@@ -6,13 +6,15 @@ import hashlib
 import hmac
 import json
 import os
+import shlex
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
-PLAN_VERSION = 1
+PLAN_VERSION = 2
 PLAN_MODE = "restart"
 GUARD_FIELDS = (
     "pane_id",
@@ -27,8 +29,141 @@ GUARD_FIELDS = (
 )
 
 
+TOOL_TAGS = {
+    "pi": "p",
+    "grok": "g",
+    "claude": "c",
+    "cursor": "r",
+    "codex": "x",
+    "opencode": "o",
+    "kimi": "k",
+    "dsh": "d",
+    "qwen": "q",
+}
+
 class RecoveryPlanError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class SessionIdentity:
+    tool: str
+    store: str
+    sid: str
+
+
+def session_identity(item: dict[str, Any], environment: dict[str, str] | None = None) -> SessionIdentity:
+    environment = os.environ if environment is None else environment
+    home = Path(environment.get("HOME", str(Path.home())))
+    tool = item["tool"]
+    if tool == "codex":
+        storage = item.get("codex_home") or environment.get("CODEX_HOME") or home / ".codex"
+    elif tool == "dsh":
+        storage = item.get("session_root") or Path(
+            item.get("dsh_home") or environment.get("DSH_HOME") or home / ".dsh"
+        ) / "sessions"
+    elif tool == "qwen":
+        storage = item.get("qwen_home") or environment.get("QWEN_HOME") or home / ".qwen"
+    else:
+        storage = item.get("cwd", "")
+    return SessionIdentity(tool, str(Path(os.path.expandvars(str(storage))).expanduser().resolve()), str(item.get("sid", "")))
+
+
+def ensure_unique_sessions(items: list[dict[str, Any]]) -> None:
+    """A Codex conversation has one writer per data directory, across panes."""
+    claims: dict[SessionIdentity, str] = {}
+    for item in items:
+        if item.get("restorable") is not True or item.get("tool") != "codex" or not item.get("sid"):
+            continue
+        identity = session_identity(item)
+        prior = claims.get(identity)
+        if prior is not None:
+            raise RecoveryPlanError(
+                f"session conflict: Codex conversation {identity.sid} is requested by "
+                f"both {prior} and {item['target']} in {identity.store}; select one pane before restarting"
+            )
+        claims[identity] = item["target"]
+
+
+def normalize_plan(
+    raw_items: list[dict[str, Any]],
+    *,
+    source: str,
+    require_guard: bool = False,
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    targets: set[str] = set()
+    for number, raw in enumerate(raw_items, start=1):
+        required = ("target", "tool", "kind", "cwd", "command", "restorable")
+        if not isinstance(raw, dict) or any(key not in raw for key in required):
+            raise RecoveryPlanError(
+                f"{source} item {number} is missing required fields"
+            )
+        if any(not isinstance(raw[key], str) for key in required if key != "restorable") or type(raw["restorable"]) is not bool:
+            raise RecoveryPlanError(f"{source} item {number} has an invalid field type")
+        if not isinstance(raw.get("sid", ""), str) or raw["kind"] not in {"resume", "fresh", "recreated", "invalid"}:
+            raise RecoveryPlanError(f"{source} item {number} has an invalid session identity")
+        item = {
+            "target": str(raw["target"]),
+            "tool": str(raw["tool"]),
+            "kind": str(raw["kind"]),
+            "restorable": raw["restorable"] is True,
+            "cwd": str(raw["cwd"]),
+            "command": str(raw["command"]),
+            "sid": str(raw.get("sid", "")),
+        }
+        if item["tool"] == "codex":
+            try:
+                arguments = shlex.split(item["command"])
+            except ValueError as error:
+                raise RecoveryPlanError(f"invalid Codex launch command: {error}") from error
+            command_home = ""
+            for argument in arguments[1:] if arguments and arguments[0] == "env" else arguments:
+                if "=" not in argument:
+                    break
+                key, value = argument.split("=", 1)
+                if key == "CODEX_HOME":
+                    command_home = value
+            item["codex_home"] = session_identity({**item, "codex_home": raw.get("codex_home") or command_home}).store
+            if command_home and session_identity({**item, "codex_home": command_home}).store != item["codex_home"]:
+                raise RecoveryPlanError("Codex command namespace does not match its selected session")
+        if item["tool"] == "dsh":
+            for key in ("dsh_home", "session_root"):
+                item[key] = str(raw.get(key, ""))
+        if item["tool"] == "qwen":
+            for key in ("qwen_home", "qwen_runtime_dir"):
+                item[key] = str(raw.get(key, ""))
+        if (
+            not item["target"]
+            or not item["tool"]
+            or not item["cwd"]
+            or not item["command"]
+        ):
+            raise RecoveryPlanError(
+                f"{source} item {number} contains an empty identity field"
+            )
+        if item["tool"] not in TOOL_TAGS:
+            raise RecoveryPlanError(
+                f"{source} item {number} has unknown tool {item['tool']!r}"
+            )
+        if item["target"] in targets:
+            raise RecoveryPlanError(
+                f"{source} contains duplicate target {item['target']}"
+            )
+        targets.add(item["target"])
+        if require_guard:
+            guard = raw.get("guard")
+            if not isinstance(guard, dict) or any(
+                field_name not in guard for field_name in GUARD_FIELDS
+            ):
+                raise RecoveryPlanError(
+                    f"{source} item {number} has an incomplete pane guard"
+                )
+            if any(not isinstance(guard[field], str) for field in GUARD_FIELDS) or any(not guard[field] for field in GUARD_FIELDS[:5]):
+                raise RecoveryPlanError(f"{source} item {number} has an invalid pane guard")
+            item["guard"] = dict(guard)
+        result.append(item)
+    return result
 
 
 def _canonical(payload: dict[str, Any]) -> bytes:
@@ -51,30 +186,13 @@ def _digest(payload: dict[str, Any]) -> str:
 def _validate_items(raw_items: object) -> list[dict[str, Any]]:
     if not isinstance(raw_items, list) or not raw_items:
         raise RecoveryPlanError("recovery plan items must be a non-empty list")
-    required = ("target", "tool", "kind", "restorable", "cwd", "command", "sid")
-    result: list[dict[str, Any]] = []
-    targets: set[str] = set()
-    for number, raw in enumerate(raw_items, start=1):
-        if not isinstance(raw, dict) or any(field not in raw for field in required):
-            raise RecoveryPlanError(f"recovery plan item {number} is missing required fields")
-        if raw.get("restorable") is not True:
-            raise RecoveryPlanError(f"recovery plan item {number} is not restorable")
-        if any(not isinstance(raw.get(field), str) for field in required if field != "restorable"):
-            raise RecoveryPlanError(f"recovery plan item {number} has a non-string field")
-        if any(not raw.get(field) for field in ("target", "tool", "kind", "cwd", "command")):
-            raise RecoveryPlanError(f"recovery plan item {number} has an empty identity field")
-        target = raw["target"]
-        if target in targets:
-            raise RecoveryPlanError(f"recovery plan contains duplicate target {target}")
-        targets.add(target)
-        guard = raw.get("guard")
-        if not isinstance(guard, dict) or any(field not in guard for field in GUARD_FIELDS):
-            raise RecoveryPlanError(f"recovery plan item {number} has an incomplete pane guard")
-        if any(not isinstance(guard[field], str) for field in GUARD_FIELDS):
-            raise RecoveryPlanError(f"recovery plan item {number} has a non-string pane guard")
-        if any(not guard[field] for field in GUARD_FIELDS[:5]):
-            raise RecoveryPlanError(f"recovery plan item {number} has an empty identity guard")
-        result.append(json.loads(_canonical(raw)))
+    result = normalize_plan(raw_items, source="sealed recovery plan", require_guard=True)
+    if any(item["restorable"] is not True for item in result):
+        raise RecoveryPlanError("sealed recovery plan contains a non-restorable item")
+    guards = [(item["guard"]["socket_path"], item["guard"]["server_pid"], item["guard"]["pane_id"]) for item in result]
+    if len(set(guards)) != len(guards):
+        raise RecoveryPlanError("sealed recovery plan contains duplicate stable pane identity")
+    ensure_unique_sessions(result)
     return result
 
 
@@ -99,6 +217,7 @@ def seal_plan(
         "plan_id": plan_id or uuid.uuid4().hex,
         "created_at": time.time() if created_at is None else created_at,
         "dump": str(resolved_dump),
+        "dump_sha256": hashlib.sha256(resolved_dump.read_bytes()).hexdigest(),
         "items": validated_items,
     }
     if not isinstance(payload["plan_id"], str) or not payload["plan_id"]:
@@ -156,6 +275,8 @@ def load_sealed_plan(
         resolved_dump = Path(dump_value).resolve(strict=True)
     except OSError as error:
         raise RecoveryPlanError(f"sealed recovery dump is unavailable: {error}") from error
+    if payload.get("dump_sha256") != hashlib.sha256(resolved_dump.read_bytes()).hexdigest():
+        raise RecoveryPlanError("sealed recovery dump changed after confirmation")
     if str(resolved_dump) != dump_value:
         raise RecoveryPlanError("sealed recovery plan dump path is not pinned")
     if expected_dump is not None:

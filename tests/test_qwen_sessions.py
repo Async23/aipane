@@ -4,8 +4,6 @@ The fixture only stays alive; it never invokes Qwen, a model or the network.
 Native metadata is written explicitly to exercise session swaps and failures.
 """
 
-import importlib.machinery
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -23,15 +21,12 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 import qwen_sessions as qwen
+from recovery_snapshot import capture_snapshot
 
 SID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 OLD_SID = "11111111-2222-4333-8444-555555555555"
 
-loader = importlib.machinery.SourceFileLoader("qwen_test_executor", str(ROOT / "bin/aipane-restore-executor"))
-spec = importlib.util.spec_from_loader(loader.name, loader)
-executor = importlib.util.module_from_spec(spec)
-sys.modules[loader.name] = executor
-loader.exec_module(executor)
+import recovery as executor
 
 
 class QwenCommandTests(unittest.TestCase):
@@ -144,11 +139,12 @@ class QwenSessionTests(unittest.TestCase):
     def restore_plan(self):
         session, window_pane = self.coord.split(":")
         window, pane = window_pane.split(".")
-        dump = self.root / "dump"
+        dump = self.root / f"dump-{time.time_ns()}"
         dump.write_text("\t".join((
             "pane", session, window, "0", ":-", pane, "qwen", ":" + str(self.root),
             "1", "node", f":node qwen --session-id {OLD_SID}",
         )) + "\n")
+        capture_snapshot(dump, json.loads((self.state / "coords-last.json").read_text()), ("fixture", "1"))
         result = subprocess.check_output(
             ["zsh", str(ROOT / "bin/ai-restore"), "--plan-json", "--dump", str(dump)],
             env=self.env, text=True,
@@ -266,7 +262,7 @@ class QwenSessionTests(unittest.TestCase):
         attempt = executor.Attempt(self.plan, 0.05, None, True, False)
         verified, failures, blocked = runner.verify_round([attempt])
         self.assertEqual(verified, [])
-        self.assertIn(self.coord, blocked)
+        self.assertEqual(len(blocked), 1)
 
     def test_explicit_fresh_launch_still_requires_native_runtime_identity(self):
         runner = executor.RestoreExecutor(self.env)

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,10 +15,20 @@ LIB = ROOT / "lib"
 if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
 
-from recovery_plan import RecoveryPlanError, load_sealed_plan, seal_plan
+from recovery_plan import RecoveryPlanError, load_sealed_plan, seal_plan, normalize_plan
 
 
 class RecoveryPlanTests(unittest.TestCase):
+    def test_codex_namespace_is_pinned_and_conflicting_launch_override_is_rejected(self):
+        item = {"target": "0:1.0", "tool": "codex", "kind": "resume", "restorable": True,
+                "cwd": "/tmp", "command": "codex resume thread-1", "sid": "thread-1"}
+        with patch.dict("os.environ", {"CODEX_HOME": "/tmp/first-codex"}):
+            pinned = normalize_plan([item], source="snapshot")[0]
+        with patch.dict("os.environ", {"CODEX_HOME": "/tmp/second-codex"}):
+            self.assertEqual(normalize_plan([pinned], source="retry")[0], pinned)
+            with self.assertRaisesRegex(RecoveryPlanError, "namespace"):
+                normalize_plan([{**pinned, "command": "CODEX_HOME=/tmp/other-codex codex resume thread-1"}], source="snapshot")
+
     def test_plan_pins_resolved_dump_and_round_trips_exact_items(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -30,6 +41,7 @@ class RecoveryPlanTests(unittest.TestCase):
                 {
                     "target": "0:1.0",
                     "tool": "codex",
+                    "codex_home": str((root / "codex").resolve()),
                     "kind": "resume",
                     "restorable": True,
                     "cwd": str(root),
@@ -56,6 +68,10 @@ class RecoveryPlanTests(unittest.TestCase):
             self.assertEqual(loaded["dump"], str(dump.resolve()))
             self.assertEqual(loaded["items"], items)
             self.assertEqual(loaded["plan_id"], "fixed-plan")
+
+            dump.write_text("snapshot changed after confirmation\n", encoding="utf-8")
+            with self.assertRaisesRegex(RecoveryPlanError, "dump changed"):
+                load_sealed_plan(plan_path)
 
     def test_plan_digest_rejects_post_confirmation_mutation(self):
         with tempfile.TemporaryDirectory() as directory:

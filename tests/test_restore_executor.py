@@ -93,9 +93,12 @@ class RestoreExecutorTests(unittest.TestCase):
                             "#{pane_current_command}": state,
                             "#{pane_id}": os.environ["FAKE_PANE_ID"],
                             "#{pane_pid}": "8484",
-                            "#{pane_tty}": "/dev/ttys042",
+                            "#{pane_tty}": "/dev/aipane-test-nonexistent",
                             "#{socket_path}": "/private/tmp/tmux-test",
                             "#{pid}": "4242",
+                            "#{session_name}": "0",
+                            "#{window_index}": "4",
+                            "#{pane_index}": "1",
                             "#{window_id}": "@1",
                             "#{synchronize-panes}": "0",
                             "#{@tmux-window-wrap-activity}": "",
@@ -103,6 +106,15 @@ class RestoreExecutorTests(unittest.TestCase):
                             "#{@tmux-window-wrap-activity-updated-at}": "",
                             "#{@tmux-window-wrap-activity-record}": "",
                         }
+                        if os.environ.get("FAKE_PER_PANE_STATE") == "1" and "-t" in args:
+                            target = args[args.index("-t") + 1]
+                            if ":" in target and "." in target:
+                                session, coordinate = target.split(":")
+                                window, pane = coordinate.split(".")
+                                replacements["#{pane_id}"] = "%" + str(1000 + int(window) * 100 + int(pane))
+                                replacements["#{session_name}"] = session
+                                replacements["#{window_index}"] = window
+                                replacements["#{pane_index}"] = pane
                         for marker, replacement in replacements.items():
                             value = value.replace(marker, replacement)
                         print(value)
@@ -190,6 +202,7 @@ class RestoreExecutorTests(unittest.TestCase):
         launch_mode: str,
         max_attempts: int = 1,
         plan_json: bool = False,
+        retry_pending: bool = False,
         report_json: bool = False,
         pane_id: str = "%42",
         guard_pane_id: str | None = None,
@@ -221,6 +234,9 @@ class RestoreExecutorTests(unittest.TestCase):
                     "activity_updated_at": "",
                     "activity_record": "",
                 }
+                if per_pane_state:
+                    window, pane = item["target"].split(":")[1].split(".")
+                    guard["pane_id"] = "%" + str(1000 + int(window) * 100 + int(pane))
                 guard.update(guard_overrides or {})
                 guarded_plan.append(
                     {
@@ -238,6 +254,7 @@ class RestoreExecutorTests(unittest.TestCase):
         env.update(
             {
                 "AIPANE_STATE_DIR": str(self.state_dir),
+                "CODEX_HOME": str(self.tmp / "codex-home"),
                 "AIPANE_TMUX": str(self.fake_tmux),
                 "AIPANE_BIND_COMMAND": str(self.fake_bind),
                 "AIPANE_GROK_LOG": str(self.grok_log),
@@ -264,7 +281,9 @@ class RestoreExecutorTests(unittest.TestCase):
         if capture_text is not None:
             env["FAKE_CAPTURE_TEXT"] = capture_text
         env.update(extra_environment or {})
-        if sealed:
+        if retry_pending:
+            arguments = [str(EXECUTOR), "--retry-pending"]
+        elif sealed:
             arguments = [
                 str(EXECUTOR),
                 "--sealed-plan",
@@ -467,7 +486,7 @@ class RestoreExecutorTests(unittest.TestCase):
         self.assertEqual(local["server_pid"], "4242")
         self.assertEqual(local["attempts"], 1)
         self.assertGreater(local["created_at"], foreign["created_at"])
-        preview = self.run_executor([], launch_mode="ready", plan_json=True)
+        preview = self.run_executor([], launch_mode="ready", plan_json=True, retry_pending=True)
         self.assertEqual(json.loads(preview.stdout)["socket_path"], local["socket_path"])
 
     def test_shared_pending_file_uses_shared_lock_with_another_state_directory(self):
@@ -487,7 +506,7 @@ class RestoreExecutorTests(unittest.TestCase):
         self.assertNotEqual(failed.returncode, 0)
         self.assertEqual(len(self.pending_items()), 1)
 
-        shown = self.run_executor([], launch_mode="ready", plan_json=True)
+        shown = self.run_executor([], launch_mode="ready", plan_json=True, retry_pending=True)
         self.assertEqual(shown.returncode, 0, shown.stderr)
         pending_plan = json.loads(shown.stdout)
         self.assertEqual(pending_plan["target"], "0:4.1")
@@ -499,7 +518,7 @@ class RestoreExecutorTests(unittest.TestCase):
             plan_json=True,
         )
         self.assertEqual(shown_with_same_snapshot.returncode, 0)
-        self.assertTrue(json.loads(shown_with_same_snapshot.stdout)["pending"])
+        self.assertNotIn("pending", json.loads(shown_with_same_snapshot.stdout))
 
         recovered = self.run_executor([], launch_mode="ready")
 
@@ -528,6 +547,34 @@ class RestoreExecutorTests(unittest.TestCase):
                 for call in tmux_calls
             )
         )
+
+    def test_snapshot_plan_never_inherits_pending_intent_at_a_reused_coordinate(self):
+        failed = self.run_executor([self.grok_plan()], launch_mode="fail")
+        self.assertNotEqual(failed.returncode, 0)
+        pending = self.pending_items()
+        fresh = {**self.grok_plan(), "sid": "", "kind": "fresh", "restorable": False}
+        preview = self.run_executor([fresh], launch_mode="ready", plan_json=True, pane_id="%99")
+        self.assertEqual(preview.returncode, 0, preview.stderr)
+        self.assertEqual(json.loads(preview.stdout)["kind"], "fresh")
+        self.assertEqual(json.loads(preview.stdout)["sid"], "")
+        empty = self.run_executor([], launch_mode="ready", plan_json=True)
+        self.assertEqual(empty.stdout.strip(), "")
+        self.assertEqual(self.pending_items(), pending)
+
+    def test_legacy_pending_without_stable_pane_identity_cannot_launch(self):
+        failed = self.run_executor([self.grok_plan()], launch_mode="fail")
+        self.assertNotEqual(failed.returncode, 0)
+        path = self.state_dir / "restore-pending.json"
+        payload = json.loads(path.read_text())
+        payload["items"][0].pop("pane_id")
+        path.write_text(json.dumps(payload))
+        before = self.tmux_log.read_bytes()
+        result = self.run_executor([], launch_mode="ready", retry_pending=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no stable pane identity", result.stderr)
+        calls = [json.loads(line) for line in self.tmux_log.read_bytes()[len(before):].splitlines()]
+        self.assertFalse(any(call[0] in {"send-keys", "respawn-pane", "set-option"} for call in calls))
+        self.assertEqual(len(self.pending_items()), 1)
 
     def test_transient_failure_is_retried_and_verified_in_the_same_run(self):
         result = self.run_executor(
@@ -602,6 +649,32 @@ class RestoreExecutorTests(unittest.TestCase):
         self.assertIn("blocked=1", result.stdout)
         self.assertNotIn("verified=1", result.stdout)
         self.assertEqual([item["target"] for item in self.pending_items()], ["0:4.1"])
+        self.assertFalse(self.bind_log.exists())
+
+    def test_codex_conversation_lock_reports_actionable_blocker(self):
+        plan = {
+            **self.grok_plan(), "tool": "codex",
+            "command": "codex resume thread-1", "sid": "thread-1",
+        }
+        result = self.run_executor(
+            [plan], launch_mode="ready", sealed=True, running_command="codex",
+            report_json=True, max_attempts=2,
+            extra_environment={"AI_RESTORE_CODEX_VERIFY_TIMEOUT": "0.15"},
+            capture_text=(
+                "This conversation is open in\nanother app\n"
+                "r to retry\n"
+                "Close it there and press R to continue\nhere.\n"
+                "r retry   f fork   esc/ctrl-c/q exit"
+            ),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        report = json.loads(result.stdout.splitlines()[-1])
+        self.assertEqual((report["verified"], report["pending"], report["blocked"]), (0, 1, 1))
+        self.assertIn("open in another app", report["errors"][0])
+        self.assertIn("press R", report["errors"][0])
+        self.assertIn("0:4.1", report["errors"][0])
+        self.assertIn("open in another app", self.pending_items()[0]["last_error"])
+        self.assertEqual(self.launch_count.read_text().strip(), "1")
         self.assertFalse(self.bind_log.exists())
 
     def test_sealed_restart_persists_intent_before_respawn(self):

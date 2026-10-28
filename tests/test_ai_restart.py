@@ -270,6 +270,7 @@ class AiRestartTests(unittest.TestCase):
                     arguments = ("--force",) if mode == "restart" else ()
                     pending = None
                     if mode == "retry":
+                        arguments = ("--retry",)
                         pending = self.write_pending()
                         before = pending.read_bytes()
                     code, output = self.run_restart_at_prompt(key, *arguments)
@@ -285,13 +286,38 @@ class AiRestartTests(unittest.TestCase):
     def test_pending_preview_explains_recovery_scope_and_last_failure(self):
         pending = self.write_pending()
         before = pending.read_bytes()
-        result = self.run_restart("--dry-run")
+        result = self.run_restart("--retry", "--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("not the full set of running AI panes", result.stdout)
         self.assertIn("previous verification failed", result.stdout)
-        self.assertIn("run ai-restart again", result.stdout)
+        self.assertIn("Full restart has not started", result.stdout)
+        self.assertNotIn("run ai-restart again", result.stdout)
         self.assertFalse(self.save_log.exists())
         self.assertEqual(pending.read_bytes(), before)
+
+    def test_full_preview_remains_available_with_pending_recovery(self):
+        pending = self.write_pending()
+        before = pending.read_bytes()
+        result = self.run_restart("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("AI panes to restart:", result.stdout)
+        self.assertIn("Outstanding recovery records", result.stdout)
+        self.assertEqual(pending.read_bytes(), before)
+
+    def test_discard_archives_one_record_without_touching_any_pane(self):
+        pending = self.write_pending()
+        before = self.tmux("list-panes", "-a", "-F", "#{pane_id}:#{pane_pid}").stdout
+        preview = self.run_restart("--dry-run")
+        identifier = preview.stdout.split("ID=", 1)[1].split()[0]
+        saved = self.save_log.read_text()
+        result = self.run_restart("--discard-pending", identifier, "--yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(pending.read_text())
+        self.assertEqual(payload["items"], [])
+        self.assertEqual(payload["history"][-1]["resolution"], "discarded")
+        self.assertEqual(payload["history"][-1]["sid"], "pending-session")
+        self.assertEqual(self.tmux("list-panes", "-a", "-F", "#{pane_id}:#{pane_pid}").stdout, before)
+        self.assertEqual(self.save_log.read_text(), saved)
 
     def other_server(self):
         command = ["tmux", "-L", f"{self.socket}-other"]
@@ -455,7 +481,7 @@ class AiRestartTests(unittest.TestCase):
         self.assertEqual(len(json.loads(pending.read_text())["items"]), 1)
         self.assertFalse(self.save_log.exists())
 
-    def configure_codex_startup(self, *, loaded=False, exits=False, read_only=False):
+    def configure_codex_startup(self, *, loaded=False, exits=False, read_only=False, lock_message=False):
         """A real process that can outlive verification before bootstrap fails."""
         source = self.tmp / "codex.c"
         source.write_text(textwrap.dedent('''
@@ -476,6 +502,12 @@ class AiRestartTests(unittest.TestCase):
                     rollout = fopen(argv[2], mode);
                     if (!rollout) return 2;
                 }
+                if (argc > 5 && strcmp(argv[5], "lock-message") == 0) {
+                    puts("This conversation is open in another app");
+                    puts("Close it there and press R to continue here.");
+                    puts("r retry   f fork   esc/ctrl-c/q exit");
+                    fflush(stdout);
+                }
                 for (;;) pause();
             }
         '''))
@@ -493,7 +525,10 @@ class AiRestartTests(unittest.TestCase):
         self.network_ready = self.tmp / "network-ready"
         self.extra_environment = {
             "TEST_TOOL": "codex", "TEST_SID": sid,
-            "TEST_AGENT_COMMAND": shlex.join([str(codex), mode, str(rollout), sid, str(self.network_ready)]),
+            "TEST_AGENT_COMMAND": shlex.join([
+                str(codex), mode, str(rollout), sid, str(self.network_ready),
+                "lock-message" if lock_message else "plain",
+            ]),
             "CODEX_HOME": str(home),
             "AI_RESTORE_VERIFY_STABILITY": "0.03",
             "AI_RESTORE_VERIFY_TIMEOUT": "0.7",
@@ -509,11 +544,73 @@ class AiRestartTests(unittest.TestCase):
         self.assertEqual(len(pending["items"]), 1)
         self.assertIn("1 pending", result.stdout)
 
+    def test_duplicate_codex_session_is_rejected_before_replacing_any_pane(self):
+        self.configure_codex_startup(loaded=True)
+        second = self.tmux("split-window", "-d", "-P", "-F",
+                           "#{session_name}:#{window_index}.#{pane_index}",
+                           "-t", self.target, "sleep 120").stdout.strip()
+        self.extra_environment["TEST_SECOND_TARGET"] = second
+        before = self.tmux("list-panes", "-a", "-F", "#{pane_id}:#{pane_pid}").stdout
+
+        result = self.run_restart("--yes", "--force")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("session conflict", result.stderr)
+        self.assertEqual(self.tmux("list-panes", "-a", "-F", "#{pane_id}:#{pane_pid}").stdout, before)
+        self.assertFalse((self.tmp / "aipane-state/restore-pending.json").exists())
+
+    def test_codex_writer_outside_plan_blocks_restart_before_respawn(self):
+        self.configure_codex_startup(loaded=True)
+        owner = self.tmux("new-window", "-d", "-P", "-F", "#{pane_id}",
+                          self.extra_environment["TEST_AGENT_COMMAND"]).stdout.strip()
+        sys.path.insert(0, str(ROOT / "lib"))
+        from codex_sessions import session_loaded
+        from recovery import Tmux
+        deadline = time.monotonic() + 3
+        adapter = Tmux(self.environment())
+        while time.monotonic() < deadline:
+            process = adapter.foreground_process(owner)
+            if process and session_loaded(process[0], self.extra_environment["TEST_SID"],
+                                          Path(self.extra_environment["CODEX_HOME"])):
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("fixture writer did not load")
+        before = self.tmux("list-panes", "-a", "-F", "#{pane_id}:#{pane_pid}").stdout
+        result = self.run_restart("--yes", "--force")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already open for writing", result.stderr)
+        self.assertEqual(self.tmux("list-panes", "-a", "-F", "#{pane_id}:#{pane_pid}").stdout, before)
+
     def test_codex_waiting_for_account_never_counts_as_loaded(self):
         self.configure_codex_startup()
         result = self.run_restart("--yes", "--force")
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("1 pending", result.stdout)
+
+    def test_retry_reports_conversation_lock_without_restarting_process(self):
+        self.configure_codex_startup(lock_message=True)
+        self.assertNotEqual(self.run_restart("--yes", "--force").returncode, 0)
+        pending_path = self.tmp / "aipane-state/restore-pending.json"
+        payload = json.loads(pending_path.read_text())
+        payload["items"][0]["last_error"] = "previous generic timeout"
+        pending_path.write_text(json.dumps(payload))
+        saved = self.save_log.read_text()
+
+        result = self.run_restart("--retry", "--yes")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("open in another app", result.stderr)
+        self.assertIn("press R", result.stderr)
+        self.assertNotIn("rerun ai-restart --retry when ready", result.stderr)
+        self.assertEqual(self.save_log.read_text(), saved)
+        self.assertEqual(json.loads(pending_path.read_text())["items"][0]["attempts"], 1)
+
+    def test_loaded_codex_with_lock_text_in_history_is_verified(self):
+        self.configure_codex_startup(loaded=True, lock_message=True)
+        result = self.run_restart("--yes", "--force")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("verified 1 AI pane(s) resumed", result.stdout)
 
     def test_codex_writable_exact_rollout_confirms_recovery(self):
         self.configure_codex_startup(loaded=True)
@@ -538,7 +635,7 @@ class AiRestartTests(unittest.TestCase):
         result = self.run_restart("--yes", "--force")
         self.assertNotEqual(result.returncode, 0, result.stdout)
 
-    def test_restart_retries_pending_before_saving_another_snapshot(self):
+    def test_explicit_retry_preserves_snapshot_and_follows_moved_pane(self):
         self.configure_codex_startup(exits=True)
         failed = self.run_restart("--yes", "--force")
         self.assertNotEqual(failed.returncode, 0, failed.stdout)
@@ -572,11 +669,12 @@ class AiRestartTests(unittest.TestCase):
                             "-t", self.pane_id, "sleep 120").stdout.strip()
         self.tmux("set-window-option", "-t", self.pane_id, "synchronize-panes", "on")
 
-        preview = self.run_restart("--dry-run")
+        preview = self.run_restart("--retry", "--dry-run")
         self.assertEqual(preview.returncode, 0, preview.stderr)
         self.assertIn("pending", preview.stdout)
-        result = self.run_restart("--yes")
+        result = self.run_restart("--retry", "--yes")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("pending recovery completed; run ai-restart again", result.stdout)
         self.assertEqual(self.save_log.read_text(), saved)
         self.assertEqual(self.snapshot_log.read_text(), snapshot)
         self.assertEqual(json.loads(pending_path.read_text())["items"], [])

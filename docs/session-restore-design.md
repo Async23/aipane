@@ -8,25 +8,10 @@
 
 ## 当前使用方式
 
-- tmux-resurrect 保存结构后，`ai-restore` 负责在原 pane 续接 AI 会话。
-- `ai-restart` 有 pending 时先补恢复，完成后直接结束；列表只包含上次未完成的恢复记录，
-  并非当前全部 AI pane。提示会显示上次失败原因；补恢复成功后再运行一次才进入新一轮重启。
-- `ai-restart --retry` 只补恢复，不保存快照或替换 pane；没有 pending 时直接结束。
-- `ai-restart --dry-run` 有 pending 时只预览，否则刷新快照并预览本次可恢复的 pane。
-- 确认提示处按 Ctrl+C 只显示取消信息并以 130 退出；Ctrl+D 按取消处理，以 0 退出。
-  两者均不替换 pane，也不改写 pending。
-- 从 tmux 外的独立终端执行 `ai-restart`；确认后由恢复执行器按 sealed plan 批量重生并
-  续接这些 pane。
-- 默认检测到任一 `busy` Agent Activity 就整体中止；旧进程显示 `unknown` 时，命令
-  要求明确确认所有任务已空闲。非交互覆盖必须使用 `--force`。
-- Grok 在进程内 `/new` 或 `/resume` 后，存盘按原生活跃会话表中的存活 PID 与 pane TTY
-  记录当前会话；恢复优先使用这份坐标绑定，并校验当前目录的会话文件（见 §19）。
-- dsh-TUI 按当前前台 Channel 的会话 ID 恢复；新建、恢复、分支和后台切换都会更新
-  绑定。落盘校验与实际加载确认见 §20。
-- Qwen Code 存盘时按前台进程的原生登记读取当前会话，覆盖启动 ID；恢复前校验
-  当前项目的聊天记录，恢复后核对运行时身份。`/clear`、`/resume` 与带参数启动均
-  使用同一条链路（见 §23）。
-- Droid 暂不在恢复范围内。
+当前命令行为、快照格式、记录生命周期与固定运行版本流程统一见
+[会话恢复与稳定运行版本](recovery-runtime.md)。以下各节保留历史问题和当时的方案；
+其中“全局坐标表参与恢复”“pending 优先进入补恢复”“version 1 sealed plan”及
+“按坐标合并 pending”等设计已由该文档中的实现替代。
 
 ## 0. 一个绕不开的前提
 
@@ -627,6 +612,13 @@ Agent 确实是当前运行时的根。创建后台 Agent 或尚未提交的 for
 Codex 的账号连接在进程启动后才完成。旧验证在进程存活 1 秒后即清除 pending，
 网络超时退出可能发生在这之后，导致下一份快照只剩 shell，丢失自动恢复依据。
 
+恢复前的会话检查同时识别 `...-<session-id>.jsonl` 和
+`...-<session-id>_<rollout-id>.jsonl`，并核对首条 `session_meta.payload.id`。
+同一会话可以有多个 rollout，原始文件压缩后仍可能有带附加 ID 的未压缩记录；
+不能因文件名不再以会话 ID 结尾就判为无效，也不能把附加 ID 当作会话 ID。
+2026-10-26 的 `0:1.1` 漏恢复由此造成。回归通过实际 `ai-restore --plan-json`
+覆盖两种文件名、归档目录、当前绑定优先和错误文件头；恢复后仍须验证进程实际加载。
+
 `lib/codex_sessions.py` 现在通过 `lsof` 检查当前前台进程是否以可写方式打开
 `CODEX_HOME/sessions` 或 `archived_sessions` 下的本地 rollout，并核对首条
 `session_meta.payload.id` 等于计划中的会话 ID。账号启动阶段的历史预览只读句柄、
@@ -637,6 +629,12 @@ Codex 的账号连接在进程启动后才完成。旧验证在进程存活 1 �
 Codex 默认验证期限为 60 秒，可用 `AI_RESTORE_CODEX_VERIFY_TIMEOUT` 调整。
 进程因启动错误退出后仍可自动重试；超时但进程仍在运行时保留现场，不发送中断。
 对执行前已存在的 Agent，验证失败也不会在下一轮重试中中断它。
+
+Codex 的“会话已在另一个应用中打开”页面会立即标为 blocked，并显示处理方法，
+不再等满验证期限后笼统报告缺少写句柄。同一会话在两个 pane 同时恢复会触发此锁；
+须先处理重复实例，在保留的锁定页面按 R 继续。`ai-restart --retry` 只验证已有进程，
+不会释放其他实例的会话锁，也不会代按 R。
+目标会话已有可写记录时，以运行时证据为准，正文中引用的锁定提示不作为启动阻塞。
 
 `ai-restart` 在保存新快照前检查 pending。有未完成恢复时只进入补恢复流程，
 确认后直接读取持久命令，在原 tmux server 内按固定 pane ID 找回当前坐标，

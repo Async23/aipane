@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Validate a frozen revision, then atomically activate the recovery runtime."""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import uuid
+
+
+COMMANDS = ("ai-restart", "ai-restore", "aipane-snapshot", "aipane-bind", "aipane-restore-executor")
+
+
+class ReleaseError(RuntimeError):
+    pass
+
+
+def git(source: Path, *args: str) -> bytes:
+    return subprocess.check_output(["git", "-C", str(source), *args], stderr=subprocess.PIPE)
+
+
+def replace_link(link: Path, destination: Path) -> None:
+    link.parent.mkdir(parents=True, exist_ok=True)
+    temporary = link.with_name(f".{link.name}.{uuid.uuid4().hex}")
+    temporary.symlink_to(destination)
+    try:
+        temporary.replace(link)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def verify(directory: Path) -> dict:
+    manifest = json.loads((directory / "release.json").read_text())
+    for relative, expected in manifest["files"].items():
+        path = directory / relative
+        if not path.resolve().is_relative_to(directory.resolve()):
+            raise ReleaseError(f"release file leaves its snapshot: {relative}")
+        if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            raise ReleaseError(f"release file changed after validation: {relative}")
+    return manifest
+
+
+def prepare(source: Path, root: Path, revision: str, *, baseline: bool = False) -> Path:
+    commit = git(source, "rev-parse", "--verify", f"{revision}^{{commit}}").decode().strip()
+    destination = root / "releases" / commit
+    if destination.exists():
+        manifest = verify(destination)
+        if manifest["validation"] != "passed" and not baseline:
+            raise ReleaseError("the imported baseline must be validated before installing it as a new release")
+        return destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".prepare-{uuid.uuid4().hex}")
+    temporary.mkdir()
+    try:
+        archive = git(source, "archive", "--format=tar", commit)
+        with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
+            bundle.extractall(temporary, filter="data")
+        missing = [name for name in COMMANDS if not (temporary / "bin" / name).is_file()]
+        if missing:
+            raise ReleaseError("release is missing commands: " + ", ".join(missing))
+        validation = "imported-baseline" if baseline else "passed"
+        if not baseline:
+            print(f"Validating frozen revision {commit[:12]}...", flush=True)
+            runner = (
+                "import unittest,sys; suite=unittest.defaultTestLoader.discover('tests',pattern='test_*.py'); "
+                "assert suite.countTestCases()>0,'release has no tests'; "
+                "sys.exit(not unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful())"
+            )
+            completed = subprocess.run([sys.executable, "-c", runner], cwd=temporary,
+                                       env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            (temporary / "validation.log").write_text(completed.stdout)
+            print(completed.stdout[-6000:], flush=True)
+            if completed.returncode:
+                raise ReleaseError("release validation failed; current runtime is unchanged")
+        files = {str(path.relative_to(temporary)): hashlib.sha256(path.read_bytes()).hexdigest()
+                 for path in temporary.rglob("*") if path.is_file() and "__pycache__" not in path.parts}
+        (temporary / "release.json").write_text(json.dumps(
+            {"version": 1, "revision": commit, "validation": validation, "files": files}, indent=2) + "\n")
+        temporary.replace(destination)
+        for path in destination.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                path.chmod(path.stat().st_mode & ~0o222)
+        return destination
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("install", "status", "rollback"))
+    parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--root", type=Path, default=Path.home() / ".local/share/aipane/runtime")
+    parser.add_argument("--bin-dir", type=Path, default=Path.home() / ".local/bin")
+    parser.add_argument("--baseline", help="initial runtime revision to preserve for rollback")
+    args = parser.parse_args()
+    root = args.root.expanduser().resolve()
+    current, previous = root / "current", root / "previous"
+    if args.action == "status":
+        if not current.is_symlink():
+            print("aipane-release: no frozen runtime installed")
+            return 0
+        manifest = verify(current.resolve())
+        print(json.dumps({"current": str(current.resolve()), "revision": manifest["revision"],
+                          "validation": manifest["validation"],
+                          "previous": str(previous.resolve()) if previous.is_symlink() else None}, indent=2))
+        return 0
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / "install.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if args.action == "rollback":
+            if not current.is_symlink() or not previous.is_symlink():
+                raise ReleaseError("no previous runtime is available")
+            target, old = previous.resolve(), current.resolve()
+            verify(target)
+            state_dir = Path(os.environ.get("AIPANE_STATE_DIR", root.parent))
+            pending = state_dir / "restore-pending.json"
+            if pending.exists():
+                backups = root / "state-backups"
+                backups.mkdir(exist_ok=True)
+                shutil.copy2(pending, backups / f"{time.time_ns()}-{old.name}.json")
+            replace_link(current, target)
+            replace_link(previous, old)
+            print(f"aipane-release: rolled back to {target.name}")
+            return 0
+        source = args.source.expanduser().resolve()
+        if git(source, "status", "--porcelain").strip():
+            raise ReleaseError("source has uncommitted changes; commit the reviewed revision before installing")
+        for name in (*COMMANDS, "aipane-release"):
+            entry = args.bin_dir / name
+            if entry.exists() and not entry.is_symlink():
+                raise ReleaseError(f"refusing to replace a regular file: {entry}")
+        target = prepare(source, root, "HEAD")
+        if not current.is_symlink():
+            initial = prepare(source, root, args.baseline, baseline=True) if args.baseline else target
+            original = {name: os.readlink(args.bin_dir / name) if (args.bin_dir / name).is_symlink() else None
+                        for name in COMMANDS}
+            (root / "original-links.json").write_text(json.dumps(original, indent=2) + "\n")
+            replace_link(current, initial)
+        old = current.resolve()
+        for name in COMMANDS:
+            replace_link(args.bin_dir / name, current / "bin" / name)
+        if old != target:
+            replace_link(previous, old)
+            replace_link(current, target)
+        # Keep the manager available when rolling back to a pre-manager baseline.
+        replace_link(args.bin_dir / "aipane-release", target / "bin/aipane-release")
+        print(f"aipane-release: activated {target.name}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (ReleaseError, OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f"aipane-release: {error}", file=sys.stderr)
+        raise SystemExit(1)

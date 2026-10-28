@@ -197,13 +197,8 @@ Inside tmux, a pane layout reuses the current window only when it has one pane; 
 ## Restart AI Panes
 
 `ai-restart` restarts recoverable AI conversations in their existing tmux panes.
-If recovery is unfinished on the current tmux server, it retries those conversations
-before saving another snapshot or starting a new restart. `--retry` explicitly
-requests recovery only.
-Droid is ignored because its session restore is not implemented.
-
-The full recovery invariants and failure model live in
-[`docs/session-restore-design.md`](docs/session-restore-design.md).
+Preview, recovery records, and installation of validated runtime snapshots are documented in
+[`Recovery runtime`](docs/recovery-runtime.md).
 
 The macOS completion-notification adapters and their sound overrides are indexed in
 [`docs/agent-notifications.md`](docs/agent-notifications.md).
@@ -211,44 +206,6 @@ The macOS completion-notification adapters and their sound overrides are indexed
 dsh-TUI setup for activity, exact session recovery, notifications, and Web
 profile coverage is indexed in [`docs/dsh-integration.md`](docs/dsh-integration.md).
 
-```bash
-ai-restart --dry-run  # preview pending recovery or a new restart
-ai-restart            # retry pending recovery, otherwise confirm a new restart
-ai-restart --retry    # retry only unfinished recovery; never start a new restart
-ai-restart --force    # allow panes currently marked busy
-```
-
-Pi can change sessions without restarting its process. Install aipane's Pi
-session-binding Adapter so `/new`, `/resume`, and `/fork` remain restorable:
-
-```bash
-AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
-mkdir -p ~/.pi/agent/extensions ~/.local/bin
-ln -sf "$AIPANE_ROOT/integrations/pi/aipane-bind.ts" \
-  ~/.pi/agent/extensions/aipane-bind.ts
-ln -sf "$AIPANE_ROOT/bin/aipane-bind" ~/.local/bin/aipane-bind
-```
-
-Run `/reload` in Pi processes that were already open.
-
-The default command aborts the whole operation if any selected Agent Activity
-is effectively busy. It resolves Codex turns from exact lifecycle evidence
-before the plan and again after confirmation.
-Missing, stale, or inconsistent evidence is shown as `unknown` and requires an
-explicit interactive confirmation that all tasks are idle. `--yes` alone never
-accepts `unknown`; `--force` is the non-interactive override. Run the command
-from a separate terminal outside tmux so it can safely replace every selected
-AI pane. This requires
-tmux-resurrect and the session-restore hooks described in
-[`docs/session-restore-design.md`](docs/session-restore-design.md).
-
-Pi, Claude, and Qwen Code can own a preassigned `--session-id` without having
-created a durable conversation yet. An empty Pi session is reopened as an empty
-TUI and
-reported as `recreated`, never as a resumed conversation. A Pi ID that exists
-under another project (or has a damaged record) remains `invalid`. Claude and
-Qwen Code still require a durable transcript and are left untouched when none
-exists.
 
 ## Process Cleanup
 
