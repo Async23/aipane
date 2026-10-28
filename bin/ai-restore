@@ -131,6 +131,11 @@ typeset CODEX_RESTORE_BASE="$CODEX_BASE -c check_for_update_on_startup=false"
 detect_tool() {
   local full="$1" cur="$2" prog
   REPLY=""
+  # A saved foreground shell must stay a shell. The full-command field can
+  # still contain a stale/background Agent command, even with a session binding.
+  case "${cur#-}" in
+    sh|bash|zsh|fish|dash|ksh|csh|tcsh) return ;;
+  esac
   # cursor-agent runs under node with a versioned path; match by substring.
   if [[ "$full" == *cursor-agent* ]]; then REPLY=cursor; return; fi
   prog="${full%% *}"; prog="${prog:t}"      # basename of argv[0]

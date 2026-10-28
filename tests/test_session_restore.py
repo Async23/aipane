@@ -26,6 +26,27 @@ VALID_GROK_SID = "11111111-2222-4333-8444-555555555555"
 
 
 class SessionRestoreTests(unittest.TestCase):
+    def test_restore_ignores_stale_agent_command_in_saved_shell(self):
+        # A real dump saved foreground zsh with the same Codex resume command
+        # as another pane. Restoring it launched a duplicate conversation.
+        for current in ("zsh", "-zsh", "bash", "-bash", "sh", "-sh", "fish", "-fish",
+                        "dash", "ksh", "csh", "tcsh"):
+            for bind_snapshot in (False, True):
+                with self.subTest(current=current, bind_snapshot=bind_snapshot):
+                    with tempfile.TemporaryDirectory() as raw_tmp:
+                        result = self.run_restore(
+                            Path(raw_tmp),
+                            coord={"sid": VALID_CODEX_SID, "tool": "x"},
+                            title="alfheim@Alfheim:~",
+                            saved_codex_ids={VALID_CODEX_SID},
+                            current_command=current,
+                            full_command=f"codex resume {VALID_CODEX_SID}",
+                            bind_snapshot=bind_snapshot,
+                            plan_json=True,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout.strip(), "")
+
     def test_unbound_coordinates_cannot_override_an_older_dump(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             result = self.run_restore(
