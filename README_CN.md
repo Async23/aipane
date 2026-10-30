@@ -146,6 +146,9 @@ export AIPANE_KIMI_LAUNCH_CMD="kimi --auto"
 
 加载这些覆盖值后，`ai --help` 会显示实际生效的启动命令。
 
+可选的 Claude Code 模型菜单及安装方式见
+[Claude Code 模型菜单](docs/claude-model-picker.md)。
+
 ## `ai` 启动器
 
 工具键及其默认命令：

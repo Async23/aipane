@@ -43,6 +43,7 @@ ln -sf "$AIPANE_ROOT/integrations/pi/aipane-bind.ts" ~/.pi/agent/extensions/aipa
 Claude 自动恢复命令带有 `AIPANE_AUTO_RESUME=1`，支持该标记的启动器可据此
 沿用已记录的模型并跳过模型选择。若无法确定原模型，启动器应报错，保留待恢复记录；
 手动启动不受影响。执行器会等待原生 Claude 进程，并检查其恢复会话 ID。
+带模型菜单的启动器及其记忆规则见 [Claude Code 模型菜单](claude-model-picker.md)。
 
 ## 快照与身份
 

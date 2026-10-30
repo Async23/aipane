@@ -151,6 +151,9 @@ export AIPANE_KIMI_LAUNCH_CMD="kimi --auto"
 Keep the Codex CLI config override when customizing its launcher; see
 [Codex activity reporting](docs/tmux-window-wrap.md#codex-launcher-and-activity).
 
+For the optional Claude Code model menu and its installation, see
+[Claude Code model picker](docs/claude-model-picker.md).
+
 ## `ai` Launcher
 
 Tool keys and default commands:
