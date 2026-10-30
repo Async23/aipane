@@ -570,13 +570,16 @@ class RestoreExecutor:
             return True
         if item["tool"] != "claude":
             return False
-        # Native Claude can expose its version (e.g. 2.1.300) as tmux's short
-        # process name. Check the actual foreground executable, not the number.
-        try:
-            arguments = shlex.split(self.tmux.foreground_command(item["target"]))
-        except ValueError:
-            return False
-        return bool(arguments) and Path(arguments[0]).name in {"claude", "claude-guard"}
+        # Native Claude can expose a version as tmux's short process name.
+        # An MCP child may precede it in the foreground process listing.
+        for _, command in self.tmux.foreground_processes(item["target"]):
+            try:
+                arguments = shlex.split(command)
+            except ValueError:
+                continue
+            if arguments and Path(arguments[0]).name in {"claude", "claude-guard"}:
+                return True
+        return False
 
     def claude_resume_matches(self, item: dict[str, Any]) -> bool:
         """Verify the native process carries the exact intended resume ID."""
@@ -609,6 +612,8 @@ class RestoreExecutor:
             return self.dsh_ready(item)
         if item["tool"] == "qwen":
             return self.qwen_ready(item)
+        if item["tool"] == "claude" and self.claude_resume_matches(item):
+            return True
         foreground = self.tmux.foreground_command(item["target"])
         sid = item.get("sid", "")
         if sid and sid in foreground:

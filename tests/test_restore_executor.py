@@ -13,6 +13,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,7 @@ if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
 
 from recovery_plan import seal_plan
+from recovery import RestoreExecutor
 from dsh_sessions import is_dsh_command_line
 
 
@@ -622,6 +624,17 @@ class RestoreExecutorTests(unittest.TestCase):
         self.assertIn("verified=2 pending=0", result.stdout)
         self.assertEqual(self.pending_items(), [])
         self.assertEqual(self.launch_count.read_text().strip(), "2")
+
+    def test_existing_claude_is_found_when_an_mcp_process_is_listed_first(self):
+        executor = RestoreExecutor({"AIPANE_STATE_DIR": str(self.state_dir),
+                                    "AIPANE_TMUX": str(self.fake_tmux)})
+        item = {"tool": "claude", "target": "0:4.1", "sid": GROK_SID}
+        processes = [(10, "chrome-devtools-mcp --headless"),
+                     (11, f"claude --resume {GROK_SID}")]
+        with patch.object(executor.tmux, "foreground_processes", return_value=processes), \
+             patch.object(executor.tmux, "pane_identity", return_value=None):
+            self.assertTrue(executor.tool_running(item, "2.1.314"))
+            self.assertTrue(executor.existing_tool_matches(item, "2.1.314"))
 
     def test_codex_update_prompt_is_blocked_instead_of_verified(self):
         plan = {
