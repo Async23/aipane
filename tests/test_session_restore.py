@@ -441,6 +441,29 @@ class SessionRestoreTests(unittest.TestCase):
             self.assertEqual(plan["kind"], "resume")
             self.assertTrue(plan["restorable"])
 
+    def test_claude_resume_plan_marks_automatic_recovery(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            claude_config = self.claude_config(tmp, conversation_exists=True)
+            result = self.run_restore(
+                tmp,
+                coord={"sid": FOREIGN_SID, "tool": "c"},
+                title="custom-title",
+                saved_codex_ids=set(),
+                plan_json=True,
+                current_command="claude",
+                full_command=f"claude --resume {FOREIGN_SID}",
+                extra_env={
+                    "CLAUDE_CONFIG_DIR": str(claude_config),
+                    "AIPANE_CLAUDE_LAUNCH_CMD": "/tmp/claude-window --dangerously-skip-permissions",
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(result.stdout)
+            self.assertTrue(plan["restorable"])
+            self.assertEqual(plan["command"],
+                             f"AIPANE_AUTO_RESUME=1 /tmp/claude-window --dangerously-skip-permissions --resume {FOREIGN_SID}")
+
     def qwen_home(self, tmp: Path, *, transcript_exists: bool) -> Path:
         home = tmp / "qwen"
         import re

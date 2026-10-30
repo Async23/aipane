@@ -453,6 +453,94 @@ class AiRestartTests(unittest.TestCase):
         self.assertIn("verified 1 AI pane(s) resumed", result.stdout)
         self.assertEqual(json.loads((self.tmp / "aipane-state/restore-pending.json").read_text())["items"], [])
 
+    def test_claude_python_launcher_can_finish_before_verification(self):
+        sid = "11111111-1111-4111-8111-111111111111"
+        self.tmux("respawn-pane", "-k", "-t", self.target,
+                  shlex.join([str(self.fake_agent), "--resume", sid]))
+        launcher = self.tmp / "claude-window"
+        launcher.write_text(textwrap.dedent(f'''\
+            #!/usr/bin/env python3
+            import os, sys, time
+            time.sleep(0.5)
+            os.execv({str(self.fake_agent)!r}, [{str(self.fake_agent)!r}, *sys.argv[1:]])
+        '''))
+        launcher.chmod(0o755)
+        self.extra_environment = {
+            "TEST_SID": sid,
+            "TEST_AGENT_COMMAND": "AIPANE_AUTO_RESUME=1 " + shlex.join([str(launcher), "--resume", sid]),
+            "AI_RESTORE_VERIFY_TIMEOUT": "3",
+        }
+
+        result = self.run_restart("--yes", "--force")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("verified 1 AI pane(s) resumed", result.stdout)
+        self.assertEqual(json.loads((self.tmp / "aipane-state/restore-pending.json").read_text())["items"], [])
+
+    def test_claude_launcher_does_not_verify_an_unrelated_process(self):
+        sid = "11111111-1111-4111-8111-111111111111"
+        self.tmux("respawn-pane", "-k", "-t", self.target,
+                  shlex.join([str(self.fake_agent), "--resume", sid]))
+        launcher = self.tmp / "claude-window"
+        launcher.write_text("#!/bin/sh\nexec /bin/sleep 120\n")
+        launcher.chmod(0o755)
+        self.extra_environment = {
+            "TEST_SID": sid,
+            "TEST_AGENT_COMMAND": "AIPANE_AUTO_RESUME=1 " + shlex.join([str(launcher), "--resume", sid]),
+            "AI_RESTORE_VERIFY_TIMEOUT": "0.5",
+        }
+
+        result = self.run_restart("--yes", "--force")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("1 pending", result.stdout)
+        self.assertEqual(self.current_command(), "sleep")
+        self.assertEqual(len(json.loads((self.tmp / "aipane-state/restore-pending.json").read_text())["items"]), 1)
+
+    def test_claude_resume_is_verified_when_python_parent_stays_running(self):
+        sid = "11111111-1111-4111-8111-111111111111"
+        self.tmux("respawn-pane", "-k", "-t", self.target,
+                  shlex.join([str(self.fake_agent), "--resume", sid]))
+        launcher = self.tmp / "claude-window"
+        launcher.write_text(textwrap.dedent(f'''\
+            #!/usr/bin/env python3
+            import subprocess, sys
+            raise SystemExit(subprocess.call([{str(self.fake_agent)!r}, *sys.argv[1:]]))
+        '''))
+        launcher.chmod(0o755)
+        self.extra_environment = {
+            "TEST_SID": sid,
+            "TEST_AGENT_COMMAND": "AIPANE_AUTO_RESUME=1 " + shlex.join([str(launcher), "--resume", sid]),
+            "AI_RESTORE_VERIFY_TIMEOUT": "2",
+        }
+
+        result = self.run_restart("--yes", "--force")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("verified 1 AI pane(s) resumed", result.stdout)
+        self.assertEqual(json.loads((self.tmp / "aipane-state/restore-pending.json").read_text())["items"], [])
+
+    def test_claude_auto_recovery_does_not_verify_the_wrong_session(self):
+        sid = "11111111-1111-4111-8111-111111111111"
+        wrong_sid = "22222222-2222-4222-8222-222222222222"
+        self.tmux("respawn-pane", "-k", "-t", self.target,
+                  shlex.join([str(self.fake_agent), "--resume", sid]))
+        launcher = self.tmp / "claude-window"
+        launcher.write_text("#!/bin/sh\nexec " + shlex.join([str(self.fake_agent), "--resume", wrong_sid]) + "\n")
+        launcher.chmod(0o755)
+        self.extra_environment = {
+            "TEST_SID": sid,
+            "TEST_AGENT_COMMAND": "AIPANE_AUTO_RESUME=1 " + shlex.join([str(launcher), "--resume", sid]),
+            "AI_RESTORE_VERIFY_TIMEOUT": "0.5",
+        }
+
+        result = self.run_restart("--yes", "--force")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("1 pending", result.stdout)
+        self.assertEqual(self.current_command(), "claude")
+        self.assertEqual(len(json.loads((self.tmp / "aipane-state/restore-pending.json").read_text())["items"]), 1)
+
     def test_version_named_claude_pending_is_verified_without_relaunch(self):
         self.configure_version_named_claude()
         self.tmux("respawn-pane", "-k", "-t", self.target,

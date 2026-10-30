@@ -53,6 +53,7 @@ SHELL_COMMANDS = {
 }
 
 FIELD_SEPARATOR = "\x1f"
+AUTO_RESUME_PREFIX = "AIPANE_AUTO_RESUME=1 "
 
 
 class RestoreExecutionError(RuntimeError):
@@ -238,6 +239,10 @@ class Tmux:
         return process[1] if process else ""
 
     def foreground_process(self, target: str) -> tuple[int, str] | None:
+        processes = self.foreground_processes(target)
+        return processes[0] if processes else None
+
+    def foreground_processes(self, target: str) -> list[tuple[int, str]]:
         completed = self.run(
             "display-message",
             "-p",
@@ -246,10 +251,10 @@ class Tmux:
             "#{pane_tty}",
         )
         if completed.returncode != 0:
-            return None
+            return []
         tty = completed.stdout.strip().removeprefix("/dev/")
         if not tty:
-            return None
+            return []
         try:
             processes = subprocess.run(
                 ["ps", "-t", tty, "-o", "pid=", "-o", "stat=", "-o", "command="],
@@ -258,14 +263,15 @@ class Tmux:
                 text=True,
             )
         except OSError:
-            return None
+            return []
         if processes.returncode != 0:
-            return None
+            return []
+        foreground = []
         for line in processes.stdout.splitlines():
             fields = line.strip().split(maxsplit=2)
             if len(fields) == 3 and fields[0].isdigit() and "+" in fields[1]:
-                return int(fields[0]), fields[2]
-        return None
+                foreground.append((int(fields[0]), fields[2]))
+        return foreground
 
     def capture_failure(self, target: str) -> str:
         completed = self.run("capture-pane", "-p", "-t", target, "-S", "-40")
@@ -572,6 +578,26 @@ class RestoreExecutor:
             return False
         return bool(arguments) and Path(arguments[0]).name in {"claude", "claude-guard"}
 
+    def claude_resume_matches(self, item: dict[str, Any]) -> bool:
+        """Verify the native process carries the exact intended resume ID."""
+        sid = item.get("sid", "")
+        if not sid:
+            return False
+        for _, command in self.tmux.foreground_processes(item["target"]):
+            try:
+                args = shlex.split(command)
+            except ValueError:
+                continue
+            if not args or Path(args[0]).name not in {"claude", "claude-guard"}:
+                continue
+            if any(
+                (arg in {"--resume", "-r"} and index + 1 < len(args) and args[index + 1] == sid)
+                or arg == f"--resume={sid}"
+                for index, arg in enumerate(args)
+            ):
+                return True
+        return False
+
     def existing_tool_matches(
         self,
         item: dict[str, Any],
@@ -760,7 +786,19 @@ class RestoreExecutor:
                     failures[identifier] = "pane disappeared"
                     active.pop(identifier)
                     continue
-                if self.tool_running(item, current):
+                auto_claude = (
+                    attempt.sent and item["tool"] == "claude"
+                    and item["command"].startswith(AUTO_RESUME_PREFIX)
+                )
+                matched_claude = self.claude_resume_matches(item) if auto_claude else False
+                if self.tool_running(item, current) or matched_claude:
+                    if auto_claude and not matched_claude:
+                        attempt.seen_running = True
+                        attempt.running_since = None
+                        if now >= deadlines[identifier]:
+                            failures[identifier] = "Claude did not start the requested session"
+                            active.pop(identifier)
+                        continue
                     if item["tool"] == "codex":
                         visible = " ".join(self.tmux.capture_visible(target).split()).lower()
                         process = self.tmux.foreground_process(target)
@@ -839,6 +877,10 @@ class RestoreExecutor:
                         failures[identifier] = self.tmux.capture_failure(target)
                         active.pop(identifier)
                         continue
+                elif auto_claude:
+                    # The recovery launcher may briefly be env or Python before
+                    # execing Claude. Wait, but never verify it as Claude.
+                    pass
                 else:
                     failures[identifier] = f"pane switched to unexpected process {current}"
                     active.pop(identifier)

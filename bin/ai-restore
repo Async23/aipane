@@ -381,7 +381,7 @@ build_resume() {
       else REPLY="$GROK_BASE"; REPLY_KIND=fresh; fi ;;
     claude)
       if [[ -n "$id" ]]; then
-        REPLY="$CLAUDE_BASE --resume $id"
+        REPLY="AIPANE_AUTO_RESUME=1 $CLAUDE_BASE --resume $id"
         if claude_session_exists "$id"; then REPLY_KIND=resume
         else REPLY_KIND=invalid; fi
       else REPLY="$CLAUDE_BASE"; REPLY_KIND=fresh; fi ;;

@@ -40,6 +40,10 @@ ln -sf "$AIPANE_ROOT/integrations/pi/aipane-bind.ts" ~/.pi/agent/extensions/aipa
 标为 `recreated`；属于其他项目或已损坏的记录标为 `invalid`。Claude 与 Qwen Code
 必须已有持久对话记录，否则保持原窗格。
 
+Claude 自动恢复命令带有 `AIPANE_AUTO_RESUME=1`，支持该标记的启动器可据此
+沿用已记录的模型并跳过模型选择。若无法确定原模型，启动器应报错，保留待恢复记录；
+手动启动不受影响。执行器会等待原生 Claude 进程，并检查其恢复会话 ID。
+
 ## 快照与身份
 
 tmux-resurrect 的 `post-save-layout` 钩子将刚写好的快照路径传给
