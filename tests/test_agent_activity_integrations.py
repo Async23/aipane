@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -217,10 +218,10 @@ class AgentActivityIntegrationTests(unittest.TestCase):
                 activity_log.read_text(),
                 "".join(
                     (
-                        "report idle|" + json.dumps(main_start),
-                        "report busy|" + json.dumps(teammate_start),
-                        "report busy|" + json.dumps(pre_tool),
-                        "report idle|" + json.dumps(teammate_idle),
+                        "report idle --owner claude|" + json.dumps(main_start),
+                        "report busy --owner claude|" + json.dumps(teammate_start),
+                        "report busy --owner claude|" + json.dumps(pre_tool),
+                        "report idle --owner claude|" + json.dumps(teammate_idle),
                     )
                 ),
             )
@@ -271,6 +272,87 @@ class AgentActivityIntegrationTests(unittest.TestCase):
                         activity_log.exists(),
                         "Desktop hooks must not change the launching pane's activity",
                     )
+
+    @unittest.skipUnless(shutil.which("cc"), "requires a C compiler")
+    def test_nested_claude_hooks_preserve_codex_activity_and_indicator(self):
+        socket_name = f"aipane-nested-claude-test-{uuid.uuid4().hex}"
+        tmux = ["tmux", "-L", socket_name]
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            fixture_home = Path(raw_tmp)
+            executable = fixture_home / "codex"
+            subprocess.run(
+                ["cc", "-x", "c", "-o", str(executable), "-"],
+                input="#include <unistd.h>\nint main(void) {sleep(60); return 0;}\n",
+                text=True, capture_output=True, check=True,
+            )
+            local_bin = fixture_home / ".local" / "bin"
+            local_bin.mkdir(parents=True)
+            (local_bin / "aipane-activity").symlink_to(ACTIVITY)
+            environment = {
+                **os.environ,
+                "HOME": str(fixture_home),
+                "AIPANE_PYTHON": sys.executable,
+                "AIPANE_TMUX": f"tmux -L {socket_name}",
+                "CLAUDE_CODE_ENTRYPOINT": "cli",
+            }
+            environment.pop("TMUX", None)
+            environment.pop("TMUX_PANE", None)
+
+            def run(arguments, payload=None):
+                return subprocess.run(
+                    arguments,
+                    input=json.dumps(payload) if payload is not None else "",
+                    env=environment, text=True, capture_output=True, check=True,
+                ).stdout.strip()
+
+            try:
+                run([*tmux, "-f", "/dev/null", "new-session", "-d", str(executable)])
+                pane = run([*tmux, "display-message", "-p", "#{pane_id}"])
+                environment["TMUX_PANE"] = pane
+                self.assertEqual(
+                    run([*tmux, "display-message", "-p", "#{pane_current_command}"]),
+                    "codex",
+                )
+
+                def projection():
+                    return run([
+                        *tmux, "show-options", "-pqv", "-t", pane,
+                        "@tmux-window-wrap-activity-record",
+                    ])
+
+                def render():
+                    return run([
+                        str(WINDOW_WRAP), "render", "--socket-name", socket_name,
+                        "--session-id", "0", "--width", "100", "--line", "0",
+                        "--left-width", "0", "--right-width", "0",
+                    ])
+
+                for state in ("busy", "idle"):
+                    for event in (
+                        "SessionStart", "UserPromptSubmit", "PreToolUse", "Stop",
+                        "StopFailure", "TeammateIdle", "SessionEnd",
+                    ):
+                        with self.subTest(parent_state=state, child_event=event):
+                            run([str(ACTIVITY), "report", state], {
+                                "session_id": "codex-parent",
+                                "turn_id": "codex-turn",
+                            })
+                            original_record = projection()
+                            run([str(CLAUDE_ACTIVITY)], {
+                                "hook_event_name": event,
+                                "source": "startup",
+                                "session_id": "nested-claude-test",
+                            })
+                            self.assertEqual(
+                                "▓" in render(), state == "busy",
+                                "Nested Claude changed its parent's visible indicator",
+                            )
+                            self.assertEqual(projection(), original_record)
+            finally:
+                subprocess.run(
+                    [*tmux, "kill-server"], env=environment,
+                    capture_output=True, check=False,
+                )
 
     def test_standard_hook_fragments_implement_turn_level_contract(self):
         for tool in ("grok", "qwen"):

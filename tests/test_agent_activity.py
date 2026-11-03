@@ -1009,6 +1009,33 @@ class AgentActivityTests(unittest.TestCase):
         self.assertEqual(ended.state, "busy")
         self.assertEqual(adapter.read(pane.pane_id).record, busy_record)
 
+    def test_report_owner_accepts_claude_native_names_and_rejects_foreign_panes(self):
+        for command in ("claude", "2.1.317", "codex", "dsh-tui", "node", "kimi"):
+            for state in ("busy", "idle"):
+                with self.subTest(command=command, state=state):
+                    activity, adapter = self.activity_for(
+                        PaneActivity(pane_id="%7", current_command=command),
+                        process_identity=lambda _pane: {"pid": 6322, "started_at": "process-1"},
+                        process_matches=lambda _process, _pane: True,
+                    )
+                    activity.report("%7", "idle" if state == "busy" else "busy")
+                    original = adapter.read("%7")
+                    writes = len(adapter.writes)
+                    report = activity.report(
+                        "%7", state, {"hook_event_name": "UserPromptSubmit"},
+                        owner="claude",
+                    )
+                    if command in {"claude", "2.1.317"}:
+                        self.assertTrue(report.accepted)
+                        self.assertEqual(report.state, state)
+                        self.assertEqual(
+                            adapter.read("%7").marker, command if state == "busy" else "",
+                        )
+                    else:
+                        self.assertFalse(report.accepted)
+                        self.assertEqual(adapter.read("%7"), original)
+                        self.assertEqual(len(adapter.writes), writes)
+
     def test_claude_native_name_binds_reports_to_the_live_process(self):
         started_at = "Fri Oct 16 09:15:30 2026"
         for pane_command, process_command, matches in (

@@ -49,7 +49,9 @@ case "$STATE" in
   busy|idle)
     # Preserve the hook payload so Agent Activity can identify repeated
     # PreToolUse fallbacks without needlessly invalidating animation frames.
-    printf '%s' "$PAYLOAD" | "$ACTIVITY" report "$STATE" >/dev/null 2>&1 || :
+    # A CLI launched by another Agent also inherits TMUX_PANE. Only update
+    # panes owned by Claude (including native numeric-version process names).
+    printf '%s' "$PAYLOAD" | "$ACTIVITY" report "$STATE" --owner claude >/dev/null 2>&1 || :
     ;;
 esac
 

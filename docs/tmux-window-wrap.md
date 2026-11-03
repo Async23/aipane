@@ -193,6 +193,13 @@ The Claude Adapter ignores desktop entrypoints (`claude-desktop` and
 their lifecycle hooks would change the launching Agent's activity, including
 marking an already-completed Codex turn busy again.
 
+Claude CLI hooks report with `--owner claude`. Agent Activity checks this owner
+against the pane's current command under the pane lock, accepting both `claude`
+and its native numeric version name. A Claude CLI invoked by Codex or another
+Agent inherits `TMUX_PANE`, but its startup, work, and completion events cannot
+change the parent pane's record or indicator. An unqualified report remains
+available to integrations that manage their own ownership checks.
+
 ### Codex launcher and activity
 
 The default Codex launcher includes `-c check_for_update_on_startup=false`.

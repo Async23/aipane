@@ -66,6 +66,10 @@ def main() -> int:
     report_parser.add_argument("state", choices=("busy", "idle"))
     report_parser.add_argument("--pane", default=os.environ.get("TMUX_PANE"))
     report_parser.add_argument("--socket-name")
+    report_parser.add_argument(
+        "--owner", default="",
+        help="accept the report only when this Agent command owns the pane",
+    )
 
     inspect_parser = commands.add_parser("inspect")
     inspect_parser.add_argument("--pane", default=os.environ.get("TMUX_PANE"))
@@ -91,7 +95,9 @@ def main() -> int:
     try:
         if arguments.command == "report":
             payload = hook_payload(sys.stdin)
-            result = activity.report(pane, arguments.state, payload)
+            result = activity.report(
+                pane, arguments.state, payload, owner=arguments.owner,
+            )
             # dsh retries failed reports. A rejected identity must not look
             # like a successful delivery to its lifecycle observer.
             return 3 if "dsh_runtime" in payload and not result.accepted else 0

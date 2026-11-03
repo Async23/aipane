@@ -1216,6 +1216,7 @@ class AgentActivity:
         state: str,
         payload: Mapping[str, object] | None = None,
         *,
+        owner: str = "",
         hook_event_name: str = "",
         hook_source: str = "",
         now_ms: int | None = None,
@@ -1257,6 +1258,14 @@ class AgentActivity:
             if not self._same_live_identity(initial, pane):
                 return ActivityReportResult(
                     state="unknown",
+                    accepted=False,
+                    changed=False,
+                )
+            if owner and not _agent_commands_compatible(owner, pane.current_command):
+                # Nested CLIs inherit TMUX_PANE from the Agent running the tool.
+                # Their hooks describe the child, not the pane's foreground Agent.
+                return ActivityReportResult(
+                    state=self._resolve(pane).state,
                     accepted=False,
                     changed=False,
                 )
