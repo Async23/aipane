@@ -537,6 +537,7 @@ class WindowWrapCliTests(unittest.TestCase):
         script_globals["animation_probe"] = lambda _socket, log: (
             owner["value"], True
         )
+        script_globals["animation_has_focused_client"] = lambda _socket: True
         script_globals["detect_color_scheme"] = lambda: "light"
         script_globals["invalidate_cache"] = mock.Mock()
         with tempfile.TemporaryDirectory() as directory:
@@ -574,6 +575,7 @@ class WindowWrapCliTests(unittest.TestCase):
         script_globals["animation_probe"] = lambda _socket, log: (
             "test-owner" if FakeTime.now < 61 else "successor", True
         )
+        script_globals["animation_has_focused_client"] = lambda _socket: True
         script_globals["detect_color_scheme"] = lambda: "light"
         script_globals["invalidate_cache"] = mock.Mock()
         reason = namespace["animate_status"]("test", 20, log=log)
@@ -603,6 +605,40 @@ class WindowWrapCliTests(unittest.TestCase):
                 )
             events = [json.loads(line)["event"] for line in path.read_text().splitlines()]
         self.assertEqual(events, ["activity_probe_errors", "activity_probe_recovered"])
+
+    def test_idle_animator_checks_activity_at_most_once_per_second(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        script_globals = namespace["animate_status"].__globals__
+        owner = {}
+        probes = []
+
+        class FakeTime:
+            now = 0.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+            @classmethod
+            def sleep(cls, seconds):
+                cls.now += max(seconds, 0.01)
+
+        def run_tmux(_socket, *arguments):
+            if arguments[:3] == ("set-environment", "-g", "TMUX_WINDOW_WRAP_ANIMATOR_OWNER"):
+                owner["value"] = arguments[-1]
+
+        def probe(_socket):
+            probes.append(FakeTime.now)
+            return (owner["value"] if FakeTime.now < 2 else "successor", False)
+
+        script_globals["time"] = FakeTime
+        script_globals["run_tmux"] = run_tmux
+        script_globals["animation_probe"] = probe
+        script_globals["detect_color_scheme"] = lambda: "light"
+        script_globals["invalidate_cache"] = mock.Mock()
+        self.assertEqual(namespace["animate_status"]("test", 10), "superseded")
+        self.assertEqual(len(probes), 3, f"idle activity scans at {probes}")
+        self.assertTrue(all(b - a >= 1 for a, b in zip(probes, probes[1:])))
 
     def test_animation_probe_still_raises_when_snapshot_retry_fails(self):
         namespace = runpy.run_path(str(SCRIPT))
@@ -2482,6 +2518,21 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             time.sleep(0.02)
         self.fail(f"client widths did not become {expected}")
 
+    def wait_for_animation_tick_change(self, timeout=2):
+        def current_tick():
+            return self.tmux(
+                "display-message", "-p", "-t", self.session_id,
+                "#{TMUX_WINDOW_WRAP_ANIMATION_TICK}",
+            ).stdout.strip()
+
+        initial = current_tick()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if current_tick() != initial:
+                return
+            time.sleep(0.02)
+        self.fail("animation tick did not advance")
+
     def source_window_wrap_config(self, animate=True, render_script=SCRIPT):
         config_text = CONFIG.read_text().replace(
             "$HOME/.local/bin/tmux-window-wrap",
@@ -2966,6 +3017,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         _, master_fd = self.attach_client(width=80)
         self.wait_for_client_count(1)
         self.wait_for_status_text(master_fd, "▓", timeout=1)
+        self.wait_for_animation_tick_change()
 
         seen_ticks = set()
         deadline = time.monotonic() + 1.5
@@ -3008,7 +3060,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             self.assertEqual(probe(self.socket_name), ("owner", False))
         self.assertTrue(created)
 
-    def test_attached_status_advances_activity_at_twenty_fps(self):
+    def test_attached_status_advances_activity_at_default_fps(self):
         first_pane = self.tmux(
             "display-message",
             "-p",
@@ -3032,6 +3084,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         _, master_fd = self.attach_client(width=80)
         self.wait_for_client_count(1)
         self.wait_for_status_text(master_fd, "▓", timeout=1)
+        self.wait_for_animation_tick_change()
 
         seen_ticks = set()
         deadline = time.monotonic() + 1.5
@@ -3046,8 +3099,84 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         self.assertGreaterEqual(
             len(seen_ticks),
             8,
-            f"expected at least eight 20 FPS ticks, saw {seen_ticks!r}",
+            f"expected at least eight animation ticks, saw {seen_ticks!r}",
         )
+
+    def test_animation_pauses_without_focus_and_resumes(self):
+        pane = self.tmux(
+            "display-message", "-p", "-t", "wrap:1", "#{pane_id}",
+        ).stdout.strip()
+        self.set_pane_activity(pane, "busy")
+        self.tmux("set-option", "-g", "focus-events", "on")
+        self.source_window_wrap_config()
+        _, master_fd = self.attach_client(width=80)
+        self.wait_for_client_count(1)
+        self.wait_for_status_text(master_fd, "▓", timeout=2)
+        self.wait_for_animation_tick_change()
+
+        def tick():
+            return self.tmux(
+                "display-message", "-p", "-t", self.session_id,
+                "#{TMUX_WINDOW_WRAP_ANIMATION_TICK}",
+            ).stdout.strip()
+
+        os.write(master_fd, b"\x1b[O")
+        # Allow the once-per-second probe to observe the real terminal event.
+        deadline = time.monotonic() + 1.3
+        while time.monotonic() < deadline:
+            self.drain_client_output(master_fd)
+            time.sleep(0.02)
+        paused_tick = tick()
+        self.drain_client_output(master_fd)
+        time.sleep(0.4)
+        self.assertEqual(tick(), paused_tick, "unfocused client kept animating")
+        marker = self.tmux(
+            "show-options", "-p", "-v", "-t", pane,
+            "@tmux-window-wrap-activity",
+        ).stdout.strip()
+        self.assertTrue(marker, "pausing animation must not clear busy state")
+
+        os.write(master_fd, b"\x1b[I")
+        self.wait_for_status_text(master_fd, "▓", timeout=2)
+        deadline = time.monotonic() + 1.5
+        while tick() == paused_tick and time.monotonic() < deadline:
+            self.drain_client_output(master_fd)
+            time.sleep(0.02)
+        self.assertNotEqual(tick(), paused_tick, "focus-in did not resume animation")
+
+    def test_animation_only_redraws_focused_clients(self):
+        pane = self.tmux(
+            "display-message", "-p", "-t", "wrap:1", "#{pane_id}",
+        ).stdout.strip()
+        self.set_pane_activity(pane, "busy")
+        self.tmux("set-option", "-g", "focus-events", "on")
+        self.source_window_wrap_config()
+        clients = [self.attach_client(width=80)[1] for _ in range(2)]
+        self.wait_for_client_count(2)
+        for fd in clients:
+            self.wait_for_status_text(fd, "▓", timeout=2)
+        self.wait_for_animation_tick_change()
+        os.write(clients[0], b"\x1b[O")
+        deadline = time.monotonic() + 0.3
+        while time.monotonic() < deadline:
+            for fd in clients:
+                self.drain_client_output(fd)
+            time.sleep(0.02)
+        output = {fd: bytearray() for fd in clients}
+        deadline = time.monotonic() + 1.2
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select(clients, [], [], 0.02)
+            for fd in readable:
+                output[fd].extend(os.read(fd, 65536))
+        self.assertEqual(output[clients[0]].count("▓".encode()), 0)
+        self.assertGreaterEqual(output[clients[1]].count("▓".encode()), 5)
+
+        # Real activity reports still refresh every client, including one in
+        # the background; only the decorative animation skips it.
+        for fd in clients:
+            self.drain_client_output(fd)
+        self.set_pane_activity(pane, "idle")
+        self.wait_for_status_text(clients[0], "手册", timeout=2)
 
     def test_animation_redraws_status_without_repainting_panes_on_all_clients(self):
         marker = "STATIC_PANE_CONTENT_6c2b40"
@@ -3066,6 +3195,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         for fd in clients:
             self.wait_for_status_text(fd, marker, timeout=2)
             self.wait_for_status_text(fd, "▓", timeout=2)
+        self.wait_for_animation_tick_change()
         # Consume startup redraws while attachment/layout work settles. Leaving
         # a PTY unread fills its buffer, which itself makes tmux redraw the pane
         # after the client catches up (unrelated to the animation).
@@ -3082,7 +3212,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
                 output[fd].extend(os.read(fd, 65536))
         for fd in clients:
             with self.subTest(client=fd):
-                self.assertGreaterEqual(output[fd].count("▓".encode()), 10)
+                self.assertGreaterEqual(output[fd].count("▓".encode()), 5)
                 self.assertEqual(
                     output[fd].count(marker.encode()), 0,
                     "animation updates repainted the static pane body",
@@ -4173,7 +4303,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "show-options", "-g", "-v", "@tmux-window-wrap-render-job"
         ).stdout.strip()
 
-        self.assertEqual(animation_fps, "20")
+        self.assertEqual(animation_fps, "10")
         self.assertEqual(status_interval, "15")
         self.assertIn(color_scheme, {"light", "dark"})
         self.assertEqual(pane_count_style, "subscript")

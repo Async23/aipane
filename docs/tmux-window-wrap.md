@@ -176,7 +176,7 @@ The tmux Adapter only reads and writes projection fields. Identity checks,
 timestamps, compare-before-write, rollback, and the two-observation repair rule
 stay local to the Agent Activity module. A missing or conflicting read resolves
 to `unknown`; repair errors are explicit and never turn `busy` into `idle`.
-The status renderer still reads only the cached scalar marker at 20 FPS.
+The status renderer still reads only the cached scalar marker at 10 FPS by default.
 Evidence files and databases are inspected only by the lower-frequency probe.
 
 Claude Code agent-team teammates do not receive a user-submitted prompt, even
@@ -237,7 +237,7 @@ the parent pane busy and bind the root thread id, while a root completion stays
 busy when its goal is still active.
 
 Codex can terminate a failed turn before its legacy notifier runs (for example,
-a remote-compaction stream failure). Once per activity probe—not in the 20 FPS
+a remote-compaction stream failure). Once per activity probe—not in the animation
 render path—the shared resolver checks the exact turn in Codex's read-only
 thread-history projection. It uses that projection only when its byte offset has
 caught up with the canonical rollout; otherwise it reads a bounded rollout tail.
@@ -383,9 +383,11 @@ Agent Activity depends on each AI Tool's lifecycle hooks or plugin Adapter. The
 indicator width is included in wrapping calculations, and a
 lightweight driver advances the hidden global environment variable
 `TMUX_WINDOW_WRAP_ANIMATION_TICK` every approximately
-`50ms` (`20 FPS`) while any busy agent pane exists. One full loop takes
-`1.2s`. Each frame updates that variable and issues `refresh-client -S` for all
-attached clients in one tmux command queue. Updating a user option with
+`100ms` (`10 FPS` by default) while an attached session has a busy agent pane
+and a regular client has focus. One full loop takes approximately `2.4s`.
+Each frame updates that variable and issues `refresh-client -S` only for
+focused, non-suspended terminal clients in one tmux command queue. Control-mode
+clients do not keep animation running. Updating a user option with
 `set-option` requests a full client redraw in tmux 3.7b; hidden environment
 state avoids that redraw and is not exported to child programs.
 Window layout stays cached, so each frame is expanded by tmux without
@@ -397,6 +399,16 @@ skipping a level, which keeps the breathing transition continuous. Only the
 current light or dark palette is cached;
 a system appearance change updates the cache key and reruns the renderer once.
 The fragment does not lower tmux's global `status-interval`.
+
+Activity reconciliation runs once per second, whether busy or idle. Lifecycle
+reports still update busy/idle markers and refresh every client immediately;
+the probe provides fallback repair and controls animation. When every terminal
+client loses focus, frame updates pause within one probe interval, while busy
+markers and repair continue. Focus returning resumes the animation within one
+probe interval. tmux initializes clients as focused, so terminals without focus
+reporting retain animation. Enable `focus-events on` for terminals that support
+focus reports; the workstation fragment already does this. Unfocused windows
+show a static busy indicator and still receive real activity/layout changes.
 
 `render --animation-variable NAME` selects the tmux format variable used by
 cached rows. The older `--animation-option` spelling and JSON
@@ -417,8 +429,9 @@ snapshot once before treating the read as a fatal error.
 
 Each entry includes a timestamp with timezone, severity, PID, owner token,
 tmux socket selector, FPS, and execution stage. Events cover startup, busy/idle
-and theme changes, ownership handoff, and shutdown with reason and uptime.
-Every minute, a heartbeat records the current busy state and frame; individual
+and theme changes, animation pause/resume, ownership handoff, and shutdown with
+reason and uptime. Every minute, a heartbeat records the current busy state,
+whether frames are animating, and the frame; individual
 frames are not logged. tmux failures record the stage, return code, and stderr
 without dumping command arguments or pane contents. Activity probe errors are
 logged even when the animator can continue; identical errors are repeated at
@@ -432,7 +445,7 @@ heartbeat and PID provide the last known state. The logger does not restart a
 stopped animator. To restart it and inspect recent events:
 
 ```bash
-tmux run-shell -b '$HOME/.local/bin/tmux-window-wrap animate --fps 20'
+tmux run-shell -b '$HOME/.local/bin/tmux-window-wrap animate --fps 10'
 tail -n 20 ~/.local/state/aipane/tmux-window-wrap-animate.log
 ```
 

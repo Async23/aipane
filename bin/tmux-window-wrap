@@ -40,10 +40,19 @@ ACTIVITY_LEVEL_SEQUENCE = (
     *range(ACTIVITY_LEVEL_COUNT),
     *range(ACTIVITY_LEVEL_COUNT - 2, 0, -1),
 )
-DEFAULT_ACTIVITY_FPS = 20
+DEFAULT_ACTIVITY_FPS = 10
+ACTIVITY_PROBE_INTERVAL = 1.0
 _ACTIVITY_CONTROLLERS = {}
 ANIMATION_TICK_ENVIRONMENT = "TMUX_WINDOW_WRAP_ANIMATION_TICK"
 REFRESH_CLIENTS_COMMAND = "#{L:refresh-client -S -t #{q:client_name};}"
+ANIMATION_CLIENT_FILTER = (
+    "#{&&:#{m:*focused*,#{client_flags}},"
+    "#{!:#{||:#{client_control_mode},#{m:*suspended*,#{client_flags}}}}}"
+)
+REFRESH_ANIMATED_CLIENTS_COMMAND = (
+    "#{L:#{?" + ANIMATION_CLIENT_FILTER
+    + ",refresh-client -S -t #{q:client_name};,}}"
+)
 RENDER_REQUEST_OPTION = "@tmux-window-wrap-render-request"
 RENDERED_REQUEST_OPTION = "@tmux-window-wrap-rendered-request"
 RENDER_KEY_ENVIRONMENT = "TMUX_WINDOW_WRAP_RENDER_KEY"
@@ -950,6 +959,15 @@ def next_animation_tick(last_tick):
     return (last_tick + 1) % len(ACTIVITY_LEVEL_SEQUENCE)
 
 
+def animation_has_focused_client(socket_name):
+    # tmux initializes clients as focused, so terminals without focus reports
+    # retain animation. Control-mode and suspended clients need no frames.
+    completed = run_tmux(
+        socket_name, "list-clients", "-F", ANIMATION_CLIENT_FILTER,
+    )
+    return "1" in completed.stdout.splitlines()
+
+
 def animate_status(socket_name, fps, log=None):
     owner = log.context["owner"] if log is not None else uuid.uuid4().hex
 
@@ -969,6 +987,7 @@ def animate_status(socket_name, fps, log=None):
         log.emit("ownership_acquired")
 
     busy = False
+    animate_frames = False
     last_tick = None
     color_scheme = None
     next_probe = 0.0
@@ -976,6 +995,7 @@ def animate_status(socket_name, fps, log=None):
     next_tick_at = 0.0
     next_heartbeat = time.monotonic() + 60.0
     previous_busy = None
+    previous_animation = None
     while True:
         now = time.monotonic()
         if now >= next_probe:
@@ -991,7 +1011,14 @@ def animate_status(socket_name, fps, log=None):
             if log is not None and busy != previous_busy:
                 log.emit("activity_changed", busy=busy)
             previous_busy = busy
-            next_probe = now + (1.0 if busy else 0.25)
+            stage("client_probe")
+            animate_frames = busy and animation_has_focused_client(socket_name)
+            if log is not None and animate_frames != previous_animation:
+                log.emit("animation_changed", active=animate_frames)
+            previous_animation = animate_frames
+            # Lifecycle reports already update and redraw the status directly.
+            # This scan repairs missed reports and starts/stops decoration.
+            next_probe = time.monotonic() + ACTIVITY_PROBE_INTERVAL
             if not busy:
                 last_tick = None
                 next_tick_at = 0.0
@@ -1015,7 +1042,7 @@ def animate_status(socket_name, fps, log=None):
                     log.emit("theme_changed", color_scheme=color_scheme)
             next_scheme_probe = now + 5.0
 
-        if busy:
+        if animate_frames:
             frame_now = time.monotonic()
             if last_tick is None or frame_now >= next_tick_at:
                 tick = next_animation_tick(last_tick)
@@ -1031,7 +1058,7 @@ def animate_status(socket_name, fps, log=None):
                     ";",
                     "run-shell",
                     "-C",
-                    REFRESH_CLIENTS_COMMAND,
+                    REFRESH_ANIMATED_CLIENTS_COMMAND,
                 )
                 last_tick = tick
                 # Schedule from the frame actually rendered. If another
@@ -1043,7 +1070,7 @@ def animate_status(socket_name, fps, log=None):
             wake_at = min(next_probe, next_scheme_probe)
         stage("waiting")
         if log is not None and time.monotonic() >= next_heartbeat:
-            log.emit("heartbeat", busy=busy, tick=last_tick)
+            log.emit("heartbeat", busy=busy, animating=animate_frames, tick=last_tick)
             next_heartbeat = time.monotonic() + 60.0
         time.sleep(max(0.01, wake_at - time.monotonic()))
 
