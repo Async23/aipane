@@ -9,6 +9,9 @@ import sys
 
 
 def confirm(screen):
+    if curses.has_colors():
+        # Let tmux supply the popup's colours instead of forcing ANSI white/black.
+        curses.use_default_colors()
     curses.curs_set(0)
     curses.set_escdelay(25)
     curses.mouseinterval(0)
