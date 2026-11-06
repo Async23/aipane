@@ -34,6 +34,11 @@ MARKED_BUSY_PANE_FORMAT = (
     + ",#{pane_current_command}}}"
 )
 BUSY_PANES_FORMAT = "#{P:" + MARKED_BUSY_PANE_FORMAT + "}"
+PANE_AGENT_OPTION = "@tmux-window-wrap-agent"
+AGENT_PANES_FORMAT = (
+    "#{P:#{&&:#{!:#{pane_dead}},#{==:#{" + PANE_AGENT_OPTION
+    + "},#{pane_pid}:#{pane_current_command}}}}"
+)
 ACTIVITY_GLYPH = "▓"
 ACTIVITY_LEVEL_COUNT = 13
 ACTIVITY_LEVEL_SEQUENCE = (
@@ -185,6 +190,7 @@ WINDOW_FORMAT = WINDOW_SEPARATOR.join(
         "#{window_active}",
         "#{pane_synchronized}",
         BUSY_PANES_FORMAT,
+        AGENT_PANES_FORMAT,
         "#{variation-selector-always-wide}",
         "#{w: #{window_index}:#{window_name}#{?pane_synchronized, ▶,} }",
     )
@@ -228,15 +234,15 @@ def display_width(text):
     return width + vs16_width_adjustment(text)
 
 
-def pane_count_annotation(window, style=DEFAULT_PANE_COUNT_STYLE):
-    pane_count = max(1, int(window.get("pane_count", 1)))
-    if pane_count == 1 or style == "off":
+def agent_count_annotation(window, style=DEFAULT_PANE_COUNT_STYLE):
+    agent_count = max(0, int(window.get("agent_count", 0)))
+    if agent_count <= 1 or style == "off":
         return ""
     if style == "subscript":
-        return str(pane_count).translate(SUBSCRIPT_DIGITS)
+        return str(agent_count).translate(SUBSCRIPT_DIGITS)
     if style == "plain":
-        return f"[{pane_count}]"
-    raise ValueError(f"unsupported pane count style: {style}")
+        return f"[{agent_count}]"
+    raise ValueError(f"unsupported annotation style: {style}")
 
 
 def window_width(window, pane_count_style=DEFAULT_PANE_COUNT_STYLE):
@@ -244,15 +250,15 @@ def window_width(window, pane_count_style=DEFAULT_PANE_COUNT_STYLE):
         base_width = window["display_width"]
     else:
         base_width = display_width(window["label"])
-    pane_count_width = display_width(
-        pane_count_annotation(window, pane_count_style)
+    count_width = display_width(
+        agent_count_annotation(window, pane_count_style)
     )
     busy_activity_count = max(
         0,
         int(window.get("busy_activity_count", 0)),
     )
     activity_width = max(0, busy_activity_count - 1)
-    return base_width + pane_count_width + activity_width
+    return base_width + count_width + activity_width
 
 
 def parse_palette(value):
@@ -578,7 +584,7 @@ def render_window(
         name_colour = "colour15" if active else "colour7"
         pane_activity += f"#[fg={name_colour}]"
     escaped_name = window["name"].replace("#", "##")
-    count_label = pane_count_annotation(window, pane_count_style)
+    count_label = agent_count_annotation(window, pane_count_style)
     count_text_style = (
         pane_count_active_text_style
         if active and pane_count_active_text_style
@@ -743,7 +749,7 @@ def _is_ai_tool_script(token):
     )
 
 
-def command_runs_ai_tool(command):
+def command_runs_ai_tool(command, *, include_browser=True):
     arguments = _command_arguments(command)
     if not arguments:
         return False
@@ -751,7 +757,7 @@ def command_runs_ai_tool(command):
     if _is_ai_tool_executable(arguments[0]):
         return True
     if executable == "agent-browser":
-        return "daemon" in arguments[1:]
+        return include_browser and "daemon" in arguments[1:]
     if executable in PACKAGE_RUNNERS:
         candidates = arguments[1:]
         subcommands = PACKAGE_RUNNER_SUBCOMMANDS.get(executable)
@@ -820,6 +826,64 @@ def _pane_process_commands(pane_pid):
         commands.append(processes[pid][1])
         pending.extend(children.get(pid, ()))
     return commands
+
+
+def refresh_agent_presence(socket_name):
+    """Project live agent panes from one process snapshot, including idle tools."""
+    try:
+        completed = run_tmux(
+            socket_name, "list-panes", "-a", "-F",
+            WINDOW_SEPARATOR.join((
+                "#{pane_id}", "#{pane_pid}", "#{pane_current_command}",
+                "#{" + PANE_AGENT_OPTION + "}",
+            )),
+        )
+    except subprocess.CalledProcessError:
+        # tmux may load this fragment before its first session exists.
+        return False
+    panes = {}
+    for line in completed.stdout.splitlines():
+        pane_id, pid, command, marker = line.split(WINDOW_SEPARATOR, 3)
+        panes[int(pid)] = (pane_id, command, marker)
+    if not panes:
+        return False
+    try:
+        processes = _process_table()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if processes is None:
+        return False
+
+    agent_pids = set()
+    for pid, (_parent, command) in processes.items():
+        seen = set()
+        while pid in processes and pid not in seen:
+            if pid in panes:
+                # Only inspect commands owned by a pane that still needs a
+                # match. Wrappers and nested helpers contribute once; browser
+                # helpers do not represent an interactive agent session.
+                if pid not in agent_pids and command_runs_ai_tool(command, include_browser=False):
+                    agent_pids.add(pid)
+                break
+            seen.add(pid)
+            pid = processes[pid][0]
+
+    updates = []
+    for pid, (pane_id, command, marker) in panes.items():
+        if pid not in processes:
+            # A missing root is an incomplete snapshot, not evidence of exit.
+            continue
+        expected = f"{pid}:{command}" if pid in agent_pids else ""
+        if marker != expected:
+            updates.append(shlex.join((
+                "set-option", "-pq", "-t", pane_id, PANE_AGENT_OPTION, expected,
+            )))
+    if not updates:
+        return False
+    # Quiet pane writes tolerate a pane closing after the snapshot. The next
+    # probe retries any surviving pane whose projection did not update.
+    run_tmux(socket_name, "source-file", "-", input="\n".join(updates) + "\n")
+    return True
 
 
 def pane_agent_status(socket_name, pane_id):
@@ -1008,6 +1072,10 @@ def animate_status(socket_name, fps, log=None):
                 if log is not None:
                     log.emit("ownership_lost", successor=current_owner)
                 return "superseded"
+            stage("agent_probe")
+            if refresh_agent_presence(socket_name):
+                stage("cache_invalidation")
+                invalidate_cache(socket_name)
             if log is not None and busy != previous_busy:
                 log.emit("activity_changed", busy=busy)
             previous_busy = busy
@@ -1245,9 +1313,10 @@ def load_tmux_payload(arguments):
             active,
             synchronized,
             pane_activity_flags,
+            agent_flags,
             variation_selector_always_wide,
             label_width,
-        ) = record.split(WINDOW_SEPARATOR, 7)
+        ) = record.split(WINDOW_SEPARATOR, 8)
         is_synchronized = synchronized == "1"
         label = f" {index}:{name}"
         if is_synchronized:
@@ -1264,8 +1333,7 @@ def load_tmux_payload(arguments):
                 "label": label,
                 "display_width": measured_width,
                 "synchronized": is_synchronized,
-                # The pane iterator emits one 0/1 activity flag per pane.
-                "pane_count": len(pane_activity_flags),
+                "agent_count": agent_flags.count("1"),
                 "busy_activity_count": pane_activity_flags.count("1"),
             }
         )
@@ -1458,7 +1526,7 @@ def main():
         "--client-theme",
         action="store_true",
         default=None,
-        help="resolve terminal theme and pane-count style options at tmux redraw",
+        help="resolve terminal theme and annotation style options at tmux redraw",
     )
     render_parser.add_argument(
         "--pane-count-style",

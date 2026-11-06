@@ -191,6 +191,8 @@ class WindowWrapCliTests(unittest.TestCase):
             "node /tmp/node_modules/@deepseek-ai/dsh/lib/bin.js --profile dsh-tui",
             "node /tmp/node_modules/@deepseek-harness-tui/dsh-tui/bin/dsh-tui.js",
             "npx @deepseek-ai/dsh",
+            "claude --dangerously-skip-permissions --resume session-1",
+            "node /tmp/node_modules/@mariozechner/pi-coding-agent/dist/cli.js",
         ):
             with self.subTest(command=command):
                 self.assertTrue(runs_agent(command))
@@ -211,6 +213,64 @@ class WindowWrapCliTests(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assertFalse(runs_agent(command))
+
+    def test_agent_presence_counts_live_tools_once_per_pane_from_one_snapshot(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        refresh = namespace["refresh_agent_presence"]
+        separator = namespace["WINDOW_SEPARATOR"]
+        rows = [
+            ("%1", "100", "codex", ""),
+            ("%2", "200", "yazi", ""),
+            ("%3", "300", "2.1.319", ""),
+            ("%4", "400", "node", ""),
+            ("%5", "500", "zsh", ""),
+        ]
+        processes = {
+            100: (1, "zsh"), 101: (100, "codex --yolo"),
+            102: (101, "node /tmp/node_modules/@openai/codex/bin/codex.js"),
+            200: (1, "zsh"), 201: (200, "yazi"),
+            300: (1, "zsh"), 301: (300, "claude --resume session-1"),
+            400: (1, "zsh"), 401: (400, "node /tmp/dsh-tui"),
+            500: (1, "zsh"), 501: (500, "agent-browser daemon"),
+        }
+        runner = mock.Mock(return_value=subprocess.CompletedProcess(
+            [], 0, stdout="\n".join(separator.join(row) for row in rows), stderr="",
+        ))
+        snapshot = mock.Mock(return_value=processes)
+        with mock.patch.dict(refresh.__globals__, {
+            "run_tmux": runner, "_process_table": snapshot,
+        }):
+            self.assertTrue(refresh("test"))
+        snapshot.assert_called_once_with()
+        self.assertEqual(runner.call_count, 2)
+        writes = runner.call_args.kwargs["input"]
+        self.assertIn("%1 @tmux-window-wrap-agent 100:codex", writes)
+        self.assertIn("%3 @tmux-window-wrap-agent 300:2.1.319", writes)
+        self.assertIn("%4 @tmux-window-wrap-agent 400:node", writes)
+        self.assertNotIn("%2", writes)
+        self.assertNotIn("%5", writes)
+
+    def test_agent_presence_clears_exited_tools_and_keeps_unknown_snapshots(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        refresh = namespace["refresh_agent_presence"]
+        row = namespace["WINDOW_SEPARATOR"].join(("%1", "100", "node", "100:node"))
+        for processes, changed in (
+            ({100: (1, "node /tmp/dsh-tui")}, False),
+            ({100: (1, "node /tmp/vite.js")}, True),
+            ({}, False),
+            (None, False),
+        ):
+            with self.subTest(processes=processes):
+                runner = mock.Mock(return_value=subprocess.CompletedProcess(
+                    [], 0, stdout=row + "\n", stderr="",
+                ))
+                with mock.patch.dict(refresh.__globals__, {
+                    "run_tmux": runner, "_process_table": lambda: processes,
+                }):
+                    self.assertEqual(refresh("test"), changed)
+                self.assertEqual(runner.call_count, 2 if changed else 1)
+                if changed:
+                    self.assertIn("@tmux-window-wrap-agent ''", runner.call_args.kwargs["input"])
 
     def test_repeated_busy_report_still_invalidates_status_cache(self):
         namespace = runpy.run_path(str(SCRIPT))
@@ -538,6 +598,7 @@ class WindowWrapCliTests(unittest.TestCase):
             owner["value"], True
         )
         script_globals["animation_has_focused_client"] = lambda _socket: True
+        script_globals["refresh_agent_presence"] = lambda _socket: False
         script_globals["detect_color_scheme"] = lambda: "light"
         script_globals["invalidate_cache"] = mock.Mock()
         with tempfile.TemporaryDirectory() as directory:
@@ -576,6 +637,7 @@ class WindowWrapCliTests(unittest.TestCase):
             "test-owner" if FakeTime.now < 61 else "successor", True
         )
         script_globals["animation_has_focused_client"] = lambda _socket: True
+        script_globals["refresh_agent_presence"] = lambda _socket: False
         script_globals["detect_color_scheme"] = lambda: "light"
         script_globals["invalidate_cache"] = mock.Mock()
         reason = namespace["animate_status"]("test", 20, log=log)
@@ -634,6 +696,7 @@ class WindowWrapCliTests(unittest.TestCase):
         script_globals["time"] = FakeTime
         script_globals["run_tmux"] = run_tmux
         script_globals["animation_probe"] = probe
+        script_globals["refresh_agent_presence"] = lambda _socket: False
         script_globals["detect_color_scheme"] = lambda: "light"
         script_globals["invalidate_cache"] = mock.Mock()
         self.assertEqual(namespace["animate_status"]("test", 10), "superseded")
@@ -1654,7 +1717,7 @@ class WindowWrapCliTests(unittest.TestCase):
             "    #[range=window|3] #[fg=colour7]3:c #[norange]",
         )
 
-    def test_render_adds_subscript_count_only_for_multiple_panes(self):
+    def test_render_shows_multiple_agents_and_hides_zero_or_one(self):
         payload = {
             "width": 80,
             "left_width": 4,
@@ -1662,24 +1725,30 @@ class WindowWrapCliTests(unittest.TestCase):
             "active": "@2",
             "windows": [
                 {
+                    "id": "@0", "index": "0", "name": "shell",
+                    "label": " 0:shell ", "agent_count": 0,
+                },
+                {
                     "id": "@1",
                     "index": "1",
                     "name": "one",
                     "label": " 1:one ",
-                    "pane_count": 1,
+                    "agent_count": 1,
                 },
                 {
                     "id": "@2",
                     "index": "2",
                     "name": "many",
                     "label": " 2:many ",
-                    "pane_count": 12,
+                    "agent_count": 12,
                 },
             ],
         }
 
         rendered = self.run_render(payload, 0)
 
+        self.assertIn("0:shell ", rendered)
+        self.assertNotIn("0₀:shell", rendered)
         self.assertIn("1:one ", rendered)
         self.assertNotIn("1₁:one", rendered)
         self.assertIn("2₁₂:many ", rendered)
@@ -1703,7 +1772,7 @@ class WindowWrapCliTests(unittest.TestCase):
                             "index": "2",
                             "name": "many",
                             "label": " 2:many ",
-                            "pane_count": 4,
+                            "agent_count": 4,
                         },
                     ],
                 }
@@ -1723,11 +1792,11 @@ class WindowWrapCliTests(unittest.TestCase):
                 },
                 {
                     "id": "@2", "index": "2", "name": "many",
-                    "label": " 2:many ", "pane_count": 12,
+                    "label": " 2:many ", "agent_count": 12,
                 },
                 {
                     "id": "@3", "index": "3", "name": "pair",
-                    "label": " 3:pair ", "pane_count": 2,
+                    "label": " 3:pair ", "agent_count": 2,
                 },
             ],
         }
@@ -1775,7 +1844,7 @@ class WindowWrapCliTests(unittest.TestCase):
                     {
                         "id": "@2",
                         "label": " 2:b ",
-                        "pane_count": 2,
+                        "agent_count": 2,
                     },
                 ],
             }
@@ -1801,7 +1870,7 @@ class WindowWrapCliTests(unittest.TestCase):
                     "index": "2",
                     "name": "many",
                     "label": " 2:many ",
-                    "pane_count": 4,
+                    "agent_count": 4,
                     "busy_activity_count": 3,
                 },
             ],
@@ -2213,6 +2282,8 @@ class AnimationLogTests(unittest.TestCase):
 
 
 class WindowWrapTmuxIntegrationTests(unittest.TestCase):
+    TEST_AGENT_COMMAND = ("/bin/bash", "-c", "exec -a codex sleep 120")
+
     def setUp(self):
         self.attached_clients = []
         self.animators = []
@@ -2336,6 +2407,20 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             capture_output=True,
             check=check,
         )
+
+    def refresh_agent_presence(self):
+        refresh = runpy.run_path(str(SCRIPT))["refresh_agent_presence"]
+        refresh(self.socket_name)
+
+    def project_agent_panes(self, target):
+        # Style tests consume the same cached presence projection as rendering.
+        rows = self.tmux(
+            "list-panes", "-t", target, "-F",
+            "#{pane_id}|#{pane_pid}:#{pane_current_command}",
+        ).stdout.splitlines()
+        for row in rows:
+            pane_id, marker = row.split("|", 1)
+            self.tmux("set-option", "-p", "-t", pane_id, "@tmux-window-wrap-agent", marker)
 
     def render_runtime(
         self,
@@ -2676,7 +2761,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         self.assertIn("0:⬅️➡️", first_line)
         self.assertIn("1:F6", first_line)
 
-    def test_runtime_pane_count_survives_zoom_and_disappears_at_one(self):
+    def test_runtime_agent_count_excludes_other_panes_and_survives_zoom(self):
         first_pane = self.tmux(
             "display-message",
             "-p",
@@ -2684,6 +2769,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "wrap:1",
             "#{pane_id}",
         ).stdout.strip()
+        self.tmux("respawn-pane", "-k", "-t", first_pane, *self.TEST_AGENT_COMMAND)
         second_pane = self.tmux(
             "split-window",
             "-d",
@@ -2692,8 +2778,10 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "#{pane_id}",
             "-t",
             "wrap:1",
-            "sleep 120",
+            *self.TEST_AGENT_COMMAND,
         ).stdout.strip()
+        self.tmux("split-window", "-d", "-t", "wrap:1", "sleep 120")
+        self.refresh_agent_presence()
 
         rendered = self.render_runtime(line=0, width=80)
         self.assertIn("1₂:手册", rendered)
@@ -2703,18 +2791,27 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         self.assertIn("1₂:手册", rendered)
 
         self.tmux("kill-pane", "-t", second_pane)
+        self.refresh_agent_presence()
+        rendered = self.render_runtime(line=0, width=80)
+        self.assertIn("1:手册", rendered)
+        self.assertNotIn("1₁:手册", rendered)
+
+        self.tmux("respawn-pane", "-k", "-t", first_pane, "sleep 120")
+        self.refresh_agent_presence()
         rendered = self.render_runtime(line=0, width=80)
         self.assertIn("1:手册", rendered)
         self.assertNotIn("1₁:手册", rendered)
 
     def test_runtime_supports_plain_and_off_pane_count_styles(self):
+        self.tmux("respawn-pane", "-k", "-t", "wrap:1", *self.TEST_AGENT_COMMAND)
         self.tmux(
             "split-window",
             "-d",
             "-t",
             "wrap:1",
-            "sleep 120",
+            *self.TEST_AGENT_COMMAND,
         )
+        self.refresh_agent_presence()
 
         plain = self.render_runtime(
             line=0,
@@ -2730,6 +2827,29 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         self.assertIn("1[2]:手册", plain)
         self.assertIn("1:手册", off)
         self.assertNotIn("1₂:手册", off)
+
+    def test_runtime_does_not_count_exited_agent_in_retained_pane(self):
+        self.tmux("set-option", "-w", "-t", "wrap:1", "remain-on-exit", "on")
+        self.tmux("respawn-pane", "-k", "-t", "wrap:1", *self.TEST_AGENT_COMMAND)
+        self.tmux("split-window", "-d", "-t", "wrap:1", *self.TEST_AGENT_COMMAND)
+        self.refresh_agent_presence()
+        self.assertIn("1₂:手册", self.render_runtime(line=0, width=80))
+        pid = int(self.tmux(
+            "display-message", "-p", "-t", "wrap:1", "#{pane_pid}",
+        ).stdout.strip())
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if self.tmux("display-message", "-p", "-t", "wrap:1", "#{pane_dead}").stdout.strip() == "1":
+                break
+            time.sleep(0.01)
+        self.assertEqual(self.tmux(
+            "display-message", "-p", "-t", "wrap:1", "#{pane_dead}",
+        ).stdout.strip(), "1")
+        # A retained pane must stop counting even before the next probe.
+        rendered = self.render_runtime(line=0, width=80)
+        self.assertIn("1:手册", rendered)
+        self.assertNotIn("1₂:手册", rendered)
 
     def test_runtime_counts_each_busy_marker_in_the_same_window(self):
         first_pane = self.tmux(
@@ -2751,6 +2871,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         ).stdout.strip()
         self.set_pane_activity(first_pane, "busy")
         self.set_pane_activity(second_pane, "busy")
+        self.project_agent_panes("wrap:1")
 
         rendered = self.render_runtime(line=0, width=80, animation_tick=0)
         self.assertEqual(rendered.count("▓"), 2)
@@ -3339,6 +3460,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
 
     def configure_theme_badge(self):
         self.tmux("split-window", "-d", "-t", "wrap:0", "sleep 120")
+        self.project_agent_panes("wrap:0")
         self.tmux("set-option", "-as", "terminal-features", ",xterm*:RGB")
         self.tmux("set-option", "-g", "@tmux-window-wrap-color-scheme", "dark")
         self.tmux(
@@ -3411,6 +3533,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             self.tmux("rename-window", "-t", f"wrap:{index}", f"window{index}")
             if index:
                 self.tmux("split-window", "-d", "-t", f"wrap:{index}", "sleep 120")
+                self.project_agent_panes(f"wrap:{index}")
         _, master_fd = self.attach_client(width=15)
         self.wait_for_client_count(1)
         self.wait_for_status("3")
@@ -3461,6 +3584,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         ).stdout.strip()
         self.set_pane_activity(pane_id, "busy")
         self.tmux("split-window", "-d", "-t", "wrap:1", "sleep 120")
+        self.project_agent_panes("wrap:1")
         count_styles = {
             "light": "fg=#1188bb nobold noitalics nounderscore",
             "dark": "fg=#55ddff,nobold,noitalics,nounderscore",
@@ -3536,7 +3660,8 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
 
         wait_for_single_scheme(next_scheme, timeout=1)
 
-    def test_attached_status_refreshes_pane_count_after_split_and_kill(self):
+    def test_attached_status_refreshes_agent_count_after_start_and_exit(self):
+        self.tmux("respawn-pane", "-k", "-t", "wrap:1", *self.TEST_AGENT_COMMAND)
         self.source_window_wrap_config()
         _, master_fd = self.attach_client(width=80)
         self.wait_for_client_count(1)
@@ -3552,14 +3677,14 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "#{pane_id}",
             "-t",
             "wrap:1",
-            "sleep 120",
+            *self.TEST_AGENT_COMMAND,
         ).stdout.strip()
         rendered = self.wait_for_status_text(
             master_fd,
             "1₂:手册",
-            timeout=0.5,
+            timeout=2.5,
         )
-        self.assertLess(rendered - started, 0.5)
+        self.assertLess(rendered - started, 2.5)
 
         self.drain_client_output(master_fd)
         started = time.monotonic()
@@ -3567,9 +3692,21 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         rendered = self.wait_for_status_text(
             master_fd,
             "1:手册",
-            timeout=0.5,
+            timeout=2.5,
         )
-        self.assertLess(rendered - started, 0.5)
+        self.assertLess(rendered - started, 2.5)
+
+        # Opening and closing an agent in an existing idle pane also refreshes.
+        shell_pane = self.tmux(
+            "split-window", "-d", "-P", "-F", "#{pane_id}",
+            "-t", "wrap:1", "sleep 120",
+        ).stdout.strip()
+        self.drain_client_output(master_fd)
+        self.tmux("respawn-pane", "-k", "-t", shell_pane, *self.TEST_AGENT_COMMAND)
+        self.wait_for_status_text(master_fd, "1₂:手册", timeout=2.5)
+        self.drain_client_output(master_fd)
+        self.tmux("respawn-pane", "-k", "-t", shell_pane, "sleep 120")
+        self.wait_for_status_text(master_fd, "1:手册", timeout=2.5)
 
     def test_runtime_accepts_unicode_line_separators_in_window_names(self):
         for separator in ("\u0085", "\u2028", "\u2029"):
@@ -3790,6 +3927,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             .stdout.strip(), name,
         )
         self.tmux("split-window", "-d", "-t", "wrap:1", "sleep 120")
+        self.project_agent_panes("wrap:1")
         for option, style in (
             ("light", "fg=#123456,nobold"),
             ("active", "fg=#654321,bold"),

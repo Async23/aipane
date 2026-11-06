@@ -6,7 +6,7 @@ Optional multi-line tmux status window list (up to 3 rows).
 
 Cached rows resolve the selected window against tmux's current `window_id` at
 each client redraw. A window switch therefore updates the highlight, activity
-palette, and pane count style together, without waiting for the Python renderer.
+palette, and agent count style together, without waiting for the Python renderer.
 Rows that finish rendering out of order cannot restore an old selection or
 highlight two different windows. The active-window cache fingerprint still
 updates the layout when a selected window must be brought into the three-row
@@ -62,23 +62,36 @@ the snapshot's selection for standalone callers. Cached rows are written through
 `source-file -` on standard input so large animated window lists do not exceed
 tmux's command argument size limit.
 
-## Pane count annotations
+## Agent count annotations
 
-Window labels show the pane total as subscript digits when a window owns more
-than one pane:
+Window labels show the number of open agent panes as subscript digits when
+there are at least two agents. Both busy and idle agents count; shells, file
+managers, and browser helpers do not:
 
 ```text
-1:single       # one pane; the implicit count stays hidden
-2₄:grid         # four panes
-3₁₂:large-grid  # twelve panes; multi-digit totals stay exact
+1:shell        # no agents; the count stays hidden
+2:work         # one agent; the count also stays hidden
+3₂:pair         # two agents, even if other panes contain shells or file managers
+4₁₂:agents     # twelve agents; multi-digit totals stay exact
 ```
 
-The annotation follows the window index, inherits its style, remains visible
-while a pane is zoomed, and participates in the renderer's width and wrapping
-calculations. Busy activity cells remain flush with the combined index, for
-example `▓▓▓2₄:grid` means three busy agent panes in a four-pane window.
+Each pane contributes at most one agent, so wrappers and nested helper
+processes do not inflate the count. Supported command identities are shared
+with `pane-agent-status`, including Codex, Claude Code, dsh-TUI, Kimi, Pi, Grok,
+Cursor, OpenCode, Gemini, and Qwen Code. Browser helpers are excluded here.
 
-The public default is `subscript`. Set the option before sourcing
+The animator checks presence once per second using one process snapshot for
+all panes. It projects the owning pane PID and current command into
+`@tmux-window-wrap-agent` and invalidates cached rows when presence changes.
+The renderer only reads this projection; zooming does not hide other panes,
+and an old projection is ignored after the owning PID or command changes.
+
+The annotation follows the window index, inherits its style, and participates
+in width and wrapping calculations. Busy activity cells remain flush with the
+combined index: `▓▓▓2₄:grid` means four open agents, three of which are busy.
+
+The public default is `subscript`. Existing `pane-count` option names remain
+the annotation's styling interface. Set the option before sourcing
 `conf/tmux-window-wrap.conf` to select a compatibility style or disable the
 annotation:
 
