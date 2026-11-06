@@ -100,7 +100,7 @@ def select_with_fzf(choices: list[dict], models: dict, default: str, executable:
         "--border-label-pos=3", "--padding=0,1", "--header-first",
         "--header=搜索模式 · 回车/Esc 进入选择", "--prompt=搜索 › ",
         "--ghost=输入模型名称，如 kimi / grok / sol", "--info=inline-right",
-        "--no-sort", "--no-hscroll", "--highlight-line", "--pointer=›", "--gutter= ",
+        "--no-sort", "--cycle", "--no-hscroll", "--highlight-line", "--pointer=›", "--gutter= ",
         "--preview=" + preview, "--preview-window=down,7,wrap,border-top",
         "--sync", "--no-tty-default",
         "--with-shell=/bin/sh -c",

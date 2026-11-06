@@ -48,6 +48,7 @@ except KeyboardInterrupt:
 
 class PickerPTY:
     def __init__(self, columns=100, lines=30, default="grok-fast", extra_env=None):
+        self.default = default
         self.master, self.slave = pty.openpty()
         self.resize(columns, lines)
         self.before = termios.tcgetattr(self.slave)
@@ -92,7 +93,7 @@ class PickerPTY:
         os.write(self.master, keys)
 
     def ready(self):
-        self.wait_for("grok-fast")
+        self.wait_for(self.default)
 
     def enter_selection(self):
         self.send(b"\x1b")
@@ -150,6 +151,37 @@ class InteractivePickerTests(unittest.TestCase):
         picker.wait_for("grok-fast")
         picker.send(b"\r")
         picker.finish("SELECTED=grok-fast")
+
+    def test_navigation_wraps_at_both_ends(self):
+        for key, default, expected in (
+            (b"j", "j-k-special", "gpt-sol"),
+            (b"k", "gpt-sol", "j-k-special"),
+            (b"\x1b[B", "j-k-special", "gpt-sol"),
+            (b"\x1b[A", "gpt-sol", "j-k-special"),
+        ):
+            with self.subTest(key=key):
+                picker = self.picker(default=default)
+                picker.enter_selection()
+                picker.send(key + b"\r")
+                picker.finish("SELECTED=" + expected)
+
+    def test_navigation_wraps_within_filtered_results(self):
+        for key, default, expected in (
+            (b"j", "j-k-special", "kimi-pro"),
+            (b"k", "kimi-pro", "j-k-special"),
+            (b"\x1b[B", "j-k-special", "kimi-pro"),
+            (b"\x1b[A", "kimi-pro", "j-k-special"),
+        ):
+            with self.subTest(key=key):
+                picker = self.picker(default=default)
+                picker.send(b"!sol")
+                picker.wait_for("3/4")
+                picker.confirm_search()
+                # Search updates can move the cursor; page to the boundary first.
+                picker.send(b"\x1b[6~" if default == "j-k-special" else b"\x1b[5~")
+                picker.wait_for(default)
+                picker.send(key + b"\r")
+                picker.finish("SELECTED=" + expected)
 
     def test_selection_mode_does_not_type_search(self):
         picker = self.picker()
