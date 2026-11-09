@@ -107,6 +107,60 @@ printf '%s\n' '{"hook_event_name":"Stop","session_id":"preview","last_assistant_
 python3 tests/test_claude_notify.py
 ```
 
+## Codex
+
+Merge [`integrations/codex/hooks.json`](../integrations/codex/hooks.json) into
+`~/.codex/hooks.json`, preserving unrelated hooks. The `PreToolUse` matcher for
+`request_user_input` and `request_user_input_async` calls the existing entrypoint:
+
+```bash
+ln -s /path/to/aipane/bin/aipane-codex-notify ~/.local/bin/aipane-codex-notify
+```
+
+Append the new matcher group when merging, so existing hook indexes and trust
+records stay stable. Codex 0.166 also requires a trusted hash for the new hook;
+review and trust this command in `/hooks` before use. Registering `hooks.json`
+alone leaves an untrusted hook inactive.
+
+This hook runs asynchronously with a 30-second timeout. It sends a question
+notification when Codex asks, including queued questions while Codex continues
+working and questions in an active Goal. It runs even when the terminal is
+focused. The title ends in `等待回答`; the body contains the first question,
+and the subtitle shows the count for a batch. It retains the Codex notifier App,
+sound selection, and click action targeting the original tmux pane.
+
+The canonical trigger is `PreToolUse`; do not add a second notification hook to
+`PostToolUse`. Each session/tool-call ID is claimed atomically, so duplicate
+callbacks, subsequent turns, and answers do not repeat the alert. Distinct calls
+with identical wording still notify. Subagent hooks and malformed questions are
+ignored. Delivery failures release the claim for a subsequent retry. No reminder
+timer or historical question replay is installed. Keep the existing `notify`
+program for completion events; `tui.notifications` can remain disabled.
+
+Question diagnostics in `$CODEX_HOME/log/codex-questions.log` contain identifiers,
+time, pane, outcome, and sender channel, without question text. Claims live in
+`$CODEX_HOME/notifications/questions/`. Sender acceptance is not proof that macOS
+displayed a banner. Existing Codex processes may need their hooks reloaded or the
+conversation resumed in a new process before the added hook takes effect.
+
+Preview the actual wrapper without sending a notification or writing state:
+
+```bash
+printf '%s\n' '{"hook_event_name":"PreToolUse","tool_name":"request_user_input_async","session_id":"preview","tool_use_id":"question-1","tool_input":{"questions":[{"title":"只重试失败工单可以吗？"}]}}' |
+  CODEX_NOTIFY_DRY_RUN=1 ~/.local/bin/aipane-codex-notify
+python3 -m unittest discover -s tests -p 'test_codex_question_notify.py'
+```
+
+For manual macOS banner and click verification, run:
+
+```bash
+~/.local/bin/aipane-codex-notify --test-question
+```
+
+Each invocation prints a unique tracer and sends one question notification.
+Confirm that the matching banner appears and clicking returns to the invoking
+pane. `CODEX_NOTIFY_DRY_RUN=1` also works with this command for a silent preview.
+
 Codex TUI's temporary task-title and catch-up recap requests inherit the legacy
 `notify` program. They can finish after the visible task has ended, each with a
 new thread/turn ID. The module suppresses these internal completions by matching
@@ -124,6 +178,7 @@ Run the Interface and compatibility contracts with:
 
 ```bash
 python3 tests/test_agent_notifications.py
+python3 tests/test_codex_question_notify.py
 python3 tests/test_claude_notify.py
 python3 tests/test_agent_notification_sounds.py
 python3 tests/test_kimi_notify.py

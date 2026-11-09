@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import uuid
 from pathlib import Path
 
 
@@ -19,7 +20,17 @@ from agent_notifications import (  # noqa: E402
 )
 
 
-def read_payload() -> dict[str, object]:
+def read_payload() -> dict[str, object] | None:
+    if sys.argv[1:] == ["--test-question"]:
+        trace = "aipane-question-" + uuid.uuid4().hex[:12]
+        print(f"question notification tracer: {trace}", file=sys.stderr)
+        return {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "request_user_input_async",
+            "session_id": "aipane-question-tracer",
+            "tool_use_id": trace,
+            "tool_input": {"questions": [{"title": f"待答问题通知测试：{trace}"}]},
+        }
     raw = ""
     if len(sys.argv) > 1 and sys.argv[1]:
         raw = sys.argv[1]
@@ -30,13 +41,15 @@ def read_payload() -> dict[str, object]:
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
-        return {"raw": raw}
-    return payload if isinstance(payload, dict) else {}
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def main() -> int:
     environment = os.environ.copy()
     payload = read_payload()
+    if payload is None:
+        return 0
     preview = environment.get("CODEX_NOTIFY_DRY_RUN", "").lower() in {
         "1",
         "true",
@@ -46,21 +59,24 @@ def main() -> int:
         adapter=MacOSNotificationAdapter(environment=environment),
         environment=environment,
     )
-    result = notifications.handle("codex", payload, preview=preview)
-    if preview and result.notification is not None:
+    try:
+        result = notifications.handle("codex", payload, preview=preview)
+    except Exception as error:
+        # Notification failures must never reject a tool or stop Codex.
+        print(json.dumps({"event": "notify_error", "error": type(error).__name__}), file=sys.stderr)
+        return 0
+    if preview:
         notification = result.notification
+        output = notification.as_dict() if notification else {}
+        output.update(
+            suppressed=result.outcome == "suppressed",
+            reason=result.reason,
+            outcome=result.outcome,
+            goal_status=notification.goal_status if notification else "",
+        )
         print(
             json.dumps(
-                {
-                    "title": notification.title,
-                    "subtitle": notification.subtitle,
-                    "body": notification.body,
-                    "suppressed": result.outcome == "suppressed",
-                    "reason": result.reason,
-                    "category": notification.category,
-                    "goal_status": notification.goal_status,
-                    "sound": notification.sound,
-                },
+                output,
                 ensure_ascii=False,
             )
         )

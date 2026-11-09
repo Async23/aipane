@@ -11,6 +11,7 @@ import shlex
 import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 import unicodedata
 from contextlib import closing
@@ -520,6 +521,11 @@ class AgentNotifications:
                 self._wait_for_grok_transcript(normalized)
             notification = self._grok_notification(normalized)
         elif agent == "codex":
+            if "hook_event_name" in normalized:
+                notification = self._codex_question_notification(normalized)
+                if notification is None:
+                    return NotificationResult(outcome="ignored", reason="unsupported_question")
+                return self._handle_codex_question(normalized, notification, preview=preview)
             notification, suppression_reason = self._codex_notification(normalized)
             if suppression_reason:
                 if not preview:
@@ -1049,6 +1055,114 @@ class AgentNotifications:
             if assistant:
                 return
             time.sleep(0.05)
+
+    def _codex_question_notification(self, payload: Mapping[str, object]) -> Notification | None:
+        tool = payload.get("tool_name")
+        if (
+            payload.get("hook_event_name") != "PreToolUse"
+            or not isinstance(tool, str)
+            or tool not in {"request_user_input", "request_user_input_async"}
+            or payload.get("agent_id")
+        ):
+            return None
+        session_id = payload.get("session_id")
+        call_id = payload.get("tool_use_id")
+        if not all(isinstance(value, str) and value.strip() for value in (session_id, call_id)):
+            return None
+        arguments = payload.get("tool_input")
+        if not isinstance(arguments, dict):
+            return None
+        questions = arguments.get("questions")
+        if not isinstance(questions, list) or not questions:
+            return None
+        texts = []
+        for question in questions:
+            if not isinstance(question, dict):
+                return None
+            value = question.get("title" if tool == "request_user_input_async" else "question")
+            if not isinstance(value, str) or not value.strip():
+                return None
+            texts.append(_plain_notification_text(value))
+
+        title = _short_display_text(_codex_tmux_thread_title(self.environment), 48)
+        if not title:
+            title = _short_display_text(_codex_root_thread_title(session_id, self.environment), 48)
+        title = title or _project_title(str(payload.get("cwd") or ""), "Codex")
+        coordinate = _tmux_coordinate(self.environment)
+        if coordinate:
+            title = f"{coordinate} · {title}"
+        action = ""
+        focus = _codex_home(self.environment) / "bin" / "codex-focus-tmux.sh"
+        if focus.is_file():
+            target = _tmux_focus_target(self.environment)
+            if any(target):
+                action = shlex.join([str(focus), *target])
+        identity = json.dumps([session_id, call_id], separators=(",", ":"))
+        return Notification(
+            title=f"{title} · 等待回答",
+            subtitle=f"{len(texts)} 个问题等待回答" if len(texts) > 1 else "有问题需要你回答",
+            body=_short_text(texts[0], 140, "…"),
+            sound=self.environment.get("CODEX_NOTIFY_SOUND", "").strip()
+            or self.choose_sound(COMPLETION_SOUNDS),
+            event="question",
+            group="codex-question-" + hashlib.sha256(identity.encode()).hexdigest()[:32],
+            action=action,
+            category="question",
+            pane_id=self.environment.get("TMUX_PANE", ""),
+        )
+
+    def _handle_codex_question(
+        self, payload: Mapping[str, object], notification: Notification, *, preview: bool
+    ) -> NotificationResult:
+        if preview:
+            return NotificationResult(outcome="previewed", notification=notification)
+        directory = _codex_home(self.environment) / "notifications" / "questions"
+        marker = directory / notification.group
+        claimed = False
+        try:
+            _ensure_private_directory(directory)
+            descriptor = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(descriptor)
+            claimed = True
+        except FileExistsError:
+            return NotificationResult(
+                outcome="deduplicated", notification=notification, reason="duplicate_question"
+            )
+        except OSError:
+            # A broken deduplication store must not block the question or delivery.
+            print(json.dumps({"event": "codex_question_dedup_failed"}), file=sys.stderr)
+        try:
+            channel = self.adapter.deliver("codex", notification)
+        except Exception as error:
+            channel = "failed"
+            print(json.dumps({"event": "codex_question_notify_failed",
+                              "error": type(error).__name__}), file=sys.stderr)
+        failed = _delivery_failed(channel)
+        if failed and claimed:
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError:
+                pass
+        outcome = "failed" if failed else "delivered"
+        record = {
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "event": "question", "group": notification.group,
+            "session_id": payload.get("session_id"),
+            "turn_id": payload.get("turn_id"),
+            "tool_use_id": payload.get("tool_use_id"),
+            "tool_name": payload.get("tool_name"),
+            "pane": notification.pane_id, "outcome": outcome, "channel": channel,
+        }
+        try:
+            log = _codex_home(self.environment) / "log" / "codex-questions.log"
+            _ensure_private_directory(log.parent)
+            descriptor = os.open(log, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+            with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        except OSError:
+            pass
+        return NotificationResult(outcome=outcome, notification=notification, channel=channel)
 
     def _codex_notification(
         self,

@@ -25,6 +25,17 @@
     ],
     "PreToolUse": [
       {
+        "matcher": "^request_user_input(_async)?$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/aipane-codex-notify",
+            "async": true,
+            "timeout": 30
+          }
+        ]
+      },
+      {
         "hooks": [
           {
             "type": "command",
