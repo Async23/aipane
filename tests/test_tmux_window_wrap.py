@@ -272,6 +272,53 @@ class WindowWrapCliTests(unittest.TestCase):
                 if changed:
                     self.assertIn("@tmux-window-wrap-agent ''", runner.call_args.kwargs["input"])
 
+    def test_agent_presence_skips_malformed_rows_and_updates_valid_panes(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        refresh = namespace["refresh_agent_presence"]
+        separator = namespace["WINDOW_SEPARATOR"]
+        valid_row = separator.join(("%1", "100", "codex", ""))
+        for malformed_row in (
+            "",
+            separator.join(("%2", "200")),
+            separator.join(("%2", "", "codex", "200:codex")),
+            separator.join(("%2", "not-a-pid", "codex", "200:codex")),
+            separator.join(("%2", "0", "codex", "200:codex")),
+            separator.join(("%2", "-200", "codex", "200:codex")),
+        ):
+            with self.subTest(row=malformed_row):
+                runner = mock.Mock(return_value=subprocess.CompletedProcess(
+                    [], 0, stdout=malformed_row + "\n" + valid_row + "\n", stderr="",
+                ))
+                snapshot = mock.Mock(return_value={100: (1, "codex --yolo")})
+                with mock.patch.dict(refresh.__globals__, {
+                    "run_tmux": runner, "_process_table": snapshot,
+                }):
+                    self.assertTrue(refresh("test"))
+                snapshot.assert_called_once_with()
+                self.assertEqual(runner.call_count, 2)
+                self.assertEqual(
+                    runner.call_args.kwargs["input"],
+                    "set-option -pq -t %1 @tmux-window-wrap-agent 100:codex\n",
+                )
+
+    def test_agent_presence_preserves_unicode_line_separators_in_commands(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        refresh = namespace["refresh_agent_presence"]
+        for line_separator in ("\u0085", "\u2028", "\u2029"):
+            with self.subTest(separator=f"U+{ord(line_separator):04X}"):
+                command = f"worker{line_separator}name"
+                row = namespace["WINDOW_SEPARATOR"].join(("%1", "100", command, ""))
+                runner = mock.Mock(return_value=subprocess.CompletedProcess(
+                    [], 0, stdout=row + "\n", stderr="",
+                ))
+                with mock.patch.dict(refresh.__globals__, {
+                    "run_tmux": runner,
+                    "_process_table": lambda: {100: (1, "codex --yolo")},
+                }):
+                    self.assertTrue(refresh("test"))
+                self.assertEqual(runner.call_count, 2)
+                self.assertIn(f"100:{command}", runner.call_args.kwargs["input"])
+
     def test_repeated_busy_report_still_invalidates_status_cache(self):
         namespace = runpy.run_path(str(SCRIPT))
         update_pane_activity = namespace["update_pane_activity"]

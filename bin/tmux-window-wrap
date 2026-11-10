@@ -842,9 +842,20 @@ def refresh_agent_presence(socket_name):
         # tmux may load this fragment before its first session exists.
         return False
     panes = {}
-    for line in completed.stdout.splitlines():
-        pane_id, pid, command, marker = line.split(WINDOW_SEPARATOR, 3)
-        panes[int(pid)] = (pane_id, command, marker)
+    # tmux records end at ASCII newlines; Unicode separators are field data.
+    for line in completed.stdout.split("\n"):
+        fields = line.split(WINDOW_SEPARATOR, 3)
+        if len(fields) != 4:
+            # One incomplete record must not terminate the animation driver.
+            continue
+        pane_id, pid, command, marker = fields
+        try:
+            pane_pid = int(pid)
+        except ValueError:
+            continue
+        if pane_pid <= 0:
+            continue
+        panes[pane_pid] = (pane_id, command, marker)
     if not panes:
         return False
     try:
