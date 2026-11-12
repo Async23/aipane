@@ -20,6 +20,7 @@ import os
 import shlex
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 
@@ -40,6 +41,17 @@ STATE_DIR = Path(
 REGISTRY = Path(os.environ.get("AIPANE_REGISTRY") or (STATE_DIR / "registry.jsonl"))
 OUT = STATE_DIR / "coords-last.json"
 TMUX = shlex.split(os.environ.get("AIPANE_TMUX", "tmux"))
+
+
+def report_error(exc: SnapshotError | OSError) -> None:
+    message = f"aipane-snapshot: {exc}"
+    print(message, file=sys.stderr)
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with (STATE_DIR / "snapshot-errors.log").open("a", encoding="utf-8") as log:
+            log.write(f"{datetime.now().astimezone().isoformat(timespec='seconds')} {message}\n")
+    except OSError:
+        pass
 
 
 def current_server_identity() -> tuple[str, str] | None:
@@ -98,13 +110,16 @@ def live_panes() -> list[tuple[str, str, str]]:
             check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, timeout=5,
         ).stdout
-    except Exception:
-        return []
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SnapshotError("cannot read tmux panes; keeping the previous snapshot") from exc
     rows = []
     for line in out.splitlines():
         parts = line.split("\t")
-        if len(parts) == 3:
-            rows.append(tuple(parts))
+        if len(parts) != 3 or not all(parts):
+            raise SnapshotError("incomplete tmux pane list; keeping the previous snapshot")
+        rows.append(tuple(parts))
+    if not rows:
+        raise SnapshotError("tmux returned no panes; keeping the previous snapshot")
     return rows
 
 
@@ -148,13 +163,20 @@ def dsh_recovery_binding(activity: AgentActivity, pane_id: str) -> dict | None:
 
 
 def main() -> int:
-    server = current_server_identity()
-    by_pane = latest_by_pane(*server) if server else {}
+    try:
+        server = current_server_identity()
+        if server is None:
+            raise SnapshotError("cannot read the tmux server identity; keeping the previous snapshot")
+        panes = live_panes()
+    except SnapshotError as exc:
+        report_error(exc)
+        return 1
+    by_pane = latest_by_pane(*server)
     activity = AgentActivity(
         adapter=TmuxActivityAdapter(command=TMUX)
     )
     coords: dict[str, dict] = {}
-    for pane_id, coord, cwd in live_panes():
+    for pane_id, coord, cwd in panes:
         inspection = activity.inspect(pane_id)
         session = inspection.session
         rec = (
@@ -225,7 +247,7 @@ def main() -> int:
         # Retained as a diagnostic projection; restore never reads this file.
         atomic_json(OUT, coords)
     except (OSError, SnapshotError) as exc:
-        print(f"aipane-snapshot: {exc}", file=sys.stderr)
+        report_error(exc)
         return 1
     return 0
 

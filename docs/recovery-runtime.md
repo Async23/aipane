@@ -57,6 +57,11 @@ tmux-resurrect 的 `post-save-layout` 钩子将刚写好的快照路径传给
 保存的启动命令和标题识别会话；缺少身份的项目不会由全局坐标表补猜。
 无参数运行 `aipane-snapshot` 只更新诊断投影。
 
+读取 tmux 服务或面板列表失败、列表为空或格式不完整时，`aipane-snapshot` 返回失败，
+保留已有快照与诊断投影，并写入状态目录中的 `snapshot-errors.log`。
+tmux-resurrect 的保存入口须检查 `post-save-layout` 钩子的退出状态：失败时保留原 `last`
+及屏幕存档，避免将缺失会话信息的新文件作为下一次恢复入口。
+
 快照中前台程序为 shell 的窗格保持 shell。即使完整命令字段或绑定中残留 Agent
 会话，也不会将该窗格纳入 AI 恢复计划，避免把其他窗格的会话重复启动到这里。
 
