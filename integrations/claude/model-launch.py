@@ -78,7 +78,11 @@ def canonical_model(value: str, settings: dict) -> str:
     model = settings.get("env", {}).get(ALIASES.get(model, ""), model)
     if model.startswith("claude-fable-5-dd-"):
         model = model.removeprefix("claude-fable-5-dd-")[::-1]
-    return {"grok-4.7-build": "grok-4.7", "deepseek-v4-flash": "deepseek-flash"}.get(model, model)
+    return {
+        "grok-4.6-build": "grok-4.6",
+        "grok-4.7-build": "grok-4.7",
+        "deepseek-v4-flash": "deepseek-flash",
+    }.get(model, model)
 
 
 def take_option(args: list[str], option: str) -> tuple[list[str], str | None]:
@@ -171,15 +175,20 @@ def make_overlay(settings: dict, metadata: dict, extra: dict, model: str) -> dic
         raise ValueError("--settings 中的 env 必须是对象")
     env["ANTHROPIC_MODEL"] = model
     env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(window)
-    # Keep the existing GPT subagent where it has the same window. Otherwise
-    # use the selected model so every subagent uses the session's window.
-    subagent = "gpt-6.1-sol" if "gpt-6.1-sol" in compatible else model
+    configured_subagent = canonical_model(
+        str(env.get("CLAUDE_CODE_SUBAGENT_MODEL", settings.get("env", {}).get("CLAUDE_CODE_SUBAGENT_MODEL", "gpt-6.1-sol"))),
+        settings,
+    )
+    subagent = configured_subagent if configured_subagent in models else model
     env["CLAUDE_CODE_SUBAGENT_MODEL"] = subagent
     env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] = "1"
-    for family in ALIASES.values():
+    for alias, family in ALIASES.items():
         requested = canonical_model(str(env.get(family, settings.get("env", {}).get(family, model))), settings)
-        if requested not in compatible:
+        allowed = models if alias == "haiku" else compatible
+        if requested not in allowed:
             env[family] = model
+        elif alias == "haiku":
+            env[family] = requested
     overlay["model"] = model
     picker = settings.get("modelPicker", {})
     options = [copy.deepcopy(item) for item in picker.get("options", []) if item.get("model") in compatible]

@@ -208,6 +208,27 @@ class ModelLauncherTests(unittest.TestCase):
                 self.assertIn("回车选 Kimi K3", prompt)
                 self.assert_model(native, "kimi-k3")
 
+    def test_automatic_resume_accepts_upstream_grok_build_model_names(self):
+        project = re.sub(r"[^A-Za-z0-9-]", "-", str(self.home.resolve()))
+        transcript = self.config / "projects" / project / (SESSION + ".jsonl")
+        for model in ("grok-4.6", "grok-4.7"):
+            with self.subTest(model=model):
+                (self.config / "settings.json").write_text(json.dumps({
+                    "model": model, "env": {},
+                    "modelPicker": {"options": [{"model": model, "label": model}]},
+                }))
+                (self.config / "model-routing.json").write_text(json.dumps({"models": {
+                    model: {"context_tokens": 500000, "billing_source": "Grok"},
+                }}))
+                transcript.write_text(json.dumps({
+                    "type": "assistant", "message": {"model": model + "-build"},
+                }) + "\n")
+                proc, master = self.launch(["--resume", SESSION], automatic=True,
+                                           inherited_model="")
+                native = self.native_data(self.read_until_decided(proc, master))
+                self.assert_model(native, model)
+                self.assertEqual(proc.wait(timeout=3), 0)
+
     def test_explicit_model_bypasses_picker_and_preserves_memory(self):
         self.remember("kimi-k3")
         before = self.state().read_bytes()
@@ -325,6 +346,35 @@ class ModelLauncherTests(unittest.TestCase):
         args = native["args"]
         self.assertEqual(args[args.index("--model") + 1], "kimi-k3")
         self.assertEqual(proc.wait(timeout=3), 0)
+
+    def test_subagent_and_haiku_models_stay_pinned_across_context_windows(self):
+        (self.config / "settings.json").write_text(json.dumps({
+            "model": "gcp/gemini-4-argon",
+            "env": {
+                "CLAUDE_CODE_SUBAGENT_MODEL": "gpt-6.1-sol",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "grok-4.7-build-fast",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-6.1-sol",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "kimi-k3",
+            },
+            "modelPicker": {"options": [{"model": "gcp/gemini-4-argon", "label": "Gemini 4 Argon"}]},
+        }))
+        (self.config / "model-routing.json").write_text(json.dumps({"models": {
+            "gcp/gemini-4-argon": {"context_tokens": 1048576, "billing_source": "Google Cloud"},
+            "kimi-k3": {"context_tokens": 1048576, "billing_source": "Kimi"},
+            "gpt-6.1-sol": {"context_tokens": 500000, "billing_source": "Codex"},
+            "grok-4.7-build-fast": {"context_tokens": 500000, "billing_source": "Grok"},
+        }}))
+        proc, master = self.launch(["--model", "gcp/gemini-4-argon"], inherited_model="")
+        native = self.native_data(self.read_until_decided(proc, master))
+        args = native["args"]
+        overlay = json.loads(args[args.index("--settings") + 1])
+        self.assertEqual(overlay["env"]["ANTHROPIC_MODEL"], "gcp/gemini-4-argon")
+        self.assertEqual(overlay["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1048576")
+        self.assertEqual(overlay["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "gpt-6.1-sol")
+        self.assertEqual(overlay["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "grok-4.7-build-fast")
+        self.assertEqual(overlay["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "gcp/gemini-4-argon")
+        self.assertEqual(proc.wait(timeout=3), 0)
+
 
 
 if __name__ == "__main__":
