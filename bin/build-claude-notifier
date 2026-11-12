@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+self_dir="$(cd "$(dirname "$0")" && pwd)"
+repo_root="$(cd "$self_dir/.." && pwd)"
+source_file="$repo_root/native/agent-notifier.m"
+icon_file="$repo_root/native/icons/claude-code.icns"
+bundle_id="com.alfheim.claude-code-notifier.v2"
+output=""
+version="3.0.0"
+build="16"
+
+while (( $# > 0 )); do
+  case "$1" in
+    --bundle-id) shift; bundle_id="${1:-}" ;;
+    --output) shift; output="${1:-}" ;;
+    --version) shift; version="${1:-}" ;;
+    --build) shift; build="${1:-}" ;;
+    -h|--help)
+      printf 'usage: build-claude-notifier --output APP [--bundle-id ID] [--version V] [--build N]\n'
+      exit 0
+      ;;
+    *) printf 'build-claude-notifier: unknown argument: %s\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if [[ -z "$bundle_id" || -z "$output" || -e "$output" || -z "$version" || -z "$build" ]]; then
+  printf 'build-claude-notifier: bundle id/version/build required; output must be a new App path\n' >&2
+  exit 2
+fi
+if [[ "$(basename "$output")" != 'Claude Code Notifier.app' ]]; then
+  printf 'build-claude-notifier: output App must be named Claude Code Notifier.app\n' >&2
+  exit 2
+fi
+for input_file in "$source_file" "$icon_file"; do
+  if [[ ! -r "$input_file" ]]; then
+    printf 'build-claude-notifier: missing input: %s\n' "$input_file" >&2
+    exit 2
+  fi
+done
+
+build_root="$(mktemp -d "${TMPDIR:-/tmp}/claude-notifier-build.XXXXXX")"
+trap 'rm -rf "$build_root"' EXIT
+stage_app="$build_root/.stage.noindex/Claude Code Notifier.app"
+contents="$stage_app/Contents"
+macos_dir="$contents/MacOS"
+resources="$contents/Resources"
+plist="$contents/Info.plist"
+mkdir -p "$macos_dir" "$resources" "$(dirname "$output")"
+
+/usr/bin/clang \
+  -fobjc-arc -fblocks -Wall -Wextra -Werror \
+  -mmacosx-version-min=13.0 \
+  -framework Cocoa -framework UserNotifications \
+  "$source_file" -o "$macos_dir/claude-notifier"
+/usr/bin/ditto "$icon_file" "$resources/ClaudeCode.icns"
+
+/usr/bin/plutil -create xml1 "$plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $bundle_id" "$plist"
+/usr/libexec/PlistBuddy -c 'Add :CFBundleName string Claude Code Notifier' "$plist"
+/usr/libexec/PlistBuddy -c 'Add :CFBundleDisplayName string Claude Code Notifier' "$plist"
+/usr/libexec/PlistBuddy -c 'Add :CFBundleExecutable string claude-notifier' "$plist"
+/usr/libexec/PlistBuddy -c 'Add :CFBundlePackageType string APPL' "$plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $version" "$plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $build" "$plist"
+/usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string ClaudeCode' "$plist"
+/usr/libexec/PlistBuddy -c 'Add :LSUIElement bool true' "$plist"
+/usr/libexec/PlistBuddy -c 'Add :NSHighResolutionCapable bool true' "$plist"
+/usr/libexec/PlistBuddy -c 'Add :LSMinimumSystemVersion string 13.0' "$plist"
+printf 'APPL????' >"$contents/PkgInfo"
+/usr/bin/codesign --force --deep --sign - "$stage_app"
+/usr/bin/codesign --verify --deep --strict "$stage_app"
+/usr/bin/ditto "$stage_app" "$output"
+printf '%s\n' "$output"

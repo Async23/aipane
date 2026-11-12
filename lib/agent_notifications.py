@@ -181,14 +181,8 @@ class MacOSNotificationAdapter:
             / "Claude Code Notifier.app"
             / "Contents"
             / "MacOS"
-            / "terminal-notifier"
+            / "claude-notifier"
         )
-        if not _executable(notifier):
-            discovered = shutil.which(
-                "terminal-notifier",
-                path=self.environment.get("PATH"),
-            )
-            notifier = Path(discovered) if discovered else notifier
         args = ["-title", notification.title]
         if notification.subtitle:
             args.extend(["-subtitle", notification.subtitle])
@@ -198,16 +192,25 @@ class MacOSNotificationAdapter:
                 notification.body,
                 "-group",
                 notification.group,
-                "-appIcon",
-                f"file://{self.home}/.claude/hooks/claude-code-icon.png",
                 "-sound",
                 notification.sound,
             ]
         )
         if notification.action:
             args.extend(["-execute", notification.action])
-        if _executable(notifier) and self._run([str(notifier), *args], timeout=5):
+        if _executable(notifier) and self._run([str(notifier), *args], timeout=10):
             return "custom-app"
+
+        print(
+            json.dumps({
+                "event": "notify_sender_failed",
+                "agent": "claude",
+                "sender": str(notifier),
+                "reason": "sender-failed" if _executable(notifier) else "sender-missing",
+                "fallback": "osascript",
+            }),
+            file=sys.stderr,
+        )
 
         script = (
             'display notification "{}" with title "{}" sound name "{}"'.format(

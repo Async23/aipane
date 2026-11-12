@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -335,7 +336,7 @@ class AgentNotificationsTests(unittest.TestCase):
             / "Claude Code Notifier.app"
             / "Contents"
             / "MacOS"
-            / "terminal-notifier"
+            / "claude-notifier"
         )
         notifier.parent.mkdir(parents=True)
         notifier.write_text(
@@ -353,8 +354,18 @@ class AgentNotificationsTests(unittest.TestCase):
                 "TMUX_PANE": "",
             }
         )
+        def run_sender(command: list[str], timeout: float) -> bool:
+            # Never send a real fallback notification if sender selection regresses.
+            if command[0] != str(notifier):
+                return False
+            return subprocess.run(
+                command, env=environment, timeout=timeout, check=False
+            ).returncode == 0
+
         result = AgentNotifications(
-            adapter=MacOSNotificationAdapter(environment=environment),
+            adapter=MacOSNotificationAdapter(
+                environment=environment, run_command=run_sender
+            ),
             environment=environment,
         ).handle(
             "claude",
@@ -377,8 +388,6 @@ class AgentNotificationsTests(unittest.TestCase):
                 "Claude finished.",
                 "-group",
                 "claude-code-task-complete",
-                "-appIcon",
-                f"file://{self.home}/.claude/hooks/claude-code-icon.png",
                 "-sound",
                 "Tink",
             ],

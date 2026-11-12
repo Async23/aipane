@@ -75,8 +75,37 @@ They retain `Claude Code Notifier.app` and the existing focus script at
 and activates Ghostty. Each session has separate notification groups. Imported
 Cursor/Grok hooks, Claude Desktop sessions, and events identified as subagents
 are ignored.
-The existing sender uses `NSUserNotificationCenter`; this integration does not
-migrate its Bundle ID or API generation.
+The sender uses `UNUserNotificationCenter` with Bundle ID
+`com.alfheim.claude-code-notifier.v2` and the original Claude bundle icon in
+[`native/icons/claude-code.icns`](../native/icons/claude-code.icns). The adapter
+directly executes `Contents/MacOS/claude-notifier`, without `-appIcon` or a
+Homebrew sender impersonating its identity. The legacy sender could exit before
+delivery when a long-lived tmux server outlived the desktop login: its
+`NSWorkspace` check could no longer see the running Notification Center. The
+modern sender talks to the notification service directly.
+
+Build with [`bin/build-claude-notifier`](../bin/build-claude-notifier) into a new
+hidden `.noindex` staging directory, keeping the final App filename:
+
+```bash
+bin/build-claude-notifier --output '/path/to/.stage.noindex/Claude Code Notifier.app'
+```
+
+Before installing, back up the existing App, adapter, notification preferences,
+and notification database. Unregister and archive the old App and any indexed
+backup copies, then install and register the staged App at
+`~/Applications/Claude Code Notifier.app`. Do not reuse the legacy Bundle ID
+with the modern API. Authorize the new identity before testing hooks:
+
+```bash
+"$HOME/Applications/Claude Code Notifier.app/Contents/MacOS/claude-notifier" -authorize
+"$HOME/Applications/Claude Code Notifier.app/Contents/MacOS/claude-notifier" -status
+```
+
+The sender has a 10-second timeout; the AppleScript fallback has a 5-second
+timeout, both inside the 20-second hook budget. Primary failures emit a
+`notify_sender_failed` JSON diagnostic without notification text; the fallback
+has the AppleScript identity/icon and cannot run the tmux focus action.
 
 Claude notifications use `<session>:<window>:<pane> · <session title>` as the
 title, the current user prompt as the subtitle, and the first plain-text line of

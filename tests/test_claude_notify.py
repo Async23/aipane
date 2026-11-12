@@ -320,7 +320,7 @@ class ClaudeNotificationTests(unittest.TestCase):
                     self.assertGreaterEqual(hook["timeout"], 15)
 
     def test_registered_command_is_silent_and_uses_the_dedicated_app(self):
-        sender = self.home / "Applications/Claude Code Notifier.app/Contents/MacOS/terminal-notifier"
+        sender = self.home / "Applications/Claude Code Notifier.app/Contents/MacOS/claude-notifier"
         sender.parent.mkdir(parents=True)
         sender.write_text(
             f"#!{sys.executable}\nimport json,os,sys\n"
@@ -345,6 +345,7 @@ class ClaudeNotificationTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
         args = json.loads(output.read_text())
+        self.assertNotIn("-appIcon", args)
         self.assertEqual(args[args.index("-message") + 1], "完成")
         self.assertEqual(args[args.index("-subtitle") + 1], "任务完成")
         record = json.loads((self.home / ".claude/hooks/notify.jsonl").read_text())
