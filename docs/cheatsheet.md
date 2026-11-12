@@ -121,12 +121,22 @@ when `SYNC` is off.
 prefix+v → move → v (or C-v rect) → y (clipboard) or Y (tmux-shot)
 ```
 
-| Key | Action |
-|-----|--------|
-| `prefix v` | copy-mode |
-| `y` | copy to macOS clipboard |
-| `Y` | screenshot selection via `tmux-shot-capture` (if installed) |
-| `prefix b` | paste tmux buffer |
+| # | Key | Action |
+|---|-----|--------|
+| 1 | `prefix v` | copy-mode with absolute line numbers (tmux 3.7+) |
+| 2 | `:120`, Enter | move the cursor to absolute output line 120 |
+| 3 | `10k` / `10j` | move up / down 10 lines |
+| 4 | `V` | select whole lines; move or use `:number` to extend the selection |
+| 5 | `y` | copy to macOS clipboard and exit copy-mode |
+| 6 | `Y` | screenshot selection via `tmux-shot-capture` (if installed) |
+| 7 | `q` | exit copy-mode |
+| 8 | `prefix b` | paste tmux buffer |
+
+For example, `:120`, Enter, `V`, `:125`, Enter, `y` copies output lines
+120–125, including both endpoints, without copying the line-number gutter.
+The `:` binding aligns the cursor after tmux's native viewport jump, including
+targets in the final screen of history. Nonnumeric input leaves the cursor
+unchanged; numbers beyond the buffer select its final line.
 
 ## Other
 

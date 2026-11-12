@@ -50,6 +50,126 @@ class GhosttyFragmentTests(unittest.TestCase):
 
 
 class TmuxWorkstationFragmentTests(unittest.TestCase):
+    def test_copy_mode_goto_matches_absolute_line_numbers(self):
+        socket = f"ws-copy-goto-{os.getpid()}-{id(self)}"
+        environment = os.environ.copy()
+        environment.pop("TMUX", None)
+        environment.pop("TMUX_PANE", None)
+        environment["TERM"] = "xterm-256color"
+        child_pid = master_fd = None
+        terminal_output = bytearray()
+
+        def tmux(*args: str, check: bool = True):
+            return subprocess.run(
+                ["tmux", "-L", socket, *args], check=check,
+                capture_output=True, text=True, env=environment,
+            )
+
+        def state(expression: str) -> str:
+            return tmux("display-message", "-p", "-t", pane, expression).stdout.strip()
+
+        def wait_until(predicate) -> bool:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if master_fd is not None:
+                    while True:
+                        try:
+                            chunk = os.read(master_fd, 65536)
+                            if not chunk:
+                                break
+                            terminal_output.extend(chunk)
+                        except BlockingIOError:
+                            break
+                if predicate():
+                    return True
+                time.sleep(0.02)
+            return predicate()
+
+        def enter_line(line) -> None:
+            terminal_output.clear()
+            os.write(master_fd, b":")
+            self.assertTrue(wait_until(lambda: b"(goto line)" in terminal_output))
+            os.write(master_fd, f"{line}\r".encode())
+
+        def jump(line: int, expected: int | None = None) -> None:
+            enter_line(line)
+            expected = line if expected is None else expected
+            self.assertTrue(
+                wait_until(lambda: state("#{e|+:#{copy_position},#{copy_cursor_y}}") == str(expected)),
+                f":{line} left cursor on {state('#{copy_cursor_line}')}; "
+                f"viewport starts at {state('#{copy_position}')}; "
+                f"terminal output: {bytes(terminal_output[-1000:])!r}",
+            )
+
+        try:
+            pane = tmux(
+                "-f", "/dev/null", "new-session", "-d", "-P", "-F", "#{pane_id}",
+                "-s", "copy-goto", "-x", "80", "-y", "24", "seq 1 200; sleep 120",
+            ).stdout.strip()
+            tmux("source-file", str(TMUX_WS))
+            child_pid, master_fd = pty.fork()
+            if child_pid == 0:
+                termios.tcsetwinsize(0, (24, 80))
+                os.execvpe(
+                    "tmux", ["tmux", "-L", socket, "attach-session", "-t", "copy-goto"],
+                    environment,
+                )
+            os.set_blocking(master_fd, False)
+            self.assertTrue(wait_until(lambda: bool(tmux("list-clients").stdout)))
+            self.assertTrue(wait_until(
+                lambda: "200" in tmux("capture-pane", "-p", "-t", pane).stdout.splitlines()
+            ))
+            # Drive the physical bridge's NUL + v, then the actual : prompt.
+            os.write(master_fd, b"\x00v")
+            self.assertTrue(wait_until(lambda: state("#{pane_in_mode}") == "1"))
+            for line in (120, 1, 200, 125, 120):
+                jump(line)
+                self.assertEqual(state("#{copy_cursor_line}"), str(line))
+            # The trailing blank line is also part of the buffer. Clamp large
+            # requests there without trying to repeat billions of movements.
+            jump(4294967296, expected=int(state("#{copy_position_limit}")))
+            jump(0, expected=1)
+            jump(120)
+
+            # Keep the selection anchor while jumping in either direction.
+            os.write(master_fd, b"V")
+            self.assertTrue(wait_until(lambda: state("#{selection_present}") == "1"))
+            jump(125)
+            tmux("send-keys", "-t", pane, "-X", "copy-selection-and-cancel")
+            self.assertEqual(
+                tmux("show-buffer").stdout.strip(),
+                "\n".join(str(line) for line in range(120, 126)),
+            )
+            os.write(master_fd, b"\x00v")
+            self.assertTrue(wait_until(lambda: state("#{pane_in_mode}") == "1"))
+            jump(125)
+            os.write(master_fd, b"V")
+            self.assertTrue(wait_until(lambda: state("#{selection_present}") == "1"))
+            jump(120)
+            tmux("send-keys", "-t", pane, "-X", "copy-selection-and-cancel")
+            self.assertEqual(
+                tmux("show-buffer").stdout.strip(),
+                "\n".join(str(line) for line in range(120, 126)),
+            )
+            # With legacy numbering, retain tmux's native offset semantics.
+            os.write(master_fd, b"\x00v")
+            self.assertTrue(wait_until(lambda: state("#{pane_in_mode}") == "1"))
+            tmux("set-option", "-w", "-t", pane, "copy-mode-line-numbers", "off")
+            cursor_y = state("#{copy_cursor_y}")
+            enter_line(120)
+            self.assertTrue(wait_until(lambda: state("#{scroll_position}") == "120"))
+            self.assertEqual(state("#{copy_cursor_y}"), cursor_y)
+        finally:
+            tmux("kill-server", check=False)
+            if master_fd is not None:
+                os.close(master_fd)
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGHUP)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(child_pid, 0)
+
     def test_status_menu_kill_guards_every_pane_in_the_clicked_window(self):
         socket = f"ws-window-menu-{os.getpid()}-{id(self)}"
         child_pid = None
