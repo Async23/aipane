@@ -115,7 +115,9 @@ def live_panes() -> list[tuple[str, str, str]]:
     rows = []
     for line in out.splitlines():
         parts = line.split("\t")
-        if len(parts) != 3 or not all(parts):
+        # tmux can report an empty cwd when a live pane's directory was removed.
+        # Its identity is still complete; preserve the unknown cwd as empty.
+        if len(parts) != 3 or not all(parts[:2]):
             raise SnapshotError("incomplete tmux pane list; keeping the previous snapshot")
         rows.append(tuple(parts))
     if not rows:

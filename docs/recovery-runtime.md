@@ -59,6 +59,8 @@ tmux-resurrect 的 `post-save-layout` 钩子将刚写好的快照路径传给
 
 读取 tmux 服务或面板列表失败、列表为空或格式不完整时，`aipane-snapshot` 返回失败，
 保留已有快照与诊断投影，并写入状态目录中的 `snapshot-errors.log`。
+面板的当前目录已删除时，tmux 可能返回空目录字段；只要面板 ID、坐标和字段数量完整，
+快照仍正常保存，目录保持为空，其他面板的会话绑定照常记录。
 tmux-resurrect 的保存入口须检查 `post-save-layout` 钩子的退出状态：失败时保留原 `last`
 及屏幕存档，避免将缺失会话信息的新文件作为下一次恢复入口。
 
