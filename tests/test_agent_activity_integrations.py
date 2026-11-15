@@ -692,12 +692,22 @@ class AgentActivityIntegrationTests(unittest.TestCase):
                 text=True,
                 env=environment,
             )
+            # The binding callback is detached from the notification process.
+            # Wait for its write before TemporaryDirectory removes its target.
+            deadline = time.monotonic() + 2
+            expected_bind = f"--tool x --sid {thread_id}\n"
+            while time.monotonic() < deadline:
+                if bind_log.exists() and bind_log.read_text() == expected_bind:
+                    break
+                time.sleep(0.01)
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(
                 activity_log.read_text(),
                 f"report busy|{payload}",
             )
+            self.assertEqual(bind_log.read_text(), expected_bind)
+            self.assertEqual(notify_log.read_text(), payload + "\n")
 
     def test_codex_unknown_completion_cannot_clear_or_rebind_pane(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
