@@ -1,0 +1,8 @@
+{
+  "aipane-antigravity": {
+    "SessionStart": [{"type": "command", "command": "$HOME/.local/bin/aipane-agy SessionStart", "timeout": 5}],
+    "PreInvocation": [{"type": "command", "command": "$HOME/.local/bin/aipane-agy PreInvocation", "timeout": 5}],
+    "PreToolUse": [{"matcher": "ask_question", "hooks": [{"type": "command", "command": "$HOME/.local/bin/aipane-agy PreToolUse", "timeout": 5}]}],
+    "Stop": [{"type": "command", "command": "$HOME/.local/bin/aipane-agy Stop", "timeout": 5}]
+  }
+}

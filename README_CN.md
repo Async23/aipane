@@ -36,7 +36,7 @@ git -C ~/.aipane pull --ff-only
 - macOS 和 zsh
 - Claude Code：供 `ai` 的 `c` 工具使用（不用 `c` 时可省略）
 - tmux：供多工具 `ai` 调用，以及使用 `--new` 或 `--layout` 时使用
-- 其他 `ai` 工具对应的可选 CLI：Codex、dsh-TUI（`dsh-tui`）、Grok、OpenCode、Cursor CLI、Qwen Code（`qwen`）、Pi（`pi`）或 Kimi Code（`kimi`）
+- 其他 `ai` 工具对应的可选 CLI：Codex、dsh-TUI（`dsh-tui`）、Grok、OpenCode、Cursor CLI、Qwen Code（`qwen`）、Pi（`pi`）、Kimi Code（`kimi`）或 Antigravity CLI（`agy`）
 
 `ai x` 这类单工具调用默认在当前 shell 中运行；未使用 `--new` 或 `--layout` 时不依赖 tmux。
 
@@ -142,6 +142,7 @@ export AIPANE_CURSOR_LAUNCH_CMD="cursor-agent --force"
 export AIPANE_QWEN_LAUNCH_CMD="qwen --yolo"
 export AIPANE_PI_LAUNCH_CMD="pi"
 export AIPANE_KIMI_LAUNCH_CMD="kimi --auto"
+export AIPANE_AGY_LAUNCH_CMD="agy"
 ```
 
 加载这些覆盖值后，`ai --help` 会显示实际生效的启动命令。
@@ -164,6 +165,7 @@ export AIPANE_KIMI_LAUNCH_CMD="kimi --auto"
 | `q` | Qwen Code | `qwen --yolo` |
 | `p` | Pi | `pi` |
 | `k` | Kimi Code | `kimi --auto` |
+| `a` | Antigravity CLI | `agy` |
 
 示例：
 
@@ -203,6 +205,9 @@ macOS 完成通知 Adapter 与声音覆盖入口统一记录在
 
 dsh-TUI 的活动状态、精确会话恢复、通知与 Web 配置入口见
 [`docs/dsh-integration.md`](docs/dsh-integration.md)。
+
+Antigravity CLI 的状态、精确恢复和通知安装入口见
+[`docs/antigravity-integration.md`](docs/antigravity-integration.md)。
 
 
 ## 进程清理

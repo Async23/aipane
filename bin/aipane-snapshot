@@ -186,7 +186,8 @@ def main() -> int:
              **({"dsh_home": session.dsh_home, "session_root": session.session_root}
                 if session.tool_key == "d" else {}),
              **({"qwen_home": session.qwen_home, "qwen_runtime_dir": session.qwen_runtime_dir}
-                if session.tool_key == "q" else {})}
+                if session.tool_key == "q" else {}),
+             **(dict(session.agy_metadata or {}) if session.tool_key == "a" else {})}
             if session is not None
             else None
         )
@@ -196,6 +197,9 @@ def main() -> int:
             if current:
                 rec = {"sid": current["sid"], "tool": "x", "codex_home": current["codex_home"]}
         if rec is None:
+            if inspection.current_command == "agy":
+                coords[coord] = {"sid": "", "tool": "a", "cwd": cwd, "binding": "unavailable"}
+                continue
             recovery = (
                 dsh_recovery_binding(activity, pane_id)
                 if inspection.current_command in {"node", "dsh", "dsh-tui", "dst"}
@@ -233,14 +237,16 @@ def main() -> int:
                 continue
         if not rec or not rec.get("sid"):
             continue  # only useful when we actually have an id (mainly codex)
-        if session is not None and session.tool_key in {"d", "q"} and session.cwd:
+        if session is not None and session.tool_key in {"d", "q", "a"} and session.cwd:
             cwd = session.cwd
         coords[coord] = {"sid": rec["sid"], "tool": rec.get("tool", ""), "cwd": cwd,
                          **({"codex_home": rec["codex_home"]} if rec.get("codex_home") else {}),
                          **({key: rec[key] for key in ("dsh_home", "session_root") if rec.get(key)}
                             if rec.get("tool") == "d" else {}),
                          **({key: rec[key] for key in ("qwen_home", "qwen_runtime_dir") if rec.get(key)}
-                            if rec.get("tool") == "q" else {})}
+                            if rec.get("tool") == "q" else {}),
+                         **({key: rec[key] for key in ("agy_home", "agy_model", "agy_effort", "agy_mode", "agy_agent") if rec.get(key)}
+                            if rec.get("tool") == "a" else {})}
 
     try:
         dump = Path(sys.argv[1]) if len(sys.argv) > 1 else None

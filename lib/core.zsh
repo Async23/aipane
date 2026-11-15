@@ -1,7 +1,7 @@
 #!/usr/bin/env zsh
 # Shared helpers for aipane.
 
-if [[ "${_AIPANE_CORE_VERSION:-}" == "4" ]]; then
+if [[ "${_AIPANE_CORE_VERSION:-}" == "5" ]]; then
   return 0
 fi
 # Migrate the previous built-in default when an existing shell reloads.
@@ -10,7 +10,7 @@ if [[ "${_AIPANE_CORE_VERSION:-}" == "3" &&
   unset AIPANE_CODEX_LAUNCH_CMD
 fi
 typeset -g _AIPANE_CORE_LOADED=1
-typeset -g _AIPANE_CORE_VERSION=4
+typeset -g _AIPANE_CORE_VERSION=5
 
 # User-configurable values (export before sourcing init.zsh to override).
 typeset -g AIPANE_CLAUDE_LAUNCH_CMD="${AIPANE_CLAUDE_LAUNCH_CMD:-claude --dangerously-skip-permissions}"
@@ -24,6 +24,7 @@ typeset -g AIPANE_CURSOR_LAUNCH_CMD="${AIPANE_CURSOR_LAUNCH_CMD:-cursor-agent --
 typeset -g AIPANE_QWEN_LAUNCH_CMD="${AIPANE_QWEN_LAUNCH_CMD:-qwen --yolo}"
 typeset -g AIPANE_PI_LAUNCH_CMD="${AIPANE_PI_LAUNCH_CMD:-pi}"
 typeset -g AIPANE_KIMI_LAUNCH_CMD="${AIPANE_KIMI_LAUNCH_CMD:-kimi --auto}"
+typeset -g AIPANE_AGY_LAUNCH_CMD="${AIPANE_AGY_LAUNCH_CMD:-agy}"
 
 _aipane_ceil_sqrt() {
   local n="$1"

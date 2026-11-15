@@ -30,6 +30,7 @@ GUARD_FIELDS = (
 
 
 TOOL_TAGS = {
+    "agy": "a",
     "pi": "p",
     "grok": "g",
     "claude": "c",
@@ -64,22 +65,24 @@ def session_identity(item: dict[str, Any], environment: dict[str, str] | None = 
         ) / "sessions"
     elif tool == "qwen":
         storage = item.get("qwen_home") or environment.get("QWEN_HOME") or home / ".qwen"
+    elif tool == "agy":
+        storage = item.get("agy_home") or home / ".gemini/antigravity-cli"
     else:
         storage = item.get("cwd", "")
     return SessionIdentity(tool, str(Path(os.path.expandvars(str(storage))).expanduser().resolve()), str(item.get("sid", "")))
 
 
 def ensure_unique_sessions(items: list[dict[str, Any]]) -> None:
-    """A Codex conversation has one writer per data directory, across panes."""
+    """Codex and Antigravity conversations have one writer per data directory."""
     claims: dict[SessionIdentity, str] = {}
     for item in items:
-        if item.get("restorable") is not True or item.get("tool") != "codex" or not item.get("sid"):
+        if item.get("restorable") is not True or item.get("tool") not in {"codex", "agy"} or not item.get("sid"):
             continue
         identity = session_identity(item)
         prior = claims.get(identity)
         if prior is not None:
             raise RecoveryPlanError(
-                f"session conflict: Codex conversation {identity.sid} is requested by "
+                f"session conflict: {'Codex' if identity.tool == 'codex' else 'Antigravity'} conversation {identity.sid} is requested by "
                 f"both {prior} and {item['target']} in {identity.store}; select one pane before restarting"
             )
         claims[identity] = item["target"]
@@ -133,6 +136,11 @@ def normalize_plan(
         if item["tool"] == "qwen":
             for key in ("qwen_home", "qwen_runtime_dir"):
                 item[key] = str(raw.get(key, ""))
+        if item["tool"] == "agy":
+            for key in ("agy_home", "agy_model", "agy_effort", "agy_mode", "agy_agent"):
+                if not isinstance(raw.get(key, ""), str):
+                    raise RecoveryPlanError(f"invalid Antigravity recovery field {key}")
+                item[key] = raw.get(key, "")
         if (
             not item["target"]
             or not item["tool"]

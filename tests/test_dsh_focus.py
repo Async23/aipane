@@ -14,12 +14,17 @@ FOCUS = ROOT / "bin/aipane-dsh-focus"
 @unittest.skipUnless(shutil.which("tmux"), "tmux required")
 class DshFocusTests(unittest.TestCase):
     def test_original_socket_pane_and_missing_pane_fallback(self):
+        for agent in ("dsh", "agy"):
+            with self.subTest(agent=agent):
+                self.verify_focus(agent)
+
+    def verify_focus(self, agent):
         with tempfile.TemporaryDirectory() as raw:
             temporary = Path(raw)
             socket = str(temporary / "tmux.sock")
             log = temporary / "focus.log"
-            environment = {**os.environ, "AIPANE_DSH_SKIP_ACTIVATE": "1",
-                           "AIPANE_DSH_FOCUS_LOG": str(log)}
+            environment = {**os.environ, f"AIPANE_{agent.upper()}_SKIP_ACTIVATE": "1",
+                           f"AIPANE_{agent.upper()}_FOCUS_LOG": str(log)}
             environment.pop("TMUX", None)
 
             def tmux(*args):
@@ -28,7 +33,7 @@ class DshFocusTests(unittest.TestCase):
                                       text=True).stdout.strip()
 
             def focus(pane, chosen_socket=socket):
-                subprocess.run([str(FOCUS), "focus-test", "@0", pane, "0",
+                subprocess.run([str(ROOT / "bin" / f"aipane-{agent}-focus"), "focus-test", "@0", pane, "0",
                                 chosen_socket], env=environment, check=True,
                                capture_output=True, text=True)
 

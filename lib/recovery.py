@@ -123,6 +123,8 @@ def command_matches(
     allow_ambiguous_node: bool = True,
 ) -> bool:
     command = current_command.lower()
+    if tool == "agy":
+        return command == "agy"
     if tool == "pi":
         return (
             (allow_ambiguous_node and command == "node")
@@ -681,6 +683,22 @@ class RestoreExecutor:
             cwd=item["cwd"], environment=environment,
         )
 
+    def agy_ready(self, item: dict[str, Any]) -> bool:
+        from agy_sessions import current_session, recovery_metadata
+        identity = self.tmux.pane_identity(item["target"])
+        if not identity:
+            return False
+        tty = self.tmux.run("display-message", "-p", "-t", item["target"], "#{pane_tty}")
+        if tty.returncode:
+            return False
+        current = current_session(pane_id=identity[0], socket_path=identity[1], server_pid=identity[2],
+                                  pane_tty=tty.stdout.strip(), environment=self.environment)
+        if not current or current["session_id"] != item.get("sid") or Path(current["cwd"]).resolve() != Path(item["cwd"]).resolve():
+            return False
+        metadata = recovery_metadata(current)
+        return all(not item.get(key) or metadata.get(key) == item[key]
+                   for key in ("agy_home", "agy_model", "agy_effort", "agy_mode", "agy_agent"))
+
     def pane_guard_matches(self, item: dict[str, Any]) -> bool:
         expected = (
             item.get("pane_id"),
@@ -844,6 +862,8 @@ class RestoreExecutor:
                     ready = False
                     if item["tool"] == "dsh":
                         ready = stable_for >= self.verify_stability and self.dsh_ready(item)
+                    elif item["tool"] == "agy":
+                        ready = stable_for >= self.verify_stability and self.agy_ready(item)
                     elif item["tool"] == "qwen":
                         if not self.qwen_ready(item):
                             attempt.ready_since = None
@@ -1122,9 +1142,20 @@ class RestoreExecutor:
                 raise RestoreExecutionError(
                     f"Qwen runtime identity could not be verified for {item['target']}; refresh the restart plan"
                 )
+            if item["tool"] == "agy" and not self.agy_ready(item):
+                raise RestoreExecutionError(f"Antigravity selected session changed in {item['target']}; refresh the restart plan")
 
     def validate_session_ownership(self, items: list[dict[str, Any]]) -> None:
         ensure_unique_sessions(items)
+        from agy_sessions import session_writers as agy_writers
+        for item in items:
+            if item["tool"] != "agy" or not item.get("sid"):
+                continue
+            identity = session_identity(item, self.environment)
+            process = self.tmux.foreground_process(item["target"])
+            foreign = agy_writers(identity.sid, identity.store, self.environment) - ({process[0]} if process else set())
+            if foreign:
+                raise RestoreExecutionError(f"session conflict: Antigravity conversation {identity.sid} is already open in another foreground process")
         codex = [item for item in items if item["tool"] == "codex" and item.get("sid")]
         owners: dict[str, dict[int, list[dict]]] = {}
         for item in codex:
@@ -1189,6 +1220,8 @@ class RestoreExecutor:
                 error = "dsh selected session changed immediately before respawn; refresh the restart plan"
             elif planned["tool"] == "qwen" and not self.qwen_ready(planned):
                 error = "Qwen runtime identity could not be verified immediately before respawn; refresh the restart plan"
+            elif planned["tool"] == "agy" and not self.agy_ready(planned):
+                error = "Antigravity selected session changed immediately before respawn; refresh the restart plan"
             else:
                 error = self.tmux.respawn(target, item["cwd"], shell)
                 if error:

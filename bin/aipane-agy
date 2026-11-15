@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Antigravity statusLine/hook Adapter; notification delivery runs off the UI path."""
+
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "lib"))
+
+from agy_sessions import AgyIntegration, notification_current
+from agent_activity import ActivityError, AgentActivity, TmuxActivityAdapter
+from agent_notifications import AgentNotifications, MacOSNotificationAdapter
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "status"
+    environment = os.environ.copy()
+    if mode == "PreToolUse":
+        # This hook observes questions. It must never veto a tool or bypass
+        # agy's own approval policy, even when metadata/delivery fails.
+        print('{"decision":"allow"}', flush=True)
+    if mode == "--test-notification":
+        payload = {"event": "question", "session_id": "tracer", "token": "tracer:" + str(time.time_ns()),
+                   "cwd": os.getcwd(), "title": "Antigravity 通知验收",
+                   "question": "请点击此通知，确认返回原来的 Ghostty/tmux 窗格。"}
+        result = AgentNotifications(adapter=MacOSNotificationAdapter(environment=environment), environment=environment).handle(
+            "agy", payload, preview=environment.get("AGY_NOTIFY_DRY_RUN") == "1")
+        print(json.dumps({"tracer": payload["token"], "outcome": result.outcome,
+                          "channel": result.channel, "notification": result.notification.as_dict() if result.notification else None}, ensure_ascii=False))
+        return 0
+    try:
+        payload = json.load(sys.stdin)
+        if not isinstance(payload, dict):
+            return 0
+    except (ValueError, OSError):
+        return 0
+    if mode in {"--deliver", "--preview"}:
+        if mode == "--deliver":
+            time.sleep(0.4)
+            if not notification_current(payload, environment):
+                return 0
+        notifications = AgentNotifications(adapter=MacOSNotificationAdapter(environment=environment), environment=environment)
+        result = notifications.handle("agy", payload, preview=mode == "--preview")
+        if mode == "--preview" and result.notification:
+            print(json.dumps(result.notification.as_dict(), ensure_ascii=False))
+        return 0
+    integration = AgyIntegration(environment)
+    if mode == "status":
+        record, events = integration.status(payload)
+    else:
+        record, events = integration.hook(mode, payload)
+    if record and record.get("pane") and record["state"] in {"busy", "idle"}:
+        activity = AgentActivity(adapter=TmuxActivityAdapter(environment=environment), environment=environment)
+        activity.report(record["pane"], record["state"], owner="agy", payload={"session_id": record["session_id"]})
+    if environment.get("AGY_NOTIFY_DRY_RUN") != "1":
+        for event in events:
+            worker = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--deliver"],
+                                      stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+            assert worker.stdin is not None
+            worker.stdin.write(json.dumps(event))
+            worker.stdin.close()
+    if mode == "status":
+        # Keep Antigravity's built-in model/quota display via stack_with_default.
+        if record and record.get("title"):
+            print(" ".join(record["title"].split())[:100])
+    elif mode != "PreToolUse":
+        print("{}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, ActivityError, subprocess.SubprocessError) as error:
+        print(json.dumps({"event": "agy_adapter_error", "error": type(error).__name__}), file=sys.stderr)
+        raise SystemExit(0)

@@ -24,7 +24,7 @@ class AipaneReleaseTests(unittest.TestCase):
         (self.source / "bin").mkdir()
         (self.source / "tests").mkdir()
         shutil.copy2(RELEASE, self.source / "bin/aipane-release")
-        for name in ("ai-restart", "ai-restore", "aipane-bind", "aipane-snapshot", "aipane-restore-executor"):
+        for name in ("ai-restart", "ai-restore", "aipane-bind", "aipane-snapshot", "aipane-restore-executor", "aipane-agy", "aipane-agy-focus"):
             script = self.source / "bin" / name
             script.write_text("#!/bin/sh\nprintf 'one\\n'\n")
             script.chmod(0o755)
@@ -83,6 +83,22 @@ class AipaneReleaseTests(unittest.TestCase):
         self.assertEqual(self.run_release("rollback").returncode, 0)
         self.assertEqual(self.installed_output(), "one")
         self.assertTrue((self.bin / "aipane-release").is_file())
+
+    def test_rollback_to_pre_antigravity_revision_removes_owned_extra_links(self):
+        for name in ("aipane-agy", "aipane-agy-focus"):
+            (self.source / "bin" / name).unlink()
+        self.commit()
+        self.assertEqual(self.run_release("install").returncode, 0)
+        for name in ("aipane-agy", "aipane-agy-focus"):
+            path = self.source / "bin" / name
+            path.write_text("#!/bin/sh\nexit 0\n")
+            path.chmod(0o755)
+        self.commit()
+        self.assertEqual(self.run_release("install").returncode, 0)
+        self.assertTrue((self.bin / "aipane-agy").is_file())
+        self.assertEqual(self.run_release("rollback").returncode, 0)
+        self.assertFalse((self.bin / "aipane-agy").is_symlink())
+        self.assertEqual(self.installed_output(), "one")
 
 
 if __name__ == "__main__":

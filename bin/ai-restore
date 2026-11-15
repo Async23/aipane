@@ -82,10 +82,10 @@ if [[ ! -e "$DUMP" ]]; then
 fi
 
 # Session identities belong to this exact dump, never the global latest map.
-typeset -A COORDS_SID COORDS_TOOL COORDS_DSH_HOME COORDS_SESSION_ROOT COORDS_CWD COORDS_QWEN_HOME COORDS_QWEN_RUNTIME COORDS_CODEX_HOME
+typeset -A COORDS_SID COORDS_TOOL COORDS_DSH_HOME COORDS_SESSION_ROOT COORDS_CWD COORDS_QWEN_HOME COORDS_QWEN_RUNTIME COORDS_CODEX_HOME COORDS_AGY
 typeset paired_rows
 paired_rows="$(command python3 "$SCRIPT_DIR/../lib/recovery_snapshot.py" "$DUMP")" || exit 1
-while IFS=$'\x1f' read -r _cl _sid _tool _dsh_home _session_root _cwd _qwen_home _qwen_runtime _codex_home; do
+while IFS=$'\x1f' read -r _cl _sid _tool _dsh_home _session_root _cwd _qwen_home _qwen_runtime _codex_home _agy; do
   if [[ -n "$_cl" ]]; then
     COORDS_SID[$_cl]="$_sid"
     COORDS_TOOL[$_cl]="$_tool"
@@ -95,6 +95,7 @@ while IFS=$'\x1f' read -r _cl _sid _tool _dsh_home _session_root _cwd _qwen_home
     COORDS_QWEN_HOME[$_cl]="$_qwen_home"
     COORDS_QWEN_RUNTIME[$_cl]="$_qwen_runtime"
     COORDS_CODEX_HOME[$_cl]="$_codex_home"
+    COORDS_AGY[$_cl]="$_agy"
   fi
 done <<< "$paired_rows"
 
@@ -118,6 +119,7 @@ typeset OPENCODE_BASE="${AIPANE_OPENCODE_LAUNCH_CMD:-opencode}"
 typeset KIMI_BASE="${AIPANE_KIMI_LAUNCH_CMD:-kimi --auto}"
 typeset DSH_BASE="${AIPANE_DSH_LAUNCH_CMD:-dsh-tui}"
 typeset QWEN_BASE="${AIPANE_QWEN_LAUNCH_CMD:-qwen --yolo}"
+typeset AGY_BASE="${AIPANE_AGY_LAUNCH_CMD:-agy}"
 
 # Migrate exact retired local overrides that can survive in an already-running
 # Ghostty shell or a restored tmux global environment.
@@ -157,6 +159,7 @@ detect_tool() {
     fi
   fi
   case "$prog" in
+    agy) REPLY=agy ;;
     pi)                REPLY=pi ;;
     grok|grok-*)       REPLY=grok ;;
     # Compatibility: recognize commands captured in pre-removal resurrect dumps.
@@ -197,6 +200,7 @@ extract_uuid() {
 coord_tool_matches() {
   local detected="$1" recorded="$2" tag
   case "$detected" in
+    agy) tag=a ;;
     pi) tag=p ;;
     grok) tag=g ;;
     claude) tag=c ;;
@@ -339,6 +343,19 @@ build_resume() {
     id="$coord_sid"
   fi
   case "$tool" in
+    agy)
+      # Only this pane's selected-session snapshot is authoritative. The CLI's
+      # --continue cache is shared by all panes in the same workspace.
+      id="$coord_sid"
+      if [[ -n "$id" ]]; then
+        if REPLY="$(command python3 "$SCRIPT_DIR/../lib/agy_sessions.py" resume "$id" "$cwd" "${coord_agy:-\{\}}" "$AGY_BASE")"; then
+          REPLY_KIND=resume
+        else
+          REPLY="$AGY_BASE"; REPLY_KIND=invalid
+        fi
+      else
+        REPLY="$AGY_BASE"; REPLY_KIND=invalid
+      fi ;;
     dsh)
       # dsh ids are opaque, not necessarily UUIDs. Only exact --resume ids or
       # the selected TUI session snapshot are admissible; never use global MRU.
@@ -447,6 +464,7 @@ emit_plan_json() {
   AIPANE_PLAN_QWEN_HOME="${coord_qwen_home:-}" \
   AIPANE_PLAN_QWEN_RUNTIME="${coord_qwen_runtime:-}" \
   AIPANE_PLAN_CODEX_HOME="${coord_codex_home:-${CODEX_HOME:-$HOME/.codex}}" \
+  AIPANE_PLAN_AGY="${coord_agy:-\{\}}" \
     command python3 -c '
 import json, os
 print(json.dumps({
@@ -457,6 +475,7 @@ print(json.dumps({
     "cwd": os.environ["AIPANE_PLAN_CWD"],
     "command": os.environ["AIPANE_PLAN_COMMAND"],
     "sid": os.environ["AIPANE_PLAN_SID"],
+    **(json.loads(os.environ["AIPANE_PLAN_AGY"]) if os.environ["AIPANE_PLAN_TOOL"] == "agy" else {}),
     **({"codex_home": os.environ["AIPANE_PLAN_CODEX_HOME"]} if os.environ["AIPANE_PLAN_TOOL"] == "codex" else {}),
     **({"dsh_home": os.environ["AIPANE_PLAN_DSH_HOME"], "session_root": os.environ["AIPANE_PLAN_SESSION_ROOT"]}
        if os.environ["AIPANE_PLAN_TOOL"] == "dsh" else {}),
@@ -494,13 +513,14 @@ while IFS= read -r line; do
   coord_session_root="${COORDS_SESSION_ROOT[$target]:-}"
   coord_qwen_home="${COORDS_QWEN_HOME[$target]:-}"
   coord_qwen_runtime="${COORDS_QWEN_RUNTIME[$target]:-}"
+  coord_agy="${COORDS_AGY[$target]:-}"
   if [[ -n "$coord_sid" ]] && ! coord_tool_matches "$tool" "$coord_tool"; then
     log "ignore $target snapshot id: detected=$tool recorded=${coord_tool:-missing}"
     coord_sid=""
     coord_dsh_home=""; coord_session_root=""
     coord_qwen_home=""; coord_qwen_runtime=""
   fi
-  if [[ ( "$tool" == dsh || "$tool" == qwen ) && -n "$coord_sid" && -n "${COORDS_CWD[$target]:-}" ]]; then
+  if [[ ( "$tool" == dsh || "$tool" == qwen || "$tool" == agy ) && -n "$coord_sid" && -n "${COORDS_CWD[$target]:-}" ]]; then
     cwd="${COORDS_CWD[$target]}"
   fi
 

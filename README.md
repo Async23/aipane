@@ -36,7 +36,7 @@ git -C ~/.aipane pull --ff-only
 - macOS and zsh
 - Claude Code for the `c` tool in `ai` (optional if you never use `c`)
 - tmux for multi-tool `ai` launches, or whenever `--new`/`--layout` is used
-- The corresponding optional CLI for each additional `ai` tool: Codex, dsh-TUI (`dsh-tui`), Grok, OpenCode, Cursor CLI, Qwen Code (`qwen`), Pi (`pi`), or Kimi Code (`kimi`)
+- The corresponding optional CLI for each additional `ai` tool: Codex, dsh-TUI (`dsh-tui`), Grok, OpenCode, Cursor CLI, Qwen Code (`qwen`), Pi (`pi`), Kimi Code (`kimi`), or Antigravity CLI (`agy`)
 
 Single-tool calls such as `ai x` run in the current shell and do not require tmux unless `--new` or `--layout` is supplied.
 
@@ -145,6 +145,7 @@ export AIPANE_CURSOR_LAUNCH_CMD="cursor-agent --force"
 export AIPANE_QWEN_LAUNCH_CMD="qwen --yolo"
 export AIPANE_PI_LAUNCH_CMD="pi"
 export AIPANE_KIMI_LAUNCH_CMD="kimi --auto"
+export AIPANE_AGY_LAUNCH_CMD="agy"
 ```
 
 `ai --help` displays the effective launcher commands after these overrides are loaded.
@@ -169,6 +170,7 @@ Tool keys and default commands:
 | `q` | Qwen Code | `qwen --yolo` |
 | `p` | Pi | `pi` |
 | `k` | Kimi Code | `kimi --auto` |
+| `a` | Antigravity CLI | `agy` |
 
 Examples:
 
@@ -208,6 +210,9 @@ The macOS completion-notification adapters and their sound overrides are indexed
 
 dsh-TUI setup for activity, exact session recovery, notifications, and Web
 profile coverage is indexed in [`docs/dsh-integration.md`](docs/dsh-integration.md).
+
+Antigravity CLI activity, exact recovery and notification setup are documented in
+[`docs/antigravity-integration.md`](docs/antigravity-integration.md).
 
 
 ## Process Cleanup

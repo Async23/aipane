@@ -18,6 +18,7 @@ import uuid
 
 
 COMMANDS = ("ai-restart", "ai-restore", "aipane-snapshot", "aipane-bind", "aipane-restore-executor")
+EXTRA_COMMANDS = ("aipane-agy", "aipane-agy-focus")
 
 
 class ReleaseError(RuntimeError):
@@ -36,6 +37,15 @@ def replace_link(link: Path, destination: Path) -> None:
         temporary.replace(link)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def sync_extra_links(bin_dir: Path, current: Path, target: Path) -> None:
+    for name in EXTRA_COMMANDS:
+        link = bin_dir / name
+        if (target / "bin" / name).is_file():
+            replace_link(link, current / "bin" / name)
+        elif link.is_symlink() and os.readlink(link) == str(current / "bin" / name):
+            link.unlink()
 
 
 def verify(directory: Path) -> dict:
@@ -65,6 +75,8 @@ def prepare(source: Path, root: Path, revision: str, *, baseline: bool = False) 
         with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
             bundle.extractall(temporary, filter="data")
         missing = [name for name in COMMANDS if not (temporary / "bin" / name).is_file()]
+        if any((temporary / "bin" / name).exists() for name in EXTRA_COMMANDS):
+            missing.extend(name for name in EXTRA_COMMANDS if not (temporary / "bin" / name).is_file())
         if missing:
             raise ReleaseError("release is missing commands: " + ", ".join(missing))
         validation = "imported-baseline" if baseline else "passed"
@@ -131,12 +143,13 @@ def main() -> int:
                 shutil.copy2(pending, backups / f"{time.time_ns()}-{old.name}.json")
             replace_link(current, target)
             replace_link(previous, old)
+            sync_extra_links(args.bin_dir, current, target)
             print(f"aipane-release: rolled back to {target.name}")
             return 0
         source = args.source.expanduser().resolve()
         if git(source, "status", "--porcelain").strip():
             raise ReleaseError("source has uncommitted changes; commit the reviewed revision before installing")
-        for name in (*COMMANDS, "aipane-release"):
+        for name in (*COMMANDS, *EXTRA_COMMANDS, "aipane-release"):
             entry = args.bin_dir / name
             if entry.exists() and not entry.is_symlink():
                 raise ReleaseError(f"refusing to replace a regular file: {entry}")
@@ -153,6 +166,7 @@ def main() -> int:
         if old != target:
             replace_link(previous, old)
             replace_link(current, target)
+        sync_extra_links(args.bin_dir, current, target)
         # Keep the manager available when rolling back to a pre-manager baseline.
         replace_link(args.bin_dir / "aipane-release", target / "bin/aipane-release")
         print(f"aipane-release: activated {target.name}")

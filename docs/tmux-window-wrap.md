@@ -78,7 +78,7 @@ managers, and browser helpers do not:
 Each pane contributes at most one agent, so wrappers and nested helper
 processes do not inflate the count. Supported command identities are shared
 with `pane-agent-status`, including Codex, Claude Code, dsh-TUI, Kimi, Pi, Grok,
-Cursor, OpenCode, Gemini, and Qwen Code. Browser helpers are excluded here.
+Cursor, OpenCode, Gemini, Antigravity CLI (`agy`), and Qwen Code. Browser helpers are excluded here.
 
 The animator checks presence once per second using one process snapshot for
 all panes. It projects the owning pane PID and current command into

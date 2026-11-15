@@ -83,5 +83,6 @@ changing the process argv, so this Adapter records the new session id on every
 | OpenCode | `opencode/aipane-bind.js` | `~/.config/opencode/plugins/` |
 | Pi | `pi/aipane-bind.ts` | `~/.pi/agent/extensions/` |
 | Qwen Code | `qwen/hooks.json` | `~/.qwen/settings.json` |
+| Antigravity CLI | [`antigravity/`](../docs/antigravity-integration.md) | `~/.gemini/config/hooks.json` and CLI `statusLine` |
 
 Pi uses `@async23/pi-tmux-window-wrap` separately for Agent Activity.

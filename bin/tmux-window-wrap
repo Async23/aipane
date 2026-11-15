@@ -68,6 +68,7 @@ SUBSCRIPT_DIGITS = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
 ANIMATOR_OWNER_ENVIRONMENT = "TMUX_WINDOW_WRAP_ANIMATOR_OWNER"
 AI_TOOL_EXECUTABLES = frozenset(
     {
+        "agy",
         "claude",
         "claude-code",
         "claude-guard",

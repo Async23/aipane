@@ -163,6 +163,7 @@ class ActivitySession:
     cwd: str = ""
     qwen_home: str = ""
     qwen_runtime_dir: str = ""
+    agy_metadata: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -1500,6 +1501,15 @@ class AgentActivity:
         )
 
     def _validated_session(self, pane: PaneActivity) -> ActivitySession | None:
+        if pane.current_command == "agy":
+            from agy_sessions import current_session, recovery_metadata
+            session = current_session(pane_id=pane.pane_id, socket_path=pane.socket_path,
+                                      server_pid=pane.server_pid, pane_tty=pane.pane_tty,
+                                      environment=self.environment)
+            if session and session.get("session_id"):
+                return ActivitySession(session_id=session["session_id"], tool_key="a",
+                                       cwd=session["cwd"], agy_metadata=recovery_metadata(session))
+            return None
         if pane.current_command in {"node", "qwen"}:
             from qwen_sessions import current_session as qwen_current_session
 
@@ -1973,6 +1983,14 @@ class AgentActivity:
         )
 
     def _resolve(self, pane: PaneActivity) -> ActivityView:
+        if pane.current_command == "agy":
+            from agy_sessions import current_session
+            session = current_session(pane_id=pane.pane_id, socket_path=pane.socket_path,
+                                      server_pid=pane.server_pid, pane_tty=pane.pane_tty,
+                                      environment=self.environment)
+            return ActivityView(state=session["state"] if session else "unknown",
+                                reported=session is not None,
+                                reason="agy_runtime" if session else "agy_runtime_unavailable")
         record = _record_object(pane.record)
         if record is None:
             busy = bool(pane.marker) and pane.marker == pane.current_command

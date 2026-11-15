@@ -16,6 +16,7 @@ Tools:
   q  Qwen Code     (${AIPANE_QWEN_LAUNCH_CMD})
   p  Pi             (${AIPANE_PI_LAUNCH_CMD})
   k  Kimi Code     (${AIPANE_KIMI_LAUNCH_CMD})
+  a  Antigravity   (${AIPANE_AGY_LAUNCH_CMD})
 
 Notes:
   Single-tool calls run in the current pane unless --new or --layout is used.
@@ -83,6 +84,9 @@ _aipane_tool_command() {
       ;;
     k)
       _aipane_command_with_args "$AIPANE_KIMI_LAUNCH_CMD" "$@"
+      ;;
+    a)
+      _aipane_command_with_args "$AIPANE_AGY_LAUNCH_CMD" "$@"
       ;;
     *)
       print -u2 "ai: internal error: unknown tool '${tool}'"
@@ -389,9 +393,9 @@ ai() {
   for (( i = 1; i <= ${#tools_str}; i++ )); do
     ch="${tools_str[i]}"
     case "$ch" in
-      c|x|d|g|o|r|q|p|k) tools+=("$ch") ;;
+      c|x|d|g|o|r|q|p|k|a) tools+=("$ch") ;;
       *)
-        print -u2 "ai: unknown tool '${ch}' (valid: c/x/d/g/o/r/q/p/k)"
+        print -u2 "ai: unknown tool '${ch}' (valid: c/x/d/g/o/r/q/p/k/a)"
         return 1
         ;;
     esac

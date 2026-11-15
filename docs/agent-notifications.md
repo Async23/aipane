@@ -28,6 +28,7 @@ fallback delivery paths use the same sound.
 | 4 | Cursor Agent | `bin/aipane-cursor-notify` | `CURSOR_NOTIFY_SOUND` |
 | 5 | Kimi Code | `bin/aipane-kimi-notify` | — |
 | 6 | dsh-TUI / dsh Web | [`bin/aipane-dsh-notify`](../bin/aipane-dsh-notify) ([installation](dsh-notifications.md)) | — |
+| 7 | Antigravity CLI | [`bin/aipane-agy`](../bin/aipane-agy) ([installation](antigravity-integration.md)) | — |
 
 Kimi Code's selected notification icon is **04 / 雾蓝**. Its tracked
 [SVG](../native/icons/kimi-code.svg) keeps the official Kimi geometry and adds

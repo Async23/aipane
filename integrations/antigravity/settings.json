@@ -1,0 +1,7 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "$HOME/.local/bin/aipane-agy status",
+    "stack_with_default": true
+  }
+}

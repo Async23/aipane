@@ -433,6 +433,7 @@ class AgentActivityIntegrationTests(unittest.TestCase):
             environment.update(
                 {
                     "HOME": str(home),
+                    "CODEX_HOME": str(home / ".codex"),
                     "AIPANE_PYTHON": sys.executable,
                     "AIPANE_CODEX_REAL_NOTIFY": str(notifier),
                     "TMUX_PANE": "%7",
@@ -510,6 +511,7 @@ class AgentActivityIntegrationTests(unittest.TestCase):
             environment.update(
                 {
                     "HOME": str(home),
+                    "CODEX_HOME": str(home / ".codex"),
                     "AIPANE_PYTHON": sys.executable,
                     "AIPANE_CODEX_REAL_NOTIFY": str(notifier),
                     "TMUX_PANE": "%7",
@@ -597,6 +599,7 @@ class AgentActivityIntegrationTests(unittest.TestCase):
             environment.update(
                 {
                     "HOME": str(home),
+                    "CODEX_HOME": str(home / ".codex"),
                     "AIPANE_PYTHON": sys.executable,
                     "AIPANE_CODEX_REAL_NOTIFY": str(notifier),
                     "TMUX_PANE": "%7",
@@ -675,6 +678,7 @@ class AgentActivityIntegrationTests(unittest.TestCase):
             environment.update(
                 {
                     "HOME": str(home),
+                    "CODEX_HOME": str(home / ".codex"),
                     "AIPANE_PYTHON": sys.executable,
                     "AIPANE_CODEX_REAL_NOTIFY": str(notifier),
                     "TMUX_PANE": "%7",

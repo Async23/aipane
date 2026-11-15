@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import plistlib
@@ -20,6 +21,8 @@ CORE_ENTRYPOINTS = (
 )
 LOCAL_BIN_ENTRYPOINT = re.compile(r"\.local/bin/(aipane-[a-z0-9-]+)")
 CONFIG_PATHS = (
+    ".gemini/config/hooks.json",
+    ".gemini/antigravity-cli/settings.json",
     ".codex/hooks.json",
     ".codex/config.toml",
     ".claude/settings.json",
@@ -98,6 +101,16 @@ def check_entrypoint(
         audit.fail(f"{shown}: broken symlink ({error})")
         return
     if actual != expected:
+        runtime = home / ".local/share/aipane/runtime/current"
+        if name in {"aipane-agy", "aipane-agy-focus"} and actual == (runtime / "bin" / name).resolve():
+            try:
+                manifest = json.loads((runtime / "release.json").read_text())
+                digest = hashlib.sha256(actual.read_bytes()).hexdigest()
+                if manifest.get("validation") == "passed" and manifest["files"].get("bin/" + name) == digest:
+                    audit.ok(f"{shown} -> validated runtime {actual}")
+                    return
+            except (OSError, ValueError, KeyError):
+                pass
         audit.fail(
             f"{shown}: does not point to this checkout "
             f"(actual {actual}, expected {expected})"
@@ -290,6 +303,34 @@ def inspect_dsh_registrations(audit: Audit, root: Path, home: Path) -> set[str]:
     return helpers
 
 
+def inspect_agy_registrations(audit: Audit, home: Path) -> set[str]:
+    settings = home / ".gemini/antigravity-cli/settings.json"
+    if not settings.exists():
+        return set()
+    try:
+        config = json.loads(settings.read_text())
+        statusline = config.get("statusLine", {})
+        if not isinstance(statusline, dict) or "aipane-agy status" not in statusline.get("command", "") or statusline.get("enabled") is False:
+            audit.fail("Antigravity CLI: aipane statusLine is not enabled")
+        hooks = json.loads((home / ".gemini/config/hooks.json").read_text()).get("aipane-antigravity", {})
+        for event in ("SessionStart", "PreInvocation", "PreToolUse", "Stop"):
+            handlers = hooks.get(event, [])
+            commands = [h.get("command", "") for group in handlers for h in group.get("hooks", [group])]
+            if sum(f"aipane-agy {event}" in cmd for cmd in commands) != 1:
+                audit.fail(f"Antigravity CLI: {event} must have one aipane registration")
+        app = home / "Applications/Antigravity Notifier.app/Contents"
+        plist = plistlib.loads((app / "Info.plist").read_bytes())
+        if (plist.get("CFBundleIdentifier") != "com.alfheim.antigravity-cli-notifier"
+                or not (app / "MacOS/agy-notifier").is_file()
+                or not (app / "Resources/Antigravity.icns").is_file()):
+            audit.fail("Antigravity CLI: notifier App identity or resources are incomplete")
+        else:
+            audit.ok("Antigravity CLI: statusLine, hooks and dedicated notifier inspected")
+    except (OSError, ValueError, TypeError, AttributeError) as error:
+        audit.fail(f"Antigravity CLI: incomplete installation ({type(error).__name__})")
+    return {"aipane-agy", "aipane-agy-focus"}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="aipane-doctor",
@@ -320,6 +361,7 @@ def main() -> int:
     checked = set(CORE_ENTRYPOINTS)
     checked.update(referenced)
     checked.update(inspect_dsh_registrations(audit, root, home))
+    checked.update(inspect_agy_registrations(audit, home))
     for name in sorted(checked):
         check_entrypoint(audit, root, home, name)
 

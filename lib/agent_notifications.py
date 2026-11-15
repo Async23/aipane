@@ -135,6 +135,13 @@ class MacOSNotificationAdapter:
             return self._deliver_kimi(notification)
         if agent == "dsh":
             return self._deliver_dsh(notification)
+        if agent == "agy":
+            notifier = self.home / "Applications/Antigravity Notifier.app/Contents/MacOS/agy-notifier"
+            args = [str(notifier), "-title", notification.title, "-subtitle", notification.subtitle,
+                    "-message", notification.body, "-group", notification.group, "-sound", notification.sound]
+            if notification.action:
+                args.extend(["-execute", notification.action])
+            return "custom-app" if _executable(notifier) and self._run(args, timeout=10) else "failed"
         raise ValueError(f"unsupported notification agent: {agent}")
 
     def _deliver_cursor(self, notification: Notification) -> str:
@@ -470,6 +477,8 @@ class AgentNotifications:
         phase: str = "ready",
     ) -> NotificationResult:
         normalized = dict(payload) if isinstance(payload, Mapping) else {}
+        if agent == "agy":
+            return self._handle_agy(normalized, preview=preview)
         if agent == "cursor":
             notification = self._cursor_notification(normalized)
         elif agent == "claude":
@@ -608,6 +617,76 @@ class AgentNotifications:
             notification=notification,
             channel=channel,
         )
+
+    def _handle_agy(self, payload: dict[str, object], *, preview: bool) -> NotificationResult:
+        from agy_sessions import state_dir
+        event = payload.get("event")
+        labels = {"completed": "任务完成", "failed": "任务失败", "interrupted": "任务中断",
+                  "question": "等待回答", "approval": "需要批准"}
+        if event not in labels or not payload.get("session_id") or not payload.get("token") or payload.get("is_subagent"):
+            return NotificationResult(outcome="ignored", reason="unsupported_event_or_identity")
+        label = labels[event]
+        title = _short_text(_first_plain_line(payload.get("title") or Path(str(payload.get("cwd") or "")).name), 48, "…") or "Antigravity"
+        coordinate = _tmux_coordinate(self.environment)
+        if coordinate:
+            title = coordinate + " · " + title
+        if event != "completed":
+            title += " · " + label
+        body = payload.get("question") or payload.get("error") or payload.get("answer") or label
+        prompt = ""
+        answer_found = bool(payload.get("answer"))
+        if payload.get("transcript_path"):
+            try:
+                path = Path(str(payload.get("transcript_path") or ""))
+                with path.open("rb") as stream:
+                    stream.seek(max(0, path.stat().st_size - 2 * 1024 * 1024))
+                    rows = stream.read().decode("utf-8", "replace").splitlines()
+                for line in reversed(rows):
+                    try:
+                        item = json.loads(line)
+                    except ValueError:
+                        continue
+                    if item.get("type") == "USER_INPUT" and item.get("source") == "USER_EXPLICIT" and isinstance(item.get("content"), str):
+                        prompt = item["content"]
+                        wrapped = re.match(r"\s*<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", prompt, re.S)
+                        if wrapped:
+                            prompt = wrapped.group(1)
+                        break
+                    if event == "completed" and not answer_found and item.get("type") in {"PLANNER_RESPONSE", "MODEL_RESPONSE"} and item.get("status", "DONE") == "DONE" and isinstance(item.get("content"), str):
+                        body = item["content"]
+                        answer_found = True
+            except OSError:
+                pass
+        target = _tmux_focus_target(self.environment)
+        focus = Path(__file__).resolve().parents[1] / "bin/aipane-agy-focus"
+        action = shlex.join([str(focus), *target, self.environment.get("TMUX", "").rsplit(",", 2)[0]])
+        identity = json.dumps([payload["session_id"], payload["token"], event], separators=(",", ":"))
+        group = "agy-" + hashlib.sha256(identity.encode()).hexdigest()[:32]
+        notification = Notification(title=title, subtitle=_short_text(_first_plain_line(prompt), 80, "…") or label,
+                                    body=_short_text(_first_plain_line(body), 140, "…"),
+                                    sound=self.choose_sound(COMPLETION_SOUNDS) if event == "completed" else "default",
+                                    event=str(event), group=group, action=action, pane_id=target[2])
+        if preview:
+            return NotificationResult(outcome="previewed", notification=notification)
+        claims = state_dir(self.environment) / "notifications"
+        _ensure_private_directory(claims)
+        claim = claims / group
+        try:
+            descriptor = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return NotificationResult(outcome="deduplicated", notification=notification, reason="duplicate_event")
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump({"at": time.time(), "event": event}, stream)
+        channel = self.adapter.deliver("agy", notification)
+        failed = _delivery_failed(channel)
+        if failed:
+            claim.unlink(missing_ok=True)
+        log = state_dir(self.environment) / "notifications.jsonl"
+        with log.open("a") as stream:
+            log.chmod(0o600)
+            stream.write(json.dumps({"at": time.time(), "event": event, "group": group,
+                                     "session_id": payload["session_id"], "pane": target[2], "channel": channel}) + "\n")
+        return NotificationResult(outcome="failed" if failed else "delivered", notification=notification, channel=channel)
 
     def _cursor_notification(self, payload: dict[str, object]) -> Notification:
         status = _compact(payload.get("status") or "completed").lower()
