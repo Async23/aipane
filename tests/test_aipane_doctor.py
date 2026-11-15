@@ -1,4 +1,5 @@
 import os
+import hashlib
 import json
 import plistlib
 import shutil
@@ -94,6 +95,31 @@ class AipaneDoctorTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("does not point to this checkout", result.stdout)
+
+    def test_recovery_helper_requires_validated_unchanged_runtime(self) -> None:
+        self.configure_core()
+        source = self.executable("aipane-bind")
+        runtime = self.home / ".local/share/aipane/runtime/current"
+        (runtime / "bin").mkdir(parents=True)
+        helper = runtime / "bin/aipane-bind"
+        shutil.copy2(source, helper)
+        (self.local_bin / "aipane-bind").symlink_to(helper)
+        config = self.home / ".codex/hooks.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({"command": "$HOME/.local/bin/aipane-bind"}))
+        digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+        for validation, stored_digest, expected_status in (
+            ("passed", digest, 0),
+            ("passed", "wrong", 1),
+            ("imported-baseline", digest, 1),
+        ):
+            with self.subTest(validation=validation, digest=stored_digest):
+                (runtime / "release.json").write_text(json.dumps({
+                    "validation": validation,
+                    "files": {"bin/aipane-bind": stored_digest},
+                }))
+                result = self.run_doctor()
+                self.assertEqual(result.returncode, expected_status, result.stdout)
 
     def test_wrong_registration_symlink_target_fails(self) -> None:
         self.configure_core()

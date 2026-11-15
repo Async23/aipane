@@ -19,6 +19,10 @@ CORE_ENTRYPOINTS = (
     "aipane-activity",
     "tmux-window-wrap",
 )
+RUNTIME_ENTRYPOINTS = {
+    "ai-restart", "ai-restore", "aipane-snapshot", "aipane-bind",
+    "aipane-restore-executor", "aipane-agy", "aipane-agy-focus",
+}
 LOCAL_BIN_ENTRYPOINT = re.compile(r"\.local/bin/(aipane-[a-z0-9-]+)")
 CONFIG_PATHS = (
     ".gemini/config/hooks.json",
@@ -102,7 +106,7 @@ def check_entrypoint(
         return
     if actual != expected:
         runtime = home / ".local/share/aipane/runtime/current"
-        if name in {"aipane-agy", "aipane-agy-focus"} and actual == (runtime / "bin" / name).resolve():
+        if name in RUNTIME_ENTRYPOINTS and actual == (runtime / "bin" / name).resolve():
             try:
                 manifest = json.loads((runtime / "release.json").read_text())
                 digest = hashlib.sha256(actual.read_bytes()).hexdigest()
