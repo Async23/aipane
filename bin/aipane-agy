@@ -68,6 +68,8 @@ def main():
         # Keep Antigravity's built-in model/quota display via stack_with_default.
         if record and record.get("title"):
             print(" ".join(record["title"].split())[:100])
+        if record and record.get("session_id"):
+            print(f"Session: {record['session_id']}")
     elif mode != "PreToolUse":
         print("{}")
     return 0

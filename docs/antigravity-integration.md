@@ -21,6 +21,9 @@ Merge [the statusLine fragment](../integrations/antigravity/settings.json) into
 `~/.gemini/antigravity-cli/settings.json`. Keep an existing custom status command
 by chaining its output after `aipane-agy status`; do not silently replace it.
 `stack_with_default` preserves the CLI's built-in model and quota display.
+The custom status line shows the conversation title when available, followed by
+the full selected conversation ID on a separate `Session: <ID>` line. The ID
+appears once a conversation starts and updates when switching conversations.
 New CLI processes load the configuration. Run `aipane-doctor` to inspect wiring.
 
 ## Activity and sessions
