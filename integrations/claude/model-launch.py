@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from model_picker import select_model
@@ -69,6 +70,69 @@ def remember_model(model: str) -> None:
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def remember_workspace_trust() -> None:
+    """Opted-in launches trust their cwd and Git checkout before Claude starts."""
+    paths = {str(Path.cwd().resolve())}
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode == 0:
+            root, common = result.stdout.rstrip("\n").split("\n", 1)
+            paths.add(str(Path(root).resolve()))
+            # Linked worktrees share trust with the main checkout.
+            if Path(common).name == ".git":
+                paths.add(str(Path(common).resolve().parent))
+    except FileNotFoundError:
+        pass
+
+    legacy = CONFIG / ".config.json"
+    config = legacy if legacy.exists() else (
+        CONFIG if os.environ.get("CLAUDE_CONFIG_DIR") else HOME
+    ) / ".claude.json"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    # Use Claude's proper-lockfile directory so concurrent native config saves
+    # and other launchers all read the latest contents under the same lock.
+    lock = Path(str(config) + ".lock")
+    deadline = time.monotonic() + 3
+    while True:
+        try:
+            lock.mkdir(mode=0o700)
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"等待 {lock} 超时")
+            time.sleep(0.05)
+    temporary = None
+    try:
+        data = read_json(config) if config.exists() else {}
+        projects = data.setdefault("projects", {})
+        if not isinstance(projects, dict):
+            raise ValueError(f"{config} 的 projects 必须是对象")
+        changed = False
+        for path in paths:
+            project = projects.setdefault(path, {})
+            if not isinstance(project, dict):
+                raise ValueError(f"{config} 的项目 {path} 必须是对象")
+            if project.get("hasTrustDialogAccepted") is not True:
+                project["hasTrustDialogAccepted"] = True
+                changed = True
+        if not changed:
+            return
+        target = config.resolve()
+        fd, filename = tempfile.mkstemp(prefix=".claude-trust-", suffix=".json", dir=target.parent)
+        temporary = Path(filename)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+        temporary.replace(target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        lock.rmdir()
 
 
 def canonical_model(value: str, settings: dict) -> str:
@@ -256,6 +320,11 @@ def main() -> int:
     overlay = make_overlay(settings, metadata, extra, model)
     if picked:
         remember_model(model)
+    if metadata.get("auto_trust_workspace") is True and interactive:
+        try:
+            remember_workspace_trust()
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            print(f"claude-window: 无法记录目录信任（{error}）；继续由 Claude 确认", file=sys.stderr)
     argv = [*args, "--model", model]
     if extra_arg is not None:
         return run_with_private_settings(argv, overlay)

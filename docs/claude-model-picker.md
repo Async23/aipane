@@ -60,6 +60,23 @@ export AIPANE_CLAUDE_LAUNCH_CMD="$HOME/.local/bin/claude-window --dangerously-sk
 启动时会设置该模型的上下文容量，并将会话内部的模型选项限制为相同容量的模型。
 自动恢复标记与恢复执行器的配合见 [恢复运行规则](recovery-runtime.md)。
 
+## 自动信任工作目录
+
+在本机 `model-routing.json` 顶层设置 `"auto_trust_workspace": true` 后，
+启动器会在交互启动和自动恢复前，将当前目录、所在 Git 仓库及 worktree 的主检出
+登记为已信任，跳过 `Accessing workspace` 确认。以后打开的新项目也会自动登记。
+这表示你选择自动信任通过该启动器打开的目录，包括其中的项目设置、hooks 和 MCP 配置。
+
+Claude Code 在家目录中接受信任时只记住本次会话，所以家目录通常每次启动都会再问。
+启动器直接写入配置中的 `projects[路径].hasTrustDialogAccepted`，也覆盖这种情况。
+写入使用与 Claude 相同的配置锁，保留其他配置，并以原子替换避免文件写到一半。
+配置损坏或无法写入时，保留原文件，提示原因并继续启动，由 Claude 显示原有确认。
+
+该选项默认关闭；删除该字段或设为 `false` 后停止自动登记，已保存的信任记录仍保留。
+它只控制目录信任；工具执行授权仍由 Claude 的权限模式控制。直接运行原生
+`~/.local/bin/claude` 不经过启动器。配置文件位置遵循 `CLAUDE_CONFIG_DIR` 和
+旧版 `.config.json` 的选择规则，多个配置目录分别记录信任。
+
 ## 验证
 
 ```bash
@@ -67,4 +84,4 @@ python3 -m unittest discover -s tests -p 'test_claude_model_*.py'
 ```
 
 测试使用临时配置和占位 Claude 程序，覆盖跨进程记忆、取消、模型移除、配置隔离、
-恢复优先级和真实 `fzf` 交互，不调用模型 API。
+恢复优先级、真实 `fzf` 交互、自动信任、worktree 和并发写入，不调用模型 API。

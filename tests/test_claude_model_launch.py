@@ -31,7 +31,7 @@ class ModelLauncherTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.home = Path(self.tmp.name)
+        self.home = Path(self.tmp.name).resolve()
         self.config = self.home / ".claude"
         project = re.sub(r"[^A-Za-z0-9-]", "-", str(self.home.resolve()))
         projects = self.config / "projects" / project
@@ -122,6 +122,100 @@ class ModelLauncherTests(unittest.TestCase):
 
     def remember(self, model):
         self.state().write_text(json.dumps({"last_model": model}))
+
+    def enable_auto_trust(self):
+        path = self.config / "model-routing.json"
+        data = json.loads(path.read_text())
+        data["auto_trust_workspace"] = True
+        path.write_text(json.dumps(data))
+
+    def trust_file(self):
+        return self.config / ".claude.json"
+
+    def test_auto_trust_is_opt_in(self):
+        proc, master = self.launch(["--model", "grok-fast"])
+        self.native_data(self.read_until_decided(proc, master))
+        self.assertEqual(proc.wait(timeout=3), 0)
+        self.assertFalse(self.trust_file().exists())
+
+    def test_auto_trust_home_preserves_existing_config_and_repairs_lost_trust(self):
+        self.enable_auto_trust()
+        for previous in (None, False):
+            with self.subTest(previous=previous):
+                original = {"theme": "dark", "projects": {
+                    str(self.home): {"lastSessionId": SESSION},
+                    "/other": {"hasTrustDialogAccepted": False},
+                }}
+                if previous is not None:
+                    original["projects"][str(self.home)]["hasTrustDialogAccepted"] = previous
+                self.trust_file().write_text(json.dumps(original))
+                proc, master = self.launch(["--model", "grok-fast"])
+                self.native_data(self.read_until_decided(proc, master))
+                self.assertEqual(proc.wait(timeout=3), 0)
+                data = json.loads(self.trust_file().read_text())
+                original["projects"][str(self.home)]["hasTrustDialogAccepted"] = True
+                self.assertEqual(data, original)
+                self.assertEqual(self.trust_file().stat().st_mode & 0o777, 0o600)
+                self.assertFalse(Path(str(self.trust_file()) + ".lock").exists())
+
+    def test_auto_trust_uses_repository_and_main_checkout_from_worktree(self):
+        self.enable_auto_trust()
+        repo = self.home / "repo"
+        worktree = self.home / "linked"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test", "-c",
+                        "user.email=test@example.invalid", "commit", "-qm", "initial",
+                        "--allow-empty"], check=True)
+        subprocess.run(["git", "-C", str(repo), "worktree", "add", "-qb", "linked",
+                        str(worktree)], check=True)
+        nested = worktree / "nested"
+        nested.mkdir()
+        proc, master = self.launch(["--model", "grok-fast"], cwd=nested)
+        self.native_data(self.read_until_decided(proc, master))
+        self.assertEqual(proc.wait(timeout=3), 0)
+        projects = json.loads(self.trust_file().read_text())["projects"]
+        self.assertEqual(set(projects), {str(nested), str(worktree), str(repo)})
+        self.assertTrue(all(row["hasTrustDialogAccepted"] for row in projects.values()))
+
+    def test_auto_trust_concurrent_launches_keep_each_directory(self):
+        self.enable_auto_trust()
+        launches = []
+        directories = [self.home / f"project-{n}" for n in range(6)]
+        for directory in directories:
+            directory.mkdir()
+            launches.append(self.launch(["--model", "grok-fast"], cwd=directory))
+        for proc, master in launches:
+            self.native_data(self.read_until_decided(proc, master))
+            self.assertEqual(proc.wait(timeout=3), 0)
+        projects = json.loads(self.trust_file().read_text())["projects"]
+        self.assertEqual(set(projects), set(map(str, directories)))
+
+    def test_auto_trust_does_not_overwrite_invalid_config_or_block_launch(self):
+        self.enable_auto_trust()
+        self.trust_file().write_text("broken")
+        proc, master = self.launch(["--model", "grok-fast"])
+        output = self.read_until_decided(proc, master)
+        self.native_data(output)
+        self.assertEqual(proc.wait(timeout=3), 0)
+        self.assertIn("无法记录目录信任".encode(), output)
+        self.assertEqual(self.trust_file().read_text(), "broken")
+
+    def test_auto_trust_is_recorded_before_automatic_resume(self):
+        self.enable_auto_trust()
+        proc, master = self.launch(["--resume", SESSION], automatic=True)
+        self.native_data(self.read_until_decided(proc, master))
+        self.assertEqual(proc.wait(timeout=3), 0)
+        projects = json.loads(self.trust_file().read_text())["projects"]
+        self.assertTrue(projects[str(self.home)]["hasTrustDialogAccepted"])
+
+    def test_auto_trust_leaves_config_untouched_after_cancelling_picker(self):
+        self.enable_auto_trust()
+        proc, master = self.launch([], inherited_model="", term="dumb")
+        self.read_until_decided(proc, master, ("q 取消: ".encode(),))
+        os.write(master, b"q\r")
+        self.read_until_decided(proc, master, ("已取消启动".encode(),))
+        self.assertEqual(proc.wait(timeout=3), 130)
+        self.assertFalse(self.trust_file().exists())
 
     def test_choice_is_remembered_across_processes_and_directories(self):
         settings_before = (self.config / "settings.json").read_bytes()
