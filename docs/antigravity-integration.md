@@ -32,8 +32,10 @@ The CLI's structured status callback provides the selected conversation ID,
 model, effort, execution mode, agent state, background tasks and approval state.
 The Adapter records a private runtime entry per tmux socket/server/pane. Readers
 verify the foreground PID, process start time and TTY before trusting that entry.
-`working`, `tool_use`, review/approval and running background/subagent tasks stay
-busy. Missing or inconsistent evidence is unknown.
+The tmux activity indicator stays busy during work, tool use, review, approval,
+goal continuation and running subagents. When the turn is idle, its indicator
+clears even if a background command such as a preview server is still running.
+Missing or inconsistent evidence is unknown.
 
 `SessionStart`/`PreInvocation`/`Stop` may precede the first callback containing a
 new conversation ID. Pending lifecycle metadata is matched only after statusLine

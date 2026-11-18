@@ -119,11 +119,17 @@ def activity_state(payload: dict) -> str:
     if (type(tasks) is not int or tasks < 0 or not isinstance(agents, list)
             or any(not isinstance(item, dict) for item in agents)):
         return "unknown"
-    if tasks or any(item.get("status") == "running" for item in agents):
+    if any(item.get("status") == "running" for item in agents):
         return "busy"
     if payload.get("agent_state") in ACTIVE or payload.get("tool_confirmation_pending") is True:
         return "busy"
     return "idle" if payload.get("agent_state") in {"idle", "error"} else "unknown"
+
+
+def completion_ready(record: dict) -> bool:
+    stop = record.get("stop")
+    return (record.get("state") == "idle" and not record.get("has_background_tasks")
+            and bool(stop) and not stop.get("continuationActive"))
 
 
 def current_session(*, pane_id: str, socket_path: str, server_pid: str,
@@ -262,9 +268,9 @@ class AgyIntegration:
                 **extra}
 
     def _complete(self, record):
-        stop = record.get("stop")
-        if not record.get("active") or record.get("state") != "idle" or not stop or stop.get("continuationActive"):
+        if not record.get("active") or not completion_ready(record):
             return []
+        stop = record["stop"]
         reason = str(stop.get("terminationReason", "")).lower()
         event = "failed" if stop.get("error") or reason in {"error", "max_steps_exceeded", "max_steps"} else (
             "interrupted" if any(word in reason for word in ("cancel", "interrupt", "user_stop")) else "completed")
@@ -310,6 +316,7 @@ class AgyIntegration:
                           tty=process["tty"], pane=self.pane, socket=self.socket, server=self.server,
                           session_id=sid, cwd=cwd, agy_home=str(cli_home(self.environment)),
                           state=state, agent_state=payload.get("agent_state"),
+                          has_background_tasks=bool(payload.get("task_count")),
                           title=str(payload.get("conversation_title") or "")[:500],
                           # v1.5.9 statusLine can incorrectly name the App's
                           # brain directory; the CLI hook and trajectory use
@@ -411,7 +418,7 @@ def notification_current(payload: dict, environment=None) -> bool:
     if not process or process.get("started_at") != record.get("started_at") or not process.get("foreground"):
         return False
     if payload.get("event") in {"completed", "failed", "interrupted"}:
-        return record.get("state") == "idle" and bool(record.get("stop"))
+        return completion_ready(record)
     return True
 
 

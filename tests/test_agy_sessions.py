@@ -75,18 +75,36 @@ class AntigravityTests(unittest.TestCase):
         self.assertEqual(events, [])
         self.assertEqual(self.hook("Stop", fullyIdle=True)[1], [])
 
-    def test_stop_waits_for_background_tasks_and_final_idle_in_either_order(self):
+    def test_background_command_outlives_turn_but_still_defers_notification(self):
         self.status(agent_state="working")
-        self.assertEqual(self.hook("Stop", fullyIdle=False, terminationReason="model_stop")[1], [])
+        self.assertEqual(self.hook("Stop", fullyIdle=True, continuationActive=False)[1], [])
         record, events = self.status(agent_state="idle", task_count=1)
-        self.assertEqual(record["state"], "busy")
+        self.assertEqual(record["state"], "idle")
+        self.assertEqual(self.current()["state"], "idle")
         self.assertEqual(events, [])
         record, events = self.status()
         self.assertEqual(events[0]["event"], "completed")
-        # A second turn can publish idle before the Stop hook arrives.
+
+    def test_stop_after_idle_with_background_command_waits_to_notify(self):
+        self.status(agent_state="working", task_count=1)
+        record, events = self.status(task_count=1)
+        self.assertEqual(record["state"], "idle")
+        self.assertEqual(events, [])
+        self.assertEqual(self.hook("Stop", fullyIdle=True, terminationReason="error", error="broken")[1], [])
+        self.assertEqual(self.status()[1][0]["event"], "failed")
+
+    def test_background_command_starting_before_delivery_defers_queued_completion(self):
         self.status(agent_state="working")
-        self.assertEqual(self.status()[1], [])
-        self.assertEqual(self.hook("Stop", fullyIdle=True, terminationReason="error", error="broken")[1][0]["event"], "failed")
+        self.hook("Stop", fullyIdle=True)
+        event = self.status()[1][0]
+        record, events = self.status(task_count=1)
+        self.assertEqual(record["state"], "idle")
+        self.assertEqual(events, [])
+        with patch.object(agy, "process_info", return_value=self.process):
+            self.assertFalse(agy.notification_current(event, self.env))
+            retry = self.status()[1][0]
+            self.assertEqual(retry["token"], event["token"])
+            self.assertTrue(agy.notification_current(retry, self.env))
 
     def test_next_turn_has_a_distinct_notification_identity(self):
         self.status(agent_state="working")
