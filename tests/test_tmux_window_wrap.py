@@ -2399,9 +2399,9 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         self.socket_path.unlink(missing_ok=True)
         self.log_directory.cleanup()
 
-    def start_animator(self):
+    def start_animator(self, script=SCRIPT):
         process = subprocess.Popen(
-            [str(SCRIPT), "animate", "--socket-name", self.socket_name,
+            [str(script), "animate", "--socket-name", self.socket_name,
              "--log-file", str(self.animation_log_path)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
@@ -3754,6 +3754,39 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         self.drain_client_output(master_fd)
         self.tmux("respawn-pane", "-k", "-t", shell_pane, "sleep 120")
         self.wait_for_status_text(master_fd, "1:手册", timeout=2.5)
+
+    def test_updating_animator_source_refreshes_existing_agent_count(self):
+        checkout = Path(self.log_directory.name)
+        (checkout / "lib").symlink_to(ROOT / "lib", target_is_directory=True)
+        script = checkout / "bin" / SCRIPT.name
+        script.parent.mkdir()
+        source = SCRIPT.read_text()
+        old_source = source.replace('        "agy",\n', "", 1)
+        self.assertNotEqual(old_source, source)
+        script.write_text(old_source)
+        script.chmod(0o755)
+
+        self.tmux("respawn-pane", "-k", "-t", "wrap:1", *self.TEST_AGENT_COMMAND)
+        self.tmux(
+            "split-window", "-d", "-t", "wrap:1",
+            "/bin/bash", "-c", "exec -a agy sleep 120",
+        )
+        self.source_window_wrap_config(animate=False)
+        animator = self.start_animator(script)
+        self.wait_for_animation_event("theme_changed", animator.pid)
+        _, master_fd = self.attach_client(width=80)
+        self.wait_for_client_count(1)
+        self.wait_for_status_text(master_fd, "1:手册", timeout=3)
+        self.assertIn("1:手册", self.render_runtime(line=0, width=80))
+        self.drain_client_output(master_fd)
+
+        replacement = script.with_suffix(".new")
+        replacement.write_text(source)
+        replacement.chmod(0o755)
+        replacement.replace(script)
+
+        self.wait_for_status_text(master_fd, "1₂:手册", timeout=3)
+        self.assertIsNone(animator.poll())
 
     def test_runtime_accepts_unicode_line_separators_in_window_names(self):
         for separator in ("\u0085", "\u2028", "\u2029"):

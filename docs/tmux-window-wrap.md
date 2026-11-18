@@ -434,8 +434,12 @@ show a static busy indicator and still receive real activity/layout changes.
 cached rows. The older `--animation-option` spelling and JSON
 `animation_option` field remain accepted for standalone callers using their
 own user options. The public configuration uses the hidden environment
-variable. Reload `conf/tmux-window-wrap.conf` after upgrading to switch both
-the cached rows and animation driver together.
+variable.
+
+The running animator reloads when its `bin/tmux-window-wrap` entry point
+changes. The next agent scan uses the updated detection rules. Reload
+`conf/tmux-window-wrap.conf` once to enable this on an older running animator,
+and whenever an upgrade changes the tmux fragment itself.
 
 The animator writes JSON Lines to
 `~/.local/state/aipane/tmux-window-wrap-animate.log`, including when launched

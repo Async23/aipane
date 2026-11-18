@@ -1044,8 +1044,18 @@ def animation_has_focused_client(socket_name):
     return "1" in completed.stdout.splitlines()
 
 
+def animator_source_version(path):
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size
+
+
 def animate_status(socket_name, fps, log=None):
     owner = log.context["owner"] if log is not None else uuid.uuid4().hex
+    source_path = Path(__file__)
+    source_version = animator_source_version(source_path)
 
     def stage(name):
         if log is not None:
@@ -1084,6 +1094,19 @@ def animate_status(socket_name, fps, log=None):
                 if log is not None:
                     log.emit("ownership_lost", successor=current_owner)
                 return "superseded"
+            version = animator_source_version(source_path)
+            if version is not None and version != source_version:
+                stage("source_reload")
+                try:
+                    # Keep serving if the replacement is still being written.
+                    compile(source_path.read_bytes(), str(source_path), "exec")
+                    if log is not None:
+                        log.emit("source_reloading")
+                    os.execv(sys.executable, [sys.executable, str(source_path), *sys.argv[1:]])
+                except (OSError, SyntaxError) as error:
+                    if log is not None:
+                        log.emit("source_reload_failed", level="error", error=str(error))
+                    source_version = version
             stage("agent_probe")
             if refresh_agent_presence(socket_name):
                 stage("cache_invalidation")
