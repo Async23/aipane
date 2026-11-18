@@ -94,7 +94,7 @@ otherwise `10`, but does not advance on repeats.
 |-----|--------|
 | `prefix \|` or `\` | split left-right |
 | `prefix -` | split top-bottom |
-| `prefix Space` | cycle layouts (tmux default) |
+| `prefix Space` | cycle `main-vertical` (50%) → `tiled` → `even-horizontal` (2 panes: L-R ↔ T-B) |
 
 ## Resize (no prefix)
 

@@ -1209,6 +1209,96 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                     os.waitpid(child_pid, 0)
                 tmux("kill-server", check=False)
 
+    def test_prefix_space_cycles_curated_layouts(self):
+        socket = f"ws-space-layout-{os.getpid()}-{id(self)}"
+        child_pid = None
+        master_fd = None
+        environment = os.environ.copy()
+        environment.pop("TMUX", None)
+        environment.pop("TMUX_PANE", None)
+        environment["TERM"] = "xterm-256color"
+
+        def tmux(*args: str, check: bool = True):
+            return subprocess.run(
+                ["tmux", "-L", socket, *args],
+                check=check,
+                capture_output=True,
+                text=True,
+                env=environment,
+            ).stdout.strip()
+
+        def press_prefix_space(previous_layout: str) -> str:
+            os.write(master_fd, b"\x00 ")
+            for _ in range(50):
+                while True:
+                    try:
+                        if not os.read(master_fd, 65536):
+                            break
+                    except BlockingIOError:
+                        break
+                current = tmux("display-message", "-p", "-t", "layout:0", "#{window_layout}")
+                if current != previous_layout:
+                    return current
+                time.sleep(0.02)
+            return tmux("display-message", "-p", "-t", "layout:0", "#{window_layout}")
+
+        try:
+            tmux(
+                "-f", "/dev/null", "new-session", "-d", "-s", "layout",
+                "-x", "158", "-y", "39", "sleep 60",
+            )
+            tmux("source-file", str(TMUX_WS))
+            self.assertEqual(tmux("show-window-options", "-gv", "main-pane-width"), "50%")
+            self.assertEqual(tmux("show-window-options", "-gv", "main-pane-height"), "50%")
+
+            child_pid, master_fd = pty.fork()
+            if child_pid == 0:
+                termios.tcsetwinsize(0, (39, 158))
+                os.execvpe(
+                    "tmux",
+                    ["tmux", "-L", socket, "attach-session", "-t", "layout"],
+                    environment,
+                )
+            os.set_blocking(master_fd, False)
+            for _ in range(50):
+                if tmux("list-clients"):
+                    break
+                time.sleep(0.02)
+
+            # 2 panes: toggle cleanly between even-horizontal ({...}) and tiled ([...]).
+            tmux("split-window", "-t", "layout:0", "sleep 60")
+            tmux("select-layout", "-t", "layout:0", "even-horizontal")
+            start_2 = tmux("display-message", "-p", "-t", "layout:0", "#{window_layout}")
+            self.assertIn("{", start_2)
+            step1_2 = press_prefix_space(start_2)
+            self.assertIn("[", step1_2)
+            self.assertNotIn("{", step1_2)
+            step2_2 = press_prefix_space(step1_2)
+            self.assertEqual(step2_2, start_2)
+
+            # 3 and 4 panes: cycle main-vertical → tiled → even-horizontal → main-vertical.
+            for pane_count in (3, 4):
+                while int(tmux("display-message", "-p", "-t", "layout:0", "#{window_panes}")) < pane_count:
+                    tmux("split-window", "-t", "layout:0", "sleep 60")
+                tmux("select-layout", "-t", "layout:0", "even-horizontal")
+                even_h = tmux("display-message", "-p", "-t", "layout:0", "#{window_layout}")
+                main_v = press_prefix_space(even_h)
+                self.assertRegex(main_v, r"^[0-9a-f]+,\d+x\d+,0,0\{.*\[")
+                tiled = press_prefix_space(main_v)
+                self.assertRegex(tiled, r"^[0-9a-f]+,\d+x\d+,0,0\[")
+                back_even_h = press_prefix_space(tiled)
+                self.assertEqual(back_even_h, even_h)
+        finally:
+            if master_fd is not None:
+                os.close(master_fd)
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGHUP)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(child_pid, 0)
+            tmux("kill-server", check=False)
+
 
 class RenameWindowPopupTests(unittest.TestCase):
     def setUp(self):
