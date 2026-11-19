@@ -178,7 +178,7 @@ class AipaneDoctorTests(unittest.TestCase):
 
     def test_legacy_activity_command_is_an_explicit_warning(self) -> None:
         self.configure_core()
-        hooks = self.home / ".cursor" / "hooks.json"
+        hooks = self.home / ".claude" / "settings.json"
         hooks.parent.mkdir(parents=True)
         hooks.write_text(
             '{"command":"$HOME/.local/bin/tmux-window-wrap activity busy"}',

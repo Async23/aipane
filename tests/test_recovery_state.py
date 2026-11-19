@@ -54,6 +54,21 @@ class RecoveryStateTests(unittest.TestCase):
         remaining = self.save_intent({**self.item, "sid": "", "kind": "invalid", "restorable": False})
         self.assertEqual(remaining, [first])
 
+    def test_retired_tool_in_old_state_cannot_run_or_block_other_recoveries(self):
+        local = {**self.item, "created_at": time.time()}
+        old = {**local, "tool": "retired", "target": "0:2.1", "pane_id": "%2"}
+        foreign = {**old, "server_pid": "456"}
+        self.file.write_text(json.dumps({"version": 1, "items": [old, local, foreign]}))
+        before = self.file.read_bytes()
+        pending = self.store.load(time.time())
+        self.assertEqual([item["tool"] for item in pending], ["codex"])
+        self.assertEqual(self.file.read_bytes(), before)
+        self.store.save(pending)
+        payload = json.loads(self.file.read_text())
+        self.assertEqual(payload["items"], [foreign, *pending])
+        self.assertEqual([(item["tool"], item["resolution"]) for item in payload["history"]],
+                         [("retired", "discarded")])
+
     def test_migration_and_discard_preserve_foreign_intent_and_audit(self):
         local = {**self.item, "created_at": time.time()}
         foreign = {**local, "server_pid": "456"}

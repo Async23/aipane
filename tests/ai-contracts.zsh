@@ -27,11 +27,10 @@ export AIPANE_CLAUDE_LAUNCH_CMD="sleep 120"
 export AIPANE_CODEX_LAUNCH_CMD="sleep 120"
 export AIPANE_DSH_LAUNCH_CMD="sleep 120"
 export AIPANE_GROK_LAUNCH_CMD="sleep 120"
-export AIPANE_OPENCODE_LAUNCH_CMD="sleep 120"
-export AIPANE_CURSOR_LAUNCH_CMD="sleep 120"
-export AIPANE_QWEN_LAUNCH_CMD="sleep 120"
 export AIPANE_PI_LAUNCH_CMD="sleep 120"
 export AIPANE_KIMI_LAUNCH_CMD="sleep 120"
+export AIPANE_AGY_LAUNCH_CMD="sleep 120"
+export AIPANE_NO_SESSION_ID=1
 
 source "$ROOT_DIR/init.zsh"
 
@@ -65,9 +64,18 @@ assert_balanced_columns() {
   done
 }
 
+keys="$(ai --help | awk '/^Tools:/{tools=1;next} /^$/{tools=0} tools{printf "%s", $1}')"
+[[ "$keys" == cxdgpka ]] || { print -u2 "unexpected launcher keys: $keys"; exit 1; }
+for key in o r q; do
+  if ai "$key" -- --version >"$TEST_DIR/error" 2>&1 || ! grep -q "unknown tool '$key'" "$TEST_DIR/error"; then
+    print -u2 "unexpected launcher for '$key'"
+    exit 1
+  fi
+done
+
 assert_balanced_columns "rows layout" rows xdg
-assert_balanced_columns "custom 1,3 layout" 1,3 xdgo
-assert_balanced_columns "automatic seven-pane layout" auto cxdgorp
+assert_balanced_columns "custom 1,3 layout" 1,3 xdgp
+assert_balanced_columns "automatic seven-pane layout" auto cxdgpka
 
 tmux() {
   case "$1" in

@@ -11,9 +11,6 @@ Tools:
   x  Codex         (${AIPANE_CODEX_LAUNCH_CMD})
   d  dsh-TUI       (${AIPANE_DSH_LAUNCH_CMD})
   g  Grok          (${AIPANE_GROK_LAUNCH_CMD})
-  o  OpenCode      (${AIPANE_OPENCODE_LAUNCH_CMD})
-  r  Cursor        (${AIPANE_CURSOR_LAUNCH_CMD})
-  q  Qwen Code     (${AIPANE_QWEN_LAUNCH_CMD})
   p  Pi             (${AIPANE_PI_LAUNCH_CMD})
   k  Kimi Code     (${AIPANE_KIMI_LAUNCH_CMD})
   a  Antigravity   (${AIPANE_AGY_LAUNCH_CMD})
@@ -25,14 +22,12 @@ Notes:
 
 Examples:
   ai cxdg
-  ai cxr
-  ai cxr --layout main-right
-  ai -l columns cxr
+  ai cxp
+  ai cxp --layout main-right
+  ai -l columns cxp
   ai x resume 019e680c-d2bd-71a2-9a9a-8cf78a2d8da1
   ai --new x resume 019e680c-d2bd-71a2-9a9a-8cf78a2d8da1
   ai x -- --help
-  ai q
-  ai xq
   ai --new cxdg
   ai cc
   ai p
@@ -69,15 +64,6 @@ _aipane_tool_command() {
       ;;
     g)
       _aipane_command_with_args "$AIPANE_GROK_LAUNCH_CMD" "$@"
-      ;;
-    o)
-      _aipane_command_with_args "$AIPANE_OPENCODE_LAUNCH_CMD" "$@"
-      ;;
-    r)
-      _aipane_command_with_args "$AIPANE_CURSOR_LAUNCH_CMD" "$@"
-      ;;
-    q)
-      _aipane_command_with_args "$AIPANE_QWEN_LAUNCH_CMD" "$@"
       ;;
     p)
       _aipane_command_with_args "$AIPANE_PI_LAUNCH_CMD" "$@"
@@ -393,9 +379,9 @@ ai() {
   for (( i = 1; i <= ${#tools_str}; i++ )); do
     ch="${tools_str[i]}"
     case "$ch" in
-      c|x|d|g|o|r|q|p|k|a) tools+=("$ch") ;;
+      c|x|d|g|p|k|a) tools+=("$ch") ;;
       *)
-        print -u2 "ai: unknown tool '${ch}' (valid: c/x/d/g/o/r/q/p/k/a)"
+        print -u2 "ai: unknown tool '${ch}' (valid: c/x/d/g/p/k/a)"
         return 1
         ;;
     esac

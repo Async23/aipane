@@ -60,8 +60,7 @@ plugin commands, goal continuations, and other non-user origins bypass it even
 though the Agent is running. Terminal lifecycle events clear the marker.
 
 The JSON and TOML files are mergeable configuration fragments; do not replace
-an existing user configuration wholesale. The OpenCode Adapter is executable
-plugin source and may be symlinked into OpenCode's plugin directory.
+an existing user configuration wholesale.
 After updating registrations, run `aipane-doctor` to verify that their local
 entrypoints resolve to the active aipane checkout.
 
@@ -76,13 +75,10 @@ changing the process argv, so this Adapter records the new session id on every
 |---|---|---|
 | Claude Code | `claude/hooks.json` | `~/.claude/settings.json` |
 | Codex | `codex/hooks.json` | `~/.codex/hooks.json` |
-| Cursor Agent | `cursor/hooks.json` | `~/.cursor/hooks.json` |
 | dsh / dsh-TUI | [`dsh/cordis.patch.yml`](dsh/cordis.patch.yml) | [activity, notifications, session binding, and Web setup](../docs/dsh-integration.md) |
 | Grok | `grok/hooks.json` | `~/.grok/hooks/*.json` |
 | Kimi Code | `kimi/hooks.toml` | `~/.kimi-code/config.toml` |
-| OpenCode | `opencode/aipane-bind.js` | `~/.config/opencode/plugins/` |
 | Pi | `pi/aipane-bind.ts` | `~/.pi/agent/extensions/` |
-| Qwen Code | `qwen/hooks.json` | `~/.qwen/settings.json` |
 | Antigravity CLI | [`antigravity/`](../docs/antigravity-integration.md) | `~/.gemini/config/hooks.json` and CLI `statusLine` |
 
 Pi uses `@async23/pi-tmux-window-wrap` separately for Agent Activity.

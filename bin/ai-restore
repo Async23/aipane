@@ -5,7 +5,7 @@
 # How it works (see ../docs/session-restore-design.md in this repository):
 #   - tmux-resurrect saves the FULL command line of every pane's foreground program.
 #   - aipane's gold-case launch puts the session id straight into that command line
-#     (pi/grok/claude via --session-id, cursor via a pre-created chat id), and any
+#     (Pi/Grok/Claude via --session-id), and any
 #     `resume`-style launch already carries its id too.
 #   - For tools whose active session still matches their launch argv, the resurrect
 #     dump contains the id directly. Pi/Codex/Grok/dsh can replace sessions in-process, so
@@ -82,18 +82,16 @@ if [[ ! -e "$DUMP" ]]; then
 fi
 
 # Session identities belong to this exact dump, never the global latest map.
-typeset -A COORDS_SID COORDS_TOOL COORDS_DSH_HOME COORDS_SESSION_ROOT COORDS_CWD COORDS_QWEN_HOME COORDS_QWEN_RUNTIME COORDS_CODEX_HOME COORDS_AGY
+typeset -A COORDS_SID COORDS_TOOL COORDS_DSH_HOME COORDS_SESSION_ROOT COORDS_CWD COORDS_CODEX_HOME COORDS_AGY
 typeset paired_rows
 paired_rows="$(command python3 "$SCRIPT_DIR/../lib/recovery_snapshot.py" "$DUMP")" || exit 1
-while IFS=$'\x1f' read -r _cl _sid _tool _dsh_home _session_root _cwd _qwen_home _qwen_runtime _codex_home _agy; do
+while IFS=$'\x1f' read -r _cl _sid _tool _dsh_home _session_root _cwd _codex_home _agy; do
   if [[ -n "$_cl" ]]; then
     COORDS_SID[$_cl]="$_sid"
     COORDS_TOOL[$_cl]="$_tool"
     COORDS_DSH_HOME[$_cl]="$_dsh_home"
     COORDS_SESSION_ROOT[$_cl]="$_session_root"
     COORDS_CWD[$_cl]="$_cwd"
-    COORDS_QWEN_HOME[$_cl]="$_qwen_home"
-    COORDS_QWEN_RUNTIME[$_cl]="$_qwen_runtime"
     COORDS_CODEX_HOME[$_cl]="$_codex_home"
     COORDS_AGY[$_cl]="$_agy"
   fi
@@ -113,12 +111,9 @@ typeset RESTORE_FRESH="${AI_RESTORE_FRESH:-0}"
 typeset PI_BASE="${AIPANE_PI_LAUNCH_CMD:-pi}"
 typeset GROK_BASE="${AIPANE_GROK_LAUNCH_CMD:-grok --always-approve}"
 typeset CLAUDE_BASE="${AIPANE_CLAUDE_LAUNCH_CMD:-claude --dangerously-skip-permissions}"
-typeset CURSOR_BASE="${AIPANE_CURSOR_LAUNCH_CMD:-cursor-agent --force}"
 typeset CODEX_BASE="${AIPANE_CODEX_LAUNCH_CMD:-codex --yolo}"
-typeset OPENCODE_BASE="${AIPANE_OPENCODE_LAUNCH_CMD:-opencode}"
 typeset KIMI_BASE="${AIPANE_KIMI_LAUNCH_CMD:-kimi --auto}"
 typeset DSH_BASE="${AIPANE_DSH_LAUNCH_CMD:-dsh-tui}"
-typeset QWEN_BASE="${AIPANE_QWEN_LAUNCH_CMD:-qwen --yolo}"
 typeset AGY_BASE="${AIPANE_AGY_LAUNCH_CMD:-agy}"
 
 # Migrate exact retired local overrides that can survive in an already-running
@@ -129,7 +124,7 @@ typeset AGY_BASE="${AIPANE_AGY_LAUNCH_CMD:-agy}"
   CODEX_BASE="codex --yolo --disable plugins"
 typeset CODEX_RESTORE_BASE="$CODEX_BASE -c check_for_update_on_startup=false"
 
-# detect_tool <full_cmd> <cur_cmd> -> REPLY in {pi,grok,claude,cursor,codex,opencode,kimi,dsh,qwen} or ""
+# detect_tool <full_cmd> <cur_cmd> -> REPLY is the supported tool name or ""
 detect_tool() {
   local full="$1" cur="$2" prog
   REPLY=""
@@ -138,8 +133,6 @@ detect_tool() {
   case "${cur#-}" in
     sh|bash|zsh|fish|dash|ksh|csh|tcsh) return ;;
   esac
-  # cursor-agent runs under node with a versioned path; match by substring.
-  if [[ "$full" == *cursor-agent* ]]; then REPLY=cursor; return; fi
   prog="${full%% *}"; prog="${prog:t}"      # basename of argv[0]
   if [[ "$prog" == node ]]; then
     # tmux-resurrect saves the outer Node launcher, often ~/.local/bin/dsh-tui.
@@ -152,11 +145,6 @@ detect_tool() {
           "$script" == */@deepseek-ai/dsh/* || "$script" == */@deepseek-harness-tui/dsh-tui/* ) ]]; then
       REPLY=dsh; return
     fi
-    # qwen is an `env node` script too: ~/.local/bin/qwen -> @qwen-code/qwen-code.
-    if [[ "$script" != -* && ( "${script:t}" == qwen ||
-          "$script" == */@qwen-code/qwen-code/* ) ]]; then
-      REPLY=qwen; return
-    fi
   fi
   case "$prog" in
     agy) REPLY=agy ;;
@@ -165,27 +153,22 @@ detect_tool() {
     # Compatibility: recognize commands captured in pre-removal resurrect dumps.
     claude|claude-guard) REPLY=claude ;;
     codex|codexx|codex-*) REPLY=codex ;;
-    opencode|opencode-*) REPLY=opencode ;;   # Mach-O binary, argv0 = opencode
     kimi|kimi-*)         REPLY=kimi ;;        # Mach-O SEA, argv0 = kimi
     dsh|dsh-tui|dst)     REPLY=dsh ;;
-    qwen)                REPLY=qwen ;;      # direct argv0 when not node-wrapped
     node|"")
-      # node wrapper without cursor-agent: fall back to the (truncated) current command
+      # Node wrapper: fall back to the (truncated) current command
       case "$cur" in
         grok-*)  REPLY=grok ;;
         codex-*) REPLY=codex ;;
         pi|pi-*) REPLY=pi ;;
         dsh|dsh-tui|dst) REPLY=dsh ;;
-        qwen)    REPLY=qwen ;;
       esac ;;
     *)
       case "$cur" in
         grok-*)     REPLY=grok ;;
         codex-*)    REPLY=codex ;;
-        opencode)   REPLY=opencode ;;
         kimi)       REPLY=kimi ;;
         dsh|dsh-tui|dst) REPLY=dsh ;;
-        qwen)       REPLY=qwen ;;
       esac ;;
   esac
 }
@@ -204,12 +187,9 @@ coord_tool_matches() {
     pi) tag=p ;;
     grok) tag=g ;;
     claude) tag=c ;;
-    cursor) tag=r ;;
     codex) tag=x ;;
-    opencode) tag=o ;;
     kimi) tag=k ;;
     dsh) tag=d ;;
-    qwen) tag=q ;;
     *) return 1 ;;
   esac
   [[ "$recorded" == "$tag" || "$recorded" == "$detected" ]]
@@ -231,13 +211,6 @@ claude_session_exists() {
   local -a matches
   matches=("$root"/projects/*/"$sid".jsonl(N))
   (( ${#matches[@]} > 0 ))
-}
-
-# Validate content and project identity, not merely a matching filename.
-qwen_session_exists() {
-  QWEN_HOME="${coord_qwen_home:-${QWEN_HOME:-$HOME/.qwen}}" \
-  QWEN_RUNTIME_DIR="${coord_qwen_runtime:-${QWEN_RUNTIME_DIR:-}}" \
-    command python3 "$SCRIPT_DIR/../lib/qwen_sessions.py" "$1" "$2"
 }
 
 # Grok's native active-session registry can name a newly opened, unsaved session.
@@ -327,7 +300,7 @@ pi_session_id_exists() {
 # Gold-case tools begin with their session id in argv. Tools can change sessions:
 # an in-process resume/fork changes the current session without changing the launch
 # argv, so a durable current coordinate binding must supersede that stale id.
-# opencode/kimi ids are not UUIDs and only come from the coordinate snapshot.
+# Kimi session IDs come from the coordinate snapshot.
 # Sets REPLY_KIND = resume|fresh|invalid for logging.
 build_resume() {
   local tool="$1" full="$2" title="$3" coord_sid="$4" cwd="$5" id
@@ -335,7 +308,7 @@ build_resume() {
   extract_uuid "$full"; id="$REPLY"
   if [[ "$tool" == codex && -n "$coord_sid" ]] && codex_session_exists "$coord_sid"; then
     id="$coord_sid"
-  elif [[ ( "$tool" == pi || "$tool" == grok || "$tool" == dsh || "$tool" == qwen ) && -n "$coord_sid" ]]; then
+  elif [[ ( "$tool" == pi || "$tool" == grok || "$tool" == dsh ) && -n "$coord_sid" ]]; then
     # The current coordinate binding is authoritative even when that new session
     # is still empty. Check durability below without falling back to stale argv.
     id="$coord_sid"
@@ -387,9 +360,6 @@ build_resume() {
         elif pi_session_id_exists "$id"; then REPLY_KIND=invalid
         else REPLY_KIND=recreated; fi
       else REPLY="$PI_BASE"; REPLY_KIND=fresh; fi ;;
-    cursor)
-      if [[ -n "$id" ]]; then REPLY="$CURSOR_BASE --resume $id"; REPLY_KIND=resume
-      else REPLY="$CURSOR_BASE"; REPLY_KIND=fresh; fi ;;
     grok)
       if [[ -n "$id" ]]; then
         REPLY="$GROK_BASE --resume $id"
@@ -402,18 +372,6 @@ build_resume() {
         if claude_session_exists "$id"; then REPLY_KIND=resume
         else REPLY_KIND=invalid; fi
       else REPLY="$CLAUDE_BASE"; REPLY_KIND=fresh; fi ;;
-    qwen)
-      # /clear and /resume change Qwen's session without changing argv.
-      # An explicitly unavailable current binding must block the stale launch.
-      if [[ -z "$coord_sid" && ( "$coord_tool" == q || "$coord_tool" == qwen ) ]]; then
-        REPLY="$QWEN_BASE"; REPLY_KIND=invalid
-        return 0
-      fi
-      if [[ -n "$id" ]]; then
-        REPLY="$QWEN_BASE --resume $id"
-        if qwen_session_exists "$id" "$cwd"; then REPLY_KIND=resume
-        else REPLY_KIND=invalid; fi
-      else REPLY="$QWEN_BASE"; REPLY_KIND=fresh; fi ;;
     codex)
       # codex id is not in argv on a bare launch, but its pane title is usually the
       # session uuid — use that as a fallback.
@@ -423,12 +381,6 @@ build_resume() {
         if codex_session_exists "$id"; then REPLY_KIND=resume
         else REPLY_KIND=invalid; fi
       else REPLY="$CODEX_RESTORE_BASE"; REPLY_KIND=fresh; fi ;;
-    opencode)
-      # id (ses_...) comes only from the coords-snapshot (recorded by the opencode
-      # plugin on the first message). opencode --continue is global "last session",
-      # too ambiguous across panes to trust, so with no id we fall back to fresh.
-      if [[ -n "$id" ]]; then REPLY="$OPENCODE_BASE --session $id"; REPLY_KIND=resume
-      else REPLY="$OPENCODE_BASE"; REPLY_KIND=fresh; fi ;;
     kimi)
       # id from the coords-snapshot (recorded by the kimi SessionStart hook). Without
       # it, kimi --continue reliably resumes the last session FOR THIS CWD (the pane's
@@ -442,9 +394,6 @@ build_resume() {
     [[ -n "$coord_dsh_home" ]] && REPLY="DSH_HOME=${(q)coord_dsh_home} $REPLY"
   elif [[ "$tool" == codex && -n "$coord_codex_home" ]]; then
     REPLY="CODEX_HOME=${(q)coord_codex_home} $REPLY"
-  elif [[ "$tool" == qwen ]]; then
-    [[ -n "$coord_qwen_runtime" ]] && REPLY="QWEN_RUNTIME_DIR=${(q)coord_qwen_runtime} $REPLY"
-    [[ -n "$coord_qwen_home" ]] && REPLY="QWEN_HOME=${(q)coord_qwen_home} $REPLY"
   fi
 }
 
@@ -461,8 +410,6 @@ emit_plan_json() {
   AIPANE_PLAN_SID="$7" \
   AIPANE_PLAN_DSH_HOME="${coord_dsh_home:-}" \
   AIPANE_PLAN_SESSION_ROOT="${coord_session_root:-}" \
-  AIPANE_PLAN_QWEN_HOME="${coord_qwen_home:-}" \
-  AIPANE_PLAN_QWEN_RUNTIME="${coord_qwen_runtime:-}" \
   AIPANE_PLAN_CODEX_HOME="${coord_codex_home:-${CODEX_HOME:-$HOME/.codex}}" \
   AIPANE_PLAN_AGY="${coord_agy:-\{\}}" \
     command python3 -c '
@@ -479,8 +426,6 @@ print(json.dumps({
     **({"codex_home": os.environ["AIPANE_PLAN_CODEX_HOME"]} if os.environ["AIPANE_PLAN_TOOL"] == "codex" else {}),
     **({"dsh_home": os.environ["AIPANE_PLAN_DSH_HOME"], "session_root": os.environ["AIPANE_PLAN_SESSION_ROOT"]}
        if os.environ["AIPANE_PLAN_TOOL"] == "dsh" else {}),
-    **({"qwen_home": os.environ["AIPANE_PLAN_QWEN_HOME"], "qwen_runtime_dir": os.environ["AIPANE_PLAN_QWEN_RUNTIME"]}
-       if os.environ["AIPANE_PLAN_TOOL"] == "qwen" else {}),
 }, ensure_ascii=False, separators=(",", ":")))
 '
 }
@@ -491,7 +436,7 @@ log "=== ai-restore start (dump=$DUMP dryrun=$DRYRUN) ==="
 
 local line
 local -a f
-local session win pane_idx title cwd cur full tool cmd target coord_sid coord_tool resume_sid coord_dsh_home coord_session_root coord_qwen_home coord_qwen_runtime
+local session win pane_idx title cwd cur full tool cmd target coord_sid coord_tool resume_sid coord_dsh_home coord_session_root
 while IFS= read -r line; do
   [[ "$line" == pane$'\t'* ]] || continue
   f=("${(@ps:\t:)line}")
@@ -511,16 +456,13 @@ while IFS= read -r line; do
   coord_tool="${COORDS_TOOL[$target]:-}"
   coord_dsh_home="${COORDS_DSH_HOME[$target]:-}"
   coord_session_root="${COORDS_SESSION_ROOT[$target]:-}"
-  coord_qwen_home="${COORDS_QWEN_HOME[$target]:-}"
-  coord_qwen_runtime="${COORDS_QWEN_RUNTIME[$target]:-}"
   coord_agy="${COORDS_AGY[$target]:-}"
   if [[ -n "$coord_sid" ]] && ! coord_tool_matches "$tool" "$coord_tool"; then
     log "ignore $target snapshot id: detected=$tool recorded=${coord_tool:-missing}"
     coord_sid=""
     coord_dsh_home=""; coord_session_root=""
-    coord_qwen_home=""; coord_qwen_runtime=""
   fi
-  if [[ ( "$tool" == dsh || "$tool" == qwen || "$tool" == agy ) && -n "$coord_sid" && -n "${COORDS_CWD[$target]:-}" ]]; then
+  if [[ ( "$tool" == dsh || "$tool" == agy ) && -n "$coord_sid" && -n "${COORDS_CWD[$target]:-}" ]]; then
     cwd="${COORDS_CWD[$target]}"
   fi
 

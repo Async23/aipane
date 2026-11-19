@@ -143,4 +143,23 @@ if [[ "${(j:|:)received}" != '--custom|two words' ]]; then
 fi
 ZSH
 
+AIPANE_TEST_ROOT="$ROOT_DIR" zsh -df <<'ZSH'
+set -eu
+unset AIPANE_NO_SESSION_ID
+typeset -g _AIPANE_INIT_VERSION=7 _AIPANE_CORE_VERSION=5 _AIPANE_SESSION_VERSION=1
+typeset -gA _AIPANE_GOLDCASE=(p 1 g 1 c 1 r 1 q 1)
+typeset -g AIPANE_OPENCODE_LAUNCH_CMD=old AIPANE_CURSOR_LAUNCH_CMD=old AIPANE_QWEN_LAUNCH_CMD=old
+_aipane_cursor_precreate() { return 99; }
+source "$AIPANE_TEST_ROOT/init.zsh"
+if (( ${+_AIPANE_GOLDCASE} || $+functions[_aipane_cursor_precreate] ||
+      ${+AIPANE_OPENCODE_LAUNCH_CMD} || ${+AIPANE_CURSOR_LAUNCH_CMD} || ${+AIPANE_QWEN_LAUNCH_CMD} )); then
+  print -u2 "retired launcher state survived a version reload"
+  exit 1
+fi
+for tool in p g c; do
+  _aipane_prepare_launch "$tool"
+  [[ -n "$REPLY_SID" && "$REPLY" == *" --session-id $REPLY_SID" ]]
+done
+ZSH
+
 print "init reload tests passed"

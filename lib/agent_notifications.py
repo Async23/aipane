@@ -30,7 +30,6 @@ __all__ = (
 
 
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
-_CURSOR_TRANSCRIPT_TAIL_BYTES = 8 * 1024 * 1024
 _CLAUDE_TRANSCRIPT_TAIL_BYTES = 8 * 1024 * 1024
 _GROK_TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024
 COMPLETION_SOUNDS = ("Glass", "Ping", "Pop", "Purr", "Submarine", "Tink")
@@ -123,8 +122,6 @@ class MacOSNotificationAdapter:
         self.run_command = run_command
 
     def deliver(self, agent: str, notification: Notification) -> str:
-        if agent == "cursor":
-            return self._deliver_cursor(notification)
         if agent == "claude":
             return self._deliver_claude(notification)
         if agent == "grok":
@@ -143,43 +140,6 @@ class MacOSNotificationAdapter:
                 args.extend(["-execute", notification.action])
             return "custom-app" if _executable(notifier) and self._run(args, timeout=10) else "failed"
         raise ValueError(f"unsupported notification agent: {agent}")
-
-    def _deliver_cursor(self, notification: Notification) -> str:
-        app = self.home / "Applications" / "Cursor Agent Notifier.app"
-        notifier = app / "Contents" / "MacOS" / "terminal-notifier"
-        icon = app / "Contents" / "Resources" / "CursorAgent.icns"
-        args = [
-            "-title",
-            notification.title,
-            "-message",
-            notification.body,
-            "-sound",
-            notification.sound,
-            "-group",
-            notification.group,
-            "-ignoreDnD",
-        ]
-        if notification.subtitle:
-            args.extend(["-subtitle", notification.subtitle])
-        if icon.is_file():
-            args.extend(["-appIcon", icon.resolve().as_uri()])
-        if notification.action:
-            args.extend(["-execute", notification.action])
-        if _executable(notifier) and self._run([str(notifier), *args], timeout=5):
-            return "custom-app"
-
-        fallback = Path("/opt/homebrew/bin/terminal-notifier")
-        if _executable(fallback) and self._run(
-            [
-                str(fallback),
-                *args,
-                "-sender",
-                "com.alfheim.cursor-cli-notifier",
-            ],
-            timeout=5,
-        ):
-            return "terminal-notifier"
-        return "failed"
 
     def _deliver_claude(self, notification: Notification) -> str:
         notifier = (
@@ -479,9 +439,8 @@ class AgentNotifications:
         normalized = dict(payload) if isinstance(payload, Mapping) else {}
         if agent == "agy":
             return self._handle_agy(normalized, preview=preview)
-        if agent == "cursor":
-            notification = self._cursor_notification(normalized)
-        elif agent == "claude":
+        if agent == "claude":
+            # Other CLIs can import Claude hooks without owning a Claude session.
             if any(
                 self.environment.get(name)
                 for name in (
@@ -604,9 +563,7 @@ class AgentNotifications:
                 reason="",
             )
         channel = self.adapter.deliver(agent, notification)
-        if agent == "cursor":
-            self._write_cursor_log(normalized, notification, channel)
-        elif agent == "claude":
+        if agent == "claude":
             self._write_claude_log(normalized, notification, channel)
         elif agent == "kimi":
             self._write_kimi_log(notification, channel)
@@ -687,56 +644,6 @@ class AgentNotifications:
             stream.write(json.dumps({"at": time.time(), "event": event, "group": group,
                                      "session_id": payload["session_id"], "pane": target[2], "channel": channel}) + "\n")
         return NotificationResult(outcome="failed" if failed else "delivered", notification=notification, channel=channel)
-
-    def _cursor_notification(self, payload: dict[str, object]) -> Notification:
-        status = _compact(payload.get("status") or "completed").lower()
-        transcript_path = (
-            payload.get("transcript_path")
-            or self.environment.get("CURSOR_TRANSCRIPT_PATH")
-            or ""
-        )
-        prompt, response = _cursor_transcript_messages(transcript_path)
-        project_dir = _cursor_project_directory(payload, self.environment)
-        title = _project_title(project_dir, "Cursor Agent")
-        subtitle = _short_text(_first_plain_line(prompt), 80, "…")
-        if status == "completed":
-            body = (
-                _short_text(_first_plain_line(response), 140, "…")
-                or "当前任务已执行完成。"
-            )
-        elif status == "aborted":
-            body = "任务已中止。"
-        else:
-            body = (
-                _short_text(_first_plain_line(response), 140, "…")
-                or "任务执行出错。"
-            )
-        conversation_id = _compact(
-            payload.get("conversation_id")
-            or payload.get("session_id")
-            or "cursor"
-        )
-        digest = hashlib.sha1(conversation_id.encode("utf-8")).hexdigest()[:12]
-        action = ""
-        cursor_home = Path(
-            self.environment.get("CURSOR_CONFIG_DIR")
-            or Path(self.environment.get("HOME", str(Path.home()))) / ".cursor"
-        ).expanduser()
-        focus_script = cursor_home / "hooks" / "cursor-focus-tmux.sh"
-        if focus_script.is_file():
-            target = _tmux_focus_target(self.environment)
-            if any(target):
-                action = shlex.join([str(focus_script), *target])
-        return Notification(
-            title=title,
-            subtitle=subtitle,
-            body=body,
-            sound=self.environment.get("CURSOR_NOTIFY_SOUND", "").strip()
-            or self.choose_sound(COMPLETION_SOUNDS),
-            event=str(payload.get("hook_event_name") or "stop"),
-            group=f"cursor-agent-turn-{digest}",
-            action=action,
-        )
 
     def _dsh_notification(self, payload: Mapping[str, object]) -> Notification | None:
         event = payload.get("event")
@@ -907,33 +814,6 @@ class AgentNotifications:
             )
             with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
-        except OSError:
-            pass
-
-    def _write_cursor_log(
-        self,
-        payload: Mapping[str, object],
-        notification: Notification,
-        channel: str,
-    ) -> None:
-        cursor_home = Path(
-            self.environment.get("CURSOR_CONFIG_DIR")
-            or Path(self.environment.get("HOME", str(Path.home()))) / ".cursor"
-        ).expanduser()
-        path = cursor_home / "hooks" / "cursor-notify.log"
-        record = {
-            "ts": time.time(),
-            "event": payload.get("hook_event_name") or "stop",
-            "status": _compact(payload.get("status") or "completed").lower(),
-            "conversation_id": payload.get("conversation_id")
-            or payload.get("session_id"),
-            "project_dir": _cursor_project_directory(payload, self.environment),
-            "channel": channel,
-        }
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         except OSError:
             pass
 
@@ -2737,68 +2617,6 @@ def _clean_user_prompt(value: object) -> str:
         flags=re.IGNORECASE | re.DOTALL,
     )
     return (matches[-1] if matches else text).strip()
-
-
-def _cursor_transcript_messages(path_value: object) -> tuple[str, str]:
-    if not isinstance(path_value, str) or not path_value.strip():
-        return "", ""
-    path = Path(path_value).expanduser()
-    if not path.is_file():
-        return "", ""
-    try:
-        with path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            end = handle.tell()
-            start = max(0, end - _CURSOR_TRANSCRIPT_TAIL_BYTES)
-            handle.seek(start)
-            data = handle.read()
-    except OSError:
-        return "", ""
-    if start:
-        newline = data.find(b"\n")
-        if newline < 0:
-            return "", ""
-        data = data[newline + 1 :]
-    user_message = ""
-    assistant_message = ""
-    for raw_line in reversed(data.splitlines()):
-        try:
-            item = json.loads(raw_line.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if not isinstance(item, dict):
-            continue
-        role = str(item.get("role") or item.get("type") or "").lower()
-        text = _content_text(item.get("message", item)).strip()
-        if not text:
-            continue
-        if role in {"assistant", "agent"} and not assistant_message:
-            assistant_message = text
-        elif role in {"user", "human"} and not user_message:
-            user_message = _clean_user_prompt(text)
-        if user_message and assistant_message:
-            break
-    return user_message, assistant_message
-
-
-def _cursor_project_directory(
-    payload: Mapping[str, object],
-    environment: Mapping[str, str],
-) -> str:
-    for value in (
-        environment.get("CURSOR_PROJECT_DIR"),
-        environment.get("CLAUDE_PROJECT_DIR"),
-        payload.get("cwd"),
-        payload.get("workspace"),
-    ):
-        if isinstance(value, str) and value.strip():
-            return str(Path(value).expanduser())
-    roots = payload.get("workspace_roots")
-    if isinstance(roots, list):
-        for root in roots:
-            if isinstance(root, str) and root.strip():
-                return str(Path(root).expanduser())
-    return ""
 
 
 def _project_title(directory: str, fallback: str) -> str:

@@ -25,10 +25,9 @@ fallback delivery paths use the same sound.
 | 1 | Codex | `bin/aipane-codex-notify` delegates to `bin/aipane-codex-desktop-notify` | `CODEX_NOTIFY_SOUND` |
 | 2 | Grok Build | `bin/aipane-grok-notify` | `GROK_NOTIFY_SOUND` |
 | 3 | Claude Code | `bin/aipane-claude-notify` | `CLAUDE_NOTIFY_SOUND` |
-| 4 | Cursor Agent | `bin/aipane-cursor-notify` | `CURSOR_NOTIFY_SOUND` |
-| 5 | Kimi Code | `bin/aipane-kimi-notify` | — |
-| 6 | dsh-TUI / dsh Web | [`bin/aipane-dsh-notify`](../bin/aipane-dsh-notify) ([installation](dsh-notifications.md)) | — |
-| 7 | Antigravity CLI | [`bin/aipane-agy`](../bin/aipane-agy) ([installation](antigravity-integration.md)) | — |
+| 4 | Kimi Code | `bin/aipane-kimi-notify` | — |
+| 5 | dsh-TUI / dsh Web | [`bin/aipane-dsh-notify`](../bin/aipane-dsh-notify) ([installation](dsh-notifications.md)) | — |
+| 6 | Antigravity CLI | [`bin/aipane-agy`](../bin/aipane-agy) ([installation](antigravity-integration.md)) | — |
 
 Kimi Code's selected notification icon is **04 / 雾蓝**. Its tracked
 [SVG](../native/icons/kimi-code.svg) keeps the official Kimi geometry and adds
@@ -73,8 +72,7 @@ disable `Notification` hooks. See the [Claude hooks reference](https://code.clau
 Notifications run asynchronously, including when the terminal is focused.
 They retain `Claude Code Notifier.app` and the existing focus script at
 `~/.claude/hooks/focus-tmux.sh`; clicking targets the original session/window/pane
-and activates Ghostty. Each session has separate notification groups. Imported
-Cursor/Grok hooks, Claude Desktop sessions, and events identified as subagents
+and activates Ghostty. Each session has separate notification groups. Hooks imported by another CLI, Claude Desktop sessions, and events identified as subagents
 are ignored.
 The sender uses `UNUserNotificationCenter` with Bundle ID
 `com.alfheim.claude-code-notifier.v2` and the original Claude bundle icon in

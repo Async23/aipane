@@ -37,7 +37,6 @@ from recovery_plan import (GUARD_FIELDS, TOOL_TAGS, RecoveryPlanError, load_seal
 from recovery_state import PendingStore, recovery_id
 from codex_sessions import session_loaded as codex_session_loaded, session_writers
 from dsh_sessions import current_session as dsh_current_session, matches_session as dsh_matches_session, is_dsh_command_line
-from qwen_sessions import current_session as qwen_current_session, session_loaded as qwen_session_loaded
 
 
 SHELL_COMMANDS = {
@@ -135,22 +134,12 @@ def command_matches(
         return command == "grok" or command.startswith("grok-")
     if tool == "claude":
         return command in {"claude", "claude-guard"}
-    if tool == "cursor":
-        return command == "cursor-agent" or (
-            allow_ambiguous_node and command == "node"
-        )
     if tool == "codex":
         return command in {"codex", "codexx"} or command.startswith("codex-")
-    if tool == "opencode":
-        return command == "opencode" or command.startswith("opencode-")
     if tool == "kimi":
         return command == "kimi" or command.startswith("kimi-")
     if tool == "dsh":
         return command in {"dsh", "dsh-tui", "dst"} or (
-            allow_ambiguous_node and command == "node"
-        )
-    if tool == "qwen":
-        return command == "qwen" or (
             allow_ambiguous_node and command == "node"
         )
     return False
@@ -612,8 +601,6 @@ class RestoreExecutor:
             return False
         if item["tool"] == "dsh":
             return self.dsh_ready(item)
-        if item["tool"] == "qwen":
-            return self.qwen_ready(item)
         if item["tool"] == "claude" and self.claude_resume_matches(item):
             return True
         foreground = self.tmux.foreground_command(item["target"])
@@ -664,25 +651,6 @@ class RestoreExecutor:
             cwd=item["cwd"], dsh_home=item.get("dsh_home", ""), session_root=item.get("session_root", ""),
         )
 
-    def qwen_ready(self, item: dict[str, Any]) -> bool:
-        tty = self.tmux.run("display-message", "-p", "-t", item["target"], "#{pane_tty}")
-        if tty.returncode:
-            return False
-        environment = self.environment.copy()
-        for key, variable in (("qwen_home", "QWEN_HOME"), ("qwen_runtime_dir", "QWEN_RUNTIME_DIR")):
-            if item.get(key):
-                environment[variable] = item[key]
-        sid = item.get("sid", "")
-        if not sid and item["kind"] == "fresh":
-            # AI_RESTORE_FRESH explicitly opts into opening a new session.
-            # It still needs native identity, but has no saved ID to match.
-            current = qwen_current_session(pane_tty=tty.stdout.strip(), environment=environment)
-            sid = (current or {}).get("session_id", "")
-        return qwen_session_loaded(
-            pane_tty=tty.stdout.strip(), sid=sid,
-            cwd=item["cwd"], environment=environment,
-        )
-
     def agy_ready(self, item: dict[str, Any]) -> bool:
         from agy_sessions import current_session, recovery_metadata
         identity = self.tmux.pane_identity(item["target"])
@@ -720,9 +688,7 @@ class RestoreExecutor:
             return None, "pane disappeared"
         matches_existing = self.existing_tool_matches(item, current)
         if interrupt_running and self.tool_running(item, current):
-            if item["tool"] == "qwen":
-                return None, "Qwen process left running; recovery pending"
-            elif item["tool"] == "dsh" and current == "node":
+            if item["tool"] == "dsh" and current == "node":
                 # A retry may see another Node program occupying this pane.
                 # Missing readiness is not authority to interrupt arbitrary node.
                 matches_existing = matches_existing or is_dsh_command_line(self.tmux.foreground_command(target))
@@ -864,15 +830,6 @@ class RestoreExecutor:
                         ready = stable_for >= self.verify_stability and self.dsh_ready(item)
                     elif item["tool"] == "agy":
                         ready = stable_for >= self.verify_stability and self.agy_ready(item)
-                    elif item["tool"] == "qwen":
-                        if not self.qwen_ready(item):
-                            attempt.ready_since = None
-                        elif attempt.ready_since is None:
-                            attempt.ready_since = time.monotonic()
-                        ready = (
-                            attempt.ready_since is not None
-                            and time.monotonic() - attempt.ready_since >= self.verify_stability
-                        )
                     elif item["tool"] == "codex":
                         if not codex_loaded:
                             attempt.ready_since = None
@@ -912,14 +869,7 @@ class RestoreExecutor:
                     continue
 
                 if now >= deadlines[identifier]:
-                    if item["tool"] == "qwen" and attempt.seen_running:
-                        blocked[identifier] = (
-                            "Qwen has not confirmed the requested session in its runtime records; "
-                            "left running, recovery pending"
-                        )
-                        active.pop(identifier)
-                        continue
-                    elif item["tool"] == "codex" and attempt.seen_running:
+                    if item["tool"] == "codex" and attempt.seen_running:
                         blocked[identifier] = (
                             "Codex has not opened the requested conversation for writing; "
                             "left running, recovery pending"
@@ -1138,10 +1088,6 @@ class RestoreExecutor:
                 raise RestoreExecutionError(
                     f"dsh selected session changed for {item['target']}; refresh the restart plan"
                 )
-            if item["tool"] == "qwen" and not self.qwen_ready(item):
-                raise RestoreExecutionError(
-                    f"Qwen runtime identity could not be verified for {item['target']}; refresh the restart plan"
-                )
             if item["tool"] == "agy" and not self.agy_ready(item):
                 raise RestoreExecutionError(f"Antigravity selected session changed in {item['target']}; refresh the restart plan")
 
@@ -1218,8 +1164,6 @@ class RestoreExecutor:
                 error = "pane guard changed immediately before respawn"
             elif planned["tool"] == "dsh" and not self.dsh_ready(planned):
                 error = "dsh selected session changed immediately before respawn; refresh the restart plan"
-            elif planned["tool"] == "qwen" and not self.qwen_ready(planned):
-                error = "Qwen runtime identity could not be verified immediately before respawn; refresh the restart plan"
             elif planned["tool"] == "agy" and not self.agy_ready(planned):
                 error = "Antigravity selected session changed immediately before respawn; refresh the restart plan"
             else:

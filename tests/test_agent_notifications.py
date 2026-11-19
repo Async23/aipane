@@ -65,101 +65,11 @@ class AgentNotificationsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.home = Path(self.temp_dir.name)
-        self.project = self.home / "cursor-project"
+        self.project = self.home / "sample-project"
         self.project.mkdir()
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
-
-    def test_cursor_completion_is_normalized_and_delivered(self) -> None:
-        transcript = self.home / "cursor-transcript.jsonl"
-        transcript.write_text(
-            "\n".join(
-                (
-                    json.dumps(
-                        {
-                            "role": "user",
-                            "message": {
-                                "content": "<user_query>Refactor notifications</user_query>"
-                            },
-                        }
-                    ),
-                    json.dumps(
-                        {
-                            "role": "assistant",
-                            "message": {
-                                "content": "## Implemented the shared module.\nMore detail."
-                            },
-                        }
-                    ),
-                )
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        environment = os.environ.copy()
-        environment.update(
-            {
-                "HOME": str(self.home),
-                "CURSOR_CONFIG_DIR": str(self.home / ".cursor"),
-                "CURSOR_NOTIFY_SOUND": "Ping",
-                "TMUX_PANE": "",
-            }
-        )
-        delivery = InMemoryNotificationAdapter()
-        notifications = AgentNotifications(
-            adapter=delivery,
-            environment=environment,
-        )
-
-        result = notifications.handle(
-            "cursor",
-            {
-                "status": "completed",
-                "conversation_id": "conversation-1",
-                "cwd": str(self.project),
-                "transcript_path": str(transcript),
-            },
-        )
-
-        self.assertEqual(result.outcome, "delivered")
-        self.assertEqual(
-            result.notification.as_dict(),
-            {
-                "title": "cursor-project",
-                "subtitle": "Refactor notifications",
-                "body": "Implemented the shared module.",
-                "sound": "Ping",
-                "event": "stop",
-                "group": "cursor-agent-turn-51cf7676896a",
-                "action": "",
-                "category": "main",
-            },
-        )
-        self.assertEqual(delivery.deliveries, [("cursor", result.notification)])
-
-    def test_cursor_completion_chooses_one_shared_pool_sound(self) -> None:
-        environment = os.environ.copy()
-        environment.update(
-            {
-                "HOME": str(self.home),
-                "CURSOR_CONFIG_DIR": str(self.home / ".cursor"),
-                "TMUX_PANE": "",
-            }
-        )
-        environment.pop("CURSOR_NOTIFY_SOUND", None)
-        notifications = AgentNotifications(
-            adapter=InMemoryNotificationAdapter(),
-            environment=environment,
-            choose_sound=lambda sounds: "Purr",
-        )
-
-        result = notifications.handle(
-            "cursor",
-            {"status": "completed", "cwd": str(self.project)},
-        )
-
-        self.assertEqual(result.notification.sound, "Purr")
 
     def test_preview_is_read_only(self) -> None:
         delivery = InMemoryNotificationAdapter()
@@ -167,110 +77,21 @@ class AgentNotificationsTests(unittest.TestCase):
             adapter=delivery,
             environment={
                 "HOME": str(self.home),
-                "CURSOR_NOTIFY_SOUND": "Ping",
+                "CLAUDE_NOTIFY_SOUND": "Ping",
                 "TMUX_PANE": "",
             },
         )
 
         result = notifications.handle(
-            "cursor",
-            {"status": "aborted", "cwd": str(self.project)},
+            "claude",
+            {"last_assistant_message": "Preview completed.", "cwd": str(self.project)},
             preview=True,
         )
 
         self.assertEqual(result.outcome, "previewed")
-        self.assertEqual(result.notification.body, "任务已中止。")
+        self.assertEqual(result.notification.body, "Preview completed.")
+        self.assertFalse((self.home / ".claude").exists())
         self.assertEqual(delivery.deliveries, [])
-
-    def test_cursor_delivery_uses_its_dedicated_notifier(self) -> None:
-        notifier = (
-            self.home
-            / "Applications"
-            / "Cursor Agent Notifier.app"
-            / "Contents"
-            / "MacOS"
-            / "terminal-notifier"
-        )
-        notifier.parent.mkdir(parents=True)
-        notifier.write_text(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$DELIVERY_LOG\"\n",
-            encoding="utf-8",
-        )
-        notifier.chmod(0o755)
-        delivery_log = self.home / "delivery.log"
-        environment = os.environ.copy()
-        environment.update(
-            {
-                "HOME": str(self.home),
-                "CURSOR_CONFIG_DIR": str(self.home / ".cursor"),
-                "CURSOR_NOTIFY_SOUND": "Ping",
-                "DELIVERY_LOG": str(delivery_log),
-                "TMUX_PANE": "",
-            }
-        )
-        notifications = AgentNotifications(
-            adapter=MacOSNotificationAdapter(environment=environment),
-            environment=environment,
-        )
-
-        result = notifications.handle(
-            "cursor",
-            {
-                "status": "aborted",
-                "conversation_id": "conversation-1",
-                "cwd": str(self.project),
-            },
-        )
-
-        self.assertEqual(result.outcome, "delivered")
-        self.assertEqual(result.channel, "custom-app")
-        self.assertEqual(
-            delivery_log.read_text(encoding="utf-8").splitlines(),
-            [
-                "-title",
-                "cursor-project",
-                "-message",
-                "任务已中止。",
-                "-sound",
-                "Ping",
-                "-group",
-                "cursor-agent-turn-51cf7676896a",
-                "-ignoreDnD",
-            ],
-        )
-
-    def test_cursor_notification_keeps_its_tmux_focus_action(self) -> None:
-        cursor_home = self.home / ".cursor"
-        focus = cursor_home / "hooks" / "cursor-focus-tmux.sh"
-        focus.parent.mkdir(parents=True)
-        focus.write_text("#!/bin/sh\n", encoding="utf-8")
-        fake_tmux = self.home / "tmux"
-        fake_tmux.write_text(
-            "#!/bin/sh\nprintf 'main\\t@4\\t%%9\\t12\\n'\n",
-            encoding="utf-8",
-        )
-        fake_tmux.chmod(0o755)
-        environment = os.environ.copy()
-        environment.update(
-            {
-                "HOME": str(self.home),
-                "CURSOR_CONFIG_DIR": str(cursor_home),
-                "CURSOR_NOTIFY_SOUND": "Ping",
-                "TMUX_PANE": "%9",
-                "AIPANE_TMUX": str(fake_tmux),
-            }
-        )
-        notifications = AgentNotifications(
-            adapter=InMemoryNotificationAdapter(),
-            environment=environment,
-        )
-
-        result = notifications.handle("cursor", {"status": "completed"})
-
-        self.assertEqual(
-            result.notification.action,
-            f"{focus} main @4 %9 12",
-        )
 
     def test_claude_completion_is_normalized_and_delivered(self) -> None:
         environment = os.environ.copy()
@@ -299,7 +120,7 @@ class AgentNotificationsTests(unittest.TestCase):
         self.assertEqual(
             result.notification.as_dict(),
             {
-                "title": "cursor-project",
+                "title": "sample-project",
                 "subtitle": "任务完成",
                 "body": "Implemented Claude notifications.",
                 "sound": "Tink",
@@ -381,7 +202,7 @@ class AgentNotificationsTests(unittest.TestCase):
             delivery_log.read_text(encoding="utf-8").splitlines(),
             [
                 "-title",
-                "cursor-project",
+                "sample-project",
                 "-subtitle",
                 "任务完成",
                 "-message",
@@ -423,7 +244,7 @@ class AgentNotificationsTests(unittest.TestCase):
         self.assertEqual(
             result.notification.as_dict(),
             {
-                "title": "cursor-project",
+                "title": "sample-project",
                 "subtitle": "Refactor notifications",
                 "body": "Grok finished.",
                 "sound": "Ping",
@@ -598,7 +419,7 @@ class AgentNotificationsTests(unittest.TestCase):
             delivery_log.read_text(encoding="utf-8").splitlines(),
             [
                 "-title",
-                "cursor-project",
+                "sample-project",
                 "-subtitle",
                 "Refactor notifications",
                 "-message",
@@ -642,7 +463,7 @@ class AgentNotificationsTests(unittest.TestCase):
         self.assertEqual(
             result.notification.as_dict(),
             {
-                "title": "cursor-project",
+                "title": "sample-project",
                 "subtitle": "Refactor notifications",
                 "body": "Codex finished.",
                 "sound": "Pop",
@@ -969,7 +790,7 @@ class AgentNotificationsTests(unittest.TestCase):
         self.assertEqual(result.notification.category, "goal")
         self.assertEqual(
             result.notification.title,
-            "cursor-project · Goal 执行中",
+            "sample-project · Goal 执行中",
         )
         self.assertEqual(
             result.notification.subtitle,
@@ -1081,7 +902,7 @@ class AgentNotificationsTests(unittest.TestCase):
 
         self.assertEqual(result.outcome, "delivered")
         self.assertEqual(result.notification.title, "Kimi task · 等待确认")
-        self.assertEqual(result.notification.subtitle, "cursor-project")
+        self.assertEqual(result.notification.subtitle, "sample-project")
         self.assertEqual(result.notification.body, "Run project tests")
         self.assertEqual(result.notification.sound, "default")
         self.assertEqual(

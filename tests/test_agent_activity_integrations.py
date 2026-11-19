@@ -354,18 +354,11 @@ class AgentActivityIntegrationTests(unittest.TestCase):
                     capture_output=True, check=False,
                 )
 
-    def test_standard_hook_fragments_implement_turn_level_contract(self):
-        for tool in ("grok", "qwen"):
-            with self.subTest(tool=tool):
-                hooks = self.load_json_hooks(tool)
-                self.assert_nested_event(hooks, "UserPromptSubmit", BUSY_COMMAND)
-                for event in ("SessionStart", "Stop", "SessionEnd"):
-                    self.assert_nested_event(hooks, event, IDLE_COMMAND)
-
-        for tool in ("grok", "qwen"):
-            with self.subTest(tool=tool, event="StopFailure"):
-                hooks = self.load_json_hooks(tool)
-                self.assert_nested_event(hooks, "StopFailure", IDLE_COMMAND)
+    def test_grok_hook_fragment_implements_turn_level_contract(self):
+        hooks = self.load_json_hooks("grok")
+        self.assert_nested_event(hooks, "UserPromptSubmit", BUSY_COMMAND)
+        for event in ("SessionStart", "Stop", "StopFailure", "SessionEnd"):
+            self.assert_nested_event(hooks, event, IDLE_COMMAND)
 
     def test_codex_does_not_report_idle_from_the_blockable_stop_hook(self):
         hooks = self.load_json_hooks("codex")
@@ -770,14 +763,6 @@ class AgentActivityIntegrationTests(unittest.TestCase):
         session_end_hook = hooks["SessionEnd"][0]["hooks"][0]
         self.assertEqual(session_end_hook["timeout"], 3)
 
-    def test_cursor_hook_fragment_implements_turn_level_contract(self):
-        hooks = self.load_json_hooks("cursor")
-
-        self.assertEqual(hooks["sessionStart"][0]["command"], IDLE_COMMAND)
-        self.assertEqual(hooks["beforeSubmitPrompt"][0]["command"], BUSY_COMMAND)
-        self.assertEqual(hooks["stop"][0]["command"], IDLE_COMMAND)
-        self.assertEqual(hooks["sessionEnd"][0]["command"], IDLE_COMMAND)
-
     def test_kimi_turn_started_hook_covers_non_user_turn_origins(self):
         path = INTEGRATIONS / "kimi" / "hooks.toml"
         hooks = tomllib.loads(path.read_text(encoding="utf-8"))["hooks"]
@@ -789,17 +774,6 @@ class AgentActivityIntegrationTests(unittest.TestCase):
             self.assertEqual(commands[event], IDLE_COMMAND)
         self.assertNotIn("PermissionRequest", commands)
         self.assertNotIn("PermissionResult", commands)
-
-    def test_opencode_adapter_owns_binding_and_activity_translation(self):
-        path = INTEGRATIONS / "opencode" / "aipane-bind.js"
-        source = path.read_text(encoding="utf-8")
-
-        self.assertIn('["report", state, "--pane", pane]', source)
-        self.assertIn('"/.local/bin/aipane-activity"', source)
-        self.assertIn('"chat.message"', source)
-        self.assertIn('event.type === "session.status"', source)
-        self.assertIn('event.type === "session.idle"', source)
-        self.assertIn('event.type === "session.error"', source)
 
     def test_renderer_has_no_terminal_title_activity_input(self):
         script = WINDOW_WRAP.read_text(encoding="utf-8")

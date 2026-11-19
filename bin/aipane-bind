@@ -39,6 +39,10 @@ done
 
 [[ -n "$sid"  ]] || { print -u2 "aipane-bind: --sid required"; exit 2; }
 [[ -n "$pane" ]] || { print -u2 "aipane-bind: no pane (set --pane or run inside tmux)"; exit 0; }
-[[ -n "$tool" ]] || tool="?"
+case "$tool" in
+  [cxdgpka]|claude|codex|dsh|grok|pi|kimi|agy) ;;
+  ""|"?") tool="?" ;;  # Untagged manual bindings carry no recovery authority.
+  *) print -u2 "aipane-bind: unknown tool '$tool'"; exit 2 ;;
+esac
 
 _aipane_registry_record "$pane" "$tool" "$sid" "$cmd"

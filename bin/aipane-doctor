@@ -30,19 +30,12 @@ CONFIG_PATHS = (
     ".codex/hooks.json",
     ".codex/config.toml",
     ".claude/settings.json",
-    ".cursor/hooks.json",
     ".kimi-code/config.toml",
-    ".qwen/settings.json",
-    ".config/opencode/plugins/aipane-bind.js",
 )
 KNOWN_REGISTRATION_LINKS = (
     (
         ".grok/hooks/aipane-activity.json",
         "integrations/grok/hooks.json",
-    ),
-    (
-        ".config/opencode/plugins/aipane-bind.js",
-        "integrations/opencode/aipane-bind.js",
     ),
 )
 DSH_PROFILE_AUDITOR = Path(__file__).resolve().parents[1] / "lib/dsh_profile_audit.mjs"

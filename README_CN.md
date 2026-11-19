@@ -36,7 +36,7 @@ git -C ~/.aipane pull --ff-only
 - macOS 和 zsh
 - Claude Code：供 `ai` 的 `c` 工具使用（不用 `c` 时可省略）
 - tmux：供多工具 `ai` 调用，以及使用 `--new` 或 `--layout` 时使用
-- 其他 `ai` 工具对应的可选 CLI：Codex、dsh-TUI（`dsh-tui`）、Grok、OpenCode、Cursor CLI、Qwen Code（`qwen`）、Pi（`pi`）、Kimi Code（`kimi`）或 Antigravity CLI（`agy`）
+- 其他 `ai` 工具对应的可选 CLI：Codex、dsh-TUI（`dsh-tui`）、Grok、Pi（`pi`）、Kimi Code（`kimi`）或 Antigravity CLI（`agy`）
 
 `ai x` 这类单工具调用默认在当前 shell 中运行；未使用 `--new` 或 `--layout` 时不依赖 tmux。
 
@@ -137,9 +137,6 @@ export AIPANE_CLAUDE_LAUNCH_CMD="claude --dangerously-skip-permissions"
 export AIPANE_CODEX_LAUNCH_CMD="codex --yolo"
 export AIPANE_DSH_LAUNCH_CMD="dsh-tui"
 export AIPANE_GROK_LAUNCH_CMD="grok --always-approve"
-export AIPANE_OPENCODE_LAUNCH_CMD="opencode"
-export AIPANE_CURSOR_LAUNCH_CMD="cursor-agent --force"
-export AIPANE_QWEN_LAUNCH_CMD="qwen --yolo"
 export AIPANE_PI_LAUNCH_CMD="pi"
 export AIPANE_KIMI_LAUNCH_CMD="kimi --auto"
 export AIPANE_AGY_LAUNCH_CMD="agy"
@@ -160,9 +157,6 @@ export AIPANE_AGY_LAUNCH_CMD="agy"
 | `x` | Codex | `codex --yolo` |
 | `d` | dsh-TUI | `dsh-tui` |
 | `g` | Grok | `grok --always-approve` |
-| `o` | OpenCode | `opencode` |
-| `r` | Cursor | `cursor-agent --force` |
-| `q` | Qwen Code | `qwen --yolo` |
 | `p` | Pi | `pi` |
 | `k` | Kimi Code | `kimi --auto` |
 | `a` | Antigravity CLI | `agy` |
@@ -176,9 +170,9 @@ ai x -- --help                            # 把类似 ai 选项的参数传给�
 ai --new x resume <session-id>            # 在新的 tmux 窗口或会话中运行
 
 ai cxdg                                   # 每个字符对应一个窗格
-ai cxr                                    # 交互选择三窗格布局
-ai cxr --layout main-right                # 跳过三窗格布局选择
-ai -l columns cxr
+ai cxp                                    # 交互选择三窗格布局
+ai cxp --layout main-right                # 跳过三窗格布局选择
+ai -l columns cxp
 ai --new cxdg
 ai cc                                     # 重复的键会启动重复的工具
 ```
@@ -274,15 +268,13 @@ killrod --dry-run
 │   ├── tmux-workstation.conf
 │   └── tmux-window-wrap.conf
 ├── integrations/            # AI Tool Agent Activity Adapter
+│   ├── antigravity/
 │   ├── claude/
 │   ├── codex/
-│   ├── cursor/
 │   ├── dsh/
 │   ├── grok/
 │   ├── kimi/
-│   ├── opencode/
-│   ├── pi/
-│   └── qwen/
+│   └── pi/
 ├── docs/
 │   ├── agent-notifications.md
 │   ├── cheatsheet.md

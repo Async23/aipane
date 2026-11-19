@@ -28,11 +28,6 @@ NOTIFIERS = (
         "CLAUDE_NOTIFY_DRY_RUN",
         "CLAUDE_NOTIFY_SOUND",
     ),
-    (
-        ROOT / "bin" / "aipane-cursor-notify",
-        "CURSOR_NOTIFY_DRY_RUN",
-        "CURSOR_NOTIFY_SOUND",
-    ),
 )
 
 
@@ -56,7 +51,6 @@ class AgentNotificationSoundTests(unittest.TestCase):
             {
                 "HOME": str(self.home),
                 "CODEX_HOME": str(self.home / ".codex"),
-                "CURSOR_CONFIG_DIR": str(self.home / ".cursor"),
                 "TMUX_PANE": "",
                 dry_run_variable: "1",
             }

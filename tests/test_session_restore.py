@@ -47,6 +47,21 @@ class SessionRestoreTests(unittest.TestCase):
                         self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual(result.stdout.strip(), "")
 
+    def test_retired_tools_in_existing_dumps_are_skipped_even_with_fresh_restore(self):
+        for tag, current, command in [
+            ("o", "opencode", "opencode --session old"),
+            ("r", "node", "node /opt/cursor-agent/index.js --resume old"),
+            ("q", "node", "node /opt/@qwen-code/qwen-code/cli.js --resume old"),
+        ]:
+            with self.subTest(tag=tag), tempfile.TemporaryDirectory() as directory:
+                result = self.run_restore(
+                    Path(directory), coord={"sid": FOREIGN_SID, "tool": tag},
+                    title=FOREIGN_SID, saved_codex_ids=set(), current_command=current,
+                    full_command=command, plan_json=True, extra_env={"AI_RESTORE_FRESH": "1"},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "")
+
     def test_unbound_coordinates_cannot_override_an_older_dump(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             result = self.run_restore(
@@ -463,126 +478,6 @@ class SessionRestoreTests(unittest.TestCase):
             self.assertTrue(plan["restorable"])
             self.assertEqual(plan["command"],
                              f"AIPANE_AUTO_RESUME=1 /tmp/claude-window --dangerously-skip-permissions --resume {FOREIGN_SID}")
-
-    def qwen_home(self, tmp: Path, *, transcript_exists: bool) -> Path:
-        home = tmp / "qwen"
-        import re
-        chats = home / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", str(tmp)) / "chats"
-        chats.mkdir(parents=True)
-        if transcript_exists:
-            (chats / f"{FOREIGN_SID}.jsonl").write_text(json.dumps({
-                "uuid": "message-1", "parentUuid": None, "type": "user",
-                "sessionId": FOREIGN_SID, "cwd": str(tmp),
-                "message": {"role": "user", "parts": [{"text": "Saved turn"}]},
-            }) + "\n")
-        return home
-
-    def test_qwen_current_binding_supersedes_launch_id(self):
-        for argv in (f"qwen --session-id {VALID_PI_SID}", "qwen --model custom"):
-            with self.subTest(argv=argv), tempfile.TemporaryDirectory() as raw:
-                tmp = Path(raw)
-                home = self.qwen_home(tmp, transcript_exists=True)
-                result = self.run_restore(
-                    tmp, coord={"sid": FOREIGN_SID, "tool": "q"},
-                    title="qwen", saved_codex_ids=set(), plan_json=True,
-                    current_command="node", full_command=f"node {argv}",
-                    extra_env={"QWEN_HOME": str(home)},
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                plan = json.loads(result.stdout)
-                self.assertTrue(plan["restorable"])
-                self.assertEqual(plan["sid"], FOREIGN_SID)
-
-    def test_qwen_unavailable_current_binding_blocks_stale_argv(self):
-        with tempfile.TemporaryDirectory() as raw:
-            tmp = Path(raw)
-            home = self.qwen_home(tmp, transcript_exists=True)
-            result = self.run_restore(
-                tmp, coord={"sid": "", "tool": "q", "binding": "unavailable"},
-                title="qwen", saved_codex_ids=set(), plan_json=True,
-                current_command="node",
-                full_command=f"node qwen --session-id {FOREIGN_SID}",
-                extra_env={"QWEN_HOME": str(home)},
-            )
-            self.assertFalse(json.loads(result.stdout)["restorable"])
-
-    def test_qwen_rejects_empty_corrupt_and_foreign_transcripts(self):
-        for contents in ("", "{broken\n", json.dumps({
-            "uuid": "1", "type": "user", "sessionId": FOREIGN_SID,
-            "cwd": "/another/project",
-            "message": {"role": "user", "parts": [{"text": "Foreign turn"}]},
-        }) + "\n"):
-            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as raw:
-                tmp = Path(raw)
-                home = self.qwen_home(tmp, transcript_exists=True)
-                transcript = next(home.glob("projects/*/chats/*.jsonl"))
-                transcript.write_text(contents)
-                result = self.run_restore(
-                    tmp, coord={"sid": FOREIGN_SID, "tool": "q"},
-                    title="qwen", saved_codex_ids=set(), plan_json=True,
-                    current_command="node",
-                    full_command=f"node qwen --session-id {FOREIGN_SID}",
-                    extra_env={"QWEN_HOME": str(home)},
-                )
-                self.assertFalse(json.loads(result.stdout)["restorable"])
-
-    def test_restore_resumes_qwen_through_its_node_launcher(self):
-        # `qwen` is an `env node` script, so the pane's foreground program is
-        # "node" and only the script token identifies the Agent. Recognizing it
-        # by argv[0] alone would silently skip every Qwen pane.
-        with tempfile.TemporaryDirectory() as raw_tmp:
-            tmp = Path(raw_tmp)
-            qwen_home = self.qwen_home(tmp, transcript_exists=True)
-            result = self.run_restore(
-                tmp,
-                coord={"sid": FOREIGN_SID, "tool": "q"},
-                title="qwen",
-                saved_codex_ids=set(),
-                plan_json=True,
-                current_command="node",
-                full_command=(
-                    f"node {tmp}/.local/bin/qwen --yolo --session-id {FOREIGN_SID}"
-                ),
-                extra_env={
-                    "QWEN_HOME": str(qwen_home),
-                    "AIPANE_QWEN_LAUNCH_CMD": "qwen --yolo",
-                },
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            plan = json.loads(result.stdout)
-            self.assertEqual(plan["tool"], "qwen")
-            self.assertEqual(plan["kind"], "resume")
-            self.assertTrue(plan["restorable"])
-            self.assertEqual(plan["command"], f"qwen --yolo --resume {FOREIGN_SID}")
-
-    def test_restore_leaves_qwen_pane_untouched_without_a_transcript(self):
-        # An aipane-assigned --session-id that never took a real turn has no
-        # chat transcript, so replaying it is not a genuine resume.
-        with tempfile.TemporaryDirectory() as raw_tmp:
-            tmp = Path(raw_tmp)
-            qwen_home = self.qwen_home(tmp, transcript_exists=False)
-            result = self.run_restore(
-                tmp,
-                coord={"sid": FOREIGN_SID, "tool": "q"},
-                title="qwen",
-                saved_codex_ids=set(),
-                plan_json=True,
-                current_command="node",
-                full_command=(
-                    f"node {tmp}/.local/bin/qwen --yolo --session-id {FOREIGN_SID}"
-                ),
-                extra_env={
-                    "QWEN_HOME": str(qwen_home),
-                    "AIPANE_QWEN_LAUNCH_CMD": "qwen --yolo",
-                },
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            plan = json.loads(result.stdout)
-            self.assertEqual(plan["tool"], "qwen")
-            self.assertEqual(plan["kind"], "invalid")
-            self.assertFalse(plan["restorable"])
 
     def test_restore_recreates_empty_pi_session_without_claiming_resume(self):
         with tempfile.TemporaryDirectory() as raw_tmp:

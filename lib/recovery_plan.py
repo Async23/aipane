@@ -34,13 +34,11 @@ TOOL_TAGS = {
     "pi": "p",
     "grok": "g",
     "claude": "c",
-    "cursor": "r",
     "codex": "x",
-    "opencode": "o",
     "kimi": "k",
     "dsh": "d",
-    "qwen": "q",
 }
+BINDING_TOOLS = frozenset(TOOL_TAGS) | frozenset(TOOL_TAGS.values())
 
 class RecoveryPlanError(RuntimeError):
     pass
@@ -63,8 +61,6 @@ def session_identity(item: dict[str, Any], environment: dict[str, str] | None = 
         storage = item.get("session_root") or Path(
             item.get("dsh_home") or environment.get("DSH_HOME") or home / ".dsh"
         ) / "sessions"
-    elif tool == "qwen":
-        storage = item.get("qwen_home") or environment.get("QWEN_HOME") or home / ".qwen"
     elif tool == "agy":
         storage = item.get("agy_home") or home / ".gemini/antigravity-cli"
     else:
@@ -132,9 +128,6 @@ def normalize_plan(
                 raise RecoveryPlanError("Codex command namespace does not match its selected session")
         if item["tool"] == "dsh":
             for key in ("dsh_home", "session_root"):
-                item[key] = str(raw.get(key, ""))
-        if item["tool"] == "qwen":
-            for key in ("qwen_home", "qwen_runtime_dir"):
                 item[key] = str(raw.get(key, ""))
         if item["tool"] == "agy":
             for key in ("agy_home", "agy_model", "agy_effort", "agy_mode", "agy_agent"):

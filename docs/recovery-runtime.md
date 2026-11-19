@@ -37,8 +37,7 @@ ln -sf "$AIPANE_ROOT/integrations/pi/aipane-bind.ts" ~/.pi/agent/extensions/aipa
 ```
 
 已运行的 Pi 执行 `/reload` 加载扩展。预分配 ID 但尚无记录的空 Pi 会话会重建空 TUI，
-标为 `recreated`；属于其他项目或已损坏的记录标为 `invalid`。Claude 与 Qwen Code
-必须已有持久对话记录，否则保持原窗格。
+标为 `recreated`；属于其他项目或已损坏的记录标为 `invalid`。Claude 必须已有持久对话记录，否则保持原窗格。
 
 Claude 自动恢复命令带有 `AIPANE_AUTO_RESUME=1`，支持该标记的启动器可据此
 沿用已记录的模型并跳过模型选择。若无法确定原模型，启动器应报错，保留待恢复记录；
@@ -84,7 +83,7 @@ Codex 优先从当前前台进程的可写会话记录确定身份和 `CODEX_HOM
 
 `restore-pending.json` 保留原有 `version: 1` / `items` 格式，增加身份版本、记录 ID
 和 `history`，兼容旧运行版本读取活动记录。所有状态变更在同一执行器锁内原子落盘，
-保留其他服务的记录。文件损坏时中止，不把损坏状态当作空列表覆盖。
+保留其他服务的记录。已移除工具的旧记录跳过重试，在其所属服务下次保存时归档。文件损坏时中止，不把损坏状态当作空列表覆盖。
 
 实现职责：
 

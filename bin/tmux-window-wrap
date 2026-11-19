@@ -75,7 +75,6 @@ AI_TOOL_EXECUTABLES = frozenset(
         "codex",
         "codex-cli",
         "codexx",
-        "cursor-agent",
         "droid",
         "dsh",
         "dsh-tui",
@@ -85,18 +84,14 @@ AI_TOOL_EXECUTABLES = frozenset(
         "grok",
         "kimi",
         "kimi-code",
-        "opencode",
         "pi",
-        "qwen",
     }
 )
-AI_TOOL_EXECUTABLE_PREFIXES = ("codex-", "grok-", "kimi-", "opencode-", "pi-")
+AI_TOOL_EXECUTABLE_PREFIXES = ("codex-", "grok-", "kimi-", "pi-")
 AI_TOOL_PATH_MARKERS = (
     "/@anthropic-ai/claude-code",
     "/@openai/codex",
-    "/cursor-agent/",
     "/pi-coding-agent/",
-    "/@qwen-code/qwen-code",
 )
 RUNTIME_EXECUTABLES = frozenset(
     {

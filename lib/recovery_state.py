@@ -50,7 +50,7 @@ class PendingStore:
         for raw in payload["items"]:
             try:
                 valid = (isinstance(raw, dict) and float(raw.get("created_at", 0)) > 0
-                         and raw.get("restorable") is True and raw.get("tool") in TOOL_TAGS
+                         and raw.get("restorable") is True
                          and all(isinstance(raw.get(key), str) and raw[key]
                                  for key in ("target", "tool", "command", "cwd", "kind")))
             except (TypeError, ValueError):
@@ -60,7 +60,7 @@ class PendingStore:
         return payload
 
     def read_all(self) -> list[dict[str, Any]]:
-        return self._read()["items"]
+        return [item for item in self._read()["items"] if item["tool"] in TOOL_TAGS]
 
     def owns(self, item: dict) -> bool:
         return self.server is not None and (item.get("socket_path"), item.get("server_pid")) == self.server
@@ -148,7 +148,9 @@ class PendingStore:
             record = self._record(previous)
             if record["recovery_id"] in ids:
                 continue
-            if record["recovery_id"] in (resolutions or {}):
+            if record["tool"] not in TOOL_TAGS:
+                status, reason = "discarded", "tool is no longer supported"
+            elif record["recovery_id"] in (resolutions or {}):
                 status, reason = resolutions[record["recovery_id"]]
             elif pane_key(record) in own_keys:
                 status, reason = "superseded", "replaced by a newly selected recovery intent"

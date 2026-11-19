@@ -14,6 +14,8 @@ from pathlib import Path
 import sys
 import uuid
 
+from recovery_plan import BINDING_TOOLS
+
 
 class SnapshotError(RuntimeError):
     pass
@@ -102,9 +104,11 @@ def main() -> int:
     args = parser.parse_args()
     try:
         bindings = snapshot_bindings(args.dump)
-        fields = ("dsh_home", "session_root", "cwd", "qwen_home", "qwen_runtime_dir", "codex_home")
+        fields = ("dsh_home", "session_root", "cwd", "codex_home")
         rows = []
         for coordinate, record in bindings.items():
+            if str(record.get("tool", "")) not in BINDING_TOOLS:
+                continue
             values = [coordinate, str(record.get("sid", "")), str(record.get("tool", "")),
                       *(str(record.get(key, "")) for key in fields)]
             if record.get("tool") in {"a", "agy"}:

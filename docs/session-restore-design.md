@@ -32,15 +32,12 @@ tmux pane 里的进程都是 tmux server 的子进程；server 一退出（`kill
 
 | 序号 | 工具 (aipane key) | id 生成时机 | store 路径 / id 形态 |
 |---|---|---|---|
-| 1 | cursor-agent (`r`) | **启动即生成（急切）** | `~/.cursor/chats/<工程hash>/<chat-uuid>/meta.json` |
-| 2 | pi (`p`) | **启动即生成（急切）** | `~/.pi/agent/sessions/<编码cwd>/` |
-| 3 | qwen (`q`) | 启动即有 ID；裸 `ai q` 预分配，带参数时由 Qwen 决定；原生登记跟踪后续切换 | `~/.qwen/projects/<编码cwd>/chats/<uuidv4>.jsonl`；非空有效对话才可恢复 |
-| 4 | codex (`x`) | **首条消息才生成（懒惰）** | `~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<uuidv7>.jsonl` |
-| 5 | grok (`g`) | **首条消息才生成（懒惰）** | `~/.grok/sessions/<urlencode cwd>/<uuidv7>/` |
-| 6 | claude (`c`) | **首条消息才生成（懒惰）** | `~/.claude/projects/<dash编码cwd>/<uuidv4>.jsonl` |
-| 7 | opencode (`o`) | **首条消息才生成（懒惰）** | `~/.local/share/opencode/`（sqlite + storage/） |
-| 8 | kimi (`k`) | **首条消息才生成（懒惰）** | 启动仅建全局 search-index；单会话 store 位置未定 |
-| 9 | dsh-TUI (`d`) | 启动即有 ID，首次写入或 flush 后持久化 | `$DSH_HOME/sessions/<project>/<id>/session.vN.jsonl.zstd`；ID 为不透明字符串 |
+| 1 | pi (`p`) | **启动即生成（急切）** | `~/.pi/agent/sessions/<编码cwd>/` |
+| 2 | codex (`x`) | **首条消息才生成（懒惰）** | `~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<uuidv7>.jsonl` |
+| 3 | grok (`g`) | **首条消息才生成（懒惰）** | `~/.grok/sessions/<urlencode cwd>/<uuidv7>/` |
+| 4 | claude (`c`) | **首条消息才生成（懒惰）** | `~/.claude/projects/<dash编码cwd>/<uuidv4>.jsonl` |
+| 5 | kimi (`k`) | **首条消息才生成（懒惰）** | 按项目保存于 `~/.kimi-code/sessions/wd_<name>_<hash>/`（§14） |
+| 6 | dsh-TUI (`d`) | 启动即有 ID，首次写入或 flush 后持久化 | `$DSH_HOME/sessions/<project>/<id>/session.vN.jsonl.zstd`；ID 为不透明字符串 |
 
 要点：懒惰派“没发消息就崩溃”时**根本没有会话被创建**，也就没有东西可丢/可恢复。
 
@@ -50,13 +47,10 @@ tmux pane 里的进程都是 tmux server 的子进程；server 一退出（`kill
 |---|---|---|---|
 | 1 | claude (`c`) | **原生 hooks + plugins** | `--include-hook-events`、`--bare` 跳过 hooks/LSP/plugin |
 | 2 | codex (`x`) | **原生 hooks + plugins** | 带信任模型（`--dangerously-bypass-hook-trust`） |
-| 3 | qwen (`q`) | **原生 hooks（`hooks` 子命令 + `/hooks`）** | 事件带 matcher；`SessionStart` 可按 source 过滤 |
-| 4 | opencode (`o`) | **plugins（JS 事件插件）** | `opencode plugin`、`--pure` 关闭外部插件；**已用 `chat.message` 插件落地，见 §14** |
-| 5 | grok (`g`) | **plugins + 市场**（未见显式 hooks） | 需查插件能否订阅会话生命周期 |
-| 6 | cursor-agent (`r`) | **plugins**（未见显式 hooks） | 急切派，无需钩子 |
-| 7 | pi (`p`) | **Extensions（会话事件）** | `session_start` 覆盖 startup/reload/new/resume/fork；已用于动态绑定，见 §15 |
-| 8 | kimi (`k`) | ~~无（仅 MCP）~~ → **有原生 `[[hooks]]`（13 事件，stdin JSON 带 `session_id`）** | **订正**：非无钩子；已用 `SessionStart` 钩子落地，见 §14 |
-| 9 | dsh-TUI (`d`) | Cordis 原生插件 + TUI Channel 注册表 | `integrations/dsh/aipane-session.mjs` 读取当前 Channel，见 §20 |
+| 3 | grok (`g`) | **plugins + 市场**（未见显式 hooks） | 需查插件能否订阅会话生命周期 |
+| 4 | pi (`p`) | **Extensions（会话事件）** | `session_start` 覆盖 startup/reload/new/resume/fork；已用于动态绑定，见 §15 |
+| 5 | kimi (`k`) | ~~无（仅 MCP）~~ → **有原生 `[[hooks]]`（13 事件，stdin JSON 带 `session_id`）** | **订正**：非无钩子；已用 `SessionStart` 钩子落地，见 §14 |
+| 6 | dsh-TUI (`d`) | Cordis 原生插件 + TUI Channel 注册表 | `integrations/dsh/aipane-session.mjs` 读取当前 Channel，见 §20 |
 
 ## 3. 核心决策
 
@@ -66,25 +60,20 @@ tmux pane 里的进程都是 tmux server 的子进程；server 一退出（`kill
 不可替代价值：工具在同一进程内替换 session 时，必须上报**当前** id；启动期已知 id
 不能代表整个进程生命周期。
 
-> **§12 已核实（2026-08-08）：核心 4 家里 pi / grok / claude 都支持 `--session-id` 预指定，
-> cursor 用 `create-chat` 预取 id → 这 4 家的**初始** id 都由 aipane 掌控；
-> Pi 后续仍需 `session_start` Adapter 跟踪进程内换会话（§15），codex 则因无预指定
-> 旗标继续使用动态绑定。**
+> Pi、Grok 和 Claude 允许 aipane 通过 `--session-id` 指定初始会话 ID（§12）。
+> Pi 通过 `session_start` 跟踪进程内的会话切换（§15），Codex 从运行中的会话获取 ID。
 
 | 序号 | 工具 | 机制决策 |
 |---|---|---|
 | 1 | claude (`c`) | **gold-case**（`--session-id <uuid>`）→ aipane 预指定 id，不用 hook/探测（见 §12） |
 | 2 | codex (`x`) | **核心工具中唯一非 gold-case**：懒惰 + 无预指定旗标 → **用 hook**（见 §12） |
-| 3 | opencode (`o`) | 懒惰 + 事件插件 → **用插件**（未纳入本轮核实） |
-| 4 | grok (`g`) | **初始 gold-case + 存盘时动态绑定**：启动预指定 id；`/new`、`/resume` 后从原生活跃会话表读取当前 id（见 §19） |
-| 5 | kimi (`k`) | 懒惰 + 无钩子 → **回落**（cwd+时间解析，未纳入本轮核实） |
-| 6 | cursor (`r`) | **半 gold-case**：无旗标，但 `create-chat` 回吐 uuid → 先建后 `--resume`（见 §12） |
-| 7 | pi (`p`) | **初始 gold-case + 动态 Adapter**：启动预指定 id；new/resume/fork 后由 `session_start` 覆盖绑定（见 §15） |
-| 8 | qwen (`q`) | **初始 gold-case + 存盘时动态绑定**：原生 PID 登记跟踪当前 ID，`--resume <id>` 续接，按项目校验 transcript 并核对运行时身份（见 §23） |
+| 3 | grok (`g`) | **初始 gold-case + 存盘时动态绑定**：启动预指定 id；`/new`、`/resume` 后从原生活跃会话表读取当前 id（见 §19） |
+| 4 | kimi (`k`) | `SessionStart` 上报当前 ID，随快照恢复（§14） |
+| 5 | pi (`p`) | **初始 gold-case + 动态 Adapter**：启动预指定 id；new/resume/fork 后由 `session_start` 覆盖绑定（见 §15） |
 
 `ai x resume <id>` 这类 **resume 启动是最省事的一档**：id 在命令里，启动即可直接绑定，
 无需 store 探测/钩子。gold-case（§12）把这一档从「resume 时」提前到「首次启动时」；
-它只确定初始身份，Pi、Codex、Grok、Qwen Code 的进程内会话切换仍需在存盘时取当前身份。
+它只确定初始身份，Pi、Codex、Grok 的进程内会话切换仍需在存盘时取当前身份。
 
 ### 3.2 绑定机制：aipane 注入关联令牌 + 统一接收脚本
 
@@ -141,7 +130,7 @@ AIPANE_LAUNCH=<uuid> AIPANE_PANE=<pane> AIPANE_TOOL=x  codex --yolo
 
 > **实现修正（见 §13）**：本机 resurrect **有** `@resurrect-hook-post-restore-all` 钩子，
 > 故不必重绑 C-r；且 resurrect 会为**每个** pane 存下完整命令行，gold-case 注入的
-> 初始 id 天然落入存档。grok/claude/cursor 可直接解析；Codex 的动态 thread 与 Pi 的
+> 初始 id 天然落入存档。grok/claude 可直接解析；Codex 的动态 thread 与 Pi 的
 > 进程内 session replacement 仍需 `aipane-snapshot` 当前坐标绑定（Pi 订正见 §15）。
 > 下面是**已实际落地**的 `~/.tmux.conf`：
 
@@ -162,25 +151,22 @@ set -g @resurrect-hook-post-restore-all '$HOME/.local/bin/ai-restore'
 
 | 序号 | 事项 |
 |---|---|
-| 1 | claude / codex / opencode 钩子的**具体事件名**、回调载荷是否含 `session_id`、能否执行任意命令 → opencode **已实证**（`chat.message` 带 `sessionID`，插件可 spawn 命令），见 §14 |
+| 1 | claude / codex 钩子的具体事件名、回调载荷中的会话 ID 和命令调用方式 |
 | 2 | grok 插件能否订阅“会话开始/首条消息”并拿到 session_id |
-| 3 | 各工具在本机当前版本下的**真实 resume 语法**（codex 用 `resume <id>` 子命令；grok `--resume <id>`；cursor `resume <chat-id>`；claude `--resume <uuid>` / `--continue`；pi 已实测=见 §11；各不相同且随版本变，且需保留原始 flag 如 `--yolo`/`--always-approve`） |
+| 3 | 各工具在本机当前版本下的**真实 resume 语法**（codex 用 `resume <id>` 子命令；grok `--resume <id>`；claude `--resume <uuid>` / `--continue`；pi 已实测=见 §11；各不相同且随版本变，且需保留原始 flag 如 `--yolo`/`--always-approve`） |
 | 4 | ~~kimi 单会话 store 的真实位置与 id 形态~~ → **已实证**：`~/.kimi-code/sessions/wd_<name>_<hash>/`（**按 cwd 分目录**，故 `--continue` 可靠）；id 经 `SessionStart` 钩子 stdin JSON 拿到，见 §14 |
-| 5 | ~~核实 codex / grok / claude / cursor 是否有类似 pi `--session-id` 的旗标~~ → **已核实，见 §12**：grok/claude 有 `--session-id`（仅新建），cursor 有 `create-chat`（回吐 id），codex 没有 |
+| 5 | ~~核实 codex / grok / claude 是否有类似 pi `--session-id` 的旗标~~ → **已核实，见 §12**：grok/claude 有 `--session-id`（仅新建），codex 没有 |
 
 ## 8. 建议的落地顺序（§12 定案后修订：gold-case 主线先行、codex 走钩子支路）
 
 1. 先做第 6 节的 resurrect/continuum 配置（马上见效、近零风险）。
 2. **gold-case 主线**：aipane 为 pi/grok/claude 各写「生成 uuid → 注入 `--session-id` 启动 →
-   记录 `(%N → uuid)` → resume 命令映射」；cursor 走「`create-chat` 预取 id → `--resume` 启动」。
-   这 4 家**无需钩子、无需 store 探测、无竞态**。
+   记录 `(%N → uuid)` → resume 命令映射」。
 3. 实现铁律二「恢复对账」+ `ai-restore`：读 resurrect 快照的命令行 → argv 解析认工具 →
    按注册表补 id → `send-keys` 跑各家 resume 命令。
 4. ~~codex 支路~~ **已落地**（见 §13「codex 支路」）：codex `notify` 包装器记 `thread-id` +
    `aipane-snapshot` 坐标快照 + ai-restore 三级 id 优先级。
-5. ~~余下非核心工具按 §3.1 补齐：opencode（插件）/ qoder（探测）/ kimi（回落）~~
-   → **opencode / kimi 已落地，见 §14**（均走钩子支路，非回落）；
-   `q` 已由 Qoder 换为 Qwen Code；初始 ID 与存盘时动态绑定均已落地，见 §23。
+5. Kimi 通过 `SessionStart` 钩子绑定当前会话（§14）。
 
 ## 9. 决策定案（2026-08-08）
 
@@ -210,7 +196,7 @@ set -g @resurrect-hook-post-restore-all '$HOME/.local/bin/ai-restore'
 ### D. 非 AI 内容（目标：尽量收集、无感恢复）
 | 序号 | 决策 |
 |---|---|
-| D1 | 分两路收集：① 非 node、命名唯一者（lazygit/yazi/ssh/top…）→ resurrect `@resurrect-processes` 白名单直接重开；② **坑**：cursor-agent / pi / vite 都是 `node`，无法靠进程名区分 → **绝不把 `node` 加入白名单**；所有 node 型 pane 交给 `ai-restore`：argv 解析后 AI→resume、非 AI node（如 vite）→原样重跑 |
+| D1 | 分两路收集：① 非 node、命名唯一者（lazygit/yazi/ssh/top…）→ resurrect `@resurrect-processes` 白名单直接重开；② Pi 和 vite 都可能显示为 `node`。通用 `node` 不进入白名单，`ai-restore` 只为识别出的受支持工具生成恢复命令 |
 | D2 | 普通 shell 只恢复 cwd；venv / 环境变量 / 后台任务不恢复。**默认不做**「每 pane 重初始化」（过脆弱、收益低）。可反悔 |
 | D3 | **定案见 §11**：pi 是一等 AI，且为唯一 gold-case（支持 `--session-id` 预指定 id）；aipane 启动注入 `--session-id`，resume 亦用之 |
 
@@ -295,14 +281,13 @@ pi 会话相关 flag（实测 `pi --help`）：
 - **已确认（2026-08-08，用户同意）**：`ai p` 默认启动改为注入 `--session-id`。
 
 ### 高价值线索（超出 D3，见 §7-5）
-pi 证明「预指定会话 id」能力存在。应回头核实 codex/grok/claude/cursor 是否也有类似旗标；
+pi 证明「预指定会话 id」能力存在。应回头核实 codex/grok/claude 是否也有类似旗标；
 若有，它们同样升级为 gold-case，整套钩子 / store 探测机制可大幅简化。
 → **已核实，见 §12。**
 
 ## 12. §7-5 核实结果：预指定 session id 的能力（2026-08-08 实测 `--help`）
 
-方法：抓各工具完整 `--help`（含子命令），检索会话/id 相关旗标；对 cursor 另跑一次
-`cursor-agent create-chat` 验证返回值。原始 help 存于 `/tmp/help_*.txt`。
+实测读取各工具及其子命令的 `--help`，核对会话 ID 选项。原始 help 存于 `/tmp/help_*.txt`。
 
 ### 结论一览
 
@@ -311,14 +296,11 @@ pi 证明「预指定会话 id」能力存在。应回头核实 codex/grok/claud
 | 1 | pi (`p`) | ✅ 直接旗标 | `--session-id <id>`：用指定项目会话 id，**不存在则创建**（幂等） | **gold-case** |
 | 2 | grok (`g`) | ✅ 直接旗标 | `-s, --session-id <SESSION_ID>`：为**新**会话指定 UUID（须合法且**尚不存在**）；resume 用 `-r` | **gold-case** |
 | 3 | claude (`c`) | ✅ 直接旗标 | `--session-id <uuid>`：为该会话指定 id（须合法 UUID） | **gold-case** |
-| 4 | cursor (`r`) | ✅ 间接（预建） | 无 `--session-id`；但 `create-chat` **返回纯 UUID**，再 `--resume <chatId>` 进入 | **半 gold-case** |
-| 5 | codex (`x`) | ❌ 无 | 无预指定旗标；`-c/--config` 只覆盖 `config.toml`，session id 内部生成；`resume <SESSION_ID>` 只接既有会话 | 非 gold-case → **仍走 hook** |
-
-cursor 实测：`cursor-agent create-chat` → 输出 `2905e7b7-016d-472c-a468-4dd51371a97b`（exit 0，纯 id）。
+| 4 | codex (`x`) | ❌ 无 | 无预指定旗标；`-c/--config` 只覆盖 `config.toml`，session id 内部生成；`resume <SESSION_ID>` 只接既有会话 | 非 gold-case → **仍走 hook** |
 
 ### 关键点：gold-case 让「急切/懒惰」之分作废
 id 是 **aipane 自己生成并写进 argv** 的，无论工具何时真正落盘会话文件，aipane 从启动第一刻就已知该 id。
-→ pi/grok/claude/cursor 的**初始绑定**无需 store 竞态；Pi 仍需 `session_start`
+→ pi/grok/claude 的**初始绑定**无需 store 竞态；Pi 仍需 `session_start`
 Adapter 跟踪进程内 session replacement，并在恢复前探测 durable JSONL。codex 仍需
 运行期信道取得初始 id。
 
@@ -329,21 +311,19 @@ Adapter 跟踪进程内 session replacement，并在恢复前探测 durable JSON
 | 1 | pi | `pi --session-id X` | durable JSONL 已验证后 `pi --session-id X` | 进程内换会话后 X 取动态坐标绑定 |
 | 2 | grok | `grok --session-id X` | `grok --resume X` | `--session-id` **仅新建**（已存在会报错）→ 恢复必须换 `-r` |
 | 3 | claude | `claude --session-id X` | `claude --resume X`（`-r`） | 同上，`--session-id` 用于新建 |
-| 4 | cursor | `X=$(cursor-agent create-chat)` 后 `cursor-agent --resume X` | `cursor-agent --resume X` | 启动多一次预建调用；两端都用 `--resume` |
-| 5 | codex | 裸启动（无法预指定）+ **hook** 回报 id | `codex resume X` | 唯一保留钩子/探测的核心工具 |
+| 4 | codex | 裸启动（无法预指定）+ **hook** 回报 id | `codex resume X` | 唯一保留钩子/探测的核心工具 |
 
-（以上须保留各自原始 flag，如 `--yolo` / `--always-approve` / `--force` 等。）
+（以上须保留各自原始 flag，如 `--yolo` / `--always-approve` 等。）
 
 ### 对整体设计的影响
 - **§3.2 关联令牌 + 钩子链路**：codex 需要运行期信道取得初始 id；Pi 需要
   `session_start` Adapter 维护后续当前 id。
-- **C4（§10）优先级 1（命令行自带 id）**：grok/claude/cursor 从首次启动即命中；
+- **C4（§10）优先级 1（命令行自带 id）**：grok/claude 从首次启动即命中；
   Pi 只有未换会话时命中，换会话后当前坐标绑定优先（§15）。
-- aipane 落地：为 pi/grok/claude/cursor 各写一个「生成 uuid → 注入启动 → 记录 (%N→X) → 定义 resume 命令」的适配；codex 单独保留 hook 支路。
+- aipane 落地：为 pi/grok/claude 各写一个「生成 uuid → 注入启动 → 记录 (%N→X) → 定义 resume 命令」的适配；codex 单独保留 hook 支路。
 
 ### 已确认（2026-08-08，用户同意）
-**aipane 默认启动**（`ai p` / `ai g` / `ai c` / `ai r`）改为「aipane 生成 uuid 并预指定」
-（cursor 走 `create-chat` 预取）。这给出确定的初始绑定；Pi 的后续动态绑定见 §15。
+**aipane 默认启动**（`ai p` / `ai g` / `ai c`）由 aipane 生成并指定 UUID。这给出确定的初始绑定；Pi 的后续动态绑定见 §15。
 落地顺序据此改为「gold-case 主线先行、codex 走钩子支路」，见 §8。
 
 ## 13. v1 实现纪要（2026-08-08 落地；含对早期设计的两处修正）
@@ -359,8 +339,7 @@ Adapter 跟踪进程内 session replacement，并在恢复前探测 durable JSON
 resurrect 的 save 会为所有 pane（不止白名单）写下 `session\twin\t..\tpane\ttitle\t:cwd\t..\tcur_cmd\t:full_cmd`。
 gold-case 注入的 `--session-id X`、以及任何 `resume` 式启动的 id，都**天然落在 full_cmd 字段**里。
 → `ai-restore` 直接解析 `last` 存档，按 `session:win.pane` 坐标把 resume 命令送回对应 pane。
-grok/claude/cursor 通常无需 `aipane-snapshot`。Codex 的动态 thread 与 Pi 的进程内
-session replacement 都需要当前坐标绑定；两者不能只信启动命令（Pi 订正见 §15）。
+Claude 可从启动参数取得会话 ID。Codex、Pi 和 Grok 能在进程内切换会话，恢复时优先使用当前坐标绑定（见 §15、§19）。
 
 ### codex 支路（实测已落地）——唯一非 gold-case 核心工具
 codex 无启动期 `--session-id`，其会话 id（`thread-id`）在**运行后**才知道。链路：
@@ -373,7 +352,7 @@ codex 无启动期 `--session-id`，其会话 id（`thread-id`）在**运行后*
 | 序号 | 位置 | 内容 |
 |---|---|---|
 | 1 | `~/.tmux.conf` | capture=on、save-interval=15、restore=off、processes 白名单、post-restore-all + post-save-layout 两钩子 |
-| 2 | `lib/session.zsh`（新） | uuid、JSONL 注册表原子追加、`_aipane_prepare_launch` gold-case 注入、cursor 预建 |
+| 2 | `lib/session.zsh`（新） | uuid、JSONL 注册表原子追加、`_aipane_prepare_launch` gold-case 注入 |
 | 3 | `init.zsh` | core 之后 source `lib/session.zsh` |
 | 4 | `cmd/pane.zsh` | 单/多 pane 启动接注入 + 记 `(%N→tool,sid)`；build 暴露 `_aipane_result_panes` |
 | 5 | `bin/ai-restore`（新） | 解析存档 + 坐标快照 → 逐 pane 重建 resume |
@@ -390,7 +369,7 @@ codex 无启动期 `--session-id`，其会话 id（`thread-id`）在**运行后*
 - **幂等 & 安全**：只对「当前停在 idle shell」的 pane 下手 → 不覆盖 resurrect 已重开的白名单进程；重复运行无害。
 - **per-tool resume 重建**：pi 在同 cwd durable JSONL 已验证后用 `--session-id X`
   续接；若该 id 在所有 Pi store 中都不存在，则以同一 id 重建空 TUI，并明确标为
-  `recreated`（动态坐标→argv）；grok/claude `--resume X`；cursor `--resume X`；codex
+  `recreated`（动态坐标→argv）；grok/claude `--resume X`；codex
   `-c check_for_update_on_startup=false resume X`（有效坐标快照→argv→标题）。
 - 恢复执行器替换 pane 进程后会清除旧进程的 activity
   marker/reporter/timestamp/record；恢复命令重新绑定 session，新的生命周期 hook 再建立
@@ -399,54 +378,19 @@ codex 无启动期 `--session-id`，其会话 id（`thread-id`）在**运行后*
 
 ### 已知残留 / 待办
 - **Claude 空会话（已处理）**：`ai c` 会先注入 id，但只运行 `/skills` 等本地 slash command 时，Claude 并未创建可恢复的 model conversation。`ai-restore` 现在会先检查 `~/.claude/projects/*/<session-id>.jsonl` 持久化 transcript；文件不存在的 id 标为 `invalid`，`ai-restart` 不会销毁该 pane 再伪报恢复成功。
-- **cursor 预建 ~3s**：`create-chat` 网络往返约 2.7–3s，每次裸 `ai r` 会等这一下。`AIPANE_CURSOR_PRECREATE=0` 可单独关闭（则 cursor pane 重启后为 fresh）。
 - **codex 首回合前重启**：`thread-id` 经 `notify`（回合完成）才拿到；若一条消息都没发过就重启，无 id 可恢复（同懒惰派空会话，合理）。标题恰为 uuid 时仍可兜底。
 - **codex config 生效范围**：`notify` 改动只对**新启动**的 codex 生效；运行中的旧进程仍用旧 notifier。
 - ai-restore 的 resume base 命令使用 aipane 默认值或直接命令覆盖；从裸 hook 环境取不到时回退为纯二进制。
 
-## 14. opencode / kimi 支路（2026-08-08 落地；订正 §3.1/§4/§7 旧结论）
+## 14. Kimi 会话绑定（2026-08-08）
 
-用户追加需求：opencode（`o`）与 kimi（`k`）也要恢复。实测推翻了早期两处判断：
+Kimi 的 `SessionStart` 钩子在新建或恢复时从标准输入收到 `session_id` 和 `cwd`。
+`~/.kimi-code/config.toml` 注册的 `bin/aipane-kimi-hook` 会调用
+`aipane-bind --tool k --sid <id> --pane $TMUX_PANE`，将会话绑定到当前窗格。
 
-- **订正一**：kimi **有钩子系统**（§4 表曾记「无（仅 MCP）」）。`~/.kimi-code/config.toml` 支持
-  Claude-Code 式 `[[hooks]]`，13 种事件；官方文档确认**钩子命令经 stdin 收 JSON**，base 字段含
-  `hook_event_name` / `session_id` / `session_title` / `cwd`，且 `SessionStart`（`source=startup|resume`）
-  一开始就带 `session_id`。钩子进程继承 `$TMUX_PANE`（现有 `tmux-window-wrap` 钩子已证）。
-- **订正二**：opencode 与 kimi 均**非 gold-case**——`opencode -s/--session <id>`、`kimi -S/--session [id]`
-  都只能**续接已存在**的会话，无「启动即预指定新 id」的旗标。二者 id 均**懒惰**（首条消息才生成，
-  opencode 形如 `ses_...`、非 UUID）。故二者归入 **codex 同类**：走「钩子 → `aipane-bind` → 坐标快照 →
-  `ai-restore` 按坐标兑底、按 id resume」，复用已建链路，`aipane-bind`/`aipane-snapshot` 与工具无关、零改动。
-
-### 信道（各接一条，均 fail-open、绝不阻断工具）
-| 序号 | 工具 | 信道 | 取 id 时机 | 记录动作 |
-|---|---|---|---|---|
-| 1 | opencode | **插件** `~/.config/opencode/plugins/aipane-bind.js`（`chat.message` 钩子，带 `sessionID`） | 首条消息 | 插件在 opencode 进程内 spawn `aipane-bind --tool o --sid <id> --pane $TMUX_PANE` |
-| 2 | kimi | **`SessionStart` 钩子** → `bin/aipane-kimi-hook`（读 stdin JSON 取 `session_id`） | 会话开始（startup/resume） | `aipane-bind --tool k --sid <id> --pane $TMUX_PANE` |
-
-### 恢复语法（ai-restore；id 只来自坐标快照，不在 argv）
-| 序号 | 工具 | 有 id（坐标快照命中） | 无 id 兜底 |
-|---|---|---|---|
-| 1 | opencode | `opencode --session <id>`（resume） | **fresh 跳过**：`opencode --continue` 是全局「上一个」、跨 pane 有歧义，不可信 |
-| 2 | kimi | `kimi --auto --session <id>`（resume） | `kimi --auto --continue`（**按 cwd 续接**，pane 的 cwd 已被 resurrect 恢复 → 仍是真 resume） |
-
-### 已落地清单（本轮新增/改动）
-| 序号 | 位置 | 内容 |
-|---|---|---|
-| 1 | `bin/aipane-kimi-hook`（新，sh） | kimi `SessionStart` 钩子包装器：stdin JSON 取 `session_id` → 后台 `aipane-bind --tool k`，恒 exit 0 |
-| 2 | `~/.config/opencode/plugins/aipane-bind.js`（新，js） | opencode 插件：`chat.message` 首条即 spawn `aipane-bind --tool o`；每会话去重；`AIPANE_OPENCODE_DEBUG=1` 记日志 |
-| 3 | `bin/ai-restore` | `detect_tool` 认 `opencode`/`kimi`（均 Mach-O，argv0 直判）；`build_resume` 增两工具的 resume/兜底；新增 `OPENCODE_BASE`/`KIMI_BASE` |
-| 4 | `~/.kimi-code/config.toml` | 新增一条 `SessionStart → aipane-kimi-hook`（不动既有 8 条钩子；已备份 `config.toml.bak.aipane-session-*`） |
-| 5 | `~/.local/bin` | symlink：`aipane-kimi-hook` |
-
-### 实测（均通过）
-- kimi 钩子：喂伪 `SessionStart` JSON → 注册表得 `{"tool":"k","sid":"sess_kimi_clean_001",...}`；`kimi doctor` 判 config 有效。
-- opencode 插件：真跑 `opencode run`（`AIPANE_OPENCODE_DEBUG=1`）→ 日志 `plugin loaded` + `bind ... sid=ses_...`，注册表得 `tool:o` 条目。**关键**：`chat.message` 在模型调用**之前**触发，故即使模型鉴权失败也已抓到 id。
-- `ai-restore --dry-run`（合成 dump + 坐标快照）：opencode 有 id→`--session`、无 id→skip；kimi 有 id→`--session`、无 id→`--continue`；codex/cursor 无回归。
-
-### 已知残留
-- 二者都属懒惰派：**重启前从未发消息**（opencode）/ **从未开过会话**（kimi 该 cwd）时无 id 可恢复——opencode 落 fresh、kimi `--continue` 若无历史则自然新开。属 §1 早已承认的边界。
-- opencode 插件加载依赖该版本的 `{id, server}` 默认导出形态（本机实测通过）；若将来 opencode 换加载器需回看。
-- kimi 同一事件挂两条 `[[hooks]]`（`aipane-activity` + `aipane-kimi-hook`）依赖 kimi「同事件多钩子皆执行」；`doctor` 已验证 config 合法，实跑时如只执行其一需改为串接。
+Kimi 按工作目录保存会话。恢复时，快照中有 ID 的窗格运行
+`kimi --auto --session <id>`。缺少 ID 时，在窗格原工作目录中运行
+`kimi --auto --continue`，从该目录的最近会话继续。
 
 ## 15. Pi 进程内换会话修正（2026-08-17）
 
@@ -663,42 +607,7 @@ macOS 上 Claude 2.1.300 的 tmux `pane_current_command` 可能为 `2.1.300`，
 回归测试在隔离的真实 tmux 中覆盖新启动验证、已有进程只验证不重启、版本号误匹配，
 以及普通重启、unknown 确认和补恢复三个提示处的 Ctrl+C / Ctrl+D 取消。
 
-## 23. Qwen Code 当前会话与恢复核验（2026-10-20）
-
-Qwen Code 的 `/clear`、`/resume` 会在同一进程内替换当前 ID，启动 argv 和 aipane 的
-初始绑定不会随之变化。`lib/qwen_sessions.py` 读取 `$QWEN_HOME/sessions/<pid>.json`，
-核对 pane TTY 的唯一前台 Qwen 进程、PID、进程出生时间及登记 schema；Linux 还核对
-原生进程启动令牌与 PID namespace。普通 Node 程序、过期 PID、其他 TTY 和歧义记录
-都不能提供会话身份。此机制独立于 Activity hooks，也覆盖 `ai q --model ...` 等启动。
-
-快照保存当前 ID、cwd、`QWEN_HOME` 和 `QWEN_RUNTIME_DIR`。已经识别为 Qwen 的 pane
-若缺少有效原生登记，会保存 `binding: unavailable`，阻止恢复时退回旧 argv。
-新会话尚未落盘时也保留其当前 ID，不能改为恢复先前已保存的会话。
-
-恢复预检只读取指定 cwd 对应的 active chats 目录，检查 JSONL、会话 ID、项目身份与
-对话内容；空文件、损坏内容、仅元数据以及其他项目的同名文件均不可恢复。
-这是保守预检，最终仍由 Qwen 原生加载器读取历史。执行器随后要求原生 PID 登记和
-该会话的 `.runtime.json` 同时指向目标 ID、cwd 与当前进程，并连续通过稳定窗口，
-才重新绑定并清除 pending。已有进程同样核验；启动 argv 或旧绑定不能代替运行时证据。
-存活但证据不足时保留 pending 和进程，重试不发送中断。原地重启执行前也重新核对
-当前会话，避免确认期间切换会话后仍按旧计划替换进程。
-
-运行记录中的 `hostname` 只校验为非空字符串，不与当前主机名比较。macOS 的主机名
-可能在进程存活期间变化（例如 `Alfheim.local` 变为 `Alfheim`）；本机身份由前台 TTY、
-原生 PID 登记及进程出生时间核验，不能因主机名快照不同而拒绝同一进程。重启前无法
-核验运行时身份时明确报告身份不可核验，不再一概声称当前会话发生了切换。
-
-已对照本机 Qwen Code 0.25.3 的原生格式。自定义目录须通过快照进程可见的
-`QWEN_HOME` / `QWEN_RUNTIME_DIR` 提供；仅写在 Qwen 私有配置中的 runtimeOutputDir
-不会被猜测。缺少这些原生记录、未知 schema 或其他无法核验的布局会阻止自动恢复，
-不降级为仅凭进程存活报告成功。
-
-`tests/test_qwen_sessions.py` 使用隔离 tmux 和不联网的 Node 占位进程，覆盖当前 ID
-优先、无初始绑定、未落盘会话、PID 复用、错误运行时记录、自定义目录以及重启前
-会话变化。`test_session_restore.py` 和 `test_restore_executor.py` 覆盖计划生成与
-“Node 已运行但目标会话未确认”仍保持 pending 的回归。
-
-## 24. 不同 tmux 服务的待恢复记录隔离（2026-10-27）
+## 23. 不同 tmux 服务的待恢复记录隔离（2026-10-27）
 
 不同 tmux 服务可以拥有相同的窗格坐标，例如 `0:4.1`。旧执行器共用
 `restore-pending.json`，按坐标合并全部记录，使测试服务的失败记录阻挡日常服务

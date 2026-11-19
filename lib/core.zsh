@@ -1,7 +1,7 @@
 #!/usr/bin/env zsh
 # Shared helpers for aipane.
 
-if [[ "${_AIPANE_CORE_VERSION:-}" == "5" ]]; then
+if [[ "${_AIPANE_CORE_VERSION:-}" == "6" ]]; then
   return 0
 fi
 # Migrate the previous built-in default when an existing shell reloads.
@@ -9,8 +9,12 @@ if [[ "${_AIPANE_CORE_VERSION:-}" == "3" &&
       "${AIPANE_CODEX_LAUNCH_CMD:-}" == "codex --yolo" ]]; then
   unset AIPANE_CODEX_LAUNCH_CMD
 fi
+# Remove launcher settings created by earlier versions in the same shell.
+if [[ -n "${_AIPANE_CORE_VERSION:-}" ]]; then
+  unset AIPANE_OPENCODE_LAUNCH_CMD AIPANE_CURSOR_LAUNCH_CMD AIPANE_QWEN_LAUNCH_CMD
+fi
 typeset -g _AIPANE_CORE_LOADED=1
-typeset -g _AIPANE_CORE_VERSION=5
+typeset -g _AIPANE_CORE_VERSION=6
 
 # User-configurable values (export before sourcing init.zsh to override).
 typeset -g AIPANE_CLAUDE_LAUNCH_CMD="${AIPANE_CLAUDE_LAUNCH_CMD:-claude --dangerously-skip-permissions}"
@@ -19,9 +23,6 @@ typeset -g AIPANE_CLAUDE_LAUNCH_CMD="${AIPANE_CLAUDE_LAUNCH_CMD:-claude --danger
 typeset -g AIPANE_CODEX_LAUNCH_CMD="${AIPANE_CODEX_LAUNCH_CMD:-codex --yolo -c check_for_update_on_startup=false}"
 typeset -g AIPANE_DSH_LAUNCH_CMD="${AIPANE_DSH_LAUNCH_CMD:-dsh-tui}"
 typeset -g AIPANE_GROK_LAUNCH_CMD="${AIPANE_GROK_LAUNCH_CMD:-grok --always-approve}"
-typeset -g AIPANE_OPENCODE_LAUNCH_CMD="${AIPANE_OPENCODE_LAUNCH_CMD:-opencode}"
-typeset -g AIPANE_CURSOR_LAUNCH_CMD="${AIPANE_CURSOR_LAUNCH_CMD:-cursor-agent --force}"
-typeset -g AIPANE_QWEN_LAUNCH_CMD="${AIPANE_QWEN_LAUNCH_CMD:-qwen --yolo}"
 typeset -g AIPANE_PI_LAUNCH_CMD="${AIPANE_PI_LAUNCH_CMD:-pi}"
 typeset -g AIPANE_KIMI_LAUNCH_CMD="${AIPANE_KIMI_LAUNCH_CMD:-kimi --auto}"
 typeset -g AIPANE_AGY_LAUNCH_CMD="${AIPANE_AGY_LAUNCH_CMD:-agy}"

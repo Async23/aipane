@@ -36,7 +36,7 @@ git -C ~/.aipane pull --ff-only
 - macOS and zsh
 - Claude Code for the `c` tool in `ai` (optional if you never use `c`)
 - tmux for multi-tool `ai` launches, or whenever `--new`/`--layout` is used
-- The corresponding optional CLI for each additional `ai` tool: Codex, dsh-TUI (`dsh-tui`), Grok, OpenCode, Cursor CLI, Qwen Code (`qwen`), Pi (`pi`), Kimi Code (`kimi`), or Antigravity CLI (`agy`)
+- The corresponding optional CLI for each additional `ai` tool: Codex, dsh-TUI (`dsh-tui`), Grok, Pi (`pi`), Kimi Code (`kimi`), or Antigravity CLI (`agy`)
 
 Single-tool calls such as `ai x` run in the current shell and do not require tmux unless `--new` or `--layout` is supplied.
 
@@ -140,9 +140,6 @@ export AIPANE_CLAUDE_LAUNCH_CMD="claude --dangerously-skip-permissions"
 export AIPANE_CODEX_LAUNCH_CMD="codex --yolo -c check_for_update_on_startup=false"
 export AIPANE_DSH_LAUNCH_CMD="dsh-tui"
 export AIPANE_GROK_LAUNCH_CMD="grok --always-approve"
-export AIPANE_OPENCODE_LAUNCH_CMD="opencode"
-export AIPANE_CURSOR_LAUNCH_CMD="cursor-agent --force"
-export AIPANE_QWEN_LAUNCH_CMD="qwen --yolo"
 export AIPANE_PI_LAUNCH_CMD="pi"
 export AIPANE_KIMI_LAUNCH_CMD="kimi --auto"
 export AIPANE_AGY_LAUNCH_CMD="agy"
@@ -165,9 +162,6 @@ Tool keys and default commands:
 | `x` | Codex | `codex --yolo -c check_for_update_on_startup=false` |
 | `d` | dsh-TUI | `dsh-tui` |
 | `g` | Grok | `grok --always-approve` |
-| `o` | OpenCode | `opencode` |
-| `r` | Cursor | `cursor-agent --force` |
-| `q` | Qwen Code | `qwen --yolo` |
 | `p` | Pi | `pi` |
 | `k` | Kimi Code | `kimi --auto` |
 | `a` | Antigravity CLI | `agy` |
@@ -181,9 +175,9 @@ ai x -- --help                            # pass an ai-looking option to the too
 ai --new x resume <session-id>            # run one tool in a new tmux window/session
 
 ai cxdg                                   # one pane per character
-ai cxr                                    # interactively choose a 3-pane layout
-ai cxr --layout main-right                # skip the 3-pane prompt
-ai -l columns cxr
+ai cxp                                    # interactively choose a 3-pane layout
+ai cxp --layout main-right                # skip the 3-pane prompt
+ai -l columns cxp
 ai --new cxdg
 ai cc                                     # duplicate keys launch duplicate tools
 ```
@@ -280,15 +274,13 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 │   ├── tmux-workstation.conf
 │   └── tmux-window-wrap.conf
 ├── integrations/            # AI Tool Agent Activity Adapters
+│   ├── antigravity/
 │   ├── claude/
 │   ├── codex/
-│   ├── cursor/
 │   ├── dsh/
 │   ├── grok/
 │   ├── kimi/
-│   ├── opencode/
-│   ├── pi/
-│   └── qwen/
+│   └── pi/
 ├── docs/
 │   ├── agent-notifications.md
 │   ├── cheatsheet.md

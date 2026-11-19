@@ -440,10 +440,10 @@ collect_mcp_pids() {
       return 0
     }
     function is_protected(cmd) {
-      return is_dsh_cmd(cmd) || cmd ~ /claude|@anthropic-ai\/claude-code|claude-code|claude-guard|codex|\/droid([[:space:]]|$)|factory-droid|agy|gemini|grok|opencode|tmux|zsh|bash|fish/
+      return is_dsh_cmd(cmd) || cmd ~ /claude|@anthropic-ai\/claude-code|claude-code|claude-guard|codex|\/droid([[:space:]]|$)|factory-droid|agy|gemini|grok|tmux|zsh|bash|fish/
     }
     function is_session_root(cmd) {
-      return is_dsh_cmd(cmd) || cmd ~ /claude-guard|factory-droid|(^|[[:space:]]|\/)(claude|droid|codex|agy|gemini|grok|opencode)([[:space:]]|$)/
+      return is_dsh_cmd(cmd) || cmd ~ /claude-guard|factory-droid|(^|[[:space:]]|\/)(claude|droid|codex|agy|gemini|grok)([[:space:]]|$)/
     }
     function is_shell_cmd(cmd) {
       return cmd ~ /^(bash|zsh|sh|fish)$/

@@ -1,11 +1,11 @@
 #!/usr/bin/env zsh
 # aipane entrypoint
 
-if [[ "${_AIPANE_INIT_VERSION:-}" == "7" ]]; then
+if [[ "${_AIPANE_INIT_VERSION:-}" == "8" ]]; then
   return 0
 fi
 typeset -g _AIPANE_INIT_LOADED=1
-typeset -g _AIPANE_INIT_VERSION=7
+typeset -g _AIPANE_INIT_VERSION=8
 
 # Unload the retired cleanup wrapper when an existing shell reloads aipane.
 # Keep unrelated user functions with the same name.
@@ -40,6 +40,7 @@ if (( $+aliases[oc] )) && [[ "${aliases[oc]}" == 'opencode' ]]; then
 fi
 
 for _aipane_legacy_f in \
+  _aipane_cursor_precreate \
   _aipane_cc_invoke \
   _aipane_link_if_missing \
   _aipane_account_dir \
@@ -53,7 +54,7 @@ for _aipane_legacy_f in \
   _aipane_project_dir_key; do
   (( $+functions[$_aipane_legacy_f] )) && unfunction "$_aipane_legacy_f"
 done
-unset _aipane_legacy_f
+unset _aipane_legacy_f _AIPANE_GOLDCASE
 
 typeset -g AIPANE_ROOT="${${(%):-%N}:A:h}"
 

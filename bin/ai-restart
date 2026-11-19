@@ -304,8 +304,6 @@ def exact_plan_items(plan: list[dict[str, object]]) -> list[dict[str, object]]:
                 **{field_name: item.get(field_name, "") for field_name in fields},
                 **({field_name: item.get(field_name, "") for field_name in ("dsh_home", "session_root")}
                    if item.get("tool") == "dsh" else {}),
-                **({field_name: item.get(field_name, "") for field_name in ("qwen_home", "qwen_runtime_dir")}
-                   if item.get("tool") == "qwen" else {}),
                 **({"codex_home": item["codex_home"]} if item.get("codex_home") else {}),
                 "guard": {
                     field_name: str(guard.get(field_name, ""))
