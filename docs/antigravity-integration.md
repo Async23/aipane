@@ -5,6 +5,13 @@
 are passed through, for example `ai a --model 'Gemini 4 Hydrogen' --effort high`.
 The default follows agy's own permission settings.
 
+When you start an agy session below your home directory, aipane checks each
+parent up to and including your home directory, even across Git roots. It passes
+each parent containing `.agents/skills/` to agy with `--add-dir`, nearest first.
+Each added directory becomes a workspace, so its rules and other workspace
+customizations apply along with its skills. This also applies in multi-pane
+launches such as `ai ca`. Subcommands such as `ai a models` run as usual.
+
 ## Install
 
 Install a tested, committed aipane runtime with `bin/aipane-release install` as

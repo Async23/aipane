@@ -341,17 +341,42 @@ class AntigravityTests(unittest.TestCase):
         self.assertEqual(len(adapter.deliveries), 1)
         self.assertEqual(notifications.handle("agy", {**payload, "token": "question:2"}).outcome, "delivered")
 
+    def launch_args(self, cwd, *args):
+        script = """
+            source "$1"
+            shift
+            capture_agy() { print -rN -- "$@"; }
+            ai a -- "$@"
+        """
+        result = subprocess.run(["zsh", "-fc", script, "launcher-test", str(ROOT / "init.zsh"), *args],
+                                cwd=cwd, env={**self.env, "AIPANE_AGY_LAUNCH_CMD": "capture_agy --sandbox"},
+                                capture_output=True, check=True)
+        return os.fsdecode(result.stdout).split("\0")[:-1]
+
     def test_launcher_passes_model_arguments_without_preallocating_a_session(self):
-        output = self.root / "arguments.json"
-        fixture = self.root / "fake-agy"
-        fixture.write_text("#!/usr/bin/env python3\nimport json,sys\nfrom pathlib import Path\n"
-                           f"Path({str(output)!r}).write_text(json.dumps(sys.argv[1:]))\n")
-        fixture.chmod(0o755)
-        command = f"source {shlex.quote(str(ROOT / 'init.zsh'))}; ai a --model 'Gemini 4 Hydrogen' --effort high"
-        result = subprocess.run(["zsh", "-c", command], env={**self.env, "AIPANE_AGY_LAUNCH_CMD": str(fixture)},
-                                capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(output.read_text()), ["--model", "Gemini 4 Hydrogen", "--effort", "high"])
+        args = ["--model", "Gemini 4 Hydrogen", "--effort", "high"]
+        self.assertEqual(self.launch_args(self.cwd, *args), ["--sandbox", *args])
+
+    def test_launcher_inherits_skill_parents_across_git_roots(self):
+        project = self.cwd / "repos" / "service"
+        for parent in (self.root, self.cwd, project):
+            (parent / ".agents/skills").mkdir(parents=True)
+        (project / ".git").mkdir()
+        inherited = ["--add-dir", str(self.cwd), "--add-dir", str(self.root)]
+        self.assertEqual(self.launch_args(project), ["--sandbox", *inherited])
+        self.assertEqual(self.launch_args(project, "-p", "models"), ["--sandbox", *inherited, "-p", "models"])
+        for explicit in (["--add-dir", "../.."], ["--add-dir=../.."]):
+            with self.subTest(explicit=explicit):
+                self.assertEqual(self.launch_args(project, *explicit),
+                                 ["--sandbox", "--add-dir", str(self.root), *explicit])
+
+    def test_launcher_skips_subcommands_and_stops_at_home(self):
+        (self.root / ".agents/skills").mkdir(parents=True)
+        for args in (["help", "models"], ["--model", "Gemini 4 Hydrogen", "models"], ["--help"], ["--version"]):
+            with self.subTest(args=args):
+                self.assertEqual(self.launch_args(self.cwd, *args), ["--sandbox", *args])
+        self.assertEqual(self.launch_args(self.root), ["--sandbox"])
+        self.assertEqual(self.launch_args(self.root.parent), ["--sandbox"])
 
     def test_question_observer_never_denies_tools_even_with_bad_input(self):
         for raw in ("{}", "{", "[]"):

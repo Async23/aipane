@@ -48,6 +48,46 @@ _aipane_command_with_args() {
   fi
 }
 
+_aipane_agy_command() {
+  local dir="${PWD:A}" home_dir="${HOME:A}" option value
+  local -a inherited
+  local -A explicit_dirs
+  local i
+
+  # A positional argument selects a subcommand. Skip values of session options
+  # so that, for example, the prompt in `-p models` stays a session argument.
+  for (( i = 1; i <= $#; i++ )); do
+    option="${argv[i]%%=*}"
+    case "$option" in
+      -h|--help|--version|[^-]*)
+        _aipane_command_with_args "$AIPANE_AGY_LAUNCH_CMD" "$@"
+        return
+        ;;
+      -p|-i|--add-dir|--agent|--conversation|--effort|--input-format|--json-schema|\
+      --log-file|--mode|--model|--output-format|--print|--print-timeout|--project|\
+      --prompt|--prompt-interactive|--settings)
+        if [[ "${argv[i]}" == *=* ]]; then
+          value="${argv[i]#*=}"
+        else
+          (( ++i ))
+          value="${argv[i]-}"
+        fi
+        if [[ "$option" == --add-dir && -n "$value" ]]; then
+          explicit_dirs[${value:A}]=1
+        fi
+        ;;
+    esac
+  done
+
+  while [[ "$dir" != "$home_dir" && "$dir" == "${home_dir%/}/"* ]]; do
+    dir="${dir:h}"
+    if [[ -d "$dir/.agents/skills" && -z "${explicit_dirs[$dir]-}" ]]; then
+      inherited+=(--add-dir "$dir")
+    fi
+  done
+  _aipane_command_with_args "$AIPANE_AGY_LAUNCH_CMD" "${inherited[@]}" "$@"
+}
+
 _aipane_tool_command() {
   local tool="$1"
   shift
@@ -72,7 +112,7 @@ _aipane_tool_command() {
       _aipane_command_with_args "$AIPANE_KIMI_LAUNCH_CMD" "$@"
       ;;
     a)
-      _aipane_command_with_args "$AIPANE_AGY_LAUNCH_CMD" "$@"
+      _aipane_agy_command "$@"
       ;;
     *)
       print -u2 "ai: internal error: unknown tool '${tool}'"

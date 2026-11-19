@@ -1,11 +1,11 @@
 #!/usr/bin/env zsh
 # aipane entrypoint
 
-if [[ "${_AIPANE_INIT_VERSION:-}" == "8" ]]; then
+if [[ "${_AIPANE_INIT_VERSION:-}" == "9" ]]; then
   return 0
 fi
 typeset -g _AIPANE_INIT_LOADED=1
-typeset -g _AIPANE_INIT_VERSION=8
+typeset -g _AIPANE_INIT_VERSION=9
 
 # Unload the retired cleanup wrapper when an existing shell reloads aipane.
 # Keep unrelated user functions with the same name.
