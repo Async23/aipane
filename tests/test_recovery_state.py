@@ -7,7 +7,7 @@ import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from recovery_state import PendingStore
+from recovery_state import PendingStore, RecoveryStateError
 
 
 class RecoveryStateTests(unittest.TestCase):
@@ -56,9 +56,12 @@ class RecoveryStateTests(unittest.TestCase):
 
     def test_retired_tool_in_old_state_cannot_run_or_block_other_recoveries(self):
         local = {**self.item, "created_at": time.time()}
-        old = {**local, "tool": "retired", "target": "0:2.1", "pane_id": "%2"}
-        foreign = {**old, "server_pid": "456"}
-        self.file.write_text(json.dumps({"version": 1, "items": [old, local, foreign]}))
+        retired = [
+            {**local, "tool": tool, "target": f"0:{i}.1", "pane_id": f"%{i}"}
+            for i, tool in enumerate(("opencode", "cursor", "qwen"), start=2)
+        ]
+        foreign = {**retired[0], "server_pid": "456"}
+        self.file.write_text(json.dumps({"version": 1, "items": [*retired, local, foreign]}))
         before = self.file.read_bytes()
         pending = self.store.load(time.time())
         self.assertEqual([item["tool"] for item in pending], ["codex"])
@@ -67,7 +70,15 @@ class RecoveryStateTests(unittest.TestCase):
         payload = json.loads(self.file.read_text())
         self.assertEqual(payload["items"], [foreign, *pending])
         self.assertEqual([(item["tool"], item["resolution"]) for item in payload["history"]],
-                         [("retired", "discarded")])
+                         [(item["tool"], "discarded") for item in retired])
+
+    def test_unknown_pending_tool_still_blocks_overwriting_the_file(self):
+        unknown = {**self.item, "tool": "misspelled", "created_at": time.time()}
+        self.file.write_text(json.dumps({"version": 1, "items": [unknown]}))
+        before = self.file.read_bytes()
+        with self.assertRaisesRegex(RecoveryStateError, "invalid pending recovery"):
+            self.store.save([])
+        self.assertEqual(self.file.read_bytes(), before)
 
     def test_migration_and_discard_preserve_foreign_intent_and_audit(self):
         local = {**self.item, "created_at": time.time()}

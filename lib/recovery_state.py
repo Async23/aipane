@@ -17,6 +17,10 @@ from recovery_plan import RecoveryPlanError, TOOL_TAGS, session_identity
 from recovery_snapshot import atomic_json
 
 
+# These names occur in valid pending files written before the adapters were removed.
+STORED_TOOLS = TOOL_TAGS.keys() | {"cursor", "opencode", "qwen"}
+
+
 class RecoveryStateError(RecoveryPlanError):
     pass
 
@@ -50,7 +54,7 @@ class PendingStore:
         for raw in payload["items"]:
             try:
                 valid = (isinstance(raw, dict) and float(raw.get("created_at", 0)) > 0
-                         and raw.get("restorable") is True
+                         and raw.get("restorable") is True and raw.get("tool") in STORED_TOOLS
                          and all(isinstance(raw.get(key), str) and raw[key]
                                  for key in ("target", "tool", "command", "cwd", "kind")))
             except (TypeError, ValueError):
