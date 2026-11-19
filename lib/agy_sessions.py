@@ -26,7 +26,6 @@ import uuid
 from urllib.parse import unquote, urlparse
 
 SID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-ACTIVE = {"working", "tool_use", "reviewing"}
 MODES = {"auto", "plan", "accept-edits"}
 EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 
@@ -113,7 +112,7 @@ def runtime_lock(path: Path):
         yield
 
 
-def activity_state(payload: dict) -> str:
+def status_phase(payload: dict) -> str:
     tasks = payload.get("task_count", 0)
     agents = payload.get("subagents", [])
     if (type(tasks) is not int or tasks < 0 or not isinstance(agents, list)
@@ -121,9 +120,21 @@ def activity_state(payload: dict) -> str:
         return "unknown"
     if any(item.get("status") == "running" for item in agents):
         return "busy"
-    if payload.get("agent_state") in ACTIVE or payload.get("tool_confirmation_pending") is True:
+    phase = payload.get("agent_state")
+    if phase in {"working", "tool_use"} or payload.get("tool_confirmation_pending") is True:
         return "busy"
-    return "idle" if payload.get("agent_state") in {"idle", "error"} else "unknown"
+    if phase == "reviewing":
+        return "reviewing"
+    return "idle" if phase in {"idle", "error"} else "unknown"
+
+
+def turn_activity(phase: str, stop: dict) -> str:
+    # The CLI can keep reporting reviewing while a finished artifact awaits the user.
+    if phase == "reviewing":
+        phase = "idle" if stop.get("fullyIdle") is True else "busy"
+    if phase == "idle" and stop.get("continuationActive"):
+        return "busy"
+    return phase
 
 
 def completion_ready(record: dict) -> bool:
@@ -304,9 +315,8 @@ class AgyIntegration:
             if pending.get("stop"):
                 record["stop"] = pending["stop"]
             before_state = record.get("state")
-            state = activity_state(payload)
-            if state == "idle" and (record.get("stop") or {}).get("continuationActive"):
-                state = "busy"
+            record["status_phase"] = status_phase(payload)
+            state = turn_activity(record["status_phase"], record.get("stop") or {})
             if state == "busy" and (not record.get("active") or before_state == "idle"):
                 record.update(active=True, generation=uuid.uuid4().hex)
                 record.pop("stop", None)
@@ -388,8 +398,11 @@ class AgyIntegration:
                     record.update(active=True, generation=uuid.uuid4().hex)
                 record["state"] = "busy"
                 record.pop("stop", None)
+                record.pop("status_phase", None)
             elif event == "Stop":
                 record["stop"] = {k: payload[k] for k in ("terminationReason", "error", "fullyIdle", "executionNum", "continuationActive") if k in payload}
+                if "status_phase" in record:
+                    record["state"] = turn_activity(record["status_phase"], record["stop"])
                 events.extend(self._complete(record))
             elif event == "PreToolUse":
                 tool = payload.get("toolCall") or {}

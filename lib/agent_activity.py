@@ -1270,6 +1270,12 @@ class AgentActivity:
                     accepted=False,
                     changed=False,
                 )
+            if owner == "agy":
+                # Stop and status callbacks can reach tmux in reverse order.
+                # Project the current foreground runtime while holding the pane lock.
+                state = self._resolve(pane).state
+                if state == "unknown":
+                    return ActivityReportResult(state=state, accepted=False, changed=False)
             if self._ignore_early_codex_idle(
                 state,
                 str(event_name) if isinstance(event_name, str) else "",

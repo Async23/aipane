@@ -2,6 +2,7 @@
 
 import json
 from contextlib import closing
+from functools import partial
 import os
 from pathlib import Path
 import shlex
@@ -74,6 +75,64 @@ class AntigravityTests(unittest.TestCase):
         self.assertEqual(record["state"], "idle")
         self.assertEqual(events, [])
         self.assertEqual(self.hook("Stop", fullyIdle=True)[1], [])
+
+    def test_artifact_review_after_terminal_stop_clears_activity(self):
+        self.status(agent_state="working")
+        self.hook("Stop", fullyIdle=True, continuationActive=False)
+        record, events = self.status(agent_state="reviewing", task_count=1)
+        self.assertEqual(record["state"], "idle")
+        self.assertEqual(events, [])
+        first = self.status(agent_state="reviewing")[1][0]
+        self.assertEqual(first["event"], "completed")
+        self.assertEqual(self.status(agent_state="reviewing")[1][0]["token"], first["token"])
+
+        self.hook("PreInvocation")
+        record, events = self.hook("Stop", fullyIdle=True)
+        self.assertEqual((record["state"], events), ("busy", []))
+        second = self.status(agent_state="reviewing")[1][0]
+        self.assertNotEqual(second["token"], first["token"])
+
+    def test_terminal_stop_clears_artifact_review_without_another_status(self):
+        self.status(agent_state="working")
+        record, events = self.status(agent_state="reviewing")
+        self.assertEqual((record["state"], events), ("busy", []))
+        for stop in ({"fullyIdle": False}, {"fullyIdle": True, "continuationActive": True}):
+            record, events = self.hook("Stop", **stop)
+            self.assertEqual((record["state"], events), ("busy", []))
+        record, events = self.hook("Stop", fullyIdle=True, continuationActive=False)
+        self.assertEqual(self.current()["state"], "idle")
+        self.assertEqual(events[0]["event"], "completed")
+
+    def test_approval_or_running_subagent_keeps_artifact_review_busy(self):
+        self.status(agent_state="working")
+        for activity in ({"tool_confirmation_pending": True}, {"subagents": [{"status": "running"}]}):
+            with self.subTest(activity=activity):
+                self.hook("PreInvocation")
+                self.status(agent_state="reviewing", **activity)
+                record, events = self.hook("Stop", fullyIdle=True)
+                self.assertEqual((record["state"], events), ("busy", []))
+                record, events = self.status(agent_state="reviewing", **activity)
+                self.assertEqual((record["state"], events), ("busy", []))
+                record, events = self.status(agent_state="reviewing")
+                self.assertEqual(record["state"], "idle")
+                self.assertEqual(events[0]["event"], "completed")
+
+    def test_delayed_review_report_cannot_overwrite_current_tmux_marker(self):
+        pane = PaneActivity("%1", "agy", pane_tty="/dev/ttys999", socket_path="/tmp/agy-test", server_pid="111")
+        adapter = InMemoryActivityAdapter([pane], environment=self.env)
+        activity = AgentActivity(adapter=adapter)
+        reader = partial(agy.current_session, reader=self.integration.reader)
+        with patch.object(agy, "current_session", wraps=reader):
+            review, _ = self.status(agent_state="reviewing")
+            done, _ = self.hook("Stop", fullyIdle=True)
+            activity.report("%1", done["state"], owner="agy")
+            activity.report("%1", review["state"], owner="agy")
+            self.assertEqual(adapter.read("%1").marker, "")
+
+            next_turn, _ = self.hook("PreInvocation")
+            activity.report("%1", next_turn["state"], owner="agy")
+            activity.report("%1", done["state"], owner="agy")
+            self.assertEqual(adapter.read("%1").marker, "agy")
 
     def test_background_command_outlives_turn_but_still_defers_notification(self):
         self.status(agent_state="working")
