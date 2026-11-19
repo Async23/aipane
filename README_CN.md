@@ -72,6 +72,7 @@ ln -sf "$AIPANE_ROOT/bin/aipane-activity" ~/.local/bin/aipane-activity
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
 ln -sf "$AIPANE_ROOT/bin/ai-restart" ~/.local/bin/ai-restart
 ln -sf "$AIPANE_ROOT/bin/aipane-dsh-tui-pill" ~/.local/bin/aipane-dsh-tui-pill
+ln -sf "$AIPANE_ROOT/bin/aipane-sessions" ~/.local/bin/aipane-sessions
 ```
 
 重命名弹窗要求 `PATH` 中存在 `fzf`。
@@ -100,6 +101,8 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `bin/tmux-window-jump` | 同数字连按、精确 index 的窗口选择器 |
 | `bin/tmux-window-wrap` | 渲染 CLI |
 | `bin/aipane-activity` | Agent Activity CLI |
+| `bin/aipane-sessions` | 零索引跨 Agent 本地会话检索与导出 CLI（`list` / `find` / `read`） |
+| `skills/aipane-sessions/SKILL.md` | 面向 Agent 的 `aipane-sessions` Skill |
 | `bin/ai-restart` | 原地安全重启并续接可恢复的 AI pane |
 | `bin/aipane-restore-executor` | 带验证、重试和持久 pending 意图的恢复执行器 |
 | [`integrations/`](integrations/README.md) | Agent 生命周期集成 |

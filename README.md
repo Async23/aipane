@@ -72,6 +72,7 @@ ln -sf "$AIPANE_ROOT/bin/aipane-activity" ~/.local/bin/aipane-activity
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
 ln -sf "$AIPANE_ROOT/bin/ai-restart" ~/.local/bin/ai-restart
 ln -sf "$AIPANE_ROOT/bin/aipane-dsh-tui-pill" ~/.local/bin/aipane-dsh-tui-pill
+ln -sf "$AIPANE_ROOT/bin/aipane-sessions" ~/.local/bin/aipane-sessions
 ```
 
 The rename popup requires `fzf` on `PATH`.
@@ -101,6 +102,8 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `bin/tmux-window-jump` | repeated-digit exact-index window selector |
 | `bin/tmux-window-wrap` | renderer CLI |
 | `bin/aipane-activity` | Agent Activity CLI |
+| `bin/aipane-sessions` | Zero-index local session lookup, search, and export CLI (`list` / `find` / `read`) |
+| `skills/aipane-sessions/SKILL.md` | Agent Skill wrapper for `aipane-sessions` |
 | `bin/ai-restart` | confirm and seal an exact in-place AI pane restart plan |
 | `bin/aipane-restore-executor` | exclusively execute, verify, retry, and persist recovery |
 | `lib/recovery_plan.py` | versioned, digest-protected restart plan contract |
