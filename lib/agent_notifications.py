@@ -247,7 +247,7 @@ class MacOSNotificationAdapter:
 
     def _deliver_codex(self, notification: Notification) -> str:
         app = self.home / "Applications" / "Codex Notifier.app"
-        icon = app / "Contents" / "Resources" / "CodexGhostty.icns"
+        notifier = app / "Contents" / "MacOS" / "terminal-notifier"
         args = [
             "-title",
             notification.title,
@@ -259,16 +259,25 @@ class MacOSNotificationAdapter:
             notification.sound,
             "-group",
             notification.group,
-            "-appIcon",
-            icon.resolve().as_uri(),
         ]
         if notification.action:
             args.extend(["-execute", notification.action])
-        if app.exists() and self._run(
-            ["/usr/bin/open", "-gj", str(app), "--args", *args],
+        if _executable(notifier) and self._run(
+            [str(notifier), *args],
             timeout=5,
         ):
             return "custom-app"
+
+        print(
+            json.dumps({
+                "event": "notify_sender_failed",
+                "agent": "codex",
+                "sender": str(notifier),
+                "reason": "sender-failed" if _executable(notifier) else "sender-missing",
+                "fallback": "terminal-notifier",
+            }),
+            file=sys.stderr,
+        )
 
         fallback = Path("/opt/homebrew/bin/terminal-notifier")
         fallback_args = [

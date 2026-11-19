@@ -137,6 +137,16 @@ python3 tests/test_claude_notify.py
 
 ## Codex
 
+The sender directly executes `~/Applications/Codex Notifier.app/Contents/MacOS/terminal-notifier`
+with Bundle ID `com.alfheim.codex-cli-notifier.v2`. Its icon comes only from
+`CFBundleIconFile=CodexGhostty`; the primary request does not pass `-appIcon`.
+Direct execution avoids a stale LaunchServices job rejecting `open --args`
+with `Operation already in progress`. This sender still uses the legacy
+`NSUserNotificationCenter` API; do not reuse its Bundle ID with a modern sender.
+The existing Homebrew and AppleScript fallbacks remain available. A primary
+failure emits a `notify_sender_failed` diagnostic before fallback; Homebrew uses
+the Ghostty icon and does not preserve the tmux click action.
+
 Merge [`integrations/codex/hooks.json`](../integrations/codex/hooks.json) into
 `~/.codex/hooks.json`, preserving unrelated hooks. The `PreToolUse` matcher for
 `request_user_input` and `request_user_input_async` calls the existing entrypoint:

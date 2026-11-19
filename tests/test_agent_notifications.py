@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import sqlite3
@@ -9,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stderr
 from pathlib import Path
 
 
@@ -22,6 +23,7 @@ from agent_notifications import (  # noqa: E402
     AgentNotifications,
     InMemoryNotificationAdapter,
     MacOSNotificationAdapter,
+    Notification,
 )
 
 
@@ -800,17 +802,31 @@ class AgentNotificationsTests(unittest.TestCase):
 
     def test_codex_delivery_uses_its_dedicated_app_identity(self) -> None:
         app = self.home / "Applications" / "Codex Notifier.app"
-        app.mkdir(parents=True)
+        notifier = app / "Contents" / "MacOS" / "terminal-notifier"
+        notifier.parent.mkdir(parents=True)
+        notifier.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$DELIVERY_LOG\"\n",
+            encoding="utf-8",
+        )
+        notifier.chmod(0o755)
+        delivery_log = self.home / "codex-delivery.log"
         commands: list[tuple[list[str], float]] = []
 
         def run_command(command: list[str], timeout: float) -> bool:
             commands.append((command, timeout))
-            return True
+            # Never launch macOS apps or send a fallback notification in tests.
+            if command[0] != str(notifier):
+                return False
+            return subprocess.run(
+                command, env=environment, timeout=timeout, check=False
+            ).returncode == 0
 
         environment = {
+            **os.environ,
             "HOME": str(self.home),
             "CODEX_HOME": str(self.home / ".codex"),
             "CODEX_NOTIFY_SOUND": "Pop",
+            "DELIVERY_LOG": str(delivery_log),
             "TMUX_PANE": "",
         }
         result = AgentNotifications(
@@ -830,15 +846,51 @@ class AgentNotificationsTests(unittest.TestCase):
 
         self.assertEqual(result.outcome, "delivered")
         self.assertEqual(result.channel, "custom-app")
-        self.assertEqual(commands[0][0][:5], [
-            "/usr/bin/open",
-            "-gj",
-            str(app),
-            "--args",
-            "-title",
-        ])
-        self.assertIn("codex-agent-turn-complete-ghostty-clean", commands[0][0])
+        self.assertEqual(len(commands), 1)
+        arguments = delivery_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(arguments[arguments.index("-title") + 1], self.project.name)
+        self.assertEqual(arguments[arguments.index("-message") + 1], "Codex finished.")
+        self.assertEqual(arguments[arguments.index("-sound") + 1], "Pop")
+        self.assertEqual(arguments[arguments.index("-group") + 1], "codex-agent-turn-complete-ghostty-clean")
+        self.assertNotIn("-appIcon", arguments)
+        self.assertNotIn("-sender", arguments)
         self.assertEqual(commands[0][1], 5)
+
+    def test_codex_sender_failure_is_visible_and_preserves_primary_click_action(self) -> None:
+        notifier = self.home / "Applications/Codex Notifier.app/Contents/MacOS/terminal-notifier"
+        notifier.parent.mkdir(parents=True)
+        notifier.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        notifier.chmod(0o755)
+        commands: list[list[str]] = []
+
+        def fail_command(command: list[str], _timeout: float) -> bool:
+            commands.append(command)
+            return False
+
+        notification = Notification(
+            title="Private title",
+            subtitle="Private prompt",
+            body="Private response",
+            sound="Pop",
+            event="agent-turn-complete",
+            group="codex-failure",
+            action="focus-original-pane",
+        )
+        diagnostic = io.StringIO()
+        adapter = MacOSNotificationAdapter(
+            environment={"HOME": str(self.home)}, run_command=fail_command
+        )
+        with redirect_stderr(diagnostic):
+            channel = adapter.deliver("codex", notification)
+
+        self.assertEqual(channel, "failed")
+        self.assertEqual(commands[0][0], str(notifier))
+        self.assertEqual(commands[0][-2:], ["-execute", "focus-original-pane"])
+        record = json.loads(diagnostic.getvalue())
+        self.assertEqual(record["event"], "notify_sender_failed")
+        self.assertEqual(record["agent"], "codex")
+        self.assertEqual(record["reason"], "sender-failed")
+        self.assertNotIn("Private", diagnostic.getvalue())
 
     def test_kimi_completion_is_normalized_and_delivered(self) -> None:
         delivery = InMemoryNotificationAdapter()
