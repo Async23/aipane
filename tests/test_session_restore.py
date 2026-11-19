@@ -62,6 +62,16 @@ class SessionRestoreTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), "")
 
+    def test_antigravity_pane_without_snapshot_metadata_is_reported_as_invalid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_restore(
+                Path(directory), coord={}, title="agy", saved_codex_ids=set(),
+                current_command="agy", full_command="agy", bind_snapshot=False, plan_json=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        item = json.loads(result.stdout)
+        self.assertEqual((item["tool"], item["kind"], item["restorable"]), ("agy", "invalid", False))
+
     def test_unbound_coordinates_cannot_override_an_older_dump(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             result = self.run_restore(

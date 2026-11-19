@@ -321,7 +321,7 @@ build_resume() {
       # --continue cache is shared by all panes in the same workspace.
       id="$coord_sid"
       if [[ -n "$id" ]]; then
-        if REPLY="$(command python3 "$SCRIPT_DIR/../lib/agy_sessions.py" resume "$id" "$cwd" "${coord_agy:-\{\}}" "$AGY_BASE")"; then
+        if REPLY="$(command python3 "$SCRIPT_DIR/../lib/agy_sessions.py" resume "$id" "$cwd" "$coord_agy" "$AGY_BASE")"; then
           REPLY_KIND=resume
         else
           REPLY="$AGY_BASE"; REPLY_KIND=invalid
@@ -411,7 +411,7 @@ emit_plan_json() {
   AIPANE_PLAN_DSH_HOME="${coord_dsh_home:-}" \
   AIPANE_PLAN_SESSION_ROOT="${coord_session_root:-}" \
   AIPANE_PLAN_CODEX_HOME="${coord_codex_home:-${CODEX_HOME:-$HOME/.codex}}" \
-  AIPANE_PLAN_AGY="${coord_agy:-\{\}}" \
+  AIPANE_PLAN_AGY="$coord_agy" \
     command python3 -c '
 import json, os
 print(json.dumps({
@@ -457,6 +457,7 @@ while IFS= read -r line; do
   coord_dsh_home="${COORDS_DSH_HOME[$target]:-}"
   coord_session_root="${COORDS_SESSION_ROOT[$target]:-}"
   coord_agy="${COORDS_AGY[$target]:-}"
+  [[ -n "$coord_agy" ]] || coord_agy='{}'
   if [[ -n "$coord_sid" ]] && ! coord_tool_matches "$tool" "$coord_tool"; then
     log "ignore $target snapshot id: detected=$tool recorded=${coord_tool:-missing}"
     coord_sid=""
@@ -481,7 +482,7 @@ while IFS= read -r line; do
 
   emit_plan_json \
     "$target" "$tool" "$REPLY_KIND" "$restorable" "$cwd" "$cmd" "$resume_sid" \
-    >>"$PLAN_FILE"
+    >>"$PLAN_FILE" || exit 1
   (( skip_fresh || skip_invalid )) && (( n_skip++ ))
 done < "$DUMP"
 
