@@ -4,8 +4,7 @@
 并按所选模型设置上下文容量。菜单确认选择后，下次打开时会默认选中这个模型。
 同一个 Claude 配置目录中的选择记录跨终端、跨项目共享。
 
-列表支持首尾循环：选择模式下，在最后一项按 `j` 或 `↓` 会回到第一项，
-在第一项按 `k` 或 `↑` 会回到最后一项。搜索后只在筛选结果中循环。
+菜单采用无模式交互：搜索框始终保持可见，直接输入文字即可实时筛选；按 `↑`/`↓`、`Ctrl+J`/`Ctrl+K`、`Ctrl+N`/`Ctrl+P` 或 `Tab`/`Shift+Tab` 可在列表中首尾循环移动；按一次 `Enter` 立即启动当前高亮模型。按 `Esc` 逐层回退：搜索框非空时清空筛选并恢复全量列表，搜索框已空时取消启动；`Ctrl+C` 随时直接取消。
 
 ## 安装
 
@@ -57,8 +56,22 @@ export AIPANE_CLAUDE_LAUNCH_CMD="$HOME/.local/bin/claude-window --dangerously-sk
 `model-routing.json` 的 `models` 为每个 ID 提供 `context_tokens` 和可选的
 `billing_source`。启动器只展示同时出现在这两处的模型。配置与认证信息保留在本机。
 
-启动时会设置该模型的上下文容量，并将会话内部的模型选项限制为相同容量的模型。
+启动时会设置该模型的上下文容量，会话内的模型菜单只显示同一提供方、同一容量的模型。
 自动恢复标记与恢复执行器的配合见 [恢复运行规则](recovery-runtime.md)。
+
+### Google Vertex AI
+
+在 `model-routing.json` 中为 Google 原生 Claude 模型设置 `"provider": "vertex"`。
+模型 ID 使用 Google 发布的原名，例如 `claude-sonnet-5-5`。顶层 `vertex.credentials`
+指向 Google 服务账号 JSON 或包含 `service_account` 的 CLIProxyAPI 凭证。
+启动器读取其中的项目和代理，也支持通过 `vertex.project_id`、`vertex.https_proxy`
+和 `vertex.region` 指定，区域默认为 `global`。
+
+使用封装凭证时，启动器将标准凭证同步到该 Claude 配置目录的
+`cache/vertex-adc/service-account.json`，目录权限为 `0700`，文件权限为 `0600`。
+后台会话可持续刷新访问令牌，源密钥轮换后再次启动即可更新副本。
+`vertex.model_defaults` 可以按 Claude Code 环境变量名设置各模型别名及子代理模型。
+跨提供方切换时重新运行启动器。云端模型准入和配额由 Google Cloud 项目单独管理。
 
 ## 自动信任工作目录
 

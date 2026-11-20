@@ -229,29 +229,80 @@ def resume_model(args: list[str], settings: dict) -> str | None:
     return None
 
 
+def vertex_environment(config: dict) -> dict[str, str]:
+    source = Path(config["credentials"]).expanduser()
+    credential = read_json(source)
+    if credential.get("disabled"):
+        raise ValueError(f"Vertex 凭证已停用: {source}")
+    account = credential.get("service_account", credential)
+    if not isinstance(account, dict) or account.get("type") != "service_account" or not account.get("project_id"):
+        raise ValueError(f"Vertex 需要 Google 服务账号凭证: {source}")
+    adc = source
+    if account is not credential:
+        # Google ADC expects the service account at the top level. Keep a
+        # private, atomically refreshed copy so detached sessions can renew tokens.
+        directory = CONFIG / "cache" / "vertex-adc"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        adc = directory / "service-account.json"
+        content = json.dumps(account, ensure_ascii=False) + "\n"
+        if not adc.exists() or adc.stat().st_mode & 0o077 or adc.read_text() != content:
+            fd, name = tempfile.mkstemp(dir=directory)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    stream.write(content)
+                os.replace(name, adc)
+            finally:
+                Path(name).unlink(missing_ok=True)
+    env = {
+        "CLAUDE_CODE_USE_VERTEX": "1",
+        "CLOUD_ML_REGION": config.get("region", "global"),
+        "ANTHROPIC_VERTEX_PROJECT_ID": config.get("project_id", account["project_id"]),
+        "GOOGLE_APPLICATION_CREDENTIALS": str(adc),
+        "ANTHROPIC_BASE_URL": "",
+        "ANTHROPIC_AUTH_TOKEN": "",
+        "ANTHROPIC_API_KEY": "",
+        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "0",
+    }
+    proxy = config.get("https_proxy", credential.get("proxy_url"))
+    if proxy:
+        env["HTTPS_PROXY"] = proxy
+    return env
+
+
 def make_overlay(settings: dict, metadata: dict, extra: dict, model: str) -> dict:
     models = metadata["models"]
+    provider = models[model].get("provider")
+    same_provider = {name for name, row in models.items() if row.get("provider") == provider}
     window = models[model]["context_tokens"]
-    compatible = {name for name, row in models.items() if row.get("context_tokens") == window}
+    compatible = {name for name in same_provider if models[name].get("context_tokens") == window}
     overlay = copy.deepcopy(extra)
     env = overlay.setdefault("env", {})
     if not isinstance(env, dict):
         raise ValueError("--settings 中的 env 必须是对象")
+    defaults = settings.get("env", {})
+    if provider == "vertex":
+        config = metadata.get("vertex", {})
+        if not config.get("credentials"):
+            raise ValueError(f"请先在 {MODEL_METADATA} 中配置 vertex.credentials")
+        env.update(vertex_environment(config))
+        defaults = config.get("model_defaults", {})
+    elif "vertex" in metadata:
+        env["CLAUDE_CODE_USE_VERTEX"] = "0"
     env["ANTHROPIC_MODEL"] = model
     env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(window)
     configured_subagent = canonical_model(
-        str(env.get("CLAUDE_CODE_SUBAGENT_MODEL", settings.get("env", {}).get("CLAUDE_CODE_SUBAGENT_MODEL", "gpt-6.1-sol"))),
+        str(env.get("CLAUDE_CODE_SUBAGENT_MODEL", defaults.get("CLAUDE_CODE_SUBAGENT_MODEL", "gpt-6.1-sol"))),
         settings,
     )
-    subagent = configured_subagent if configured_subagent in models else model
+    subagent = configured_subagent if configured_subagent in same_provider else model
     env["CLAUDE_CODE_SUBAGENT_MODEL"] = subagent
     env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] = "1"
     for alias, family in ALIASES.items():
-        requested = canonical_model(str(env.get(family, settings.get("env", {}).get(family, model))), settings)
-        allowed = models if alias == "haiku" else compatible
+        requested = canonical_model(str(env.get(family, defaults.get(family, model))), settings)
+        allowed = same_provider if alias == "haiku" else compatible
         if requested not in allowed:
             env[family] = model
-        elif alias == "haiku":
+        elif alias == "haiku" or provider == "vertex":
             env[family] = requested
     overlay["model"] = model
     picker = settings.get("modelPicker", {})
@@ -318,6 +369,12 @@ def main() -> int:
     if model not in metadata.get("models", {}):
         raise ValueError(f"模型 {model!r} 没有配置窗口，请先在 {MODEL_METADATA} 中配置")
     overlay = make_overlay(settings, metadata, extra, model)
+    vertex = metadata["models"][model].get("provider") == "vertex"
+    if vertex:
+        # The SDK and status line can inspect the environment before settings load.
+        os.environ.update({k: v for k, v in overlay["env"].items() if isinstance(v, str)})
+    elif "vertex" in metadata:
+        os.environ["CLAUDE_CODE_USE_VERTEX"] = "0"
     if picked:
         remember_model(model)
     if metadata.get("auto_trust_workspace") is True and interactive:
@@ -326,7 +383,7 @@ def main() -> int:
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             print(f"claude-window: 无法记录目录信任（{error}）；继续由 Claude 确认", file=sys.stderr)
     argv = [*args, "--model", model]
-    if extra_arg is not None:
+    if extra_arg is not None or vertex:
         return run_with_private_settings(argv, overlay)
     os.execv(NATIVE_CLAUDE, ["claude", *argv, "--settings", json.dumps(overlay, ensure_ascii=False)])
     return 0

@@ -95,16 +95,6 @@ class PickerPTY:
     def ready(self):
         self.wait_for(self.default)
 
-    def enter_selection(self):
-        self.send(b"\x1b")
-        self.wait_for("选择模式")
-
-    def confirm_search(self):
-        self.send(b"\r")
-        self.wait_for("选择模式")
-        if self.proc.poll() is not None:
-            raise AssertionError("Confirming search started the model")
-
     def finish(self, expected, code=0):
         self.wait_for(expected)
         if self.proc.wait(timeout=3) != code:
@@ -128,47 +118,43 @@ class InteractivePickerTests(unittest.TestCase):
         picker.ready()
         return picker
 
-    def test_enter_keeps_highlighted_default_and_restores_terminal(self):
+    def test_enter_launches_highlighted_default_immediately_and_restores_terminal(self):
         picker = self.picker()
-        picker.confirm_search()
         picker.send(b"\r")
         picker.finish("SELECTED=grok-fast")
 
-    def test_arrow_changes_selection(self):
+    def test_arrow_changes_selection_and_enter_launches(self):
         picker = self.picker()
         picker.send(b"\x1b[A")
         picker.wait_for("kimi-pro")
-        picker.confirm_search()
         picker.send(b"\r")
         picker.finish("SELECTED=kimi-pro")
 
-    def test_j_and_k_move_in_selection_mode(self):
+    def test_ctrl_j_and_ctrl_k_move_selection(self):
         picker = self.picker()
-        picker.enter_selection()
-        picker.send(b"k")
+        picker.send(b"\x0b")
         picker.wait_for("kimi-pro")
-        picker.send(b"j")
+        picker.send(b"\x0a")
         picker.wait_for("grok-fast")
         picker.send(b"\r")
         picker.finish("SELECTED=grok-fast")
 
     def test_navigation_wraps_at_both_ends(self):
         for key, default, expected in (
-            (b"j", "j-k-special", "gpt-sol"),
-            (b"k", "gpt-sol", "j-k-special"),
+            (b"\x0a", "j-k-special", "gpt-sol"),
+            (b"\x0b", "gpt-sol", "j-k-special"),
             (b"\x1b[B", "j-k-special", "gpt-sol"),
             (b"\x1b[A", "gpt-sol", "j-k-special"),
         ):
             with self.subTest(key=key):
                 picker = self.picker(default=default)
-                picker.enter_selection()
                 picker.send(key + b"\r")
                 picker.finish("SELECTED=" + expected)
 
     def test_navigation_wraps_within_filtered_results(self):
         for key, default, expected in (
-            (b"j", "j-k-special", "kimi-pro"),
-            (b"k", "kimi-pro", "j-k-special"),
+            (b"\x0a", "j-k-special", "kimi-pro"),
+            (b"\x0b", "kimi-pro", "j-k-special"),
             (b"\x1b[B", "j-k-special", "kimi-pro"),
             (b"\x1b[A", "kimi-pro", "j-k-special"),
         ):
@@ -176,166 +162,100 @@ class InteractivePickerTests(unittest.TestCase):
                 picker = self.picker(default=default)
                 picker.send(b"!sol")
                 picker.wait_for("3/4")
-                picker.confirm_search()
                 # Search updates can move the cursor; page to the boundary first.
                 picker.send(b"\x1b[6~" if default == "j-k-special" else b"\x1b[5~")
                 picker.wait_for(default)
                 picker.send(key + b"\r")
                 picker.finish("SELECTED=" + expected)
 
-    def test_selection_mode_does_not_type_search(self):
-        picker = self.picker()
-        picker.enter_selection()
-        picker.send(b"sol\r")
-        picker.finish("SELECTED=grok-fast")
-
-    def test_paste_in_selection_mode_does_not_change_search(self):
-        picker = self.picker()
-        picker.enter_selection()
-        picker.send(b"\x1b[200~Kimi Pro\x1b[201~\r")
-        picker.finish("SELECTED=grok-fast")
-
-    def test_search_accepts_j_k_and_slash_as_text(self):
+    def test_search_accepts_j_k_and_slash_as_text_and_launches_on_single_enter(self):
         picker = self.picker()
         picker.send(b"j/k")
         picker.wait_for("j-k-special")
-        picker.confirm_search()
         picker.send(b"\r")
         picker.finish("SELECTED=j-k-special")
 
-    def test_escape_returns_to_selection_and_preserves_filter(self):
+    def test_escape_clears_query_first_then_aborts_when_empty(self):
         picker = self.picker()
         picker.send(b"pro")
         picker.wait_for("kimi-pro")
         picker.send(b"\x1b")
-        picker.wait_for("选择模式")
-        picker.send(b"j")
-        picker.send(b"\r")
-        picker.finish("SELECTED=kimi-pro")
+        picker.wait_for("4/4")
+        self.assertIsNone(picker.proc.poll())
+        picker.send(b"\x1b")
+        picker.finish("CANCELLED", 130)
 
-    def test_j_k_navigation_resumes_with_search_results(self):
-        picker = self.picker()
-        picker.send(b"k\r")
-        picker.wait_for("选择模式")
-        picker.send(b"k")
-        picker.wait_for("kimi-pro")
-        picker.send(b"\r")
-        picker.finish("SELECTED=kimi-pro")
-
-    def test_clear_search_from_selection_mode(self):
+    def test_escape_clears_query_and_allows_immediate_re_search(self):
         picker = self.picker()
         picker.send(b"pro")
         picker.wait_for("kimi-pro")
         picker.send(b"\x1b")
-        picker.wait_for("选择模式")
-        picker.send(b"\x15")
-        picker.wait_for("Grok Fast")
-        picker.send(b"j")
-        picker.wait_for("kimi-pro")
-        picker.send(b"j")
-        picker.wait_for("grok-fast")
-        picker.send(b"\r")
-        picker.finish("SELECTED=grok-fast")
-
-    def test_clear_search_also_clears_input_when_search_reopens(self):
-        picker = self.picker()
-        picker.send(b"pro")
-        picker.wait_for("kimi-pro")
-        picker.send(b"\x1b")
-        picker.wait_for("选择模式")
-        picker.send(b"\x15")
-        picker.wait_for("Grok Fast")
-        picker.send(b"/j/k")
+        picker.wait_for("4/4")
+        picker.send(b"j/k")
         picker.wait_for("j-k-special")
-        picker.confirm_search()
         picker.send(b"\r")
         picker.finish("SELECTED=j-k-special")
 
-    def test_clear_empty_search_keeps_selection_mode(self):
+    def test_ctrl_u_clears_query_and_keeps_picker_open(self):
         picker = self.picker()
-        picker.enter_selection()
-        picker.send(b"\x15k")
+        picker.send(b"pro")
+        picker.wait_for("kimi-pro")
+        picker.send(b"\x15")
+        picker.wait_for("4/4")
+        picker.send(b"j/k")
+        picker.wait_for("j-k-special")
+        picker.send(b"\r")
+        picker.finish("SELECTED=j-k-special")
+
+    def test_ctrl_u_on_empty_query_is_safe_noop(self):
+        picker = self.picker()
+        picker.send(b"\x15\x0b")
         picker.wait_for("kimi-pro")
         picker.send(b"\r")
         picker.finish("SELECTED=kimi-pro")
 
-    def test_clear_no_results_from_selection_mode(self):
+    def test_escape_clears_no_results_and_recovers(self):
         picker = self.picker()
         picker.send(b"zzzzzz")
         picker.wait_for("没有匹配的模型")
-        picker.send(b"\x1b")
-        picker.wait_for("选择模式")
-        picker.send(b"\x15")
-        picker.wait_for("Grok Fast")
-        picker.send(b"/j/k")
-        picker.wait_for("j-k-special")
-        picker.confirm_search()
         picker.send(b"\r")
-        picker.finish("SELECTED=j-k-special")
+        time.sleep(.1)
+        self.assertIsNone(picker.proc.poll())
+        picker.send(b"\x1b")
+        picker.wait_for("4/4")
+        picker.send(b"sol")
+        picker.wait_for("gpt-sol")
+        picker.send(b"\r")
+        picker.finish("SELECTED=gpt-sol")
 
-    def test_search_and_bracketed_paste(self):
+    def test_search_and_bracketed_paste_launches_on_single_enter(self):
         picker = self.picker()
         picker.send(b"\x1b[200~Kimi Pro\x1b[201~")
         picker.wait_for("kimi-pro")
-        picker.confirm_search()
-        picker.send(b"\r")
-        picker.finish("SELECTED=kimi-pro")
-
-    def test_search_can_be_reopened_after_navigation(self):
-        picker = self.picker()
-        picker.send(b"j/k")
-        picker.wait_for("j-k-special")
-        picker.send(b"\x1b")
-        picker.wait_for("选择模式")
-        picker.send(b"/")
-        picker.wait_for("搜索模式")
-        picker.send(b"\x15kimi")
-        picker.wait_for("kimi-pro")
-        picker.confirm_search()
         picker.send(b"\r")
         picker.finish("SELECTED=kimi-pro")
 
     def test_mouse_selects_the_clicked_row(self):
         picker = self.picker()
-        picker.enter_selection()
-        # In selection mode the search input is hidden, so Kimi is on row 5.
-        picker.send(b"\x1b[<0;12;5M\x1b[<0;12;5m")
+        # With header-first + persistent search prompt + column header, Kimi Pro is on row 7.
+        picker.send(b"\x1b[<0;12;7M\x1b[<0;12;7m")
         picker.wait_for("kimi-pro")
         picker.send(b"\r")
         picker.finish("SELECTED=kimi-pro")
 
-    def test_empty_result_does_not_launch_and_can_recover(self):
-        picker = self.picker()
-        picker.send(b"zzzzzz")
-        picker.wait_for("没有匹配的模型")
-        picker.confirm_search()
-        picker.send(b"\r")
-        time.sleep(.1)
-        self.assertIsNone(picker.proc.poll())
-        picker.send(b"\x15")
-        picker.wait_for("Grok Fast")
-        picker.send(b"/sol")
-        picker.wait_for("gpt-sol")
-        picker.confirm_search()
-        picker.send(b"\r")
-        picker.finish("SELECTED=gpt-sol")
-
-    def test_escape_and_ctrl_c_cancel_and_restore_terminal(self):
+    def test_escape_on_empty_query_and_ctrl_c_cancel_and_restore_terminal(self):
         for key in (b"\x1b", b"\x03"):
             with self.subTest(key=key):
                 picker = self.picker()
-                picker.enter_selection()
                 picker.send(key)
                 picker.finish("CANCELLED", 130)
 
-    def test_escape_from_search_then_escape_or_ctrl_c_cancels(self):
-        for last_key in (b"\x1b", b"\x03"):
-            with self.subTest(last_key=last_key):
-                picker = self.picker()
-                if last_key == b"\x1b":
-                    picker.enter_selection()
-                picker.send(last_key)
-                picker.finish("CANCELLED", 130)
+    def test_ctrl_c_cancels_even_with_active_query(self):
+        picker = self.picker()
+        picker.send(b"kimi")
+        picker.wait_for("kimi-pro")
+        picker.send(b"\x03")
+        picker.finish("CANCELLED", 130)
 
     def test_narrow_terminal_and_resize(self):
         picker = self.picker(columns=48, lines=18)
@@ -343,14 +263,12 @@ class InteractivePickerTests(unittest.TestCase):
         picker.send(b"kimi")
         picker.wait_for("kimi-pro")
         picker.resize(48, 18)
-        picker.confirm_search()
         picker.send(b"\r")
         picker.finish("SELECTED=kimi-pro")
 
     def test_global_fzf_options_cannot_auto_accept_or_replace_choices(self):
         picker = self.picker(extra_env={"FZF_DEFAULT_OPTS": "--filter=wrong --bind=start:accept",
                                        "FZF_DEFAULT_OPTS_FILE": "/does/not/exist"})
-        picker.confirm_search()
         picker.send(b"\r")
         picker.finish("SELECTED=grok-fast")
 

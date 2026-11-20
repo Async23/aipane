@@ -76,21 +76,20 @@ def select_with_fzf(choices: list[dict], models: dict, default: str, executable:
                           if option["model"] == default), 1)
     preview = (
         "if [ -n {1} ]; then printf '%s\\n' {4}; "
-        "else printf '%s\\n' '没有匹配的模型' '换个关键词，或按 Ctrl+U 清空搜索。' ''; fi; "
-        'if [ "$FZF_INPUT_STATE" = hidden ]; then '
-        'if [ -n "$FZF_QUERY" ]; then printf "筛选：%s\\n" "$FZF_QUERY"; '
-        "else printf '\\n'; fi; "
+        "else printf '%s\\n' '没有匹配的模型' '按 Esc 或 Ctrl+U 清空筛选。' ''; fi; "
+        'if [ -n "$FZF_QUERY" ]; then '
         'if [ "$FZF_PREVIEW_COLUMNS" -ge 72 ]; then '
-        "printf '%s' 'j/k 或 ↑/↓ 选择 · / 搜索 · 回车启动 · Esc 取消 · Ctrl+U 清空'; "
-        "else printf '%s\\n' 'j/k 或 ↑/↓ 选择 · / 搜索 · 回车启动' 'Esc 取消 · Ctrl+U 清空筛选'; fi; "
-        "else printf '\\n'; "
+        "printf '\\n%s' '↑/↓ 或 Ctrl+J/K 选择 · 回车启动 · Esc 清空筛选 · Ctrl+C 取消'; "
+        "else printf '\\n%s\\n' '↑/↓ 或 Ctrl+J/K 选择 · 回车启动' 'Esc 清空筛选 · Ctrl+C 取消'; fi; "
+        "else "
         'if [ "$FZF_PREVIEW_COLUMNS" -ge 72 ]; then '
-        "printf '%s' '输入名称搜索 · 回车/Esc 进入选择 · ↑/↓ 选择 · Ctrl+U 清空'; "
-        "else printf '%s\\n' '输入名称搜索 · 回车/Esc 进入选择' '↑/↓ 选择 · Ctrl+U 清空'; fi; fi; "
+        "printf '\\n%s' '输入名称筛选 · ↑/↓ 或 Ctrl+J/K 选择 · 回车启动 · Esc 取消'; "
+        "else printf '\\n%s\\n' '输入名称筛选 · ↑/↓ 或 Ctrl+J/K 选择' '回车启动 · Esc 取消'; fi; fi; "
         ": {q}"
     )
-    # Hiding the input creates a true navigation mode without discarding its
-    # query. In search mode, unbind j/k and / so they remain ordinary text.
+    # Keep the launcher modeless: the query input stays visible so filter state
+    # is never hidden, Enter launches immediately, and Esc pops one level at a
+    # time (clear query first, then abort when already empty).
     command = [
         executable, "--read0", "--print0", "--delimiter=\t",
         "--with-nth=" + ("2" if columns >= 78 else "3"),
@@ -98,31 +97,17 @@ def select_with_fzf(choices: list[dict], models: dict, default: str, executable:
         "--layout=reverse", "--height=~" + str(min(len(choices), 10) + 15),
         "--border=sharp", "--border-label= Claude Code · 选择模型 ",
         "--border-label-pos=3", "--padding=0,1", "--header-first",
-        "--header=搜索模式 · 回车/Esc 进入选择", "--prompt=搜索 › ",
-        "--ghost=输入模型名称，如 kimi / grok / sol", "--info=inline-right",
+        "--header=本次启动使用所选模型", "--prompt=搜索 › ",
+        "--ghost=输入名称筛选，如 opus / argon / sol", "--info=inline-right",
         "--no-sort", "--cycle", "--no-hscroll", "--highlight-line", "--pointer=›", "--gutter= ",
-        "--preview=" + preview, "--preview-window=down,7,wrap,border-top",
+        "--preview=" + preview, "--preview-window=down,6,wrap,border-top",
         "--sync", "--no-tty-default",
         "--with-shell=/bin/sh -c",
         "--bind=load:pos(" + str(default_index) + "),"
-        "double-click:accept-non-empty,ctrl-c:abort,"
-        "tab:down,shift-tab:up",
-        "--bind=j:down,k:up,/:show-input+unbind(j,k,/)+change-header(搜索模式 · 回车/Esc 进入选择)+refresh-preview",
-        '--bind=enter:transform:if [ "$FZF_INPUT_STATE" = hidden ]; then '
-        "printf '%s' 'accept-non-empty'; else printf '%s' 'trigger(esc)'; fi",
-        '--bind=esc:transform:if [ "$FZF_INPUT_STATE" = hidden ]; then '
-        "printf '%s' 'abort'; else printf '%s' "
-        "'hide-input+rebind(j,k,/)+change-header(选择模式 · 本次启动使用所选模型)+refresh-preview'; fi",
-        # Wait for the cleared query's results before hiding the input again.
-        # A result event can also fire on startup, so only handle our marker.
-        "--bind=start:unbind(result,j,k,/)",
-        '--bind=result:transform:if [ "$FZF_PROMPT" = "清空筛选 › " ]; then '
-        "printf '%s' 'hide-input+rebind(j,k,/)+change-prompt(搜索 › )+change-header(选择模式 · 本次启动使用所选模型)+refresh-preview+unbind(result)'; fi",
-        '--bind=ctrl-u:transform:if [ "$FZF_INPUT_STATE" = hidden ]; then '
-        'if [ -n "$FZF_QUERY" ]; then '
-        "printf '%s' 'change-prompt(清空筛选 › )+rebind(result)+show-input+clear-query'; "
-        "else printf '%s' 'ignore'; fi; "
-        "else printf '%s' 'clear-query'; fi",
+        "enter:accept-non-empty,double-click:accept-non-empty,ctrl-c:abort,"
+        "ctrl-j:down,ctrl-k:up,ctrl-n:down,ctrl-p:up,tab:down,shift-tab:up,ctrl-u:clear-query",
+        '--bind=esc:transform:if [ -n "$FZF_QUERY" ]; then '
+        "printf '%s' 'clear-query'; else printf '%s' 'abort'; fi",
         '--bind=resize:transform:if [ "$FZF_COLUMNS" -ge 78 ]; then '
         "printf '%s' 'change-with-nth(2)'; else printf '%s' 'change-with-nth(3)'; fi",
     ]

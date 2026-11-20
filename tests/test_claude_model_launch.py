@@ -23,7 +23,13 @@ SESSION = "11111111-1111-4111-8111-111111111111"
 UNKNOWN_SESSION = "22222222-2222-4222-8222-222222222222"
 FAKE_CLAUDE = """#!/usr/bin/env python3
 import json, os, sys
-print('NATIVE=' + json.dumps({'args': sys.argv[1:], 'automatic_marker': os.environ.get('AIPANE_AUTO_RESUME')}), flush=True)
+from pathlib import Path
+args = sys.argv[1:]
+settings = args[args.index('--settings') + 1]
+overlay = json.loads(settings if settings.startswith('{') else Path(settings).read_text())
+print('NATIVE=' + json.dumps({'args': args, 'overlay': overlay,
+      'provider_flag': os.environ.get('CLAUDE_CODE_USE_VERTEX'),
+      'automatic_marker': os.environ.get('AIPANE_AUTO_RESUME')}), flush=True)
 """
 
 
@@ -84,7 +90,8 @@ class ModelLauncherTests(unittest.TestCase):
         tail = b""
         deadline = time.monotonic() + 5
         markers = markers or (b"NATIVE=", "选择模型".encode(), "无法确定".encode())
-        while not any(marker in output for marker in markers):
+        while (not any(marker in output for marker in markers)
+               or (b"NATIVE=" in output and b"\n" not in output.partition(b"NATIVE=")[2])):
             if time.monotonic() >= deadline:
                 self.fail(f"launcher did not reach native CLI, picker, or error: {output[-300:]!r}")
             if select.select([master], [], [], .05)[0]:
@@ -128,6 +135,80 @@ class ModelLauncherTests(unittest.TestCase):
         data = json.loads(path.read_text())
         data["auto_trust_workspace"] = True
         path.write_text(json.dumps(data))
+
+    def configure_vertex(self):
+        models = ["claude-opus-5-5", "claude-sonnet-5-5"]
+        self.credential = self.home / "vertex.json"
+        self.account = {"type": "service_account", "project_id": "example-project",
+                        "private_key": "test-only-key"}
+        self.credential.write_text(json.dumps({"type": "vertex", "service_account": self.account,
+                                               "proxy_url": "http://127.0.0.1:7897"}))
+        path = self.config / "model-routing.json"
+        data = json.loads(path.read_text())
+        data["vertex"] = {"credentials": str(self.credential),
+                          "model_defaults": {"ANTHROPIC_DEFAULT_SONNET_MODEL": models[1]}}
+        for model in models:
+            data["models"][model] = {"provider": "vertex", "context_tokens": 1048576}
+        path.write_text(json.dumps(data))
+        path = self.config / "settings.json"
+        data = json.loads(path.read_text())
+        data["env"] = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8317",
+                       "ANTHROPIC_AUTH_TOKEN": "gateway-token",
+                       "CLAUDE_CODE_SUBAGENT_MODEL": "grok-fast",
+                       "ANTHROPIC_DEFAULT_HAIKU_MODEL": "kimi-k3"}
+        data["modelPicker"]["options"].extend({"model": name, "label": name} for name in models)
+        path.write_text(json.dumps(data))
+        return models
+
+    def test_vertex_picker_sets_native_route_and_isolates_auxiliary_models(self):
+        opus, sonnet = self.configure_vertex()
+        _, native = self.pick("3\r")
+        self.assert_model(native, opus)
+        self.assertEqual(json.loads(self.state().read_text())["last_model"], opus)
+        self.assertEqual(native["provider_flag"], "1")
+        overlay = native["overlay"]
+        env = overlay["env"]
+        self.assertEqual(env["ANTHROPIC_MODEL"], opus)
+        self.assertEqual(env["ANTHROPIC_VERTEX_PROJECT_ID"], self.account["project_id"])
+        self.assertEqual(env["CLOUD_ML_REGION"], "global")
+        self.assertEqual(env["HTTPS_PROXY"], "http://127.0.0.1:7897")
+        self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], opus)
+        self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], sonnet)
+        self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], opus)
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "")
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "")
+        self.assertEqual(env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"], "0")
+        self.assertEqual([row["model"] for row in overlay["modelPicker"]["options"]], [opus, sonnet])
+        self.assertNotIn("gateway-token", json.dumps(native))
+        self.assertNotIn(self.account["private_key"], json.dumps(native))
+        adc = Path(env["GOOGLE_APPLICATION_CREDENTIALS"])
+        self.assertEqual(json.loads(adc.read_text()), self.account)
+        self.assertEqual(adc.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(adc.parent.stat().st_mode & 0o777, 0o700)
+        self.assertFalse(Path(native["args"][-1]).exists())
+
+        self.account["private_key"] = "rotated-test-key"
+        self.credential.write_text(json.dumps({"type": "vertex", "service_account": self.account}))
+        transcript = next((self.config / "projects").glob("*/*.jsonl"))
+        transcript.write_text(json.dumps({"type": "assistant", "message": {"model": opus}}) + "\n")
+        proc, master = self.launch(["--resume", SESSION], automatic=True)
+        recovered = self.native_data(self.read_until_decided(proc, master))
+        self.assert_model(recovered, opus)
+        self.assertEqual(proc.wait(timeout=3), 0)
+        self.assertEqual(json.loads(adc.read_text()), self.account)
+
+    def test_gateway_menu_excludes_vertex_models_of_the_same_size(self):
+        self.configure_vertex()
+        self.credential.unlink()
+        proc, master = self.launch(["--model", "kimi-k3"])
+        native = self.native_data(self.read_until_decided(proc, master))
+        self.assertEqual(proc.wait(timeout=3), 0)
+        self.assertEqual(native["provider_flag"], "0")
+        env = native["overlay"]["env"]
+        self.assertNotIn("ANTHROPIC_BASE_URL", env)
+        self.assertNotIn("GOOGLE_APPLICATION_CREDENTIALS", env)
+        self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], "grok-fast")
+        self.assertEqual([r["model"] for r in native["overlay"]["modelPicker"]["options"]], ["kimi-k3"])
 
     def trust_file(self):
         return self.config / ".claude.json"
@@ -370,16 +451,12 @@ class ModelLauncherTests(unittest.TestCase):
         os.write(master, b"kimi")
         self.read_until_decided(proc, master, (b"kimi-k3",))
         os.write(master, b"\r")
-        self.read_until_decided(proc, master, ("选择模式".encode(),))
-        os.write(master, b"\r")
         native = self.native_data(self.read_until_decided(proc, master))
         self.assert_model(native, "kimi-k3")
         self.assertEqual(proc.wait(timeout=3), 0)
 
         proc, master = self.launch([], inherited_model="")
         self.read_until_decided(proc, master, (b"kimi-k3",))
-        os.write(master, b"\r")
-        self.read_until_decided(proc, master, ("选择模式".encode(),))
         os.write(master, b"\r")
         native = self.native_data(self.read_until_decided(proc, master))
         self.assert_model(native, "kimi-k3")
