@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -273,10 +274,179 @@ class AgentSessionsTest(unittest.TestCase):
         exported_bytes = Path(src["exported"]).read_bytes()
         self.assertEqual(hashlib.sha256(exported_bytes).hexdigest(), src["sha256"])
         self.assertEqual(src["records"], 3)
+        self.assertEqual(src["attachments"], [])
+        self.assertFalse((out_dir / "attachments").exists())
 
         # Refuses to overwrite existing directory
         with self.assertRaises(FileExistsError):
             mod.read_session(dsh_id, agent="dsh", view="export", output_dir=str(out_dir), home=self.home)
+
+    def test_read_timeline_full_preserves_long_multiline_and_all_events(self) -> None:
+        sid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        p = self.home / ".codex" / "sessions" / "2026" / "11" / "20" / f"rollout-2026-11-20T10-00-00-{sid}.jsonl"
+        long_reply = "Line one\n" + ("中" * 420) + "\nFinal sentinel tail."
+        records = [{"type": "session_meta", "timestamp": "2026-11-20T02:00:00Z", "payload": {"id": sid}}]
+        for i in range(130):
+            records.append(
+                {
+                    "type": "response_item",
+                    "timestamp": f"2026-11-20T02:00:{i:02d}Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": long_reply if i == 129 else f"msg-{i}"}],
+                    },
+                }
+            )
+        write_jsonl(p, records)
+
+        # Default timeline truncates at 120 events and 300 chars
+        compact = mod.read_session(sid, agent="codex", view="timeline", home=self.home)
+        self.assertFalse(compact["full"])
+        c_src = compact["sources"][0]
+        self.assertTrue(c_src["truncated"])
+        self.assertEqual(len(c_src["events"]), 120)
+
+        # --full returns all 130 events and full untruncated multiline text
+        full_res = mod.read_session(sid, agent="codex", view="timeline", full=True, home=self.home)
+        self.assertTrue(full_res["full"])
+        f_src = full_res["sources"][0]
+        self.assertFalse(f_src["truncated"])
+        self.assertEqual(len(f_src["events"]), 130)
+        self.assertEqual(f_src["events"][-1]["text"], long_reply)
+
+        # Grok streaming chunks merge without 300-char cap under full=True
+        gid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        gp = self.home / ".grok" / "sessions" / gid / "updates.jsonl"
+        write_jsonl(
+            gp,
+            [
+                {
+                    "params": {
+                        "update": {"sessionUpdate": "agent_message_chunk", "content": {"text": "Part1 " + ("X" * 250)}}
+                    }
+                },
+                {
+                    "params": {
+                        "update": {"sessionUpdate": "agent_message_chunk", "content": {"text": "\nPart2 " + ("Y" * 250)}}
+                    }
+                },
+            ],
+        )
+        grok_full = mod.read_session(gid, agent="grok", view="timeline", full=True, home=self.home)
+        self.assertEqual(
+            grok_full["sources"][0]["events"][0]["text"],
+            "Part1 " + ("X" * 250) + "\nPart2 " + ("Y" * 250),
+        )
+
+    def test_read_export_unpacks_embedded_and_linked_images(self) -> None:
+        png_bytes = b"\x89PNG\r\n\x1a\nfake-png-payload"
+        jpg_bytes = b"\xff\xd8\xff\xe0fake-jpg-payload"
+        b64_png = base64.b64encode(png_bytes).decode("ascii")
+        b64_jpg = base64.b64encode(jpg_bytes).decode("ascii")
+
+        # 1. Codex data:image/png;base64 + malformed base64 tolerance
+        codex_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        cp = self.home / ".codex" / "sessions" / "2026" / "11" / "20" / f"rollout-2026-11-20T10-00-00-{codex_id}.jsonl"
+        write_jsonl(
+            cp,
+            [
+                {"type": "session_meta", "timestamp": "2026-11-20T02:00:00Z", "payload": {"id": codex_id}},
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-11-20T02:00:01Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_image", "image_url": f"data:image/png;base64,{b64_png}"},
+                            {"type": "input_image", "image_url": "data:image/png;base64,!!!not-valid!!!"},
+                            {"type": "input_text", "text": "Look at this screenshot"},
+                        ],
+                    },
+                },
+            ],
+        )
+        codex_out = self.home / "export-codex"
+        cres = mod.read_session(codex_id, agent="codex", view="export", output_dir=str(codex_out), home=self.home)
+        c_src = cres["manifest"]["sources"][0]
+        self.assertEqual(len(c_src["attachments"]), 1)
+        att = c_src["attachments"][0]
+        self.assertEqual(att["line"], 2)
+        self.assertEqual(att["mime_type"], "image/png")
+        self.assertTrue(att["path"].endswith("001-L2-01.png"))
+        self.assertEqual(Path(att["path"]).read_bytes(), png_bytes)
+        self.assertEqual(hashlib.sha256(png_bytes).hexdigest(), att["sha256"])
+
+        # 2. Claude Anthropic base64 image block
+        claude_id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+        clp = self.home / ".claude" / "projects" / "-tmp-proj" / f"{claude_id}.jsonl"
+        write_jsonl(
+            clp,
+            [
+                {
+                    "type": "user",
+                    "timestamp": "2026-11-20T02:00:01Z",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": "image/jpeg", "data": b64_jpg},
+                            }
+                        ],
+                    },
+                }
+            ],
+        )
+        claude_out = self.home / "export-claude"
+        clres = mod.read_session(claude_id, agent="claude", view="export", output_dir=str(claude_out), home=self.home)
+        cl_att = clres["manifest"]["sources"][0]["attachments"][0]
+        self.assertEqual(cl_att["mime_type"], "image/jpeg")
+        self.assertTrue(cl_att["path"].endswith("001-L1-01.jpg"))
+        self.assertEqual(Path(cl_att["path"]).read_bytes(), jpg_bytes)
+
+        # 3. Pi inline base64 image block
+        pi_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+        pip = self.home / ".pi" / "agent" / "sessions" / f"2026-11-20_{pi_id}.jsonl"
+        write_jsonl(
+            pip,
+            [
+                {
+                    "type": "message",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "image", "data": b64_png, "mimeType": "image/png"}],
+                    },
+                }
+            ],
+        )
+        pi_out = self.home / "export-pi"
+        pires = mod.read_session(pi_id, agent="pi", view="export", output_dir=str(pi_out), home=self.home)
+        self.assertEqual(Path(pires["manifest"]["sources"][0]["attachments"][0]["path"]).read_bytes(), png_bytes)
+
+        # 4. Antigravity file:// media URI copied into attachments/
+        agy_id = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+        media_src = self.home / ".gemini" / "antigravity-cli" / "brain" / agy_id / ".system_generated" / "logs" / "media" / "shot.jpg"
+        media_src.parent.mkdir(parents=True, exist_ok=True)
+        media_src.write_bytes(jpg_bytes)
+        agy_log = self.home / ".gemini" / "antigravity-cli" / "brain" / agy_id / ".system_generated" / "logs" / "transcript_full.jsonl"
+        write_jsonl(
+            agy_log,
+            [
+                {
+                    "type": "USER_INPUT",
+                    "created_at": "2026-11-20T02:00:00Z",
+                    "content": "<USER_REQUEST>Check image</USER_REQUEST>",
+                    "media": [{"mime_type": "image/jpeg", "uri": media_src.as_uri()}],
+                }
+            ],
+        )
+        agy_out = self.home / "export-agy"
+        ares = mod.read_session(agy_id, agent="agy", view="export", output_dir=str(agy_out), home=self.home)
+        a_att = ares["manifest"]["sources"][0]["attachments"][0]
+        self.assertEqual(a_att["source_uri"], media_src.as_uri())
+        self.assertEqual(Path(a_att["path"]).read_bytes(), jpg_bytes)
 
 
 if __name__ == "__main__":

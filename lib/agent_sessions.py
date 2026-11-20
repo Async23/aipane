@@ -12,6 +12,7 @@ Primitives:
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import hashlib
 import json
@@ -21,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -41,6 +43,28 @@ UUID_RE = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
 )
 DSH_GEN_RE = re.compile(r"^session(?:\.v(\d+))?\.jsonl(?:\.zstd)?$")
+DATA_IMAGE_RE = re.compile(r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.+)$", re.S)
+ATTACHMENT_HINT_TOKENS = (
+    "data:image/",
+    '"base64"',
+    '"mimeType"',
+    '"mime_type"',
+    '"media_type"',
+    '"inlineData"',
+    '"inline_data"',
+    '"media"',
+)
+MIME_EXT_MAP = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "image/svg+xml": "svg",
+    "image/avif": "avif",
+    "image/heic": "heic",
+    "image/bmp": "bmp",
+}
 
 
 @dataclass
@@ -236,6 +260,9 @@ def prune_by_time(
 def extract_text_from_content(content: Any) -> str:
     if isinstance(content, str):
         return content
+    if isinstance(content, dict):
+        t = content.get("text") or content.get("content")
+        return t if isinstance(t, str) else ""
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:
@@ -535,6 +562,170 @@ def resolve_session_sources(
     return result
 
 
+def _ext_for_mime(mime: str) -> str:
+    clean = mime.split(";", 1)[0].strip().lower()
+    if clean in MIME_EXT_MAP:
+        return MIME_EXT_MAP[clean]
+    if "/" in clean:
+        sub = re.sub(r"[^a-z0-9]", "", clean.split("/", 1)[1].split("+", 1)[0])
+        if sub:
+            return sub
+    return "bin"
+
+
+def _decode_base64_bytes(b64: str) -> bytes | None:
+    cleaned = re.sub(r"\s+", "", b64)
+    if not cleaned:
+        return None
+    pad = (-len(cleaned)) % 4
+    padded = cleaned + ("=" * pad)
+    try:
+        return base64.b64decode(padded, validate=True)
+    except Exception:
+        return None
+
+
+def _resolve_local_media_path(uri: str) -> Path | None:
+    if uri.startswith("file://"):
+        parsed = urllib.parse.urlparse(uri)
+        if parsed.netloc not in ("", "localhost"):
+            return None
+        path_str = urllib.parse.unquote(parsed.path)
+        if not path_str:
+            return None
+        return Path(path_str)
+    if uri.startswith("/"):
+        return Path(uri)
+    return None
+
+
+def _iter_record_attachments(
+    obj: Any,
+) -> Iterator[tuple[str, bytes | None, Path | None, str | None]]:
+    """Yield (mime_type, raw_bytes, local_path, source_uri) for embedded/linked media."""
+    if isinstance(obj, list):
+        for item in obj:
+            yield from _iter_record_attachments(item)
+        return
+    if not isinstance(obj, dict):
+        return
+
+    btype = obj.get("type")
+
+    # 1. Codex / OpenAI style: {"type": "input_image"|"image_url", "image_url": "data:image/..."}
+    if btype in ("input_image", "image_url", "image"):
+        img_url = obj.get("image_url")
+        url_str = img_url.get("url") if isinstance(img_url, dict) else img_url
+        if isinstance(url_str, str):
+            m = DATA_IMAGE_RE.match(url_str)
+            if m:
+                raw = _decode_base64_bytes(m.group(2))
+                if raw is not None:
+                    yield (m.group(1).lower(), raw, None, None)
+                    return
+
+    # 2. Claude / Anthropic style: {"type": "image", "source": {"type": "base64", "media_type": ..., "data": ...}}
+    if btype == "image" and isinstance(obj.get("source"), dict):
+        src = obj["source"]
+        if src.get("type") == "base64" and isinstance(src.get("data"), str):
+            mime = src.get("media_type") or src.get("mime_type") or src.get("mimeType")
+            if isinstance(mime, str) and mime.lower().startswith("image/"):
+                raw = _decode_base64_bytes(src["data"])
+                if raw is not None:
+                    yield (mime.lower(), raw, None, None)
+                    return
+
+    # 3. Pi / DSH / generic inline image block: {"type": "image", "data": "...", "mimeType": "image/..."}
+    if btype == "image" and isinstance(obj.get("data"), str):
+        mime = obj.get("mimeType") or obj.get("mime_type") or obj.get("media_type")
+        if isinstance(mime, str) and mime.lower().startswith("image/"):
+            raw = _decode_base64_bytes(obj["data"])
+            if raw is not None:
+                yield (mime.lower(), raw, None, None)
+                return
+
+    # 4. Gemini inlineData / inline_data block
+    for inline_key in ("inlineData", "inline_data"):
+        inline = obj.get(inline_key)
+        if isinstance(inline, dict) and isinstance(inline.get("data"), str):
+            mime = inline.get("mimeType") or inline.get("mime_type") or inline.get("media_type")
+            if isinstance(mime, str) and mime.lower().startswith("image/"):
+                raw = _decode_base64_bytes(inline["data"])
+                if raw is not None:
+                    yield (mime.lower(), raw, None, None)
+                    return
+
+    # 5. Antigravity media array: [{"mime_type": "image/jpeg", "uri": "file:///..."}]
+    handled_media = False
+    media_list = obj.get("media")
+    if isinstance(media_list, list):
+        handled_media = True
+        for item in media_list:
+            if not isinstance(item, dict):
+                continue
+            mime = item.get("mime_type") or item.get("mimeType") or item.get("media_type")
+            uri = item.get("uri")
+            if isinstance(mime, str) and mime.lower().startswith("image/") and isinstance(uri, str):
+                m = DATA_IMAGE_RE.match(uri)
+                if m:
+                    raw = _decode_base64_bytes(m.group(2))
+                    if raw is not None:
+                        yield (m.group(1).lower(), raw, None, None)
+                        continue
+                local_path = _resolve_local_media_path(uri)
+                if local_path is not None and local_path.is_file():
+                    yield (mime.lower(), None, local_path, uri)
+
+    for k, v in obj.items():
+        if handled_media and k == "media":
+            continue
+        if isinstance(v, (dict, list)):
+            yield from _iter_record_attachments(v)
+
+
+def _extract_line_attachments(
+    line: str,
+    source_idx: int,
+    line_no: int,
+    attachments_dir: Path,
+) -> list[dict[str, Any]]:
+    if not any(tok in line for tok in ATTACHMENT_HINT_TOKENS):
+        return []
+    try:
+        rec = json.loads(line)
+    except Exception:
+        return []
+
+    extracted: list[dict[str, Any]] = []
+    att_seq = 0
+    for mime, raw_bytes, src_path, source_uri in _iter_record_attachments(rec):
+        data: bytes | None = raw_bytes
+        if data is None and src_path is not None:
+            try:
+                data = src_path.read_bytes()
+            except Exception:
+                continue
+        if data is None:
+            continue
+
+        att_seq += 1
+        attachments_dir.mkdir(parents=True, exist_ok=True)
+        ext = _ext_for_mime(mime)
+        att_path = attachments_dir / f"{source_idx:03d}-L{line_no}-{att_seq:02d}.{ext}"
+        att_path.write_bytes(data)
+        entry: dict[str, Any] = {
+            "line": line_no,
+            "mime_type": mime,
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "path": str(att_path.resolve()),
+        }
+        if source_uri:
+            entry["source_uri"] = source_uri
+        extracted.append(entry)
+    return extracted
+
+
 def export_sources(
     session_id: str,
     sources: list[SessionFile],
@@ -545,6 +736,7 @@ def export_sources(
         raise FileExistsError(f"output directory already exists: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=False)
 
+    attachments_dir = output_dir / "attachments"
     manifest_sources: list[dict[str, Any]] = []
     for idx, sf in enumerate(sources, 1):
         out_name = f"{idx:03d}-{sf.agent}.jsonl"
@@ -552,14 +744,18 @@ def export_sources(
         hasher = hashlib.sha256()
         byte_count = 0
         record_count = 0
+        attachments_meta: list[dict[str, Any]] = []
         with out_path.open("wb") as dst:
-            for line in iter_decoded_lines(sf.path):
+            for line_no, line in enumerate(iter_decoded_lines(sf.path), 1):
                 encoded = line.encode("utf-8", errors="replace")
                 dst.write(encoded)
                 hasher.update(encoded)
                 byte_count += len(encoded)
                 if line.strip():
                     record_count += 1
+                    attachments_meta.extend(
+                        _extract_line_attachments(line, idx, line_no, attachments_dir)
+                    )
         manifest_sources.append(
             {
                 "source": {
@@ -572,6 +768,7 @@ def export_sources(
                 "bytes": byte_count,
                 "records": record_count,
                 "sha256": hasher.hexdigest(),
+                "attachments": attachments_meta,
             }
         )
 
@@ -589,9 +786,15 @@ def export_sources(
     return manifest
 
 
-def parse_timeline_events(agent: str, path: Path) -> tuple[list[dict[str, Any]], int]:
+def parse_timeline_events(
+    agent: str, path: Path, full: bool = False
+) -> tuple[list[dict[str, Any]], int]:
     events: list[dict[str, Any]] = []
     total_records = 0
+
+    def fmt(text: str) -> str:
+        return text.strip() if full else clean_preview(text, 300)
+
     for idx, line in enumerate(iter_decoded_lines(path), 1):
         line = line.strip()
         if not line:
@@ -623,7 +826,7 @@ def parse_timeline_events(agent: str, path: Path) -> tuple[list[dict[str, Any]],
                                 "line": idx,
                                 "ts": ts,
                                 "kind": p["role"],
-                                "text": clean_preview(txt, 300),
+                                "text": fmt(txt),
                             }
                         )
                 elif pt in ("function_call", "custom_tool_call"):
@@ -649,7 +852,7 @@ def parse_timeline_events(agent: str, path: Path) -> tuple[list[dict[str, Any]],
                             "line": idx,
                             "ts": ts,
                             "kind": "user",
-                            "text": clean_preview(txt, 300),
+                            "text": fmt(txt),
                         }
                     )
             elif t == "PLANNER_RESPONSE":
@@ -661,7 +864,7 @@ def parse_timeline_events(agent: str, path: Path) -> tuple[list[dict[str, Any]],
                             "line": idx,
                             "ts": ts,
                             "kind": "assistant",
-                            "text": clean_preview(txt, 300),
+                            "text": fmt(txt),
                         }
                     )
                 for tc in tcs:
@@ -686,7 +889,7 @@ def parse_timeline_events(agent: str, path: Path) -> tuple[list[dict[str, Any]],
                             "line": idx,
                             "ts": ts,
                             "kind": "user",
-                            "text": clean_preview(txt, 300),
+                            "text": fmt(txt),
                         }
                     )
             elif t == "assistant":
@@ -699,7 +902,7 @@ def parse_timeline_events(agent: str, path: Path) -> tuple[list[dict[str, Any]],
                             "line": idx,
                             "ts": ts,
                             "kind": "assistant",
-                            "text": clean_preview(txt, 300),
+                            "text": fmt(txt),
                         }
                     )
                 if isinstance(content, list):
@@ -727,7 +930,7 @@ def parse_timeline_events(agent: str, path: Path) -> tuple[list[dict[str, Any]],
                                 "line": idx,
                                 "ts": ts,
                                 "kind": "user",
-                                "text": clean_preview(txt, 300),
+                                "text": fmt(txt),
                             }
                         )
                 elif role == "assistant":
@@ -738,7 +941,7 @@ def parse_timeline_events(agent: str, path: Path) -> tuple[list[dict[str, Any]],
                                 "line": idx,
                                 "ts": ts,
                                 "kind": "assistant",
-                                "text": clean_preview(txt, 300),
+                                "text": fmt(txt),
                             }
                         )
                     if isinstance(content, list):
@@ -766,7 +969,7 @@ def parse_timeline_events(agent: str, path: Path) -> tuple[list[dict[str, Any]],
                                 "line": idx,
                                 "ts": ts,
                                 "kind": "user",
-                                "text": clean_preview(txt, 300),
+                                "text": fmt(txt),
                             }
                         )
             elif t == "assistant/message":
@@ -778,7 +981,7 @@ def parse_timeline_events(agent: str, path: Path) -> tuple[list[dict[str, Any]],
                             "line": idx,
                             "ts": ts,
                             "kind": "assistant",
-                            "text": clean_preview(txt, 300),
+                            "text": fmt(txt),
                         }
                     )
             elif t in ("tool/call", "tool/start"):
@@ -796,8 +999,20 @@ def parse_timeline_events(agent: str, path: Path) -> tuple[list[dict[str, Any]],
             su = upd.get("sessionUpdate")
             if su in ("user_message_chunk", "agent_message_chunk"):
                 txt = extract_text_from_content(upd.get("content"))
-                if txt.strip():
-                    kind = "user" if su == "user_message_chunk" else "assistant"
+                kind = "user" if su == "user_message_chunk" else "assistant"
+                if full:
+                    if events and events[-1]["kind"] == kind:
+                        events[-1]["text"] += txt
+                    elif txt.strip():
+                        events.append(
+                            {
+                                "line": idx,
+                                "ts": ts,
+                                "kind": kind,
+                                "text": txt,
+                            }
+                        )
+                elif txt.strip():
                     if events and events[-1]["kind"] == kind:
                         if len(events[-1]["text"]) < 300:
                             events[-1]["text"] = clean_preview(
@@ -832,9 +1047,14 @@ def parse_timeline_events(agent: str, path: Path) -> tuple[list[dict[str, Any]],
                             "line": idx,
                             "ts": ts,
                             "kind": role,
-                            "text": clean_preview(txt, 300),
+                            "text": fmt(txt),
                         }
                     )
+
+    if agent == "grok" and full:
+        for ev in events:
+            if "text" in ev:
+                ev["text"] = ev["text"].strip()
 
     return events, total_records
 
@@ -1013,7 +1233,8 @@ def read_session(
     view: str = "timeline",
     include_children: bool = True,
     output_dir: str | None = None,
-    max_events: int = 120,
+    max_events: int | None = None,
+    full: bool = False,
     home: Path | None = None,
 ) -> dict[str, Any]:
     sources = resolve_session_sources(
@@ -1039,9 +1260,16 @@ def read_session(
             "manifest": manifest,
         }
 
+    effective_max = max_events if max_events is not None else (None if full else 120)
     all_sources = []
     for sf in sources:
-        evs, records = parse_timeline_events(sf.agent, sf.path)
+        evs, records = parse_timeline_events(sf.agent, sf.path, full=full)
+        if effective_max is not None and effective_max > 0:
+            truncated = len(evs) > effective_max
+            out_events = evs[:effective_max]
+        else:
+            truncated = False
+            out_events = evs
         all_sources.append(
             {
                 "agent": sf.agent,
@@ -1050,13 +1278,14 @@ def read_session(
                 "source_path": str(sf.path),
                 "records": records,
                 "total_timeline_events": len(evs),
-                "truncated": len(evs) > max_events,
-                "events": evs[:max_events],
+                "truncated": truncated,
+                "events": out_events,
             }
         )
     return {
         "command": "read",
         "view": "timeline",
+        "full": full,
         "session_id": session_id,
         "complete": True,
         "sources": all_sources,
@@ -1090,9 +1319,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_read.add_argument("session_id", help="Exact native session ID (Antigravity IDE: ide/<id>)")
     p_read.add_argument("--agent", help="Optional agent disambiguator")
     p_read.add_argument("--view", choices=("timeline", "export"), default="timeline", help="Output mode (default: timeline)")
+    p_read.add_argument("--full", action="store_true", help="Include full untruncated timeline text and all events")
     p_read.add_argument("--no-children", action="store_true", help="Do not follow child sessions")
     p_read.add_argument("--output-dir", help="Target export directory (must not exist)")
-    p_read.add_argument("--max-events", type=int, default=120, help="Max timeline events per source (default: 120)")
+    p_read.add_argument(
+        "--max-events",
+        type=int,
+        default=None,
+        help="Max timeline events per source (default: 120; unlimited with --full)",
+    )
 
     return p
 
@@ -1124,6 +1359,7 @@ def main(argv: list[str] | None = None) -> int:
                 include_children=not args.no_children,
                 output_dir=args.output_dir,
                 max_events=args.max_events,
+                full=args.full,
             )
     except (FileNotFoundError, FileExistsError, ValueError, RuntimeError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))
