@@ -124,17 +124,44 @@ def status_phase(payload: dict) -> str:
     if phase in {"working", "tool_use"} or payload.get("tool_confirmation_pending") is True:
         return "busy"
     if phase == "reviewing":
-        return "reviewing"
+        queued = payload.get("pending_input_count", 0)
+        if type(queued) is not int or queued < 0:
+            return "unknown"
+        return "busy" if queued else "reviewing"
     return "idle" if phase in {"idle", "error"} else "unknown"
 
 
-def turn_activity(phase: str, stop: dict) -> str:
-    # The CLI can keep reporting reviewing while a finished artifact awaits the user.
+def turn_activity(phase: str, stop: dict, *, active: bool) -> str:
     if phase == "reviewing":
-        phase = "idle" if stop.get("fullyIdle") is True else "busy"
+        # Opening a conversation can display its artifacts without starting a turn.
+        if stop:
+            phase = "idle" if stop.get("fullyIdle") is True else "busy"
+        else:
+            phase = "busy" if active else "idle"
     if phase == "idle" and stop.get("continuationActive"):
         return "busy"
     return phase
+
+
+def final_reply_predates_process(transcript: Path, started_at: float) -> bool:
+    """Corroborate a passive review when upgrading an ambiguous old busy record."""
+    try:
+        with transcript.open("rb") as stream:
+            size = stream.seek(0, os.SEEK_END)
+            limit = 65536
+            stream.seek(max(0, size - limit))
+            if size > limit:
+                stream.readline(limit)  # Discard an incomplete first line.
+            lines = stream.read(limit).splitlines()
+            if not lines or os.fstat(stream.fileno()).st_mtime >= started_at:
+                return False
+        step = json.loads(lines[-1])
+    except (OSError, ValueError):
+        return False
+    return (isinstance(step, dict) and step.get("source") == "MODEL"
+            and step.get("type") == "PLANNER_RESPONSE" and step.get("status") == "DONE"
+            and isinstance(step.get("content"), str) and bool(step["content"].strip())
+            and not step.get("tool_calls") and not step.get("truncated_fields"))
 
 
 def completion_ready(record: dict) -> bool:
@@ -315,23 +342,31 @@ class AgyIntegration:
             if pending.get("stop"):
                 record["stop"] = pending["stop"]
             before_state = record.get("state")
-            record["status_phase"] = status_phase(payload)
-            state = turn_activity(record["status_phase"], record.get("stop") or {})
+            # v1.5.9 can report the desktop brain path. Use the selected CLI conversation.
+            transcript = (cli_home(self.environment) / "brain" / sid / ".system_generated/logs/transcript.jsonl"
+                          if sid else None)
+            phase = status_phase(payload)
+            if phase == "reviewing" and not sid and not record.get("active"):
+                phase = "unknown"
+            if (record.get("activity_version", 1) == 1 and record.get("active")
+                    and record.get("status_phase") == "reviewing" and phase == "reviewing"
+                    and not record.get("stop") and transcript
+                    and final_reply_predates_process(transcript, process["started_at"])):
+                record["active"] = False
+            record["status_phase"] = phase
+            state = turn_activity(phase, record.get("stop") or {}, active=record.get("active", False))
             if state == "busy" and (not record.get("active") or before_state == "idle"):
                 record.update(active=True, generation=uuid.uuid4().hex)
                 record.pop("stop", None)
             model = payload.get("model")
             model = {k: v for k,v in model.items() if k in {"id", "effort", "display_name"} and isinstance(v, str)} if isinstance(model, dict) else {}
-            record.update(version=1, pid=process["pid"], started_at=process["started_at"],
+            record.update(version=1, activity_version=2, pid=process["pid"], started_at=process["started_at"],
                           tty=process["tty"], pane=self.pane, socket=self.socket, server=self.server,
                           session_id=sid, cwd=cwd, agy_home=str(cli_home(self.environment)),
                           state=state, agent_state=payload.get("agent_state"),
                           has_background_tasks=bool(payload.get("task_count")),
                           title=str(payload.get("conversation_title") or "")[:500],
-                          # v1.5.9 statusLine can incorrectly name the App's
-                          # brain directory; the CLI hook and trajectory use
-                          # antigravity-cli. Never read another surface's log.
-                          transcript_path=str(cli_home(self.environment) / "brain" / sid / ".system_generated/logs/transcript.jsonl") if sid else "",
+                          transcript_path=str(transcript) if transcript else "",
                           model=model, cycle_mode=payload.get("cycle_mode", ""),
                           agent_name=(payload.get("agent") or {}).get("name", "") if isinstance(payload.get("agent", {}), dict) else "",
                           updated_at=time.time(), sequence=int(record.get("sequence", 0)) + 1)
@@ -402,7 +437,7 @@ class AgyIntegration:
             elif event == "Stop":
                 record["stop"] = {k: payload[k] for k in ("terminationReason", "error", "fullyIdle", "executionNum", "continuationActive") if k in payload}
                 if "status_phase" in record:
-                    record["state"] = turn_activity(record["status_phase"], record["stop"])
+                    record["state"] = turn_activity(record["status_phase"], record["stop"], active=record.get("active", False))
                 events.extend(self._complete(record))
             elif event == "PreToolUse":
                 tool = payload.get("toolCall") or {}

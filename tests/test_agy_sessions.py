@@ -76,6 +76,59 @@ class AntigravityTests(unittest.TestCase):
         self.assertEqual(events, [])
         self.assertEqual(self.hook("Stop", fullyIdle=True)[1], [])
 
+    def test_reopening_a_finished_artifact_keeps_the_window_marker_off(self):
+        pane = PaneActivity("%1", "agy", pane_tty="/dev/ttys999", socket_path="/tmp/agy-test", server_pid="111")
+        adapter = InMemoryActivityAdapter([pane], environment=self.env)
+        activity = AgentActivity(adapter=adapter)
+        reader = partial(agy.current_session, reader=self.integration.reader)
+        with patch.object(agy, "current_session", wraps=reader):
+            self.status(agent_state="working")
+            self.hook("Stop", fullyIdle=True)
+            finished, _ = self.status(agent_state="reviewing", artifact_count=1)
+            self.assertEqual(finished["state"], "idle")
+
+            self.process = {**self.process, "pid": 1001, "started_at": 200.0}
+            unbound, _ = self.status(conversation_id="", agent_state="reviewing")
+            self.assertEqual(unbound["state"], "unknown")
+            for _ in range(2):
+                reopened, events = self.status(agent_state="reviewing", artifact_count=1)
+                activity.report("%1", reopened["state"], owner="agy")
+                self.assertEqual((reopened["state"], events, adapter.read("%1").marker), ("idle", [], ""))
+
+            self.hook("PreInvocation")
+            running, events = self.status(agent_state="reviewing", artifact_count=1)
+            activity.report("%1", running["state"], owner="agy")
+            self.assertEqual((running["state"], events, adapter.read("%1").marker), ("busy", [], "agy"))
+
+    def test_cold_artifact_with_foreground_work_stays_busy(self):
+        for signal in ({"tool_confirmation_pending": True}, {"subagents": [{"status": "running"}]},
+                       {"pending_input_count": 1}):
+            with self.subTest(signal=signal):
+                self.process = {**self.process, "started_at": self.process["started_at"] + 1}
+                record, _ = self.status(agent_state="reviewing", artifact_count=1, **signal)
+                self.assertEqual(record["state"], "busy")
+                self.assertEqual(self.status(agent_state="reviewing", artifact_count=1)[0]["state"], "busy")
+
+    def test_upgrade_of_an_already_lit_review_requires_a_final_reply_before_launch(self):
+        final = {"source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "content": "Finished"}
+        for step, modified, expected in (
+            (final, 50, "idle"),
+            (final, 110, "busy"),
+            ({**final, "tool_calls": [{"name": "run_command"}]}, 50, "busy"),
+            ({"type": "USER_INPUT", "status": "DONE"}, 50, "busy"),
+        ):
+            with self.subTest(step=step, modified=modified):
+                old, _ = self.status(agent_state="reviewing")
+                old.pop("activity_version", None)
+                old.update(active=True, state="busy")
+                agy._write(self.integration.path, old)
+                transcript = Path(old["transcript_path"])
+                transcript.parent.mkdir(parents=True, exist_ok=True)
+                transcript.write_text(json.dumps(step) + "\n")
+                os.utime(transcript, (modified, modified))
+                corrected, events = self.status(agent_state="reviewing", artifact_count=1)
+                self.assertEqual((corrected["state"], events), (expected, []))
+
     def test_artifact_review_after_terminal_stop_clears_activity(self):
         self.status(agent_state="working")
         self.hook("Stop", fullyIdle=True, continuationActive=False)
@@ -123,7 +176,9 @@ class AntigravityTests(unittest.TestCase):
         activity = AgentActivity(adapter=adapter)
         reader = partial(agy.current_session, reader=self.integration.reader)
         with patch.object(agy, "current_session", wraps=reader):
+            self.status(agent_state="working")
             review, _ = self.status(agent_state="reviewing")
+            self.assertEqual(review["state"], "busy")
             done, _ = self.hook("Stop", fullyIdle=True)
             activity.report("%1", done["state"], owner="agy")
             activity.report("%1", review["state"], owner="agy")
