@@ -46,7 +46,7 @@ git -C ~/.aipane pull --ff-only
 
 | 部分 | 作用 |
 |------|------|
-| Ghostty Cmd 桥 | `Cmd+S` prefix；单次 `Cmd+T/W/D/[]/…`；`Cmd+I` 中央弹窗重命名；`Cmd+Opt+P` 显示 pane ID |
+| Ghostty Cmd 桥 | `Cmd+S` prefix；单次 `Cmd+T/W/D/[]/…`；`Cmd+I` 中央弹窗重命名；`Cmd+Opt+P` 打开交互式会话与窗格拾取器；`Cmd+Opt+Y` 复制当前窗格 AI session ID |
 | Shift+Enter | tmux 里给 Codex 等稳定换行（→ Ctrl+J） |
 | tmux workstation | 数字连按跳窗、zoom 保持导航、广播/单格豁免、pane 顶栏、256 色表、vi 复制 |
 | window-wrap | 状态栏窗口标签最多 3 行 |
@@ -65,6 +65,7 @@ AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
 mkdir -p ~/.local/bin
 ln -sf "$AIPANE_ROOT/bin/aipane-doctor" ~/.local/bin/aipane-doctor
 ln -sf "$AIPANE_ROOT/bin/tmux-rename-window-popup" ~/.local/bin/tmux-rename-window-popup
+ln -sf "$AIPANE_ROOT/bin/tmux-session-picker" ~/.local/bin/tmux-session-picker
 ln -sf "$AIPANE_ROOT/bin/tmux-close-window-popup" ~/.local/bin/tmux-close-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
 ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
@@ -97,6 +98,7 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `conf/tmux-window-wrap.conf` | 窗口列表多行 |
 | `bin/aipane-doctor` | 只读检查安装与 Agent Activity 布线 |
 | `bin/tmux-rename-window-popup` | 中央弹窗、稳定目标的窗口重命名 UI |
+| `bin/tmux-session-picker` | 交互式 AI 会话与窗格拾取器弹窗（`Cmd+Opt+P` / `prefix+Q`） |
 | `bin/tmux-colour-palette` | 终端索引色表（`0–255`） |
 | `bin/tmux-window-jump` | 同数字连按、精确 index 的窗口选择器 |
 | `bin/tmux-window-wrap` | 渲染 CLI |

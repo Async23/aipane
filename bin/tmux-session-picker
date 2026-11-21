@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""Interactive fzf session & pane picker for tmux display-popup.
+
+Streams live tmux AI panes first (current window siblings -> other windows)
+for sub-100ms time-to-interactive, then appends recent Antigravity IDE and
+closed disk sessions without blocking initial input.
+
+Actions:
+  Enter    Inject selected reference(s) safely into origin pane via bracketed
+           paste (single: '<agent>:<sid>'; multi: '<agent>:<sid> (<loc>) ...')
+  Tab      Toggle multi-select
+  Ctrl+Y   Copy raw session ID(s) to macOS clipboard + tmux paste buffer
+  Ctrl+G   Jump focus to the selected live tmux pane
+  Esc      Cancel without side effects
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+LIB_DIR = ROOT / "lib"
+if str(LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(LIB_DIR))
+
+import agent_sessions  # noqa: E402
+import live_sessions  # noqa: E402
+
+RESET = "\033[0m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+MAGENTA = "\033[35m"
+
+AGENT_COLOURS = {
+    "agy": CYAN,
+    "codex": GREEN,
+    "claude": YELLOW,
+    "dsh": MAGENTA,
+    "kimi": CYAN,
+    "grok": YELLOW,
+    "pi": GREEN,
+}
+
+
+def _short_age(mtime_iso: str, now_ts: float) -> str:
+    try:
+        parsed = dt.datetime.fromisoformat(mtime_iso).timestamp()
+    except ValueError:
+        return "recent"
+    delta = max(0, int(now_ts - parsed))
+    if delta < 60:
+        return f"{delta}s"
+    if delta < 3600:
+        return f"{delta // 60}m"
+    if delta < 86400:
+        return f"{delta // 3600}h"
+    return f"{delta // 86400}d"
+
+
+def _clip(text: str, limit: int) -> str:
+    clean = " ".join((text or "").replace("\t", " ").split()).strip()
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 1] + "…"
+
+
+def _pane_sort_key(p: live_sessions.LivePaneSession) -> tuple[str, int, int, str]:
+    try:
+        win_num = int(p.window_index)
+    except ValueError:
+        win_num = 99999
+    try:
+        pane_num = int(p.pane_index)
+    except ValueError:
+        pane_num = 99999
+    return (p.session_name, win_num, pane_num, p.pane_id)
+
+
+def format_live_row(
+    item: live_sessions.LivePaneSession,
+    *,
+    in_origin_window: bool,
+    is_origin_pane: bool,
+) -> str:
+    tag = item.agent_alias or item.agent or item.current_command
+    colour = AGENT_COLOURS.get(tag, CYAN)
+    if in_origin_window:
+        marker = f"{DIM}·{RESET}" if is_origin_pane else f"{GREEN}★{RESET}"
+        loc = f".{item.pane_index}" + (" (self)" if is_origin_pane else "")
+        loc_col = f"{loc:<11}"
+    else:
+        marker = f"{CYAN}●{RESET}"
+        wlabel = _clip(item.window_name, 14)
+        loc_raw = f"{item.coord} [{wlabel}]" if wlabel else item.coord
+        loc_col = f"{loc_raw:<24}"
+
+    title = _clip(item.title, 48)
+    if not title:
+        tail = Path(item.cwd).name if item.cwd else ""
+        title = f"{DIM}({tail or 'untitled'}){RESET}"
+    short_sid = item.session_id[:8] if item.session_id else "no-sid"
+    display = f"{marker} {loc_col}  {colour}{tag:<6}{RESET}  {title}  {DIM}{short_sid}{RESET}"
+    return "\t".join(("live", item.pane_id, tag, item.session_id, item.coord, display))
+
+
+def format_disk_row(entry: dict[str, Any], now_ts: float) -> str:
+    raw_agent = str(entry.get("agent", ""))
+    tag = live_sessions.DISPLAY_AGENT.get(raw_agent, raw_agent)
+    sid = str(entry.get("session_id", ""))
+    colour = AGENT_COLOURS.get(tag, CYAN)
+    is_ide = sid.startswith("ide/")
+    age = _short_age(str(entry.get("mtime", "")), now_ts)
+    if is_ide:
+        marker = f"{MAGENTA}◆{RESET}"
+        loc_col = f"{'IDE · ' + age:<24}"
+        loc_tag = "IDE"
+    else:
+        marker = f"{DIM}○{RESET}"
+        loc_col = f"{age + ' ago':<24}"
+        loc_tag = f"{age} ago"
+
+    preview = _clip(str(entry.get("preview", "")), 48) or f"{DIM}(no preview){RESET}"
+    short_sid = sid.removeprefix("ide/")[:8]
+    display = f"{marker} {loc_col}  {colour}{tag:<6}{RESET}  {preview}  {DIM}{short_sid}{RESET}"
+    return "\t".join(("disk", "-", tag, sid, loc_tag, display))
+
+
+def format_injection_payload(rows: list[list[str]]) -> str:
+    """Format Option B (human+machine readable):
+
+    - Single selection: '<agent>:<sid>'
+    - Multi selection:  single-line space-separated '<agent>:<sid> (<loc>)'
+      so multi-pane handoffs never embed newlines that could submit a TUI prompt.
+    """
+    valid = [r for r in rows if len(r) >= 5 and r[2] and r[3]]
+    if not valid:
+        return ""
+    if len(valid) == 1:
+        _, _, tag, sid, _ = valid[0][:5]
+        return f"{tag}:{sid}"
+    parts: list[str] = []
+    for row in valid:
+        _, _, tag, sid, loc = row[:5]
+        parts.append(f"{tag}:{sid} ({loc})" if loc else f"{tag}:{sid}")
+    return "  ".join(parts)
+
+
+def format_raw_copy_payload(rows: list[list[str]]) -> str:
+    sids = [r[3] for r in rows if len(r) >= 4 and r[3]]
+    return "\n".join(sids)
+
+
+def _tmux_run(env: dict[str, str], *args: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    cmd = [*live_sessions._tmux_command(env), *args]
+    return subprocess.run(
+        cmd,
+        input=input_text,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=3,
+        check=False,
+    )
+
+
+def _display_message(env: dict[str, str], text: str) -> None:
+    try:
+        _tmux_run(env, "display-message", "--", text)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def inject_into_pane(origin_pane: str, text: str, env: dict[str, str]) -> bool:
+    """Safely inject text into origin_pane via a transient named tmux buffer (-p -d)."""
+    if not origin_pane or not text:
+        return False
+    probe = _tmux_run(env, "display-message", "-p", "-t", origin_pane, "#{pane_id}\t#{pane_in_mode}\t#{pane_dead}")
+    if probe.returncode != 0:
+        return False
+    fields = probe.stdout.strip().split("\t")
+    if len(fields) != 3 or fields[0] != origin_pane or fields[1] == "1" or fields[2] == "1":
+        return False
+
+    buf_name = f"aipane-pick-{os.getpid()}"
+    loaded = _tmux_run(env, "load-buffer", "-b", buf_name, "-", input_text=text)
+    if loaded.returncode != 0:
+        return False
+    pasted = _tmux_run(env, "paste-buffer", "-p", "-d", "-b", buf_name, "-t", origin_pane)
+    if pasted.returncode != 0:
+        _tmux_run(env, "delete-buffer", "-b", buf_name)
+        return False
+    return True
+
+
+def jump_to_pane(pane_id: str, env: dict[str, str]) -> bool:
+    if not pane_id or pane_id == "-" or not pane_id.startswith("%"):
+        return False
+    probe = _tmux_run(env, "display-message", "-p", "-t", pane_id, "#{session_name}\t#{window_id}")
+    if probe.returncode != 0:
+        return False
+    fields = probe.stdout.strip().split("\t")
+    if len(fields) != 2:
+        return False
+    sess, win = fields
+    _tmux_run(env, "switch-client", "-t", sess)
+    _tmux_run(env, "select-window", "-t", win)
+    return _tmux_run(env, "select-pane", "-t", pane_id).returncode == 0
+
+
+def _stream_candidates(
+    stream,
+    *,
+    origin_pane: str,
+    origin_window: str,
+    env: dict[str, str],
+    include_disk: bool,
+) -> None:
+    seen_live: set[tuple[str, str]] = set()
+    try:
+        live = live_sessions.list_live_panes(only_agents=True, environment=env)
+        in_win_siblings: list[live_sessions.LivePaneSession] = []
+        in_win_self: list[live_sessions.LivePaneSession] = []
+        other_win: list[live_sessions.LivePaneSession] = []
+
+        for item in live:
+            if not item.session_id:
+                continue
+            seen_live.add((item.agent, item.session_id))
+            if origin_window and item.window_id == origin_window:
+                if origin_pane and item.pane_id == origin_pane:
+                    in_win_self.append(item)
+                else:
+                    in_win_siblings.append(item)
+            else:
+                other_win.append(item)
+
+        in_win_siblings.sort(key=_pane_sort_key)
+        other_win.sort(key=_pane_sort_key)
+
+        for item in in_win_siblings:
+            stream.write(format_live_row(item, in_origin_window=True, is_origin_pane=False) + "\n")
+        for item in in_win_self:
+            stream.write(format_live_row(item, in_origin_window=True, is_origin_pane=True) + "\n")
+        for item in other_win:
+            stream.write(format_live_row(item, in_origin_window=False, is_origin_pane=False) + "\n")
+        stream.flush()
+
+        if include_disk:
+            days = int(env.get("AIPANE_PICKER_RECENT_DAYS", "7") or "7")
+            limit = int(env.get("AIPANE_PICKER_RECENT_LIMIT", "50") or "50")
+            recent = agent_sessions.list_sessions(days=days, limit=limit).get("sessions", [])
+            now_ts = time.time()
+            ide_rows: list[dict[str, Any]] = []
+            closed_rows: list[dict[str, Any]] = []
+            for entry in recent:
+                key = (str(entry.get("agent", "")), str(entry.get("session_id", "")))
+                if key in seen_live:
+                    continue
+                if str(entry.get("session_id", "")).startswith("ide/"):
+                    ide_rows.append(entry)
+                else:
+                    closed_rows.append(entry)
+            for entry in [*ide_rows, *closed_rows]:
+                stream.write(format_disk_row(entry, now_ts) + "\n")
+            stream.flush()
+    except (BrokenPipeError, OSError):
+        pass
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def main() -> int:
+    env = os.environ.copy()
+    fzf_bin = env.get("AIPANE_FZF_BIN") or shutil.which("fzf")
+    if not fzf_bin:
+        _display_message(env, "Session picker: fzf not found")
+        return 1
+
+    origin_pane = env.get("AIPANE_PICKER_ORIGIN_PANE", "")
+    origin_window = env.get("AIPANE_PICKER_ORIGIN_WINDOW", "")
+    if not origin_pane:
+        probe = _tmux_run(env, "display-message", "-p", "#{pane_id}\t#{window_id}")
+        if probe.returncode == 0 and "\t" in probe.stdout:
+            origin_pane, origin_window = probe.stdout.strip().split("\t", 1)
+
+    sessions_cli = str(ROOT / "bin" / "aipane-sessions")
+    preview_cmd = (
+        f"{shlex.quote(sys.executable)} {shlex.quote(sessions_cli)} "
+        "preview --kind {1} --pane {2} --agent {3} --sid {4}"
+    )
+
+    columns = shutil.get_terminal_size((120, 30)).columns
+    preview_window = "right:48%:wrap:border-left" if columns >= 100 else "down:42%:wrap:border-top"
+    footer = "Enter Inject · Tab Multi · ^Y Copy ID · ^G Jump · Esc Cancel"
+
+    fzf_env = env.copy()
+    fzf_env.pop("FZF_DEFAULT_OPTS", None)
+    fzf_env.pop("FZF_DEFAULT_OPTS_FILE", None)
+
+    fzf_args = [
+        fzf_bin,
+        "--ansi",
+        "--multi",
+        "--layout=reverse",
+        "--border=none",
+        "--info=inline-right",
+        "--delimiter=\t",
+        "--with-nth=6",
+        "--prompt=› ",
+        "--pointer=▸",
+        "--marker=✓",
+        f"--footer={footer}",
+        "--footer-border=none",
+        "--expect=ctrl-y,ctrl-g",
+        "--bind=esc:abort,ctrl-u:clear-query,tab:toggle+down,btab:toggle+up",
+        f"--preview={preview_cmd}",
+        f"--preview-window={preview_window}",
+    ]
+
+    proc = subprocess.Popen(
+        fzf_args,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        env=fzf_env,
+    )
+    assert proc.stdin is not None and proc.stdout is not None
+
+    include_disk = env.get("AIPANE_PICKER_SKIP_DISK", "0") != "1"
+    feeder = threading.Thread(
+        target=_stream_candidates,
+        kwargs={
+            "stream": proc.stdin,
+            "origin_pane": origin_pane,
+            "origin_window": origin_window,
+            "env": env,
+            "include_disk": include_disk,
+        },
+        daemon=True,
+    )
+    feeder.start()
+
+    stdout_text = proc.stdout.read()
+    returncode = proc.wait()
+    feeder.join(timeout=0.5)
+
+    if returncode in (1, 130):
+        return 0
+    if returncode != 0:
+        _display_message(env, f"Session picker: fzf exited with status {returncode}")
+        return returncode
+
+    lines = stdout_text.splitlines()
+    if not lines:
+        return 0
+    action_key = lines[0].strip()
+    selected_rows = [line.split("\t") for line in lines[1:] if line.strip()]
+    if not selected_rows:
+        return 0
+
+    if action_key == "ctrl-g":
+        first = selected_rows[0]
+        if first[0] != "live" or not jump_to_pane(first[1], env):
+            _display_message(env, "Selected session is not running in an active tmux pane")
+            return 0
+        return 0
+
+    if action_key == "ctrl-y":
+        raw_text = format_raw_copy_payload(selected_rows)
+        if not raw_text:
+            return 0
+        sinks = live_sessions.copy_text_to_clipboard(raw_text, environment=env)
+        if not sinks:
+            _display_message(env, "Session picker: clipboard copy failed")
+            return 1
+        if len(selected_rows) == 1:
+            row = selected_rows[0]
+            sid = row[3]
+            short_sid = f"{sid[:8]}…{sid[-4:]}" if len(sid) > 15 else sid
+            _display_message(env, f"Copied [{row[2]} · {row[4]}] {short_sid}")
+        else:
+            _display_message(env, f"Copied {len(selected_rows)} raw session IDs")
+        return 0
+
+    # Default action (Enter): inject Option B format safely into origin pane.
+    payload = format_injection_payload(selected_rows)
+    if not payload:
+        return 0
+    if inject_into_pane(origin_pane, payload, env):
+        return 0
+
+    # Safe fallback when origin pane is in copy-mode or disappeared: copy instead of losing selection.
+    sinks = live_sessions.copy_text_to_clipboard(payload, environment=env)
+    if sinks:
+        _display_message(env, f"Origin pane unavailable for paste; copied {len(selected_rows)} ref(s) to clipboard")
+        return 0
+    _display_message(env, "Session picker: could not inject or copy selection")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

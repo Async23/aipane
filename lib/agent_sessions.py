@@ -123,8 +123,22 @@ def agent_roots(agent: str, home: Path | None = None) -> list[tuple[Path, dict[s
         base = Path(os.environ.get("PI_CODING_AGENT_DIR") or (h / ".pi" / "agent"))
         return [(base / "sessions", {})]
     if agent == "kimi":
-        base = Path(os.environ.get("KIMI_HOME") or (h / ".kimi"))
-        return [(base / "sessions", {})]
+        roots: list[tuple[Path, dict[str, Any]]] = []
+        seen: set[Path] = set()
+        for env_key in ("KIMI_CODE_HOME", "KIMI_HOME"):
+            val = os.environ.get(env_key)
+            if val:
+                p = Path(val).expanduser() / "sessions"
+                if p not in seen:
+                    seen.add(p)
+                    roots.append((p, {}))
+        if not roots:
+            for rel in (".kimi-code", ".kimi"):
+                p = h / rel / "sessions"
+                if p not in seen:
+                    seen.add(p)
+                    roots.append((p, {}))
+        return roots
     return []
 
 
@@ -230,17 +244,32 @@ def discover_agent_files(agent: str, home: Path | None = None) -> list[SessionFi
             for p in root.rglob("wire.jsonl"):
                 if not p.is_file():
                     continue
+                is_sub = False
+                parent_sid: str | None = None
                 sid = p.parent.name
-                for part in reversed(p.parts):
-                    if part.startswith("session_"):
-                        sid = part[len("session_") :]
-                        break
-                    m = UUID_RE.search(part)
-                    if m:
-                        sid = m.group(1)
-                        break
+                # Kimi Code 2.x layout: .../session_<uuid>/agents/<agent>/wire.jsonl
+                if len(p.parts) >= 4 and p.parents[1].name == "agents":
+                    agent_slot = p.parent.name
+                    session_dir_name = p.parents[2].name
+                    if agent_slot == "main":
+                        sid = session_dir_name
+                    else:
+                        is_sub = True
+                        parent_sid = session_dir_name
+                        sid = f"{session_dir_name}/{agent_slot}"
+                else:
+                    for part in reversed(p.parts):
+                        if part.startswith("session_"):
+                            sid = part
+                            break
+                        m = UUID_RE.search(part)
+                        if m:
+                            sid = m.group(1)
+                            break
                 st = p.stat()
-                found.append(SessionFile("kimi", sid, p, st.st_mtime, st.st_size))
+                found.append(
+                    SessionFile("kimi", sid, p, st.st_mtime, st.st_size, is_sub, parent_sid)
+                )
 
     return found
 
@@ -370,6 +399,21 @@ def extract_preview(sf: SessionFile) -> str:
                     return clean_preview(title)
             except Exception:
                 pass
+    elif sf.agent == "kimi":
+        sdir = (
+            sf.path.parents[2]
+            if len(sf.path.parts) >= 4 and sf.path.parents[1].name == "agents"
+            else sf.path.parent
+        )
+        state = sdir / "state.json"
+        if state.is_file():
+            try:
+                d = json.loads(state.read_text(errors="replace"))
+                title = d.get("title") or d.get("lastPrompt")
+                if isinstance(title, str) and title.strip():
+                    return clean_preview(title)
+            except Exception:
+                pass
 
     for line in read_head_lines(sf.path):
         line = line.strip()
@@ -419,7 +463,11 @@ def extract_preview(sf: SessionFile) -> str:
             if upd.get("sessionUpdate") == "user_message_chunk":
                 text = extract_text_from_content(upd.get("content"))
         elif sf.agent == "kimi":
-            if rec.get("role") == "user":
+            if rec.get("type") == "context.append_message":
+                msg = rec.get("message") or {}
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    text = extract_text_from_content(msg.get("content"))
+            elif rec.get("role") == "user":
                 text = extract_text_from_content(rec.get("content"))
 
         if text and not is_noise_user_text(text):
@@ -441,12 +489,46 @@ def read_first_json(path: Path) -> dict[str, Any] | None:
     return None
 
 
+def parse_session_ref(
+    raw_ref: str,
+    explicit_agent: str | None = None,
+) -> tuple[str, str | None]:
+    """Parse '<agent>:<session_id>' or bare '<session_id>'.
+
+    Recognizes canonical agent names and aliases (e.g. 'agy:ide/<id>',
+    'codex:<uuid>', 'kimi:session_<uuid>') without mangling bare IDs.
+    """
+    ref = raw_ref.strip()
+    if ":" in ref:
+        prefix, rest = ref.split(":", 1)
+        key = prefix.strip().lower()
+        canonical = AGENT_ALIASES.get(key, key)
+        if canonical in ALL_AGENTS and rest.strip():
+            if explicit_agent:
+                norm_explicit = normalize_agents([explicit_agent])[0]
+                if norm_explicit != canonical:
+                    raise ValueError(
+                        f"conflicting agent specifier: prefix {prefix!r} vs --agent {explicit_agent!r}"
+                    )
+            return rest.strip(), canonical
+    return ref, explicit_agent
+
+
+def _kimi_id_matches(file_sid: str, query_sid: str) -> bool:
+    if file_sid == query_sid:
+        return True
+    f_bare = file_sid[len("session_") :] if file_sid.startswith("session_") else file_sid
+    q_bare = query_sid[len("session_") :] if query_sid.startswith("session_") else query_sid
+    return bool(f_bare) and f_bare == q_bare
+
+
 def resolve_session_sources(
     session_id: str,
     agent: str | None = None,
     include_children: bool = True,
     home: Path | None = None,
 ) -> list[SessionFile]:
+    session_id, agent = parse_session_ref(session_id, agent)
     agents = normalize_agents([agent]) if agent else list(ALL_AGENTS)
     matches: list[SessionFile] = []
     by_agent: dict[str, list[SessionFile]] = {}
@@ -455,7 +537,9 @@ def resolve_session_sources(
         files = discover_agent_files(ag, home=home)
         by_agent[ag] = files
         for sf in files:
-            if sf.session_id == session_id:
+            if sf.session_id == session_id or (
+                ag == "kimi" and not sf.is_subagent and _kimi_id_matches(sf.session_id, session_id)
+            ):
                 matches.append(sf)
 
     if not matches:
@@ -558,6 +642,15 @@ def resolve_session_sources(
                     result.append(sf)
                     seen_paths.add(sf.path)
                     queue_paths.append(str(sf.path))
+
+    elif target_agent == "kimi":
+        parent_ids = {m.session_id for m in matches}
+        for sf in all_agent_files:
+            if sf.is_subagent and sf.parent_id and any(
+                _kimi_id_matches(sf.parent_id, pid) for pid in parent_ids
+            ) and sf.path not in seen_paths:
+                result.append(sf)
+                seen_paths.add(sf.path)
 
     return result
 
@@ -1038,18 +1131,61 @@ def parse_timeline_events(
                 )
 
         elif agent == "kimi":
-            role = rec.get("role")
-            if role in ("user", "assistant"):
-                txt = extract_text_from_content(rec.get("content"))
-                if txt.strip():
-                    events.append(
-                        {
-                            "line": idx,
-                            "ts": ts,
-                            "kind": role,
-                            "text": fmt(txt),
-                        }
-                    )
+            t = rec.get("type")
+            if t == "context.append_message":
+                msg = rec.get("message") or {}
+                if isinstance(msg, dict):
+                    role = msg.get("role")
+                    if role in ("user", "assistant"):
+                        txt = extract_text_from_content(msg.get("content"))
+                        if txt.strip() and (role != "user" or not is_noise_user_text(txt)):
+                            events.append(
+                                {
+                                    "line": idx,
+                                    "ts": ts,
+                                    "kind": role,
+                                    "text": fmt(txt),
+                                }
+                            )
+            elif t == "context.append_loop_event":
+                ev = rec.get("event") or {}
+                if isinstance(ev, dict):
+                    et = ev.get("type")
+                    if et == "content.part":
+                        part = ev.get("part") or {}
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            txt = str(part.get("text") or "")
+                            if txt.strip():
+                                events.append(
+                                    {
+                                        "line": idx,
+                                        "ts": ts,
+                                        "kind": "assistant",
+                                        "text": fmt(txt),
+                                    }
+                                )
+                    elif et == "tool.call":
+                        events.append(
+                            {
+                                "line": idx,
+                                "ts": ts,
+                                "kind": "tool_call",
+                                "tool": ev.get("name"),
+                            }
+                        )
+            else:
+                role = rec.get("role")
+                if role in ("user", "assistant"):
+                    txt = extract_text_from_content(rec.get("content"))
+                    if txt.strip():
+                        events.append(
+                            {
+                                "line": idx,
+                                "ts": ts,
+                                "kind": role,
+                                "text": fmt(txt),
+                            }
+                        )
 
     if agent == "grok" and full:
         for ev in events:
@@ -1228,7 +1364,7 @@ def find_sessions(
 
 
 def read_session(
-    session_id: str,
+    session_id: str | None = None,
     agent: str | None = None,
     view: str = "timeline",
     include_children: bool = True,
@@ -1236,7 +1372,34 @@ def read_session(
     max_events: int | None = None,
     full: bool = False,
     home: Path | None = None,
+    pane: str | None = None,
+    environment: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    resolved_pane_info: dict[str, Any] | None = None
+    if pane:
+        import live_sessions
+
+        env = dict(os.environ if environment is None else environment)
+        panes = live_sessions.list_live_panes(environment=env, home=home)
+        target_pane = live_sessions.resolve_pane_spec(
+            pane, panes, current_pane_id=env.get("TMUX_PANE", "")
+        )
+        if not target_pane.agent:
+            raise ValueError(
+                f"pane {target_pane.coord} ({target_pane.current_command}) is not a supported AI agent"
+            )
+        if not target_pane.session_id:
+            raise FileNotFoundError(
+                f"{target_pane.agent_alias or target_pane.agent} in {target_pane.coord} has no active session yet"
+            )
+        session_id = target_pane.session_id
+        agent = agent or target_pane.agent
+        resolved_pane_info = target_pane.as_dict()
+
+    if not session_id:
+        raise ValueError("session_id or --pane is required")
+
+    session_id, agent = parse_session_ref(session_id, agent)
     sources = resolve_session_sources(
         session_id=session_id,
         agent=agent,
@@ -1252,13 +1415,16 @@ def read_session(
             safe_id = session_id.replace("/", "_")
             out_dir = Path(f"/tmp/aipane-sessions-{safe_id}-{stamp}")
         manifest = export_sources(session_id, sources, out_dir, include_children)
-        return {
+        payload: dict[str, Any] = {
             "command": "read",
             "view": "export",
             "output_dir": str(out_dir.resolve()),
             "manifest_path": str((out_dir / "manifest.json").resolve()),
             "manifest": manifest,
         }
+        if resolved_pane_info is not None:
+            payload["resolved_pane"] = resolved_pane_info
+        return payload
 
     effective_max = max_events if max_events is not None else (None if full else 120)
     all_sources = []
@@ -1282,7 +1448,7 @@ def read_session(
                 "events": out_events,
             }
         )
-    return {
+    result: dict[str, Any] = {
         "command": "read",
         "view": "timeline",
         "full": full,
@@ -1290,14 +1456,247 @@ def read_session(
         "complete": True,
         "sources": all_sources,
     }
+    if resolved_pane_info is not None:
+        result["resolved_pane"] = resolved_pane_info
+    return result
+
+
+def list_live_pane_sessions(
+    *,
+    scope: str = "window",
+    pane: str | None = None,
+    include_non_agents: bool = False,
+    home: Path | None = None,
+    environment: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    import live_sessions
+
+    t0 = time.monotonic()
+    env = dict(os.environ if environment is None else environment)
+    current_pane_id = env.get("TMUX_PANE", "")
+    all_panes = live_sessions.list_live_panes(environment=env, home=home)
+
+    current = (
+        next((p for p in all_panes if p.pane_id == current_pane_id), None)
+        if current_pane_id
+        else next((p for p in all_panes if p.window_active and p.pane_active), None)
+    )
+
+    if pane:
+        selected = [live_sessions.resolve_pane_spec(pane, all_panes, current_pane_id=current_pane_id)]
+        effective_scope = "pane"
+    elif scope == "all" or current is None:
+        selected = list(all_panes)
+        effective_scope = "all"
+    elif scope == "siblings":
+        selected = [
+            p
+            for p in all_panes
+            if p.session_name == current.session_name
+            and p.window_id == current.window_id
+            and p.pane_id != current.pane_id
+        ]
+        effective_scope = "siblings"
+    else:
+        selected = [
+            p
+            for p in all_panes
+            if p.session_name == current.session_name and p.window_id == current.window_id
+        ]
+        effective_scope = "window"
+
+    if not include_non_agents and not pane:
+        selected = [p for p in selected if p.agent]
+
+    return {
+        "command": "panes",
+        "scope": effective_scope,
+        "current_pane": current.as_dict() if current else None,
+        "count": len(selected),
+        "elapsed_ms": int((time.monotonic() - t0) * 1000),
+        "panes": [p.as_dict() for p in selected],
+    }
+
+
+def _tmux_display_message(message: str, environment: dict[str, str], duration_ms: int = 2500) -> None:
+    import live_sessions
+
+    cmd = [*live_sessions._tmux_command(environment), "display-message", "-d", str(duration_ms), "--", message]
+    try:
+        subprocess.run(cmd, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def yank_pane_session(
+    target: str | None = None,
+    *,
+    fmt: str = "raw",
+    display: bool = True,
+    home: Path | None = None,
+    environment: dict[str, str] | None = None,
+) -> tuple[dict[str, Any], int]:
+    import live_sessions
+
+    env = dict(os.environ if environment is None else environment)
+    lookup_target = target or env.get("TMUX_PANE") or None
+    if lookup_target and (lookup_target.startswith("%") or ":" in lookup_target):
+        panes = live_sessions.list_live_panes(target=lookup_target, environment=env, home=home)
+        item = panes[0] if panes else None
+    else:
+        panes = live_sessions.list_live_panes(environment=env, home=home)
+        if lookup_target:
+            item = live_sessions.resolve_pane_spec(
+                lookup_target, panes, current_pane_id=env.get("TMUX_PANE", "")
+            )
+        else:
+            item = next((p for p in panes if p.window_active and p.pane_active), None)
+
+    if item is None:
+        msg = f"No live tmux pane found for {target or 'current pane'}"
+        if display:
+            _tmux_display_message(msg, env)
+        return {"command": "yank", "ok": False, "error": msg}, 1
+
+    if not item.agent:
+        msg = f"No AI agent in {item.coord} ({item.current_command})"
+        if display:
+            _tmux_display_message(msg, env)
+        return {"command": "yank", "ok": False, "pane": item.as_dict(), "error": msg}, 1
+
+    if not item.session_id:
+        tag = item.agent_alias or item.agent
+        msg = f"{tag} in {item.coord} has no active session yet"
+        if display:
+            _tmux_display_message(msg, env)
+        return {"command": "yank", "ok": False, "pane": item.as_dict(), "error": msg}, 1
+
+    payload_text = (
+        f"{item.agent_alias}:{item.session_id}" if fmt == "ref" else item.session_id
+    )
+    sinks = live_sessions.copy_text_to_clipboard(payload_text, environment=env)
+    if not sinks:
+        msg = "Failed to copy session ID to clipboard or tmux buffer"
+        if display:
+            _tmux_display_message(msg, env)
+        return {"command": "yank", "ok": False, "pane": item.as_dict(), "error": msg}, 1
+
+    banner = live_sessions.format_yank_banner(item)
+    if display:
+        _tmux_display_message(banner, env)
+    return {
+        "command": "yank",
+        "ok": True,
+        "copied": payload_text,
+        "sinks": sinks,
+        "banner": banner,
+        "pane": item.as_dict(),
+    }, 0
+
+
+def render_preview(
+    *,
+    kind: str,
+    pane_id: str = "",
+    agent: str = "",
+    session_id: str = "",
+    lines: int = 38,
+    home: Path | None = None,
+    environment: dict[str, str] | None = None,
+) -> str:
+    """Render ANSI-friendly human preview text for the fzf session picker."""
+    import live_sessions
+
+    env = dict(os.environ if environment is None else environment)
+    dim = "\033[2m"
+    bold = "\033[1m"
+    cyan = "\033[36m"
+    green = "\033[32m"
+    yellow = "\033[33m"
+    reset = "\033[0m"
+
+    header_parts: list[str] = []
+    if kind == "live" and pane_id and pane_id != "-":
+        panes = live_sessions.list_live_panes(target=pane_id, environment=env, home=home)
+        p = panes[0] if panes else None
+        if p:
+            tag = p.agent_alias or p.agent or p.current_command
+            header_parts.append(f"{bold}{cyan}{tag}{reset}  {bold}{p.coord}{reset} [{p.window_name}]")
+            if p.title:
+                header_parts.append(f"{bold}Title:{reset} {p.title}")
+            header_parts.append(f"{dim}SID:   {p.session_id or '(none)'}  ({p.authority or 'n/a'}){reset}")
+            header_parts.append(f"{dim}CWD:   {p.cwd}{reset}")
+        else:
+            header_parts.append(f"{bold}{cyan}{agent}{reset}  {pane_id}")
+            if session_id:
+                header_parts.append(f"{dim}SID:   {session_id}{reset}")
+        header_parts.append(f"{dim}{'─' * 56}{reset}")
+
+        cap_cmd = [*live_sessions._tmux_command(env), "capture-pane", "-ep", "-t", pane_id]
+        try:
+            proc = subprocess.run(cap_cmd, capture_output=True, text=True, env=env, timeout=2, check=False)
+            if proc.returncode == 0:
+                raw_lines = proc.stdout.splitlines()
+                while raw_lines and not re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", raw_lines[-1]).strip():
+                    raw_lines.pop()
+                body = raw_lines[-lines:] if raw_lines else [f"{dim}(empty screen){reset}"]
+            else:
+                body = [f"{dim}(pane capture unavailable){reset}"]
+        except (OSError, subprocess.SubprocessError):
+            body = [f"{dim}(pane capture timed out){reset}"]
+        return "\n".join([*header_parts, *body])
+
+    # Disk / IDE session preview
+    sid_clean, norm_agent = parse_session_ref(session_id, agent or None)
+    label = f"{agent or norm_agent or 'session'}  {sid_clean}"
+    header_parts.append(f"{bold}{cyan}{label}{reset}")
+    header_parts.append(f"{dim}{'─' * 56}{reset}")
+    try:
+        data = read_session(
+            session_id=sid_clean,
+            agent=norm_agent,
+            view="timeline",
+            include_children=False,
+            max_events=24,
+            full=False,
+            home=home,
+        )
+        sources = data.get("sources") or []
+        events = sources[0].get("events", []) if sources else []
+        body_lines: list[str] = []
+        shown = [e for e in events if e.get("kind") in ("user", "assistant")]
+        if len(shown) > 10:
+            shown = [*shown[:3], {"kind": "gap", "text": f"… {len(shown) - 8} turns omitted …"}, *shown[-5:]]
+        for ev in shown:
+            ek = ev.get("kind")
+            txt = str(ev.get("text") or "").strip()
+            if ek == "user":
+                body_lines.append(f"{bold}{green}USER{reset}  {txt}")
+            elif ek == "assistant":
+                body_lines.append(f"{bold}{yellow}ASST{reset}  {txt}")
+            elif ek == "gap":
+                body_lines.append(f"{dim}{txt}{reset}")
+        if not body_lines:
+            body_lines.append(f"{dim}(no text messages recorded yet){reset}")
+    except Exception as exc:
+        body_lines = [f"{dim}(preview unavailable: {exc}){reset}"]
+    return "\n".join([*header_parts, *body_lines])
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="aipane-sessions",
-        description="Zero-index local session discovery, search, and export across 7 AI CLIs.",
+        description="Zero-index local session discovery, live tmux topology, search, and export across 7 AI CLIs.",
     )
     sub = p.add_subparsers(dest="subcmd", required=True)
+
+    p_panes = sub.add_parser("panes", help="List live tmux panes with resolved AI session IDs")
+    scope_group = p_panes.add_mutually_exclusive_group()
+    scope_group.add_argument("--window", action="store_true", help="List panes in the current tmux window (default)")
+    scope_group.add_argument("--siblings", action="store_true", help="List other AI panes in the current tmux window")
+    scope_group.add_argument("--all", action="store_true", help="List all live AI panes across the tmux server")
+    p_panes.add_argument("--pane", help="Resolve one pane specifier ('.', '1', '4.1', '0:4.1', '%%510')")
+    p_panes.add_argument("--include-non-agents", action="store_true", help="Include non-AI panes (shell, yazi, etc.)")
 
     p_list = sub.add_parser("list", help="List recent sessions by mtime")
     p_list.add_argument("--agent", action="append", help="Filter by agent (repeatable or comma-separated)")
@@ -1315,8 +1714,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_find.add_argument("--case-sensitive", action="store_true", help="Case-sensitive match")
     p_find.add_argument("--all-matches-per-session", action="store_true", help="Return multiple hits per session")
 
-    p_read = sub.add_parser("read", help="Read timeline or export full logs for a known session ID")
-    p_read.add_argument("session_id", help="Exact native session ID (Antigravity IDE: ide/<id>)")
+    p_read = sub.add_parser("read", help="Read timeline or export full logs for a session ID or live pane")
+    p_read.add_argument("session_id", nargs="?", help="Exact session ID, '<agent>:<id>', or omit with --pane")
+    p_read.add_argument("--pane", help="Resolve live tmux pane ('.', '1', '4.1', '0:4.1', '%%510') instead of passing session_id")
     p_read.add_argument("--agent", help="Optional agent disambiguator")
     p_read.add_argument("--view", choices=("timeline", "export"), default="timeline", help="Output mode (default: timeline)")
     p_read.add_argument("--full", action="store_true", help="Include full untruncated timeline text and all events")
@@ -1329,6 +1729,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max timeline events per source (default: 120; unlimited with --full)",
     )
 
+    p_yank = sub.add_parser("yank", help="Copy a live tmux pane's current AI session ID to the clipboard")
+    p_yank.add_argument("target", nargs="?", help="Optional pane ID or coordinate (defaults to current pane)")
+    p_yank.add_argument("--format", choices=("raw", "ref"), default="raw", help="Copy raw ID or '<agent>:<id>' (default: raw)")
+    p_yank.add_argument("--no-display", action="store_true", help="Suppress tmux status-line confirmation message")
+
+    p_preview = sub.add_parser("preview", help=argparse.SUPPRESS)
+    p_preview.add_argument("--kind", choices=("live", "disk"), default="live")
+    p_preview.add_argument("--pane", default="")
+    p_preview.add_argument("--agent", default="")
+    p_preview.add_argument("--sid", default="")
+    p_preview.add_argument("--lines", type=int, default=38)
+
     return p
 
 
@@ -1336,7 +1748,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        if args.subcmd == "list":
+        if args.subcmd == "panes":
+            scope = "all" if args.all else ("siblings" if args.siblings else "window")
+            result = list_live_pane_sessions(
+                scope=scope,
+                pane=args.pane,
+                include_non_agents=args.include_non_agents,
+            )
+        elif args.subcmd == "list":
             result = list_sessions(
                 agents=args.agent, days=args.days, scan_all=args.all, limit=args.limit
             )
@@ -1351,6 +1770,25 @@ def main(argv: list[str] | None = None) -> int:
                 case_sensitive=args.case_sensitive,
                 all_matches_per_session=args.all_matches_per_session,
             )
+        elif args.subcmd == "yank":
+            result, code = yank_pane_session(
+                target=args.target,
+                fmt=args.format,
+                display=not args.no_display,
+            )
+            print(json.dumps(result, ensure_ascii=False))
+            return code
+        elif args.subcmd == "preview":
+            print(
+                render_preview(
+                    kind=args.kind,
+                    pane_id=args.pane,
+                    agent=args.agent,
+                    session_id=args.sid,
+                    lines=args.lines,
+                )
+            )
+            return 0
         else:
             result = read_session(
                 session_id=args.session_id,
@@ -1360,6 +1798,7 @@ def main(argv: list[str] | None = None) -> int:
                 output_dir=args.output_dir,
                 max_events=args.max_events,
                 full=args.full,
+                pane=args.pane,
             )
     except (FileNotFoundError, FileExistsError, ValueError, RuntimeError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))

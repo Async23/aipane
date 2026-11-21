@@ -26,6 +26,7 @@ WRAP_BIN = ROOT / "bin" / "tmux-window-wrap"
 DOCTOR_BIN = ROOT / "bin" / "aipane-doctor"
 WINDOW_JUMP_BIN = ROOT / "bin" / "tmux-window-jump"
 RENAME_BIN = ROOT / "bin" / "tmux-rename-window-popup"
+PICKER_BIN = ROOT / "bin" / "tmux-session-picker"
 COLOUR_PALETTE_BIN = ROOT / "bin" / "tmux-colour-palette"
 CHEATSHEET = ROOT / "docs" / "cheatsheet.md"
 WS_DOC = ROOT / "docs" / "ghostty-tmux-workstation.md"
@@ -37,6 +38,7 @@ class GhosttyFragmentTests(unittest.TestCase):
         self.assertIn("keybind = cmd+s=text:\\x00", text)
         self.assertNotIn("keybind = cmd+s=unbind", text)
         self.assertIn("keybind = super+alt+p=text:\\x00Q", text)
+        self.assertIn("keybind = super+alt+y=text:\\x00y", text)
         self.assertIn("keybind = cmd+t=text:\\x00c", text)
         self.assertIn("keybind = cmd+d=text:\\x00|", text)
         self.assertIn("keybind = shift+enter=text:\\x0a", text)
@@ -838,7 +840,11 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
         self.assertIn("window_zoomed_flag", text)
         self.assertIn("bind v copy-mode", text)
         self.assertIn("bind P display-popup", text)
-        self.assertIn("bind Q display-popup", text)
+        self.assertIn("bind Q if-shell", text)
+        self.assertIn("tmux-session-picker", text)
+        self.assertIn("AIPANE_PICKER_ORIGIN_PANE=#{pane_id}", text)
+        self.assertIn("bind y run-shell", text)
+        self.assertIn("DoubleClick1Border", text)
         self.assertIn("unbind A", text)
         self.assertNotIn("bind A display-popup", text)
         self.assertIn("bind , run-shell -C", text)
@@ -855,6 +861,9 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
         self.assertTrue(WINDOW_JUMP_BIN.is_file())
         self.assertTrue(os.access(WINDOW_JUMP_BIN, os.X_OK))
         self.assertTrue(RENAME_BIN.is_file())
+        self.assertTrue(os.access(RENAME_BIN, os.X_OK))
+        self.assertTrue(PICKER_BIN.is_file())
+        self.assertTrue(os.access(PICKER_BIN, os.X_OK))
         self.assertTrue(COLOUR_PALETTE_BIN.is_file())
         # stay a fragment: no TPM / no personal home paths
         self.assertNotIn("@plugin", text)
@@ -1599,7 +1608,8 @@ class DocsPointerTests(unittest.TestCase):
 
         cheatsheet = CHEATSHEET.read_text(encoding="utf-8")
         self.assertIn("| `Cmd+S` | prefix only |", cheatsheet)
-        self.assertIn("| `Cmd+Opt+P` | popup pane ID list |", cheatsheet)
+        self.assertIn("| `Cmd+Opt+P` | interactive session & pane picker popup", cheatsheet)
+        self.assertIn("| `Cmd+Opt+Y` | copy current pane's AI session ID to clipboard |", cheatsheet)
         self.assertIn("| `Cmd+I` | centered popup rename window |", cheatsheet)
         self.assertIn("red-background `OFF` badge", cheatsheet)
         self.assertIn(

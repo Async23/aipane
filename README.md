@@ -46,7 +46,7 @@ Terminal shell tuned for many AI CLI panes. **Not** loaded by `init.zsh`. Person
 
 | Piece | What it does |
 |-------|----------------|
-| Ghostty Cmd bridge | `Cmd+S` prefix; one-shot `Cmd+T/W/D/[]/…`; `Cmd+I` renames in a centered popup; `Cmd+Opt+P` shows pane IDs |
+| Ghostty Cmd bridge | `Cmd+S` prefix; one-shot `Cmd+T/W/D/[]/…`; `Cmd+I` renames in a centered popup; `Cmd+Opt+P` opens session & pane picker; `Cmd+Opt+Y` copies current pane's AI session ID |
 | Shift+Enter | Newline for Codex/other CLIs under tmux (`→` Ctrl+J) |
 | tmux workstation | repeated-digit window jump, zoom-aware nav, broadcast + per-pane mute, pane top bar, 256-colour palette, vi copy-mode |
 | window-wrap | status window labels wrap up to 3 lines |
@@ -65,6 +65,7 @@ AIPANE_ROOT="${AIPANE_ROOT:-$HOME/.aipane}"
 mkdir -p ~/.local/bin
 ln -sf "$AIPANE_ROOT/bin/aipane-doctor" ~/.local/bin/aipane-doctor
 ln -sf "$AIPANE_ROOT/bin/tmux-rename-window-popup" ~/.local/bin/tmux-rename-window-popup
+ln -sf "$AIPANE_ROOT/bin/tmux-session-picker" ~/.local/bin/tmux-session-picker
 ln -sf "$AIPANE_ROOT/bin/tmux-close-window-popup" ~/.local/bin/tmux-close-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
 ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
@@ -97,6 +98,7 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `conf/tmux-window-wrap.conf` | multi-line window list |
 | `bin/aipane-doctor` | read-only installation and Agent Activity wiring audit |
 | `bin/tmux-rename-window-popup` | centered stable-target window rename UI |
+| `bin/tmux-session-picker` | interactive AI session & pane picker popup (`Cmd+Opt+P` / `prefix+Q`) |
 | `bin/tmux-close-window-popup` | centered stable-target window close confirmation |
 | `bin/tmux-colour-palette` | indexed terminal colour palette (`0–255`) |
 | `bin/tmux-window-jump` | repeated-digit exact-index window selector |

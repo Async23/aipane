@@ -20,6 +20,7 @@ Optional terminal shell for multi-agent CLI work. **Not** loaded by `init.zsh`.
 | `conf/tmux-window-wrap.conf` | multi-line window list |
 | `bin/aipane-doctor` | read-only installation and Agent Activity wiring audit |
 | `bin/tmux-rename-window-popup` | stable-target window rename UI (requires `fzf`) |
+| `bin/tmux-session-picker` | interactive AI session & pane picker popup (requires `fzf`) |
 | `bin/tmux-close-window-popup` | stable-target close confirmation with mouse and keyboard input |
 | `bin/tmux-colour-palette` | indexed terminal colour palette (`0–255`) |
 | `bin/tmux-window-jump` | repeated-digit exact-index window selector |
@@ -35,6 +36,7 @@ mkdir -p ~/.local/bin
 
 ln -sf "$AIPANE_ROOT/bin/aipane-doctor" ~/.local/bin/aipane-doctor
 ln -sf "$AIPANE_ROOT/bin/tmux-rename-window-popup" ~/.local/bin/tmux-rename-window-popup
+ln -sf "$AIPANE_ROOT/bin/tmux-session-picker" ~/.local/bin/tmux-session-picker
 ln -sf "$AIPANE_ROOT/bin/tmux-close-window-popup" ~/.local/bin/tmux-close-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
 ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
