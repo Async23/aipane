@@ -113,7 +113,7 @@ def main() -> int:
                       *(str(record.get(key, "")) for key in fields)]
             if record.get("tool") in {"a", "agy"}:
                 values.append(json.dumps({key: record.get(key, "") for key in
-                                         ("agy_home", "agy_model", "agy_effort", "agy_mode", "agy_agent")}, separators=(",", ":")))
+                                         ("agy_home", "agy_model", "agy_effort", "agy_mode", "agy_agent", "agy_route")}, separators=(",", ":")))
             if any("\x1f" in value or "\n" in value or "\r" in value for value in values):
                 raise SnapshotError("session identity contains a record separator")
             rows.append("\x1f".join(values))

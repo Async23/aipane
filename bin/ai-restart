@@ -305,6 +305,8 @@ def exact_plan_items(plan: list[dict[str, object]]) -> list[dict[str, object]]:
                 **({field_name: item.get(field_name, "") for field_name in ("dsh_home", "session_root")}
                    if item.get("tool") == "dsh" else {}),
                 **({"codex_home": item["codex_home"]} if item.get("codex_home") else {}),
+                **({field_name: item.get(field_name, "") for field_name in ("agy_home", "agy_model", "agy_effort", "agy_mode", "agy_agent", "agy_route")}
+                   if item.get("tool") == "agy" else {}),
                 "guard": {
                     field_name: str(guard.get(field_name, ""))
                     for field_name in GUARD_FIELDS

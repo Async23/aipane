@@ -22,6 +22,7 @@ CORE_ENTRYPOINTS = (
 RUNTIME_ENTRYPOINTS = {
     "ai-restart", "ai-restore", "aipane-snapshot", "aipane-bind",
     "aipane-restore-executor", "aipane-agy", "aipane-agy-focus",
+    "aipane-agy-launch",
 }
 LOCAL_BIN_ENTRYPOINT = re.compile(r"\.local/bin/(aipane-[a-z0-9-]+)")
 CONFIG_PATHS = (
@@ -300,7 +301,7 @@ def inspect_dsh_registrations(audit: Audit, root: Path, home: Path) -> set[str]:
     return helpers
 
 
-def inspect_agy_registrations(audit: Audit, home: Path) -> set[str]:
+def inspect_agy_registrations(audit: Audit, root: Path, home: Path) -> set[str]:
     settings = home / ".gemini/antigravity-cli/settings.json"
     if not settings.exists():
         return set()
@@ -325,7 +326,10 @@ def inspect_agy_registrations(audit: Audit, home: Path) -> set[str]:
             audit.ok("Antigravity CLI: statusLine, hooks and dedicated notifier inspected")
     except (OSError, ValueError, TypeError, AttributeError) as error:
         audit.fail(f"Antigravity CLI: incomplete installation ({type(error).__name__})")
-    return {"aipane-agy", "aipane-agy-focus"}
+    helpers = {"aipane-agy", "aipane-agy-focus"}
+    if (root / "bin/aipane-agy-launch").is_file():
+        helpers.add("aipane-agy-launch")
+    return helpers
 
 
 def main() -> int:
@@ -358,7 +362,7 @@ def main() -> int:
     checked = set(CORE_ENTRYPOINTS)
     checked.update(referenced)
     checked.update(inspect_dsh_registrations(audit, root, home))
-    checked.update(inspect_agy_registrations(audit, home))
+    checked.update(inspect_agy_registrations(audit, root, home))
     for name in sorted(checked):
         check_entrypoint(audit, root, home, name)
 

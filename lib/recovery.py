@@ -665,7 +665,7 @@ class RestoreExecutor:
             return False
         metadata = recovery_metadata(current)
         return all(not item.get(key) or metadata.get(key) == item[key]
-                   for key in ("agy_home", "agy_model", "agy_effort", "agy_mode", "agy_agent"))
+                   for key in ("agy_home", "agy_model", "agy_effort", "agy_mode", "agy_agent", "agy_route"))
 
     def pane_guard_matches(self, item: dict[str, Any]) -> bool:
         expected = (
@@ -775,10 +775,11 @@ class RestoreExecutor:
                     failures[identifier] = "pane disappeared"
                     active.pop(identifier)
                     continue
-                auto_claude = (
-                    attempt.sent and item["tool"] == "claude"
+                auto_launcher = (
+                    attempt.sent
                     and item["command"].startswith(AUTO_RESUME_PREFIX)
                 )
+                auto_claude = auto_launcher and item["tool"] == "claude"
                 matched_claude = self.claude_resume_matches(item) if auto_claude else False
                 if self.tool_running(item, current) or matched_claude:
                     if auto_claude and not matched_claude:
@@ -859,9 +860,10 @@ class RestoreExecutor:
                         failures[identifier] = self.tmux.capture_failure(target)
                         active.pop(identifier)
                         continue
-                elif auto_claude:
-                    # The recovery launcher may briefly be env or Python before
-                    # execing Claude. Wait, but never verify it as Claude.
+                elif auto_launcher:
+                    # A managed recovery launcher (Claude, Antigravity, ...) may
+                    # briefly run env or Python before execing the native binary.
+                    # Wait for the real tool, never verifying the wrapper itself.
                     pass
                 else:
                     failures[identifier] = f"pane switched to unexpected process {current}"

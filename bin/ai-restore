@@ -322,6 +322,13 @@ build_resume() {
       id="$coord_sid"
       if [[ -n "$id" ]]; then
         if REPLY="$(command python3 "$SCRIPT_DIR/../lib/agy_sessions.py" resume "$id" "$cwd" "$coord_agy" "$AGY_BASE")"; then
+          local agy_route=""
+          agy_route="$(command python3 -c 'import json,sys; d=json.loads(sys.argv[1] or "{}"); r=d.get("agy_route",""); print(r if r in {"plan","gcp"} else "")' "$coord_agy" 2>/dev/null || true)"
+          if [[ -n "$agy_route" ]]; then
+            REPLY="AIPANE_AUTO_RESUME=1 AIPANE_AGY_ROUTE=$agy_route $REPLY"
+          else
+            REPLY="AIPANE_AUTO_RESUME=1 $REPLY"
+          fi
           REPLY_KIND=resume
         else
           REPLY="$AGY_BASE"; REPLY_KIND=invalid

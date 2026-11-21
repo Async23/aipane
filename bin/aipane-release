@@ -18,7 +18,8 @@ import uuid
 
 
 COMMANDS = ("ai-restart", "ai-restore", "aipane-snapshot", "aipane-bind", "aipane-restore-executor")
-EXTRA_COMMANDS = ("aipane-agy", "aipane-agy-focus")
+EXTRA_COMMANDS = ("aipane-agy", "aipane-agy-focus", "aipane-agy-launch")
+AGY_CORE_EXTRA = ("aipane-agy", "aipane-agy-focus")
 
 
 class ReleaseError(RuntimeError):
@@ -75,8 +76,8 @@ def prepare(source: Path, root: Path, revision: str, *, baseline: bool = False) 
         with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
             bundle.extractall(temporary, filter="data")
         missing = [name for name in COMMANDS if not (temporary / "bin" / name).is_file()]
-        if any((temporary / "bin" / name).exists() for name in EXTRA_COMMANDS):
-            missing.extend(name for name in EXTRA_COMMANDS if not (temporary / "bin" / name).is_file())
+        if any((temporary / "bin" / name).exists() for name in AGY_CORE_EXTRA):
+            missing.extend(name for name in AGY_CORE_EXTRA if not (temporary / "bin" / name).is_file())
         if missing:
             raise ReleaseError("release is missing commands: " + ", ".join(missing))
         validation = "imported-baseline" if baseline else "passed"

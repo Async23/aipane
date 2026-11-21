@@ -28,6 +28,9 @@ from urllib.parse import unquote, urlparse
 SID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 MODES = {"auto", "plan", "accept-edits"}
 EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+ROUTES = {"plan", "gcp"}
+FIXED_VARIANT_SUFFIX = re.compile(r"\((low|medium|high|xhigh|extra|max)\)$", re.I)
+AGY_RECOVERY_FIELDS = ("agy_home", "agy_model", "agy_effort", "agy_mode", "agy_agent", "agy_route")
 
 
 def state_dir(environment=None) -> Path:
@@ -235,9 +238,8 @@ def resume_command(sid: str, cwd: str, metadata: dict, base="agy") -> str:
         if value:
             if value not in allowed:
                 raise ValueError(f"invalid Antigravity {key}")
-            if key == "agy_effort" and re.search(r"\((low|medium|high|extra)\)$", str(metadata.get("agy_model", "")), re.I):
-                # Legacy model variants encode effort in their selector ID.
-                # agy warns if --effort is also passed to these fixed variants.
+            if key == "agy_effort" and FIXED_VARIANT_SUFFIX.search(str(metadata.get("agy_model", ""))):
+                # Model variants whose selector ID already encodes effort reject --effort.
                 continue
             args.extend([flag, value])
     for flag, key in [("--model", "agy_model"), ("--agent", "agy_agent")]:
@@ -253,7 +255,7 @@ def recovery_metadata(record: dict) -> dict:
     model = record.get("model") or {}
     return {"agy_home": record["agy_home"], "agy_model": model.get("id", ""),
             "agy_effort": model.get("effort", ""), "agy_mode": record.get("cycle_mode", ""),
-            "agy_agent": record.get("agent_name", "")}
+            "agy_agent": record.get("agent_name", ""), "agy_route": record.get("route", "")}
 
 
 def session_writers(sid: str, home: str, environment=None) -> set[int]:
@@ -360,6 +362,13 @@ class AgyIntegration:
                 record.pop("stop", None)
             model = payload.get("model")
             model = {k: v for k,v in model.items() if k in {"id", "effort", "display_name"} and isinstance(v, str)} if isinstance(model, dict) else {}
+            env_route = str(self.environment.get("AIPANE_AGY_ROUTE") or "").strip().lower()
+            if env_route in ROUTES:
+                route = env_route
+            elif str(self.environment.get("AGY_ADC_AUTH") or "").strip().lower() == "true":
+                route = "gcp"
+            else:
+                route = ""
             record.update(version=1, activity_version=2, pid=process["pid"], started_at=process["started_at"],
                           tty=process["tty"], pane=self.pane, socket=self.socket, server=self.server,
                           session_id=sid, cwd=cwd, agy_home=str(cli_home(self.environment)),
@@ -367,7 +376,7 @@ class AgyIntegration:
                           has_background_tasks=bool(payload.get("task_count")),
                           title=str(payload.get("conversation_title") or "")[:500],
                           transcript_path=str(transcript) if transcript else "",
-                          model=model, cycle_mode=payload.get("cycle_mode", ""),
+                          model=model, route=route, cycle_mode=payload.get("cycle_mode", ""),
                           agent_name=(payload.get("agent") or {}).get("name", "") if isinstance(payload.get("agent", {}), dict) else "",
                           updated_at=time.time(), sequence=int(record.get("sequence", 0)) + 1)
             events = []
@@ -382,7 +391,23 @@ class AgyIntegration:
             if sid:
                 binding = session_path(sid, cli_home(self.environment), self.environment)
                 with runtime_lock(binding):
-                    _write(binding, {"version": 1, "session_id": sid, "home": str(cli_home(self.environment).resolve()), "cwd": cwd})
+                    _write(binding, {
+                        "version": 1,
+                        "session_id": sid,
+                        "home": str(cli_home(self.environment).resolve()),
+                        "cwd": cwd,
+                        **({"model": model["id"]} if model.get("id") else {}),
+                        **({"effort": model["effort"]} if model.get("effort") else {}),
+                        **({"route": route} if route else {}),
+                    })
+            if isinstance(payload.get("quota"), dict) and payload["quota"]:
+                try:
+                    from agy_catalog import atomic_write_json, normalize_quota_payload, quota_snapshot_path
+                    snapshot = normalize_quota_payload(payload)
+                    if snapshot is not None:
+                        atomic_write_json(quota_snapshot_path(self.environment), snapshot)
+                except Exception:
+                    pass
             return record, events
 
     def hook(self, event: str, payload: dict) -> tuple[dict | None, list[dict]]:

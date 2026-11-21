@@ -324,9 +324,34 @@ class AntigravityTests(unittest.TestCase):
 
     def test_legacy_model_variant_restores_effort_without_an_unsupported_flag(self):
         home = self.durable_session()
-        command = agy.resume_command(SID, str(self.cwd), {"agy_home": str(home),
-                                      "agy_model": "Gemini 3.1 Pro (Low)", "agy_effort": "low"})
-        self.assertNotIn("--effort", shlex.split(command))
+        for model, effort in (
+            ("Gemini 3.1 Pro (Low)", "low"),
+            ("Gemini 4 Neon (XHigh)", "xhigh"),
+            ("Claude Opus 5.5 (Max)", "max"),
+        ):
+            with self.subTest(model=model):
+                command = agy.resume_command(SID, str(self.cwd), {"agy_home": str(home),
+                                              "agy_model": model, "agy_effort": effort})
+                self.assertNotIn("--effort", shlex.split(command))
+
+    def test_status_persists_quota_snapshot_and_session_model_route(self):
+        env = {**self.env, "AIPANE_AGY_ROUTE": "gcp"}
+        integration = agy.AgyIntegration(env, reader=lambda pid: self.process,
+                                         producer=lambda: self.process, pane_matches=lambda process: True)
+        record, _ = integration.status({
+            **self.payload,
+            "model": {"id": "Claude Opus 5.5 (Max)", "effort": "max"},
+            "quota": {"3p-5h": {"remaining_fraction": 0.9, "reset_in_seconds": 1800}},
+        })
+        self.assertEqual(record["route"], "gcp")
+        self.assertEqual(agy.recovery_metadata(record)["agy_route"], "gcp")
+        binding = agy._read(agy.session_path(SID, agy.cli_home(env), env))
+        self.assertEqual(binding["model"], "Claude Opus 5.5 (Max)")
+        self.assertEqual(binding["route"], "gcp")
+        quota_file = agy.state_dir(env) / "quota-snapshot.json"
+        self.assertTrue(quota_file.is_file())
+        quota = json.loads(quota_file.read_text())
+        self.assertEqual(quota["buckets"]["3p-5h"]["remaining_fraction"], 0.9)
 
     def test_notification_uses_final_response_and_unwraps_user_request(self):
         transcript = self.root / "transcript.jsonl"
@@ -383,6 +408,94 @@ class AntigravityTests(unittest.TestCase):
         self.assertEqual(plan["sid"], SID)
         self.assertIn("--conversation", plan["command"])
         self.assertNotIn("--continue", plan["command"])
+        self.assertTrue(plan["command"].startswith("AIPANE_AUTO_RESUME=1 "))
+
+    def test_sealed_restart_plan_retains_agy_verification_fields(self):
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("ai_restart_mod", str(ROOT / "bin/ai-restart"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        guard = {field: "v" for field in (
+            "pane_id", "socket_path", "server_pid", "pane_pid", "current_command",
+            "activity_marker", "activity_reporter", "activity_updated_at", "activity_record",
+        )}
+        raw = [{
+            "target": "s:1.1", "tool": "agy", "kind": "resume", "restorable": True,
+            "cwd": str(self.cwd), "command": "AIPANE_AUTO_RESUME=1 agy --conversation " + SID,
+            "sid": SID, "agy_home": str(agy.cli_home(self.env)),
+            "agy_model": "Gemini 4 Neon (XHigh)", "agy_effort": "xhigh",
+            "agy_mode": "auto", "agy_agent": "", "agy_route": "plan", "guard": guard,
+        }]
+        exact = module.exact_plan_items(raw)
+        self.assertEqual(exact[0]["agy_model"], "Gemini 4 Neon (XHigh)")
+        self.assertEqual(exact[0]["agy_effort"], "xhigh")
+        self.assertEqual(exact[0]["agy_route"], "plan")
+
+    def test_recovery_executor_allows_auto_resume_python_wrapper_and_checks_model(self):
+        import recovery
+
+        class FakeTmux:
+            def __init__(self):
+                self.commands = ["python3", "agy", "agy", "agy"]
+                self.index = 0
+                self.activity = type("A", (), {"inspect": lambda _s, _t: None})()
+
+            def current_command(self, _target):
+                value = self.commands[min(self.index, len(self.commands) - 1)]
+                self.index += 1
+                return value
+
+            def pane_identity(self, _target):
+                return ("%1", "/tmp/agy-test", "111")
+
+            def run(self, *args, **_kw):
+                return subprocess.CompletedProcess(args, 0, "/dev/ttys999\n", "")
+
+            def capture_failure(self, _target):
+                return "failed"
+
+        self.status(model={"id": "Gemini 4 Neon (XHigh)", "effort": "xhigh"})
+        executor = recovery.RestoreExecutor(
+            {
+                **self.env,
+                "AI_RESTORE_VERIFY_TIMEOUT": "0.5",
+                "AI_RESTORE_VERIFY_STABILITY": "0.01",
+                "AI_RESTORE_POLL_INTERVAL": "0.01",
+            },
+        )
+        executor.tmux = FakeTmux()
+        base_item = {
+            "target": "s:1.1", "tool": "agy", "kind": "resume", "restorable": True,
+            "cwd": str(self.cwd), "sid": SID,
+            "command": f"AIPANE_AUTO_RESUME=1 aipane-agy-launch --conversation {SID}",
+            "agy_home": str(agy.cli_home(self.env)),
+            "agy_model": "Gemini 4 Neon (XHigh)",
+            "agy_effort": "xhigh",
+            "agy_mode": "auto",
+            "agy_agent": "",
+            "agy_route": "",
+        }
+        reader = partial(agy.current_session, reader=lambda _pid: self.process)
+        with patch.object(agy, "current_session", wraps=reader):
+            attempt = recovery.Attempt(
+                item=dict(base_item), grok_offset=None, existing_process=False,
+                verify_timeout=0.5, sent=True,
+            )
+            verified, failures, blocked = executor.verify_round([attempt])
+            self.assertEqual((len(verified), failures, blocked), (1, {}, {}))
+
+            # Mismatched expected model must NOT verify as ready.
+            wrong_item = {**base_item, "agy_model": "Gemini 4 Carbon (High)", "agy_effort": "high"}
+            executor.tmux = FakeTmux()
+            bad_attempt = recovery.Attempt(
+                item=wrong_item, grok_offset=None, existing_process=False,
+                verify_timeout=0.08, sent=True,
+            )
+            verified, failures, _ = executor.verify_round([bad_attempt])
+            self.assertEqual(len(verified), 0)
+            self.assertEqual(len(failures), 1)
 
     def test_notification_preview_does_not_claim_or_deliver_and_duplicate_is_suppressed(self):
         adapter = InMemoryNotificationAdapter()

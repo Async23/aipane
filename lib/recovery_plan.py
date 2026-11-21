@@ -130,7 +130,7 @@ def normalize_plan(
             for key in ("dsh_home", "session_root"):
                 item[key] = str(raw.get(key, ""))
         if item["tool"] == "agy":
-            for key in ("agy_home", "agy_model", "agy_effort", "agy_mode", "agy_agent"):
+            for key in ("agy_home", "agy_model", "agy_effort", "agy_mode", "agy_agent", "agy_route"):
                 if not isinstance(raw.get(key, ""), str):
                     raise RecoveryPlanError(f"invalid Antigravity recovery field {key}")
                 item[key] = raw.get(key, "")

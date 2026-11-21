@@ -2,8 +2,31 @@
 
 `ai a` starts the official `agy` CLI; `ai ax` combines Antigravity and Codex.
 `AIPANE_AGY_LAUNCH_CMD` overrides the default `agy` command. Single-tool arguments
-are passed through, for example `ai a --model 'Gemini 4 Hydrogen' --effort high`.
+are passed through, for example `ai a --model gemini-4-hydrogen-high`.
 The default follows agy's own permission settings.
+
+`bin/aipane-agy-launch` provides a unified pre-launch picker and composition
+layer for both `ai a` and direct `agy` invocations:
+
+- **Model family & inline effort picker**: Collapses `agy models` variants into
+  a compact model-family view (9 families on plan quota) with per-family effort
+  memory, `←`/`→` effort stepping on empty queries (`Option+,`/`Option+.`
+  anytime), automatic expansion to flat variants when typing multi-word or
+  effort queries (e.g. `neon xh`, `opus low`), `Ctrl+T` manual view toggle, and
+  `Ctrl+R` live catalog refresh.
+- **SWR catalog cache & quota display**: Reads the local catalog cache
+  (`$AIPANE_STATE_DIR/agy/catalog-*.json`) immediately on launch and refreshes
+  stale or version-changed catalogs in a detached single-flight background
+  process. Displays recent quota remaining from `aipane-agy status` snapshots
+  without fabricating values past reset boundaries.
+- **Three-way preference reconciliation**: Tracks confirmed selections in
+  `$AIPANE_STATE_DIR/agy/picker-state.json` alongside `last_seen_settings_model`,
+  so in-session `/model` changes are respected while unrelated `settings.json`
+  rewrites (such as `trustedWorkspaces`) do not clobber launcher memory.
+- **Unified composition**: Deep-merges macOS light/dark Solarized `colorScheme`,
+  optional local GCP ADC routes (`~/.config/aipane/agy-launch.json`, toggled
+  with `Ctrl+G`), and user `--settings` into a single `--settings` payload,
+  inherits parent `.agents/skills` via `--add-dir`, and hands off via `os.execve`.
 
 When you start an agy session below your home directory, aipane checks each
 parent up to and including your home directory, even across Git roots. It passes
@@ -15,8 +38,9 @@ launches such as `ai ca`. Subcommands such as `ai a models` run as usual.
 ## Install
 
 Install a tested, committed aipane runtime with `bin/aipane-release install` as
-described in [recovery-runtime.md](recovery-runtime.md). This installs both
-`aipane-agy` and `aipane-agy-focus` from the same immutable release as recovery.
+described in [recovery-runtime.md](recovery-runtime.md). This installs
+`aipane-agy`, `aipane-agy-focus`, and `aipane-agy-launch` from the same
+immutable release as recovery.
 
 Merge [the hook fragment](../integrations/antigravity/hooks.json) into
 `~/.gemini/config/hooks.json`, preserving unrelated named hooks. Hooks placed in

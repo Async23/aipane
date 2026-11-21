@@ -229,7 +229,7 @@ def main() -> int:
                          **({"codex_home": rec["codex_home"]} if rec.get("codex_home") else {}),
                          **({key: rec[key] for key in ("dsh_home", "session_root") if rec.get(key)}
                             if rec.get("tool") == "d" else {}),
-                         **({key: rec[key] for key in ("agy_home", "agy_model", "agy_effort", "agy_mode", "agy_agent") if rec.get(key)}
+                         **({key: rec[key] for key in ("agy_home", "agy_model", "agy_effort", "agy_mode", "agy_agent", "agy_route") if rec.get(key)}
                             if rec.get("tool") == "a" else {})}
 
     try:
