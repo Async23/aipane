@@ -46,7 +46,7 @@ Terminal shell tuned for many AI CLI panes. **Not** loaded by `init.zsh`. Person
 
 | Piece | What it does |
 |-------|----------------|
-| Ghostty Cmd bridge | `Cmd+S` prefix; one-shot `Cmd+T/W/D/[]/…`; `Cmd+I` renames in a centered popup; `Cmd+Opt+P` opens session & pane picker; `Cmd+Opt+Y` copies current pane's AI session ID |
+| Ghostty Cmd bridge | `Cmd+S` prefix; one-shot `Cmd+T/W/D/[]/…`; `Cmd+I` renames in a centered popup; `Cmd+Opt+P` opens session & pane picker; `Cmd+Opt+Y` copies current pane's AI session ref (`<agent>:<id>`) |
 | Shift+Enter | Newline for Codex/other CLIs under tmux (`→` Ctrl+J) |
 | tmux workstation | repeated-digit window jump, zoom-aware nav, broadcast + per-pane mute, pane top bar, 256-colour palette, vi copy-mode |
 | window-wrap | status window labels wrap up to 3 lines |

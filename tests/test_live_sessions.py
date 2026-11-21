@@ -423,9 +423,13 @@ class PickerAndTmuxIntegrationTests(unittest.TestCase):
             multi_out,
             "agy:1111-aaaa (0:4.1)  codex:2222-bbbb (0:4.3)  agy:ide/3333-cccc (IDE)",
         )
-        self.assertEqual(picker.format_raw_copy_payload(multi), "1111-aaaa\n2222-bbbb\nide/3333-cccc")
+        self.assertEqual(picker.format_copy_payload(single), "agy:1111-aaaa")
+        self.assertEqual(
+            picker.format_copy_payload(multi),
+            "agy:1111-aaaa\ncodex:2222-bbbb\nagy:ide/3333-cccc",
+        )
 
-    def test_picker_enter_injects_without_clobbering_default_buffer_and_ctrl_y_copies_raw(self) -> None:
+    def test_picker_enter_injects_without_clobbering_default_buffer_and_ctrl_y_copies_ref(self) -> None:
         node_bin = shutil.which("node")
         if not node_bin:
             self.skipTest("node is required for live pane integration test")
@@ -488,13 +492,24 @@ class PickerAndTmuxIntegrationTests(unittest.TestCase):
         bufs = self.tmux("list-buffers", "-F", "#{buffer_name}", check=False).stdout
         self.assertNotIn("aipane-pick-", bufs)
 
-        # Fake fzf #2: Ctrl+Y copies raw session ID without '<agent>:' prefix.
+        # Fake fzf #2: Ctrl+Y copies '<agent>:<sid>' ref to clipboard + tmux buffer.
         fake_fzf_yank = self.home / "fzf-yank"
         fake_fzf_yank.write_text("#!/bin/sh\nline=$(head -n 1)\nprintf 'ctrl-y\\n%s\\n' \"$line\"\n", encoding="utf-8")
         fake_fzf_yank.chmod(0o755)
         run_env["AIPANE_FZF_BIN"] = str(fake_fzf_yank)
         res2 = subprocess.run([str(PICKER_BIN)], env=run_env, capture_output=True, text=True, check=False)
         self.assertEqual(res2.returncode, 0, res2.stderr)
+        self.assertEqual(self.tmux("show-buffer").stdout, f"dsh:{dsh_sid}")
+
+        # Direct yank defaults to '<agent>:<sid>' ref and supports explicit --format raw.
+        out_ref, code_ref = sessions_mod.yank_pane_session(p2, display=False, home=self.home, environment=self.env)
+        self.assertEqual(code_ref, 0)
+        self.assertEqual(out_ref["copied"], f"dsh:{dsh_sid}")
+        self.assertEqual(self.tmux("show-buffer").stdout, f"dsh:{dsh_sid}")
+
+        out_raw, code_raw = sessions_mod.yank_pane_session(p2, fmt="raw", display=False, home=self.home, environment=self.env)
+        self.assertEqual(code_raw, 0)
+        self.assertEqual(out_raw["copied"], dsh_sid)
         self.assertEqual(self.tmux("show-buffer").stdout, dsh_sid)
 
         # Direct yank on non-AI pane p1 (running cat) fails cleanly and preserves clipboard!
@@ -562,14 +577,15 @@ class PickerAndTmuxIntegrationTests(unittest.TestCase):
                 os.write(master_fd, f"\x1b[<0;{click_x};1M\x1b[<0;{click_x};1m".encode())
                 time.sleep(0.05)
 
+            expected_ref = f"dsh:{dsh_sid}"
             deadline = time.monotonic() + 3.0
             copied = ""
             while time.monotonic() < deadline:
                 copied = self.tmux("show-buffer", check=False).stdout.strip()
-                if copied == dsh_sid:
+                if copied == expected_ref:
                     break
                 time.sleep(0.05)
-            self.assertEqual(copied, dsh_sid)
+            self.assertEqual(copied, expected_ref)
             # Active pane must stay p1, and neither pane may enter view-mode from run-shell stdout!
             active_now = self.tmux("display-message", "-p", "-t", self.w1, "#{pane_id}").stdout.strip()
             self.assertEqual(active_now, self.p1)
@@ -588,10 +604,10 @@ class PickerAndTmuxIntegrationTests(unittest.TestCase):
             copied_y = ""
             while time.monotonic() < deadline:
                 copied_y = self.tmux("show-buffer", check=False).stdout.strip()
-                if copied_y == dsh_sid:
+                if copied_y == expected_ref:
                     break
                 time.sleep(0.05)
-            self.assertEqual(copied_y, dsh_sid)
+            self.assertEqual(copied_y, expected_ref)
             self.assertEqual(
                 self.tmux("display-message", "-p", "-t", p2, "#{pane_in_mode}").stdout.strip(),
                 "0",

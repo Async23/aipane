@@ -46,7 +46,7 @@ git -C ~/.aipane pull --ff-only
 
 | 部分 | 作用 |
 |------|------|
-| Ghostty Cmd 桥 | `Cmd+S` prefix；单次 `Cmd+T/W/D/[]/…`；`Cmd+I` 中央弹窗重命名；`Cmd+Opt+P` 打开交互式会话与窗格拾取器；`Cmd+Opt+Y` 复制当前窗格 AI session ID |
+| Ghostty Cmd 桥 | `Cmd+S` prefix；单次 `Cmd+T/W/D/[]/…`；`Cmd+I` 中央弹窗重命名；`Cmd+Opt+P` 打开交互式会话与窗格拾取器；`Cmd+Opt+Y` 复制当前窗格 AI 会话引用（`<agent>:<id>`） |
 | Shift+Enter | tmux 里给 Codex 等稳定换行（→ Ctrl+J） |
 | tmux workstation | 数字连按跳窗、zoom 保持导航、广播/单格豁免、pane 顶栏、256 色表、vi 复制 |
 | window-wrap | 状态栏窗口标签最多 3 行 |

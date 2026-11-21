@@ -1609,7 +1609,7 @@ class DocsPointerTests(unittest.TestCase):
         cheatsheet = CHEATSHEET.read_text(encoding="utf-8")
         self.assertIn("| `Cmd+S` | prefix only |", cheatsheet)
         self.assertIn("| `Cmd+Opt+P` | interactive session & pane picker popup", cheatsheet)
-        self.assertIn("| `Cmd+Opt+Y` | copy current pane's AI session ID to clipboard |", cheatsheet)
+        self.assertIn("| `Cmd+Opt+Y` | copy current pane's AI session ref (`<agent>:<id>`) to clipboard |", cheatsheet)
         self.assertIn("| `Cmd+I` | centered popup rename window |", cheatsheet)
         self.assertIn("red-background `OFF` badge", cheatsheet)
         self.assertIn(

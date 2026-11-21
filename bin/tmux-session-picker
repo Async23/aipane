@@ -9,7 +9,7 @@ Actions:
   Enter    Inject selected reference(s) safely into origin pane via bracketed
            paste (single: '<agent>:<sid>'; multi: '<agent>:<sid> (<loc>) ...')
   Tab      Toggle multi-select
-  Ctrl+Y   Copy raw session ID(s) to macOS clipboard + tmux paste buffer
+  Ctrl+Y   Copy '<agent>:<sid>' ref(s) to macOS clipboard + tmux paste buffer
   Ctrl+G   Jump focus to the selected live tmux pane
   Esc      Cancel without side effects
 """
@@ -157,9 +157,17 @@ def format_injection_payload(rows: list[list[str]]) -> str:
     return "  ".join(parts)
 
 
-def format_raw_copy_payload(rows: list[list[str]]) -> str:
-    sids = [r[3] for r in rows if len(r) >= 4 and r[3]]
-    return "\n".join(sids)
+def format_copy_payload(rows: list[list[str]]) -> str:
+    """Format newline-separated '<agent>:<sid>' refs for clipboard copy."""
+    refs: list[str] = []
+    for row in rows:
+        if len(row) < 4:
+            continue
+        tag, sid = row[2], row[3]
+        if not sid:
+            continue
+        refs.append(f"{tag}:{sid}" if tag else sid)
+    return "\n".join(refs)
 
 
 def _tmux_run(env: dict[str, str], *args: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -306,7 +314,7 @@ def main() -> int:
 
     columns = shutil.get_terminal_size((120, 30)).columns
     preview_window = "right:48%:wrap:border-left" if columns >= 100 else "down:42%:wrap:border-top"
-    footer = "Enter Inject · Tab Multi · ^Y Copy ID · ^G Jump · Esc Cancel"
+    footer = "Enter Inject · Tab Multi · ^Y Copy Ref · ^G Jump · Esc Cancel"
 
     fzf_env = env.copy()
     fzf_env.pop("FZF_DEFAULT_OPTS", None)
@@ -381,10 +389,10 @@ def main() -> int:
         return 0
 
     if action_key == "ctrl-y":
-        raw_text = format_raw_copy_payload(selected_rows)
-        if not raw_text:
+        copy_text = format_copy_payload(selected_rows)
+        if not copy_text:
             return 0
-        sinks = live_sessions.copy_text_to_clipboard(raw_text, environment=env)
+        sinks = live_sessions.copy_text_to_clipboard(copy_text, environment=env)
         if not sinks:
             _display_message(env, "Session picker: clipboard copy failed")
             return 1
@@ -394,7 +402,7 @@ def main() -> int:
             short_sid = f"{sid[:8]}…{sid[-4:]}" if len(sid) > 15 else sid
             _display_message(env, f"Copied [{row[2]} · {row[4]}] {short_sid}")
         else:
-            _display_message(env, f"Copied {len(selected_rows)} raw session IDs")
+            _display_message(env, f"Copied {len(selected_rows)} session refs")
         return 0
 
     # Default action (Enter): inject Option B format safely into origin pane.

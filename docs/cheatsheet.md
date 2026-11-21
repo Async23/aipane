@@ -2,7 +2,7 @@
 
 Prefix is **Ctrl-Space**. In Ghostty, **Cmd+S** sends the general tmux prefix;
 **Cmd+Opt+P** opens the interactive session & pane picker popup, and **Cmd+Opt+Y**
-copies the active pane's current AI session ID. Other mapped Cmd shortcuts
+copies the active pane's current AI session ref (`<agent>:<id>`). Other mapped Cmd shortcuts
 also send complete prefix+key chords.
 
 ## Ghostty Cmd bridge
@@ -10,8 +10,8 @@ also send complete prefix+key chords.
 | Key | Action |
 |-----|--------|
 | `Cmd+S` | prefix only |
-| `Cmd+Opt+P` | interactive session & pane picker popup (`Enter` inject, `Tab` multi, `^Y` copy raw ID, `^G` jump) |
-| `Cmd+Opt+Y` | copy current pane's AI session ID to clipboard |
+| `Cmd+Opt+P` | interactive session & pane picker popup (`Enter` inject, `Tab` multi, `^Y` copy `<agent>:<id>`, `^G` jump) |
+| `Cmd+Opt+Y` | copy current pane's AI session ref (`<agent>:<id>`) to clipboard |
 | `Cmd+T` | new window |
 | `Cmd+W` | kill pane; centered confirm when the last pane runs an AI Tool |
 | `Cmd+D` / `Cmd+Shift+D` | split L-R / T-B |
@@ -146,7 +146,7 @@ unchanged; numbers beyond the buffer select its final line.
 |-----|--------|
 | `prefix P` | indexed colour palette (`0–255`; `q`/`Esc` closes) |
 | `prefix Q` / `Cmd+Opt+P` | interactive session & pane picker popup |
-| `prefix y` / `Cmd+Opt+Y` | copy current pane's AI session ID to clipboard |
-| double-click pane top bar | copy that pane's AI session ID without changing focus |
+| `prefix y` / `Cmd+Opt+Y` | copy current pane's AI session ref (`<agent>:<id>`) to clipboard |
+| double-click pane top bar | copy that pane's AI session ref (`<agent>:<id>`) without changing focus |
 | double-click status window label | zoom that window's pane |
 | multi-line window list | `tmux-window-wrap` when labels overflow |

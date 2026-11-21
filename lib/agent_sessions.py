@@ -1531,7 +1531,7 @@ def _tmux_display_message(message: str, environment: dict[str, str], duration_ms
 def yank_pane_session(
     target: str | None = None,
     *,
-    fmt: str = "raw",
+    fmt: str = "ref",
     display: bool = True,
     home: Path | None = None,
     environment: dict[str, str] | None = None,
@@ -1571,8 +1571,9 @@ def yank_pane_session(
             _tmux_display_message(msg, env)
         return {"command": "yank", "ok": False, "pane": item.as_dict(), "error": msg}, 1
 
+    tag = item.agent_alias or item.agent
     payload_text = (
-        f"{item.agent_alias}:{item.session_id}" if fmt == "ref" else item.session_id
+        f"{tag}:{item.session_id}" if (fmt == "ref" and tag) else item.session_id
     )
     sinks = live_sessions.copy_text_to_clipboard(payload_text, environment=env)
     if not sinks:
@@ -1729,9 +1730,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max timeline events per source (default: 120; unlimited with --full)",
     )
 
-    p_yank = sub.add_parser("yank", help="Copy a live tmux pane's current AI session ID to the clipboard")
+    p_yank = sub.add_parser("yank", help="Copy a live tmux pane's current AI session ref ('<agent>:<id>') to the clipboard")
     p_yank.add_argument("target", nargs="?", help="Optional pane ID or coordinate (defaults to current pane)")
-    p_yank.add_argument("--format", choices=("raw", "ref"), default="raw", help="Copy raw ID or '<agent>:<id>' (default: raw)")
+    p_yank.add_argument("--format", choices=("ref", "raw"), default="ref", help="Copy '<agent>:<id>' or raw ID (default: ref)")
     p_yank.add_argument("--no-display", action="store_true", help="Suppress tmux status-line confirmation message")
 
     p_preview = sub.add_parser("preview", help=argparse.SUPPRESS)
