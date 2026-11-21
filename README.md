@@ -187,14 +187,14 @@ ai cc                                     # duplicate keys launch duplicate tool
 
 Available layouts:
 
-- `auto`: automatic grid; skips the 3-pane prompt
+- `auto`: aspect-aware grid; skips the 3-pane prompt
 - `main-left`, `main-right`: asymmetric layouts that require exactly three panes
 - `columns`, `rows`: one column or row per tool
 - Custom column counts such as `1,2` or `2,1`; the sum must equal the number of tools
 
 Tool arguments are supported only when the tools string contains one tool. Multi-tool calls with extra arguments are rejected so incompatible arguments are not sent to multiple CLIs.
 
-Inside tmux, a pane layout reuses the current window only when it has one pane; use `--new` to create a new window. Outside tmux, pane launches create a temporary session and attach to it.
+Inside tmux, pane layouts split the current pane in place without disturbing sibling panes; use `--new` to create a new window instead. Outside tmux, pane launches create a temporary session and attach to it.
 
 ## Restart AI Panes
 

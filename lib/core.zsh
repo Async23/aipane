@@ -1,7 +1,7 @@
 #!/usr/bin/env zsh
 # Shared helpers for aipane.
 
-if [[ "${_AIPANE_CORE_VERSION:-}" == "6" ]]; then
+if [[ "${_AIPANE_CORE_VERSION:-}" == "7" ]]; then
   return 0
 fi
 # Migrate the previous built-in default when an existing shell reloads.
@@ -14,7 +14,7 @@ if [[ -n "${_AIPANE_CORE_VERSION:-}" ]]; then
   unset AIPANE_OPENCODE_LAUNCH_CMD AIPANE_CURSOR_LAUNCH_CMD AIPANE_QWEN_LAUNCH_CMD
 fi
 typeset -g _AIPANE_CORE_LOADED=1
-typeset -g _AIPANE_CORE_VERSION=6
+typeset -g _AIPANE_CORE_VERSION=7
 
 # User-configurable values (export before sourcing init.zsh to override).
 typeset -g AIPANE_CLAUDE_LAUNCH_CMD="${AIPANE_CLAUDE_LAUNCH_CMD:-claude --dangerously-skip-permissions}"
@@ -26,6 +26,8 @@ typeset -g AIPANE_GROK_LAUNCH_CMD="${AIPANE_GROK_LAUNCH_CMD:-grok --always-appro
 typeset -g AIPANE_PI_LAUNCH_CMD="${AIPANE_PI_LAUNCH_CMD:-pi}"
 typeset -g AIPANE_KIMI_LAUNCH_CMD="${AIPANE_KIMI_LAUNCH_CMD:-kimi --auto}"
 typeset -g AIPANE_AGY_LAUNCH_CMD="${AIPANE_AGY_LAUNCH_CMD:-agy}"
+typeset -g AIPANE_MIN_PANE_WIDTH="${AIPANE_MIN_PANE_WIDTH:-24}"
+typeset -g AIPANE_MIN_PANE_HEIGHT="${AIPANE_MIN_PANE_HEIGHT:-7}"
 
 _aipane_ceil_sqrt() {
   local n="$1"
@@ -89,4 +91,98 @@ _aipane_grid_for_count() {
   fi
 
   REPLY="$cols $rows ${(j: :)per_col}"
+}
+
+_aipane_portrait_grid_for_count() {
+  local count="$1"
+  local cols=1 rows c
+  local -a per_col
+
+  if (( count <= 0 )); then
+    print -u2 "aipane: pane count must be positive"
+    return 1
+  fi
+
+  while (( (cols + 1) * (cols + 1) <= count )); do
+    (( cols++ ))
+  done
+
+  rows=$(( (count + cols - 1) / cols ))
+  for (( c = 1; c <= cols; c++ )); do
+    per_col+=($(( ((count - c) / cols) + 1 )))
+  done
+
+  REPLY="$cols $rows ${(j: :)per_col}"
+}
+
+_aipane_grid_fits() {
+  local pane_w="$1" pane_h="$2" cols="$3" rows="$4"
+  (( cols > 0 && rows > 0 )) || return 1
+  local min_w=$(( (pane_w - (cols - 1)) / cols ))
+  local min_h=$(( (pane_h - (rows - 1)) / rows ))
+  (( min_w >= AIPANE_MIN_PANE_WIDTH && min_h >= AIPANE_MIN_PANE_HEIGHT ))
+}
+
+_aipane_grid_for_pane() {
+  local count="$1" pane_w="${2:-0}" pane_h="${3:-0}" cell_w="${4:-0}" cell_h="${5:-0}"
+  local primary secondary is_portrait=0
+  local -a parts
+
+  if (( count <= 0 )); then
+    print -u2 "aipane: pane count must be positive"
+    return 1
+  fi
+
+  if (( count == 1 || pane_w <= 0 || pane_h <= 0 )); then
+    _aipane_grid_for_count "$count"
+    return $?
+  fi
+
+  if (( cell_w > 0 && cell_h > 0 )); then
+    (( pane_w * cell_w < pane_h * cell_h )) && is_portrait=1
+  else
+    (( pane_w < pane_h * 2 )) && is_portrait=1
+  fi
+
+  if (( is_portrait )); then
+    _aipane_portrait_grid_for_count "$count" || return 1
+    primary="$REPLY"
+    _aipane_grid_for_count "$count" || return 1
+    secondary="$REPLY"
+  else
+    _aipane_grid_for_count "$count" || return 1
+    primary="$REPLY"
+    _aipane_portrait_grid_for_count "$count" || return 1
+    secondary="$REPLY"
+  fi
+
+  parts=("${(s: :)primary}")
+  if _aipane_grid_fits "$pane_w" "$pane_h" "${parts[1]}" "${parts[2]}"; then
+    REPLY="$primary"
+    return 0
+  fi
+
+  parts=("${(s: :)secondary}")
+  if _aipane_grid_fits "$pane_w" "$pane_h" "${parts[1]}" "${parts[2]}"; then
+    REPLY="$secondary"
+    return 0
+  fi
+
+  if _aipane_grid_fits "$pane_w" "$pane_h" "$count" 1; then
+    local -a ones=()
+    local i
+    for (( i = 1; i <= count; i++ )); do
+      ones+=(1)
+    done
+    REPLY="$count 1 ${(j: :)ones}"
+    return 0
+  fi
+
+  if _aipane_grid_fits "$pane_w" "$pane_h" 1 "$count"; then
+    REPLY="1 $count $count"
+    return 0
+  fi
+
+  REPLY="$primary"
+  return 0
 }

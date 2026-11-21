@@ -124,12 +124,16 @@ _aipane_tool_command() {
 _aipane_layout_spec_for_count() {
   local pane_count="$1"
   local layout="$2"
+  local pane_w="${3:-0}"
+  local pane_h="${4:-0}"
+  local cell_w="${5:-0}"
+  local cell_h="${6:-0}"
   local -a parts per_col
   local cols rows sum value
 
   case "$layout" in
     ""|auto)
-      _aipane_grid_for_count "$pane_count" || return 1
+      _aipane_grid_for_pane "$pane_count" "$pane_w" "$pane_h" "$cell_w" "$cell_h" || return 1
       return 0
       ;;
     main-left|left)
@@ -246,14 +250,30 @@ _aipane_select_three_pane_layout() {
   done
 }
 
+_aipane_pane_cleanup_failed_build() {
+  local mode="$1" window_id="$2" session_name="$3"
+  shift 3
+  local pane
+
+  if [[ "$mode" == "window" && -n "$window_id" ]]; then
+    tmux kill-window -t "$window_id" >/dev/null 2>&1 || true
+  elif [[ "$mode" == "session" && -n "$session_name" ]]; then
+    tmux kill-session -t "$session_name" >/dev/null 2>&1 || true
+  else
+    for pane in "$@"; do
+      tmux kill-pane -t "$pane" >/dev/null 2>&1 || true
+    done
+  fi
+}
+
 _aipane_pane_build_and_run_tmux() {
   local mode="$1"
   local pane_count="$2"
   local cols="$3"
   local rows="$4"
-  local -a rows_per_col commands col_tops pane_ids
+  local -a rows_per_col commands col_tops pane_ids created_panes target_opt
   local new_info window_id root_pane expected v
-  local c needed_rows remaining_rows split_percentage anchor new_pane
+  local c r needed_rows anchor new_pane
   local i
   shift 4
 
@@ -276,13 +296,8 @@ _aipane_pane_build_and_run_tmux() {
   fi
 
   if [[ "$mode" == "here" ]]; then
-    local existing_panes
-    existing_panes="$(tmux display-message -p '#{window_panes}')" || return 1
-    if (( existing_panes != 1 )); then
-      print -u2 "ai: current window has ${existing_panes} panes; use --new to create a new window"
-      return 1
-    fi
-    new_info="$(tmux display-message -p '#{window_id} #{pane_id}')" || return 1
+    [[ -n "${TMUX_PANE:-}" ]] && target_opt=(-t "$TMUX_PANE")
+    new_info="$(tmux display-message "${target_opt[@]}" -p '#{window_id} #{pane_id}')" || return 1
   elif [[ "$mode" == "window" ]]; then
     new_info="$(tmux new-window -c "$PWD" -P -F '#{window_id} #{pane_id}')" || return 1
   elif [[ "$mode" == "session" ]]; then
@@ -296,36 +311,74 @@ _aipane_pane_build_and_run_tmux() {
   window_id="${new_info%% *}"
   root_pane="${new_info#* }"
 
-  # Build columns, then rows per column.
-  col_tops=("$root_pane")
-  for (( c = 2; c <= cols; c++ )); do
-    new_pane="$(tmux split-window -h -d -P -F '#{pane_id}' -t "${col_tops[c-1]}")" || return 1
-    col_tops+=("$new_pane")
-    sleep 0.12
-  done
+  if (( pane_count == 1 )); then
+    pane_ids=("$root_pane")
+  else
+    local root_dims pane_w pane_h
+    root_dims="$(tmux display-message -t "$root_pane" -p '#{pane_width} #{pane_height}')" || {
+      _aipane_pane_cleanup_failed_build "$mode" "$window_id" "${_aipane_session:-}"
+      return 1
+    }
+    pane_w="${root_dims%% *}"
+    pane_h="${root_dims#* }"
 
-  if (( cols > 1 )); then
-    tmux select-layout -t "$window_id" even-horizontal || return 1
-    sleep 0.12
+    if ! _aipane_grid_fits "$pane_w" "$pane_h" "$cols" "$rows"; then
+      _aipane_pane_cleanup_failed_build "$mode" "$window_id" "${_aipane_session:-}"
+      if [[ "$mode" == "here" ]]; then
+        print -u2 "ai: current pane (${pane_w}x${pane_h}) is too small for ${cols}x${rows} layout (min ${AIPANE_MIN_PANE_WIDTH}x${AIPANE_MIN_PANE_HEIGHT} per pane); use --new to create a new window"
+      else
+        print -u2 "ai: window (${pane_w}x${pane_h}) is too small for ${cols}x${rows} layout (min ${AIPANE_MIN_PANE_WIDTH}x${AIPANE_MIN_PANE_HEIGHT} per pane)"
+      fi
+      return 1
+    fi
+
+    # Split columns and rows strictly inside root_pane using exact cell counts
+    # so sibling panes in the same window keep their geometry untouched.
+    col_tops=("$root_pane")
+    local rem_w="$pane_w" rem_cols="$cols" col_w right_w
+    for (( c = 2; c <= cols; c++ )); do
+      col_w=$(( (rem_w - (rem_cols - 1)) / rem_cols ))
+      right_w=$(( rem_w - col_w - 1 ))
+      new_pane="$(tmux split-window -h -d -c "$PWD" -l "$right_w" -P -F '#{pane_id}' -t "${col_tops[c-1]}")" || {
+        _aipane_pane_cleanup_failed_build "$mode" "$window_id" "${_aipane_session:-}" "${created_panes[@]}"
+        return 1
+      }
+      col_tops+=("$new_pane")
+      created_panes+=("$new_pane")
+      rem_w="$right_w"
+      (( rem_cols-- ))
+      sleep 0.05
+    done
+
+    pane_ids=()
+    local rem_h rem_rows row_h bottom_h
+    for (( c = 1; c <= cols; c++ )); do
+      needed_rows="${rows_per_col[c]}"
+      anchor="${col_tops[c]}"
+      pane_ids+=("$anchor")
+      if (( needed_rows > 1 )); then
+        rem_h="$pane_h"
+        rem_rows="$needed_rows"
+        for (( r = 2; r <= needed_rows; r++ )); do
+          row_h=$(( (rem_h - (rem_rows - 1)) / rem_rows ))
+          bottom_h=$(( rem_h - row_h - 1 ))
+          new_pane="$(tmux split-window -v -d -c "$PWD" -l "$bottom_h" -P -F '#{pane_id}' -t "$anchor")" || {
+            _aipane_pane_cleanup_failed_build "$mode" "$window_id" "${_aipane_session:-}" "${created_panes[@]}"
+            return 1
+          }
+          pane_ids+=("$new_pane")
+          created_panes+=("$new_pane")
+          anchor="$new_pane"
+          rem_h="$bottom_h"
+          (( rem_rows-- ))
+          sleep 0.05
+        done
+      fi
+    done
   fi
 
-  for (( c = 1; c <= cols; c++ )); do
-    needed_rows="${rows_per_col[c]}"
-    remaining_rows="$needed_rows"
-    anchor="${col_tops[c]}"
-    for (( r = 2; r <= needed_rows; r++ )); do
-      split_percentage=$(( 100 * (remaining_rows - 1) / remaining_rows ))
-      new_pane="$(tmux split-window -v -d -p "$split_percentage" -P -F '#{pane_id}' -t "$anchor")" || return 1
-      anchor="$new_pane"
-      (( remaining_rows-- ))
-      sleep 0.12
-    done
-  done
-
-  # Reorder panes column-major (left->right, then top->bottom) so the tools string maps
-  # directly into columns: tool[i] fills the i-th pane in column-major order.
-  pane_ids=("${(@f)$(tmux list-panes -t "$window_id" -F '#{pane_id} #{pane_top} #{pane_left}' | sort -n -k3,3 -k2,2 | cut -d' ' -f1)}")
   if (( ${#pane_ids[@]} != pane_count )); then
+    _aipane_pane_cleanup_failed_build "$mode" "$window_id" "${_aipane_session:-}" "${created_panes[@]}"
     print -u2 "ai: internal error: expected ${pane_count} panes, found ${#pane_ids[@]}"
     return 1
   fi
@@ -452,30 +505,87 @@ ai() {
     fi
   fi
 
-  _aipane_layout_spec_for_count "$pane_count" "${_layout_spec:-auto}" || return 1
-  grid_spec_parts=("${(s: :)REPLY}")
-  cols="${grid_spec_parts[1]}"
-  rows="${grid_spec_parts[2]}"
-  rows_per_col=("${grid_spec_parts[@]:2}")
-
   _aipane_ensure_tmux || return 1
   local _tmux_mode="$REPLY"
   if [[ "$_tmux_mode" == "window" && "$_new_window" -eq 0 ]]; then
     _tmux_mode="here"
   fi
 
+  local _target_w=0 _target_h=0 _cell_w=0 _cell_h=0 _was_zoomed=0 _zoom_pane=""
+  if (( pane_count > 1 )); then
+    if [[ "$_tmux_mode" == "here" ]]; then
+      local -a _target_opt=()
+      [[ -n "${TMUX_PANE:-}" ]] && _target_opt=(-t "$TMUX_PANE")
+      local _here_info _zoom_flag
+      _here_info="$(tmux display-message "${_target_opt[@]}" -p '#{pane_id} #{window_zoomed_flag} #{pane_width} #{pane_height} #{window_cell_width} #{window_cell_height}')" || return 1
+      local -a _here_parts=("${(s: :)_here_info}")
+      _zoom_pane="${_here_parts[1]}"
+      _zoom_flag="${_here_parts[2]}"
+      _target_w="${_here_parts[3]}"
+      _target_h="${_here_parts[4]}"
+      _cell_w="${_here_parts[5]:-0}"
+      _cell_h="${_here_parts[6]:-0}"
+      if [[ "$_zoom_flag" == "1" ]]; then
+        tmux resize-pane -Z -t "$_zoom_pane" || return 1
+        _was_zoomed=1
+        _here_info="$(tmux display-message -t "$_zoom_pane" -p '#{pane_width} #{pane_height}')" || {
+          tmux resize-pane -Z -t "$_zoom_pane" >/dev/null 2>&1 || true
+          return 1
+        }
+        _target_w="${_here_info%% *}"
+        _target_h="${_here_info#* }"
+      fi
+    elif [[ "$_tmux_mode" == "window" ]]; then
+      local _win_info _border_pos
+      if _win_info="$(tmux display-message -p '#{window_width} #{window_height} #{window_cell_width} #{window_cell_height} #{pane-border-status}' 2>/dev/null)"; then
+        local -a _win_parts=("${(s: :)_win_info}")
+        _target_w="${_win_parts[1]:-0}"
+        _target_h="${_win_parts[2]:-0}"
+        _cell_w="${_win_parts[3]:-0}"
+        _cell_h="${_win_parts[4]:-0}"
+        _border_pos="${_win_parts[5]:-off}"
+        if [[ "$_border_pos" == "top" || "$_border_pos" == "bottom" ]] && (( _target_h > 1 )); then
+          (( _target_h-- ))
+        fi
+      fi
+    fi
+  fi
+
+  if ! _aipane_layout_spec_for_count "$pane_count" "${_layout_spec:-auto}" "$_target_w" "$_target_h" "$_cell_w" "$_cell_h"; then
+    (( _was_zoomed )) && tmux resize-pane -Z -t "$_zoom_pane" >/dev/null 2>&1 || true
+    return 1
+  fi
+  grid_spec_parts=("${(s: :)REPLY}")
+  cols="${grid_spec_parts[1]}"
+  rows="${grid_spec_parts[2]}"
+  rows_per_col=("${grid_spec_parts[@]:2}")
+
+  if [[ "$_tmux_mode" == "here" ]] && (( cols > 1 || rows > 1 )); then
+    if ! _aipane_grid_fits "$_target_w" "$_target_h" "$cols" "$rows"; then
+      (( _was_zoomed )) && tmux resize-pane -Z -t "$_zoom_pane" >/dev/null 2>&1 || true
+      print -u2 "ai: current pane (${_target_w}x${_target_h}) is too small for ${cols}x${rows} layout (min ${AIPANE_MIN_PANE_WIDTH}x${AIPANE_MIN_PANE_HEIGHT} per pane); use --new to create a new window"
+      return 1
+    fi
+  fi
+
   local -a sids
   for ch in "${tools[@]}"; do
-    _aipane_prepare_launch "$ch" "${tool_args[@]}" || return 1
+    if ! _aipane_prepare_launch "$ch" "${tool_args[@]}"; then
+      (( _was_zoomed )) && tmux resize-pane -Z -t "$_zoom_pane" >/dev/null 2>&1 || true
+      return 1
+    fi
     commands+=("$REPLY")
     sids+=("$REPLY_SID")
   done
 
   typeset -ga _aipane_result_panes=()
-  _aipane_pane_build_and_run_tmux \
+  if ! _aipane_pane_build_and_run_tmux \
     "$_tmux_mode" "$pane_count" "$cols" "$rows" \
     "${rows_per_col[@]}" \
-    "${commands[@]}" || return 1
+    "${commands[@]}"; then
+    (( _was_zoomed )) && tmux resize-pane -Z -t "$_zoom_pane" >/dev/null 2>&1 || true
+    return 1
+  fi
 
   # Record pane→session bindings (pane_ids are column-major, aligned with commands/tools/sids).
   if (( ${#_aipane_result_panes[@]} == pane_count )); then
