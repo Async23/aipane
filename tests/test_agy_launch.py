@@ -525,6 +525,35 @@ class AgyLauncherEndToEndTests(unittest.TestCase):
         self.assertEqual(proc.wait(timeout=4), 0)
         self.assertEqual(self.native_from_pty(out)["args"][-1], "gemini-4-carbon-high")
 
+    @unittest.skipUnless(shutil.which("fzf"), "fzf is not installed")
+    def test_pty_ctrl_hjkl_and_option_hl_home_row_navigation(self):
+        proc, master = self.spawn_pty([])
+        self.read_until(proc, master, b"gemini-4-neon-xhigh")
+        # Ctrl+J moves down from Neon (row 1) to Carbon (row 2, default medium).
+        os.write(master, b"\x0a")
+        self.read_until(proc, master, b"gemini-4-carbon-medium")
+        # Empty query: Ctrl+L steps up (medium -> high), Ctrl+H steps down (-> medium), Ctrl+L -> high.
+        os.write(master, b"\x0c")
+        self.read_until(proc, master, b"gemini-4-carbon-high")
+        os.write(master, b"\x08")
+        self.read_until(proc, master, b"gemini-4-carbon-medium")
+        os.write(master, b"\x0c")
+        self.read_until(proc, master, b"gemini-4-carbon-high")
+        # Non-empty query: Ctrl+H deletes the typo 'z' instead of stepping effort!
+        os.write(master, b"carboz")
+        self.read_until(proc, master, b"0/9")
+        os.write(master, b"\x08")
+        self.read_until(proc, master, b"gemini-4-carbon-high")
+        # Option+l (\x1bl) steps forward (high -> low), Option+h (\x1bh) steps back (-> high) during query.
+        os.write(master, b"\x1bl")
+        self.read_until(proc, master, b"gemini-4-carbon-low")
+        os.write(master, b"\x1bh")
+        self.read_until(proc, master, b"gemini-4-carbon-high")
+        os.write(master, b"\r")
+        out = self.read_until(proc, master, b"NATIVE=")
+        self.assertEqual(proc.wait(timeout=4), 0)
+        self.assertEqual(self.native_from_pty(out)["args"][-1], "gemini-4-carbon-high")
+
 
 if __name__ == "__main__":
     unittest.main()

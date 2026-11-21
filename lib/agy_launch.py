@@ -666,7 +666,7 @@ def build_picker_page(
     else:
         name_width = min(22, max(16, *(len(f.name) for f in catalog.families)))
         effort_width = 26
-        header_wide = f"{cell('模型家族', name_width)}  {cell('推理档位 (←/→)', effort_width)}  {cell('配额余量', 18)}"
+        header_wide = f"{cell('模型家族', name_width)}  {cell('推理档位 (Ctrl+H/L)', effort_width)}  {cell('配额余量', 18)}"
         header_narrow = f"{cell('模型家族', 20)}  {cell('档位', 10)}"
         default_variant = catalog.resolve_identifier(default_slug)
         default_family = default_variant.family if default_variant else catalog.families[0].name
@@ -705,7 +705,7 @@ def build_picker_page(
             avail = " / ".join(v.variant_label for v in family.variants)
             detail_lines = [
                 f"{active_variant.slug}  ({active_variant.display_name})",
-                (f"可选档位：{avail}（←/→ 或 Opt+,/. 调节）" if family.adjustable else "固定配置（不可调档）"),
+                (f"可选档位：{avail}（Ctrl+H/L 或 Opt+h/l 调节）" if family.adjustable else "固定配置（不可调档）"),
                 (q_detail or f"路由：{route_cfg.label}")
                 + f" · 主题 {scheme}"
                 + (f" · {freshness}" if freshness else ""),

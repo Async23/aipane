@@ -10,10 +10,11 @@ layer for both `ai a` and direct `agy` invocations:
 
 - **Model family & inline effort picker**: Collapses `agy models` variants into
   a compact model-family view (9 families on plan quota) with per-family effort
-  memory, `←`/`→` effort stepping on empty queries (`Option+,`/`Option+.`
-  anytime), automatic expansion to flat variants when typing multi-word or
-  effort queries (e.g. `neon xh`, `opus low`), `Ctrl+T` manual view toggle, and
-  `Ctrl+R` live catalog refresh.
+  memory, home-row `Ctrl+J`/`Ctrl+K` navigation and `Ctrl+H`/`Ctrl+L` effort
+  stepping on empty queries (`Option+h`/`Option+l` anytime; `←`/`→` and
+  `Option+,`/`Option+.` also supported), automatic expansion to flat variants
+  when typing multi-word or effort queries (e.g. `neon xh`, `opus low`),
+  `Ctrl+T` manual view toggle, and `Ctrl+R` live catalog refresh.
 - **SWR catalog cache & quota display**: Reads the local catalog cache
   (`$AIPANE_STATE_DIR/agy/catalog-*.json`) immediately on launch and refreshes
   stale or version-changed catalogs in a detached single-flight background

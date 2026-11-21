@@ -60,17 +60,17 @@ class DynamicBindings:
     allow_route_toggle: bool = False
     allow_refresh: bool = True
     empty_query_hint_wide: str = (
-        "输入名称/档位筛选 · ↑/↓ 选择 · ←/→ 调档 · Enter 启动 · Esc 取消"
+        "打词直达 (如 neon xh) · Ctrl+J/K 选 · Ctrl+H/L 调档 · Enter 启动 · Esc 取消"
     )
     empty_query_hint_narrow: tuple[str, str] = (
-        "输入筛选 · ↑/↓ 选择 · ←/→ 调档",
+        "打词直达 · Ctrl+J/K 选 · Ctrl+H/L 调档",
         "Enter 启动 · Esc 取消",
     )
     active_query_hint_wide: str = (
-        "↑/↓ 选择 · Opt+,/. 调档 · Enter 启动 · Esc 清空 · Ctrl+C 取消"
+        "Ctrl+J/K 选 · Opt+h/l 调档 · Enter 启动 · Esc 清空 · Ctrl+C 取消"
     )
     active_query_hint_narrow: tuple[str, str] = (
-        "↑/↓ 选择 · Opt+,/. 调档 · Enter 启动",
+        "Ctrl+J/K 选 · Opt+h/l 调档 · Enter 启动",
         "Esc 清空 · Ctrl+C 取消",
     )
 
@@ -181,8 +181,19 @@ def _build_dynamic_binds(bindings: DynamicBindings, subtitle: str) -> list[str]:
     binds: list[str] = []
 
     if bindings.allow_step:
-        # Empty query: ←/→ step effort in place (matching native /effort).
-        # Non-empty query: preserve normal text cursor editing inside query box.
+        # Empty query: Ctrl+H/L (home-row compass with Ctrl+J/K) and ←/→ step
+        # effort in place. Non-empty query preserves Ctrl+H backward-delete-char
+        # and ←/→ cursor editing inside the search box.
+        binds.append(
+            '--bind=ctrl-h:transform:'
+            'if [ -n "$FZF_QUERY" ]; then printf "%s" "backward-delete-char"; '
+            f'else {helper} step --state {state} --key {{1}} --delta -1 --pos "$FZF_POS"; fi'
+        )
+        binds.append(
+            '--bind=ctrl-l:transform:'
+            'if [ -n "$FZF_QUERY" ]; then printf "%s" "clear-screen"; '
+            f'else {helper} step --state {state} --key {{1}} --delta 1 --pos "$FZF_POS"; fi'
+        )
         binds.append(
             '--bind=left:transform:'
             'if [ -n "$FZF_QUERY" ]; then printf "%s" "backward-char"; '
@@ -193,7 +204,14 @@ def _build_dynamic_binds(bindings: DynamicBindings, subtitle: str) -> list[str]:
             'if [ -n "$FZF_QUERY" ]; then printf "%s" "forward-char"; '
             f'else {helper} step --state {state} --key {{1}} --delta 1 --pos "$FZF_POS"; fi'
         )
-        # Option+, / Option+. adjust effort regardless of query text.
+        # Option+h/l (lowercase; tmux only claims shifted M-H/M-L) and Option+,/.
+        # adjust effort regardless of query text.
+        binds.append(
+            f'--bind=alt-h:transform:{helper} step --state {state} --key {{1}} --delta -1 --pos "$FZF_POS"'
+        )
+        binds.append(
+            f'--bind=alt-l:transform:{helper} step --state {state} --key {{1}} --delta 1 --pos "$FZF_POS"'
+        )
         binds.append(
             f'--bind=alt-,:transform:{helper} step --state {state} --key {{1}} --delta -1 --pos "$FZF_POS"'
         )
