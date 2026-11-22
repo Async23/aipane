@@ -1096,7 +1096,7 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
         socket = f"ws-jump-binding-{os.getpid()}-{id(self)}"
         child_pid = None
         master_fd = None
-        with tempfile.TemporaryDirectory() as temp_home:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_home:
             tmux_environment = os.environ.copy()
             tmux_environment.pop("TMUX", None)
             tmux_environment.pop("TMUX_PANE", None)
@@ -1317,7 +1317,7 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
         socket = f"ws-status-toggle-{os.getpid()}-{id(self)}"
         child_pid = None
         master_fd = None
-        with tempfile.TemporaryDirectory() as temp_home:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_home:
             environment = os.environ.copy()
             environment.pop("TMUX", None)
             environment.pop("TMUX_PANE", None)
