@@ -55,7 +55,13 @@ def main():
         record, events = integration.hook(mode, payload)
     if record and record.get("pane") and record["state"] in {"busy", "idle"}:
         activity = AgentActivity(adapter=TmuxActivityAdapter(environment=environment), environment=environment)
-        activity.report(record["pane"], record["state"], owner="agy", payload={"session_id": record["session_id"]})
+        activity.report(
+            record["pane"],
+            record["state"],
+            owner="agy",
+            hook_event_name="StatusLine" if mode == "status" else mode,
+            payload={"session_id": record["session_id"]},
+        )
     if environment.get("AGY_NOTIFY_DRY_RUN") != "1":
         for event in events:
             worker = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--deliver"],

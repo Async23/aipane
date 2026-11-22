@@ -1323,11 +1323,14 @@ class AgentActivity:
             )
             changed = self._apply_changes(pane, changes)
 
+            # Periodic status-line polls and PreToolUse fallbacks fire many
+            # times within a single busy turn; skip cache invalidation when the
+            # busy marker is already active so they do not storm rerenders.
             repeated_busy = (
                 decision.state == "busy"
                 and pane.marker == desired_marker
                 and pane.reporter == pane.current_command
-                and event_name != "PreToolUse"
+                and event_name not in {"PreToolUse", "StatusLine"}
             )
             marker_changed = pane.marker != desired_marker
             if marker_changed or repeated_busy:

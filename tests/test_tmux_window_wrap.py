@@ -418,6 +418,65 @@ class WindowWrapCliTests(unittest.TestCase):
 
         self.assertEqual(invalidations, [])
 
+    def test_repeated_status_line_busy_does_not_rerender_status(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        update_pane_activity = namespace["update_pane_activity"]
+        script_globals = update_pane_activity.__globals__
+        invalidations = []
+        current_marker = ""
+
+        def fake_run_tmux(_socket_name, *arguments):
+            nonlocal current_marker
+            if arguments[0] == "display-message":
+                value = namespace["WINDOW_SEPARATOR"].join(
+                    (
+                        "%1",
+                        "agy",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        current_marker,
+                        "agy" if current_marker else "",
+                        "",
+                        "",
+                    )
+                )
+            elif arguments[0] == "set-option":
+                if arguments[-2] == "@tmux-window-wrap-activity":
+                    current_marker = arguments[-1]
+                value = ""
+            else:
+                raise AssertionError(arguments)
+            return subprocess.CompletedProcess(
+                ["tmux", *arguments],
+                0,
+                stdout=value + "\n",
+                stderr="",
+            )
+
+        script_globals["run_tmux"] = fake_run_tmux
+        script_globals["invalidate_cache"] = invalidations.append
+
+        # Initial idle -> busy transition via StatusLine must still invalidate.
+        update_pane_activity(
+            "test-socket",
+            "%1",
+            "busy",
+            hook_event_name="StatusLine",
+        )
+        self.assertEqual(invalidations, ["test-socket"])
+
+        # Subsequent StatusLine ticks while already busy must not storm rerenders.
+        update_pane_activity(
+            "test-socket",
+            "%1",
+            "busy",
+            hook_event_name="StatusLine",
+        )
+        self.assertEqual(invalidations, ["test-socket"])
+
     def test_codex_busy_report_writes_exact_activity_record_first(self):
         namespace = runpy.run_path(str(SCRIPT))
         update_pane_activity = namespace["update_pane_activity"]
@@ -3404,6 +3463,53 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         self.source_window_wrap_config(animate=False)
         _, master_fd = self.attach_client(width=80)
         self.wait_for_status_text(master_fd, "upgraded-layout", timeout=2)
+
+    def test_store_rows_stages_payloads_and_rejects_stale_request_without_leftover_env(self):
+        key_a = "gen-a|literal #{window_name} 'quoted'"
+        subprocess.run(
+            [str(SCRIPT), "render", "--store-rows", "--request-id", "20",
+             "--render-key", key_a, "--session-id", self.session_id,
+             "--socket-name", self.socket_name, "--width", "80",
+             "--left-width", "0", "--right-width", "0",
+             "--animation-variable", "TMUX_WINDOW_WRAP_ANIMATION_TICK"],
+            text=True, capture_output=True, check=True,
+        )
+        row0 = self.tmux(
+            "show-options", "-t", self.session_id, "-qv", "@tmux-window-wrap-row-0",
+        ).stdout.rstrip("\n")
+        stored_key = self.tmux(
+            "display-message", "-p", "-t", self.session_id,
+            "#{TMUX_WINDOW_WRAP_RENDER_KEY}",
+        ).stdout.rstrip("\n")
+        self.assertTrue(row0)
+        self.assertEqual(stored_key, key_a)
+
+        # Stale request ID must not overwrite rows or render key.
+        subprocess.run(
+            [str(SCRIPT), "render", "--store-rows", "--request-id", "19",
+             "--render-key", "stale-key", "--session-id", self.session_id,
+             "--socket-name", self.socket_name, "--width", "80",
+             "--left-width", "0", "--right-width", "0",
+             "--animation-variable", "TMUX_WINDOW_WRAP_ANIMATION_TICK"],
+            text=True, capture_output=True, check=True,
+        )
+        self.assertEqual(
+            self.tmux(
+                "show-options", "-t", self.session_id, "-qv", "@tmux-window-wrap-row-0",
+            ).stdout.rstrip("\n"),
+            row0,
+        )
+        self.assertEqual(
+            self.tmux(
+                "display-message", "-p", "-t", self.session_id,
+                "#{TMUX_WINDOW_WRAP_RENDER_KEY}",
+            ).stdout.rstrip("\n"),
+            key_a,
+        )
+        env_dump = self.tmux(
+            "show-environment", "-t", self.session_id,
+        ).stdout
+        self.assertNotIn("TMUX_WINDOW_WRAP_STAGE_", env_dump)
 
     def test_format_timeout_keeps_previous_rows_without_opening_error_view(self):
         # Capture the actual run-shell argument after the status launcher has

@@ -1704,19 +1704,29 @@ def main():
             sys.stdout.write(rendered + "\n")
             return
         rows = [(arguments.store_option, rendered)]
-    commands = [
-        [
-            "set-option", "-t", arguments.session_id,
-            option, row,
-        ]
-        for option, row in rows
-    ]
     if arguments.store_rows:
         line_count = plan(payload)["line_count"]
         desired = "on" if line_count == 1 else str(line_count)
+        stage_commands = []
+        commit_commands = []
+        cleanup_commands = []
+        for index, (option, row) in enumerate(rows):
+            stage_var = f"TMUX_WINDOW_WRAP_STAGE_ROW_{index}"
+            stage_commands.append([
+                "set-environment", "-h", "-t", arguments.session_id,
+                stage_var, row,
+            ])
+            commit_commands.append([
+                "set-option", "-F", "-t", arguments.session_id,
+                option, "#{" + stage_var + "}",
+            ])
+            cleanup_commands.append([
+                "set-environment", "-u", "-t", arguments.session_id,
+                stage_var,
+            ])
         # Check hidden status when committing, not before another writer can
         # change the height. Rows, height and request number form one update.
-        commands.extend((
+        commit_commands.extend((
             [
                 "if-shell", "-F", "-t", arguments.session_id,
                 "#{&&:#{!=:#{status},off},#{!=:#{status}," + desired + "}}",
@@ -1728,23 +1738,46 @@ def main():
             ],
         ))
         if arguments.render_key is not None:
-            commands.append([
+            stage_key = "TMUX_WINDOW_WRAP_STAGE_RENDER_KEY"
+            stage_commands.append([
                 "set-environment", "-h", "-t", arguments.session_id,
-                RENDER_KEY_ENVIRONMENT, arguments.render_key,
+                stage_key, arguments.render_key,
             ])
-    # One command queue publishes the complete layout before tmux redraws.
-    # Stream through stdin because animated rows can exceed the IPC argument
-    # limit; quoting also preserves literal window names and format expressions.
-    source = "".join(shlex.join(command) + "\n" for command in commands)
-    if arguments.store_rows:
+            commit_commands.append([
+                "set-environment", "-hF", "-t", arguments.session_id,
+                RENDER_KEY_ENVIRONMENT, "#{" + stage_key + "}",
+            ])
+            cleanup_commands.append([
+                "set-environment", "-u", "-t", arguments.session_id,
+                stage_key,
+            ])
+        # Stage large row strings in hidden session environment variables
+        # outside if-shell so tmux 3.7b's args_make_commands refcount leak
+        # cannot pin multi-kilobyte status payloads on every render.
         condition = (
             "#{e|>:" + str(arguments.request_id) + ",#{?" + RENDERED_REQUEST_OPTION
             + ",#{" + RENDERED_REQUEST_OPTION + "},0}}"
         )
         source = (
-            shlex.join(["if-shell", "-F", "-t", arguments.session_id, condition])
-            + " {\n" + source + "}\n"
+            "".join(shlex.join(command) + "\n" for command in stage_commands)
+            + shlex.join(["if-shell", "-F", "-t", arguments.session_id, condition])
+            + " {\n"
+            + "".join(shlex.join(command) + "\n" for command in commit_commands)
+            + "}\n"
+            + "".join(shlex.join(command) + "\n" for command in cleanup_commands)
         )
+    else:
+        commands = [
+            [
+                "set-option", "-t", arguments.session_id,
+                option, row,
+            ]
+            for option, row in rows
+        ]
+        # One command queue publishes the complete layout before tmux redraws.
+        # Stream through stdin because animated rows can exceed the IPC argument
+        # limit; quoting also preserves literal window names and format expressions.
+        source = "".join(shlex.join(command) + "\n" for command in commands)
     run_tmux(
         arguments.socket_name,
         "source-file", "-",
