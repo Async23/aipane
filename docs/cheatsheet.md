@@ -20,6 +20,7 @@ also send complete prefix+key chords.
 | `Cmd+I` | centered popup rename window |
 | `Cmd+Shift+I` | rename session |
 | `Cmd+Shift+Enter` | zoom pane |
+| `Cmd+B` | toggle tmux statusline |
 | `Cmd+1…9` | select exact index; repeat within 700ms to add 10 |
 | `Cmd+0` | select 0 if present, otherwise 10; repeat within 700ms to add 10 |
 | `Cmd+Opt+I` | broadcast on/off (window) |
@@ -145,6 +146,7 @@ unchanged; numbers beyond the buffer select its final line.
 | Key | Action |
 |-----|--------|
 | `prefix P` | indexed colour palette (`0–255`; `q`/`Esc` closes) |
+| `prefix T` / `Cmd+B` | toggle current session statusline |
 | `prefix Q` / `Cmd+Opt+P` | interactive session & pane picker popup |
 | `prefix y` / `Cmd+Opt+Y` | copy current pane's AI session ref (`<agent>:<id>`) to clipboard |
 | double-click pane top bar | copy that pane's AI session ref (`<agent>:<id>`) without changing focus |

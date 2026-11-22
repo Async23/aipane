@@ -41,6 +41,7 @@ class GhosttyFragmentTests(unittest.TestCase):
         self.assertIn("keybind = super+alt+y=text:\\x00y", text)
         self.assertIn("keybind = cmd+t=text:\\x00c", text)
         self.assertIn("keybind = cmd+d=text:\\x00|", text)
+        self.assertIn("keybind = cmd+b=text:\\x00T", text)
         self.assertIn("keybind = shift+enter=text:\\x0a", text)
         self.assertIn("macos-option-as-alt = true", text)
         for digit in range(10):
@@ -954,6 +955,10 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 text=True,
             ).stdout
             self.assertRegex(keys, re.compile(r"prefix\s+B\s+.*synchronize-panes"))
+            self.assertRegex(
+                keys,
+                re.compile(r"prefix\s+T\s+.*status.*run-shell -b -c /.*set-option status off"),
+            )
             self.assertRegex(keys, re.compile(r"prefix\s+v\s+.*copy-mode"))
             self.assertRegex(
                 keys,
@@ -1308,6 +1313,131 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 os.waitpid(child_pid, 0)
             tmux("kill-server", check=False)
 
+    def test_prefix_T_toggles_statusline_and_restores_wrapped_height(self):
+        socket = f"ws-status-toggle-{os.getpid()}-{id(self)}"
+        child_pid = None
+        master_fd = None
+        with tempfile.TemporaryDirectory() as temp_home:
+            environment = os.environ.copy()
+            environment.pop("TMUX", None)
+            environment.pop("TMUX_PANE", None)
+            environment["HOME"] = temp_home
+            environment["TERM"] = "xterm-256color"
+
+            helper_dir = Path(temp_home) / ".local" / "bin"
+            helper_dir.mkdir(parents=True)
+            (helper_dir / "tmux-window-wrap").symlink_to(WRAP_BIN)
+
+            def tmux(*args: str, check: bool = True):
+                return subprocess.run(
+                    ["tmux", "-L", socket, *args],
+                    check=check,
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                ).stdout.strip()
+
+            def drain() -> None:
+                if master_fd is None:
+                    return
+                while True:
+                    try:
+                        if not os.read(master_fd, 65536):
+                            break
+                    except BlockingIOError:
+                        break
+
+            def wait_until(predicate, timeout: float = 5.0) -> bool:
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    drain()
+                    if predicate():
+                        return True
+                    time.sleep(0.05)
+                drain()
+                return bool(predicate())
+
+            def status_of(target: str) -> str:
+                return tmux("show-options", "-t", target, "-v", "status")
+
+            def all_rows(target: str) -> str:
+                return "\n".join(
+                    tmux("show-options", "-t", target, "-v", f"@tmux-window-wrap-row-{i}")
+                    for i in range(3)
+                )
+
+            try:
+                tmux(
+                    "-f", "/dev/null", "new-session", "-d", "-s", "wrapped",
+                    "-x", "80", "-y", "24", "sleep 60",
+                )
+                tmux("source-file", str(TMUX_WS))
+                tmux("set-option", "-g", "status-right", "")
+                tmux("source-file", str(TMUX_WRAP))
+                for index in range(25):
+                    tmux("new-window", "-d", "-t", "wrapped", "-n", f"win{index:02d}", "sleep 60")
+                tmux("select-window", "-t", "wrapped:1")
+                tmux("new-session", "-d", "-s", "single", "-n", "solo", "sleep 60")
+
+                child_pid, master_fd = pty.fork()
+                if child_pid == 0:
+                    termios.tcsetwinsize(0, (24, 80))
+                    os.execvpe(
+                        "tmux",
+                        ["tmux", "-L", socket, "attach-session", "-t", "wrapped"],
+                        environment,
+                    )
+                os.set_blocking(master_fd, False)
+
+                self.assertTrue(wait_until(lambda: bool(tmux("list-clients"))))
+                self.assertTrue(wait_until(lambda: status_of("wrapped") == "3"))
+
+                # Replay Ghostty Cmd+B (\x00T) to hide the 3-row statusline.
+                os.write(master_fd, b"\x00T")
+                self.assertTrue(wait_until(lambda: status_of("wrapped") == "off", timeout=2.0))
+
+                # Renaming while hidden must keep the statusline hidden.
+                tmux("rename-window", "-t", "wrapped:1", "hidden_renamed")
+                time.sleep(0.3)
+                drain()
+                self.assertEqual(status_of("wrapped"), "off")
+
+                # Toggle back on: restore 3 rows and refresh cached rows.
+                os.write(master_fd, b"\x00T")
+                self.assertTrue(wait_until(lambda: status_of("wrapped") == "3", timeout=2.0))
+                self.assertTrue(
+                    wait_until(lambda: "hidden_renamed" in all_rows("wrapped"), timeout=3.0)
+                )
+
+                # Hide, remove overflow windows, then restore and reconcile down to 1 row.
+                os.write(master_fd, b"\x00T")
+                self.assertTrue(wait_until(lambda: status_of("wrapped") == "off", timeout=2.0))
+                for window_id in tmux("list-windows", "-t", "wrapped", "-F", "#{window_id}").splitlines()[1:]:
+                    tmux("kill-window", "-t", window_id)
+                time.sleep(0.3)
+                drain()
+                self.assertEqual(status_of("wrapped"), "off")
+                os.write(master_fd, b"\x00T")
+                self.assertTrue(wait_until(lambda: status_of("wrapped") == "on", timeout=3.0))
+
+                # Single-row session toggles cleanly on → off → on.
+                tmux("switch-client", "-t", "single")
+                self.assertTrue(wait_until(lambda: status_of("single") == "on", timeout=3.0))
+                os.write(master_fd, b"\x00T")
+                self.assertTrue(wait_until(lambda: status_of("single") == "off", timeout=2.0))
+                os.write(master_fd, b"\x00T")
+                self.assertTrue(wait_until(lambda: status_of("single") == "on", timeout=2.0))
+            finally:
+                if master_fd is not None:
+                    os.close(master_fd)
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGHUP)
+                    except ProcessLookupError:
+                        pass
+                    os.waitpid(child_pid, 0)
+                tmux("kill-server", check=False)
+
 
 class RenameWindowPopupTests(unittest.TestCase):
     def setUp(self):
@@ -1611,6 +1741,8 @@ class DocsPointerTests(unittest.TestCase):
         self.assertIn("| `Cmd+Opt+P` | interactive session & pane picker popup", cheatsheet)
         self.assertIn("| `Cmd+Opt+Y` | copy current pane's AI session ref (`<agent>:<id>`) to clipboard |", cheatsheet)
         self.assertIn("| `Cmd+I` | centered popup rename window |", cheatsheet)
+        self.assertIn("| `Cmd+B` | toggle tmux statusline |", cheatsheet)
+        self.assertIn("| `prefix T` / `Cmd+B` | toggle current session statusline |", cheatsheet)
         self.assertIn("red-background `OFF` badge", cheatsheet)
         self.assertIn(
             "| `prefix P` | indexed colour palette "
