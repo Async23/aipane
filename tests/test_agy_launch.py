@@ -526,9 +526,10 @@ class AgyLauncherEndToEndTests(unittest.TestCase):
         self.assertEqual(self.native_from_pty(out)["args"][-1], "gemini-4-carbon-high")
 
     @unittest.skipUnless(shutil.which("fzf"), "fzf is not installed")
-    def test_pty_ctrl_hjkl_and_option_hl_home_row_navigation(self):
+    def test_pty_ctrl_hjkl_unified_navigation_and_backspace_editing(self):
         proc, master = self.spawn_pty([])
-        self.read_until(proc, master, b"gemini-4-neon-xhigh")
+        initial = self.read_until(proc, master, b"gemini-4-neon-xhigh")
+        self.assertNotIn("Opt+h/l".encode(), initial)
         # Ctrl+J moves down from Neon (row 1) to Carbon (row 2, default medium).
         os.write(master, b"\x0a")
         self.read_until(proc, master, b"gemini-4-carbon-medium")
@@ -539,12 +540,19 @@ class AgyLauncherEndToEndTests(unittest.TestCase):
         self.read_until(proc, master, b"gemini-4-carbon-medium")
         os.write(master, b"\x0c")
         self.read_until(proc, master, b"gemini-4-carbon-high")
-        # Non-empty query: Ctrl+H deletes the typo 'z' instead of stepping effort!
+        # Active query: physical Delete/Backspace (\x7f) deletes typo 'z', while Ctrl+H/L still step effort!
         os.write(master, b"carboz")
         self.read_until(proc, master, b"0/9")
+        os.write(master, b"\x7f")
+        active_screen = self.read_until(proc, master, b"gemini-4-carbon-high")
+        self.assertNotIn("Opt+h/l".encode(), active_screen)
+        self.assertIn("Ctrl+H/L 调档".encode(), active_screen)
+        # Active query: Ctrl+H steps down (high -> medium) and Ctrl+L steps back up (-> high) without erasing query.
         os.write(master, b"\x08")
+        self.read_until(proc, master, b"gemini-4-carbon-medium")
+        os.write(master, b"\x0c")
         self.read_until(proc, master, b"gemini-4-carbon-high")
-        # Option+l (\x1bl) steps forward (high -> low), Option+h (\x1bh) steps back (-> high) during query.
+        # Silent Option+l/h aliases remain functional.
         os.write(master, b"\x1bl")
         self.read_until(proc, master, b"gemini-4-carbon-low")
         os.write(master, b"\x1bh")
@@ -553,6 +561,19 @@ class AgyLauncherEndToEndTests(unittest.TestCase):
         out = self.read_until(proc, master, b"NATIVE=")
         self.assertEqual(proc.wait(timeout=4), 0)
         self.assertEqual(self.native_from_pty(out)["args"][-1], "gemini-4-carbon-high")
+
+    @unittest.skipUnless(shutil.which("fzf"), "fzf is not installed")
+    def test_pty_subprocess_fallback_when_socket_disabled(self):
+        proc, master = self.spawn_pty([], AIPANE_PICKER_NO_SOCKET="1")
+        self.read_until(proc, master, b"gemini-4-neon-xhigh")
+        os.write(master, b"neon")
+        self.read_until(proc, master, b"2/9")
+        os.write(master, b"\x08")
+        self.read_until(proc, master, b"gemini-4-neon-high")
+        os.write(master, b"\r")
+        out = self.read_until(proc, master, b"NATIVE=")
+        self.assertEqual(proc.wait(timeout=4), 0)
+        self.assertEqual(self.native_from_pty(out)["args"][-1], "gemini-4-neon-high")
 
 
 if __name__ == "__main__":

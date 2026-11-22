@@ -9,9 +9,11 @@ import os
 from pathlib import Path
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any
 
@@ -30,6 +32,7 @@ from agy_catalog import (
     load_cached_catalog,
     load_quota_snapshot,
     quota_group_for_model,
+    quota_snapshot_path,
     state_dir,
     try_background_refresh,
 )
@@ -705,7 +708,7 @@ def build_picker_page(
             avail = " / ".join(v.variant_label for v in family.variants)
             detail_lines = [
                 f"{active_variant.slug}  ({active_variant.display_name})",
-                (f"可选档位：{avail}（Ctrl+H/L 或 Opt+h/l 调节）" if family.adjustable else "固定配置（不可调档）"),
+                (f"可选档位：{avail}（Ctrl+H/L 调节）" if family.adjustable else "固定配置（不可调档）"),
                 (q_detail or f"路由：{route_cfg.label}")
                 + f" · 主题 {scheme}"
                 + (f" · {freshness}" if freshness else ""),
@@ -758,25 +761,340 @@ def _save_ui_state(state_file: Path, ui_state: dict[str, Any]) -> None:
     atomic_write_json(state_file, ui_state)
 
 
-def _catalog_from_ui_state(
-    ui_state: dict[str, Any],
-    *,
-    force_refresh: bool = False,
-) -> Catalog:
-    env = dict(os.environ)
-    routes = load_routes(env)
-    route_name = ui_state["route"]
-    route_cfg = routes.get(route_name) or routes["plan"]
-    binary = Path(ui_state["binary"])
-    return get_catalog_for_route(
-        binary,
-        route_cfg,
-        base_env=env,
-        settings_model=ui_state.get("settings_model", ""),
-        remembered_slug=ui_state.get("default_by_route", {}).get(route_name, ""),
-        force_refresh=force_refresh,
-        allow_background_refresh=False,
-    )
+def _socket_client_binary(env: dict[str, str] | None = None) -> str | None:
+    environ = os.environ if env is None else env
+    if environ.get("AIPANE_PICKER_NO_SOCKET") == "1":
+        return None
+    if sys.platform == "darwin" and os.access("/usr/bin/nc", os.X_OK):
+        return "/usr/bin/nc"
+    return None
+
+
+class _PickerSession:
+    """Shared state machine for both the warm socket server and subprocess helper."""
+
+    def __init__(
+        self,
+        *,
+        state_file: Path,
+        ui_state: dict[str, Any],
+        routes: dict[str, RouteConfig],
+        env: dict[str, str],
+        catalogs: dict[str, Catalog] | None = None,
+        quota_snapshot: dict[str, Any] | None = None,
+        quota_mtime_ns: int | None = None,
+    ) -> None:
+        self.state_file = state_file
+        self.ui_state = ui_state
+        self.routes = routes
+        self.env = env
+        self.catalogs: dict[str, Catalog] = dict(catalogs or {})
+        self._quota_mtime_ns = quota_mtime_ns
+        self._quota_snapshot = quota_snapshot
+        self._quota_loaded = quota_snapshot is not None or quota_mtime_ns is not None
+
+    def _route_cfg(self) -> RouteConfig:
+        return self.routes.get(self.ui_state["route"]) or self.routes["plan"]
+
+    def _current_quota(self) -> dict[str, Any] | None:
+        qpath = quota_snapshot_path(self.env)
+        try:
+            mtime_ns: int | None = qpath.stat().st_mtime_ns
+        except OSError:
+            mtime_ns = None
+        if not self._quota_loaded or mtime_ns != self._quota_mtime_ns:
+            self._quota_snapshot = load_quota_snapshot(self.env) if mtime_ns is not None else None
+            self._quota_mtime_ns = mtime_ns
+            self._quota_loaded = True
+        return self._quota_snapshot
+
+    def _catalog(self, route_cfg: RouteConfig, *, force_refresh: bool = False) -> Catalog:
+        if not force_refresh and route_cfg.name in self.catalogs:
+            return self.catalogs[route_cfg.name]
+        catalog = get_catalog_for_route(
+            Path(self.ui_state["binary"]),
+            route_cfg,
+            base_env=self.env,
+            settings_model=self.ui_state.get("settings_model", ""),
+            remembered_slug=self.ui_state.get("default_by_route", {}).get(route_cfg.name, ""),
+            force_refresh=force_refresh,
+            allow_background_refresh=False,
+        )
+        self.catalogs[route_cfg.name] = catalog
+        return catalog
+
+    def _build_records(self, *, route_cfg: RouteConfig, catalog: Catalog, view: str) -> tuple[PickerPage, str]:
+        page = build_picker_page(
+            catalog,
+            route_cfg=route_cfg,
+            view=view,
+            efforts=self.ui_state["efforts"],
+            default_slug=self.ui_state["default_by_route"].get(route_cfg.name, ""),
+            quota_snapshot=self._current_quota(),
+            has_multiple_routes=len(self.routes) > 1,
+            scheme=self.ui_state["scheme"],
+            effort_lock=self.ui_state.get("effort_lock"),
+        )
+        return page, format_records(page)
+
+    def _reload_action(self, *, view: str, records: str) -> str:
+        raw_records_file = self.ui_state.get("records_file")
+        if raw_records_file:
+            target = Path(raw_records_file)
+            tmp = target.with_suffix(".tmp")
+            tmp.write_text(records, encoding="utf-8")
+            os.replace(tmp, target)
+            return f"reload-sync(cat {shlex.quote(str(target))})"
+        helper_cmd = " ".join(shlex.quote(p) for p in self.ui_state["helper_command"])
+        state_q = shlex.quote(str(self.state_file))
+        return f"reload-sync({helper_cmd} render --state {state_q} --view {view})"
+
+    def render(self, view: str | None = None) -> str:
+        route_cfg = self._route_cfg()
+        target_view = view or self.ui_state["view"]
+        catalog = self._catalog(route_cfg, force_refresh=False)
+        _, records = self._build_records(route_cfg=route_cfg, catalog=catalog, view=target_view)
+        return records
+
+    def refresh(self) -> str:
+        route_cfg = self._route_cfg()
+        catalog = self._catalog(route_cfg, force_refresh=True)
+        view = "flat" if (
+            Path(self.ui_state["manual_flat_flag"]).exists()
+            or Path(self.ui_state["auto_flat_flag"]).exists()
+        ) else "family"
+        _, records = self._build_records(route_cfg=route_cfg, catalog=catalog, view=view)
+        return records
+
+    def step(self, key: str, delta: int, pos: str) -> str:
+        if not key.startswith("family:"):
+            return ""
+        if (
+            Path(self.ui_state["manual_flat_flag"]).exists()
+            or Path(self.ui_state["auto_flat_flag"]).exists()
+        ):
+            return ""
+        route_cfg = self._route_cfg()
+        family_name = key.removeprefix("family:")
+        catalog = self._catalog(route_cfg, force_refresh=False)
+        family = catalog.by_family().get(family_name)
+        if family is None or not family.adjustable:
+            return ""
+        fam_key = f"{route_cfg.name}:{family.name}"
+        current_label = self.ui_state["efforts"].get(fam_key, "")
+        labels = [v.variant_label for v in family.variants]
+        if current_label in labels:
+            idx = labels.index(current_label)
+        else:
+            default_v = next(
+                (v for v in family.variants if v.slug == family.default_variant_slug),
+                family.variants[0],
+            )
+            idx = labels.index(default_v.variant_label)
+        next_label = labels[(idx + delta) % len(labels)]
+        self.ui_state["efforts"][fam_key] = next_label
+        _save_ui_state(self.state_file, self.ui_state)
+        Path(self.ui_state["next_pos_file"]).write_text(f"{pos}\n", encoding="utf-8")
+        _, records = self._build_records(route_cfg=route_cfg, catalog=catalog, view="family")
+        return self._reload_action(view="family", records=records)
+
+    def toggle_view(self, key: str, pos: str, query: str) -> str:
+        del pos
+        route_cfg = self._route_cfg()
+        manual_flag = Path(self.ui_state["manual_flat_flag"])
+        auto_flag = Path(self.ui_state["auto_flat_flag"])
+        next_pos_file = Path(self.ui_state["next_pos_file"])
+        currently_flat = manual_flag.exists() or auto_flag.exists()
+        catalog = self._catalog(route_cfg, force_refresh=False)
+        if currently_flat:
+            manual_flag.unlink(missing_ok=True)
+            auto_flag.unlink(missing_ok=True)
+            self.ui_state["view"] = "family"
+            target_pos = 1
+            if key.startswith("slug:"):
+                v = catalog.resolve_identifier(key.removeprefix("slug:"))
+                if v is not None:
+                    self.ui_state["efforts"][f"{route_cfg.name}:{v.family}"] = v.variant_label
+                    for idx, fam in enumerate(catalog.families, 1):
+                        if fam.name == v.family:
+                            target_pos = idx
+                            break
+            _save_ui_state(self.state_file, self.ui_state)
+            if not query.strip():
+                next_pos_file.write_text(f"{target_pos}\n", encoding="utf-8")
+            else:
+                next_pos_file.unlink(missing_ok=True)
+            label = Path(self.ui_state["family_label_file"]).read_text(encoding="utf-8")
+            _, records = self._build_records(route_cfg=route_cfg, catalog=catalog, view="family")
+            return self._reload_action(view="family", records=records) + f"+change-border-label({label})"
+
+        manual_flag.write_text("1", encoding="utf-8")
+        auto_flag.unlink(missing_ok=True)
+        self.ui_state["view"] = "flat"
+        target_pos = 1
+        if key.startswith("family:"):
+            fam_name = key.removeprefix("family:")
+            pref = self.ui_state["efforts"].get(f"{route_cfg.name}:{fam_name}", "")
+            v = catalog.resolve_family_and_effort(fam_name, pref)
+            if v is not None:
+                for idx, item in enumerate(catalog.variants, 1):
+                    if item.slug == v.slug:
+                        target_pos = idx
+                        break
+        _save_ui_state(self.state_file, self.ui_state)
+        if not query.strip():
+            next_pos_file.write_text(f"{target_pos}\n", encoding="utf-8")
+        else:
+            next_pos_file.unlink(missing_ok=True)
+        label = Path(self.ui_state["flat_label_file"]).read_text(encoding="utf-8")
+        _, records = self._build_records(route_cfg=route_cfg, catalog=catalog, view="flat")
+        return self._reload_action(view="flat", records=records) + f"+change-border-label({label})"
+
+    def toggle_route(self, query: str) -> str:
+        route_cfg = self._route_cfg()
+        names = list(self.routes.keys())
+        if len(names) <= 1:
+            return ""
+        next_route = names[(names.index(route_cfg.name) + 1) % len(names)]
+        next_cfg = self.routes[next_route]
+        self.ui_state["route"] = next_route
+        _write_label_files(self.ui_state, next_cfg)
+        view = "flat" if (
+            Path(self.ui_state["manual_flat_flag"]).exists()
+            or Path(self.ui_state["auto_flat_flag"]).exists()
+        ) else "family"
+        self.ui_state["view"] = view
+        _save_ui_state(self.state_file, self.ui_state)
+        catalog = self._catalog(next_cfg, force_refresh=False)
+        page, records = self._build_records(route_cfg=next_cfg, catalog=catalog, view=view)
+        next_pos_file = Path(self.ui_state["next_pos_file"])
+        if not query.strip():
+            next_pos_file.write_text(f"{page.default_index}\n", encoding="utf-8")
+        else:
+            next_pos_file.unlink(missing_ok=True)
+        label = (
+            Path(self.ui_state["flat_label_file"]).read_text(encoding="utf-8")
+            if view == "flat"
+            else Path(self.ui_state["family_label_file"]).read_text(encoding="utf-8")
+        )
+        return self._reload_action(view=view, records=records) + f"+change-border-label({label})"
+
+    def dispatch(self, raw_line: str) -> str:
+        parts = raw_line.rstrip("\r\n").split("\x1f")
+        if not parts or not parts[0]:
+            return ""
+        action = parts[0]
+        if action == "step":
+            key = parts[1] if len(parts) > 1 else ""
+            delta = int(parts[2]) if len(parts) > 2 and parts[2] else 1
+            pos = parts[3] if len(parts) > 3 and parts[3] else "1"
+            return self.step(key, delta, pos)
+        if action == "render":
+            view = parts[1] if len(parts) > 1 and parts[1] else None
+            return self.render(view)
+        if action == "toggle-view":
+            key = parts[1] if len(parts) > 1 else ""
+            pos = parts[2] if len(parts) > 2 else "1"
+            query = parts[3] if len(parts) > 3 else ""
+            return self.toggle_view(key, pos, query)
+        if action == "toggle-route":
+            query = parts[1] if len(parts) > 1 else ""
+            return self.toggle_route(query)
+        if action == "refresh":
+            return self.refresh()
+        return ""
+
+
+class _PickerServer:
+    """In-process AF_UNIX callback server eliminating per-keystroke Python cold starts."""
+
+    def __init__(self, session: _PickerSession, sock_path: Path, *, env: dict[str, str]) -> None:
+        self._session = session
+        self._requested_path = sock_path
+        self._env = env
+        self.socket_path: Path | None = None
+        self.nc_executable: str | None = None
+        self._sock: socket.socket | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> _PickerServer:
+        nc = _socket_client_binary(self._env)
+        if not nc or len(str(self._requested_path).encode("utf-8")) >= 100:
+            return self
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            srv.bind(str(self._requested_path))
+            os.chmod(self._requested_path, 0o600)
+            srv.listen(16)
+            srv.settimeout(0.2)
+        except OSError:
+            srv.close()
+            self._requested_path.unlink(missing_ok=True)
+            return self
+        self._sock = srv
+        self.socket_path = self._requested_path
+        self.nc_executable = nc
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+        return self
+
+    def _serve(self) -> None:
+        assert self._sock is not None
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with conn:
+                conn.settimeout(1.0)
+                chunks: list[bytes] = []
+                total = 0
+                try:
+                    while total < 16384:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        total += len(chunk)
+                        if b"\n" in chunk:
+                            break
+                except OSError:
+                    continue
+                if not chunks:
+                    continue
+                request = b"".join(chunks).decode("utf-8", errors="replace")
+                try:
+                    response = self._session.dispatch(request)
+                except Exception:
+                    response = ""
+                if response:
+                    try:
+                        conn.sendall(response.encode("utf-8"))
+                    except OSError:
+                        pass
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._stop.set()
+        if self._sock is not None:
+            if self.socket_path is not None:
+                try:
+                    wakeup = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    wakeup.settimeout(0.1)
+                    wakeup.connect(str(self.socket_path))
+                    wakeup.close()
+                except OSError:
+                    pass
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if self.socket_path is not None:
+            self.socket_path.unlink(missing_ok=True)
 
 
 def handle_helper_command(argv: list[str]) -> int:
@@ -785,171 +1103,35 @@ def handle_helper_command(argv: list[str]) -> int:
     state_file = Path(argv[argv.index("--state") + 1])
     ui_state = _load_ui_state(state_file)
     env = dict(os.environ)
-    routes = load_routes(env)
-    route_cfg = routes.get(ui_state["route"]) or routes["plan"]
-    quota = load_quota_snapshot(env)
-    helper_cmd = " ".join(shlex.quote(p) for p in ui_state["helper_command"])
-    state_q = shlex.quote(str(state_file))
+    session = _PickerSession(
+        state_file=state_file,
+        ui_state=ui_state,
+        routes=load_routes(env),
+        env=env,
+    )
 
     if action == "render":
         view = argv[argv.index("--view") + 1] if "--view" in argv else ui_state["view"]
-        catalog = _catalog_from_ui_state(ui_state, force_refresh=False)
-        page = build_picker_page(
-            catalog,
-            route_cfg=route_cfg,
-            view=view,
-            efforts=ui_state["efforts"],
-            default_slug=ui_state["default_by_route"].get(route_cfg.name, ""),
-            quota_snapshot=quota,
-            has_multiple_routes=len(routes) > 1,
-            scheme=ui_state["scheme"],
-            effort_lock=ui_state.get("effort_lock"),
-        )
-        sys.stdout.write(format_records(page))
+        sys.stdout.write(session.render(view))
         return 0
-
     if action == "refresh":
-        catalog = _catalog_from_ui_state(ui_state, force_refresh=True)
-        view = "flat" if (
-            Path(ui_state["manual_flat_flag"]).exists() or Path(ui_state["auto_flat_flag"]).exists()
-        ) else "family"
-        page = build_picker_page(
-            catalog,
-            route_cfg=route_cfg,
-            view=view,
-            efforts=ui_state["efforts"],
-            default_slug=ui_state["default_by_route"].get(route_cfg.name, ""),
-            quota_snapshot=quota,
-            has_multiple_routes=len(routes) > 1,
-            scheme=ui_state["scheme"],
-            effort_lock=ui_state.get("effort_lock"),
-        )
-        sys.stdout.write(format_records(page))
+        sys.stdout.write(session.refresh())
         return 0
-
     if action == "step":
         key = argv[argv.index("--key") + 1] if "--key" in argv else ""
         delta = int(argv[argv.index("--delta") + 1]) if "--delta" in argv else 1
         pos = argv[argv.index("--pos") + 1] if "--pos" in argv else "1"
-        if not key.startswith("family:"):
-            return 0
-        family_name = key.removeprefix("family:")
-        catalog = _catalog_from_ui_state(ui_state, force_refresh=False)
-        family = catalog.by_family().get(family_name)
-        if family is None or not family.adjustable:
-            return 0
-        fam_key = f"{route_cfg.name}:{family.name}"
-        current_label = ui_state["efforts"].get(fam_key, "")
-        labels = [v.variant_label for v in family.variants]
-        if current_label in labels:
-            idx = labels.index(current_label)
-        else:
-            default_v = next((v for v in family.variants if v.slug == family.default_variant_slug), family.variants[0])
-            idx = labels.index(default_v.variant_label)
-        next_label = labels[(idx + delta) % len(labels)]
-        ui_state["efforts"][fam_key] = next_label
-        _save_ui_state(state_file, ui_state)
-        Path(ui_state["next_pos_file"]).write_text(str(pos), encoding="utf-8")
-        sys.stdout.write(f"reload-sync({helper_cmd} render --state {state_q} --view family)")
+        sys.stdout.write(session.step(key, delta, pos))
         return 0
-
     if action == "toggle-view":
         key = argv[argv.index("--key") + 1] if "--key" in argv else ""
+        pos = argv[argv.index("--pos") + 1] if "--pos" in argv else "1"
         query = argv[argv.index("--query") + 1] if "--query" in argv else ""
-        manual_flag = Path(ui_state["manual_flat_flag"])
-        auto_flag = Path(ui_state["auto_flat_flag"])
-        next_pos_file = Path(ui_state["next_pos_file"])
-        currently_flat = manual_flag.exists() or auto_flag.exists()
-        catalog = _catalog_from_ui_state(ui_state, force_refresh=False)
-        if currently_flat:
-            manual_flag.unlink(missing_ok=True)
-            auto_flag.unlink(missing_ok=True)
-            ui_state["view"] = "family"
-            target_pos = 1
-            if key.startswith("slug:"):
-                v = catalog.resolve_identifier(key.removeprefix("slug:"))
-                if v is not None:
-                    ui_state["efforts"][f"{route_cfg.name}:{v.family}"] = v.variant_label
-                    for idx, fam in enumerate(catalog.families, 1):
-                        if fam.name == v.family:
-                            target_pos = idx
-                            break
-            _save_ui_state(state_file, ui_state)
-            if not query.strip():
-                next_pos_file.write_text(str(target_pos), encoding="utf-8")
-            else:
-                next_pos_file.unlink(missing_ok=True)
-            label = Path(ui_state["family_label_file"]).read_text(encoding="utf-8")
-            sys.stdout.write(
-                f"reload-sync({helper_cmd} render --state {state_q} --view family)"
-                f"+change-border-label({label})"
-            )
-        else:
-            manual_flag.write_text("1", encoding="utf-8")
-            auto_flag.unlink(missing_ok=True)
-            ui_state["view"] = "flat"
-            target_pos = 1
-            if key.startswith("family:"):
-                fam_name = key.removeprefix("family:")
-                pref = ui_state["efforts"].get(f"{route_cfg.name}:{fam_name}", "")
-                v = catalog.resolve_family_and_effort(fam_name, pref)
-                if v is not None:
-                    for idx, item in enumerate(catalog.variants, 1):
-                        if item.slug == v.slug:
-                            target_pos = idx
-                            break
-            _save_ui_state(state_file, ui_state)
-            if not query.strip():
-                next_pos_file.write_text(str(target_pos), encoding="utf-8")
-            else:
-                next_pos_file.unlink(missing_ok=True)
-            label = Path(ui_state["flat_label_file"]).read_text(encoding="utf-8")
-            sys.stdout.write(
-                f"reload-sync({helper_cmd} render --state {state_q} --view flat)"
-                f"+change-border-label({label})"
-            )
+        sys.stdout.write(session.toggle_view(key, pos, query))
         return 0
-
     if action == "toggle-route":
         query = argv[argv.index("--query") + 1] if "--query" in argv else ""
-        names = list(routes.keys())
-        if len(names) <= 1:
-            return 0
-        next_route = names[(names.index(route_cfg.name) + 1) % len(names)]
-        next_cfg = routes[next_route]
-        ui_state["route"] = next_route
-        _write_label_files(ui_state, next_cfg)
-        view = "flat" if (
-            Path(ui_state["manual_flat_flag"]).exists() or Path(ui_state["auto_flat_flag"]).exists()
-        ) else "family"
-        ui_state["view"] = view
-        _save_ui_state(state_file, ui_state)
-        catalog = _catalog_from_ui_state(ui_state, force_refresh=False)
-        page = build_picker_page(
-            catalog,
-            route_cfg=next_cfg,
-            view=view,
-            efforts=ui_state["efforts"],
-            default_slug=ui_state["default_by_route"].get(next_route, ""),
-            quota_snapshot=quota,
-            has_multiple_routes=len(routes) > 1,
-            scheme=ui_state["scheme"],
-            effort_lock=ui_state.get("effort_lock"),
-        )
-        next_pos_file = Path(ui_state["next_pos_file"])
-        if not query.strip():
-            next_pos_file.write_text(str(page.default_index), encoding="utf-8")
-        else:
-            next_pos_file.unlink(missing_ok=True)
-        label = (
-            Path(ui_state["flat_label_file"]).read_text(encoding="utf-8")
-            if view == "flat"
-            else Path(ui_state["family_label_file"]).read_text(encoding="utf-8")
-        )
-        sys.stdout.write(
-            f"reload-sync({helper_cmd} render --state {state_q} --view {view})"
-            f"+change-border-label({label})"
-        )
+        sys.stdout.write(session.toggle_route(query))
         return 0
 
     raise ValueError(f"未知选择器动作: {action}")
@@ -1073,7 +1255,7 @@ def run_interactive_picker(
         effort_lock=effort_lock,
     )
 
-    with tempfile.TemporaryDirectory(prefix="aipane-agy-picker-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="agyp-") as tmp:
         os.chmod(tmp, 0o700)
         tmp_dir = Path(tmp)
         state_file = tmp_dir / "ui-state.json"
@@ -1082,7 +1264,9 @@ def run_interactive_picker(
         family_label_file = tmp_dir / "label_family.txt"
         flat_label_file = tmp_dir / "label_flat.txt"
         next_pos_file = tmp_dir / "next_pos.txt"
-        next_pos_file.write_text(str(page.default_index), encoding="utf-8")
+        records_file = tmp_dir / "r.dat"
+        sock_path = tmp_dir / "s"
+        next_pos_file.write_text(f"{page.default_index}\n", encoding="utf-8")
         helper_command = (sys.executable, str(launcher_script), "--_picker-helper")
         ui_state: dict[str, Any] = {
             "route": route_cfg.name,
@@ -1099,22 +1283,23 @@ def run_interactive_picker(
             "family_label_file": str(family_label_file),
             "flat_label_file": str(flat_label_file),
             "next_pos_file": str(next_pos_file),
+            "records_file": str(records_file),
         }
         _write_label_files(ui_state, route_cfg)
         _save_ui_state(state_file, ui_state)
 
-        bindings = DynamicBindings(
-            helper_command=helper_command,
+        try:
+            initial_quota_mtime: int | None = quota_snapshot_path(base_env).stat().st_mtime_ns
+        except OSError:
+            initial_quota_mtime = None
+        session = _PickerSession(
             state_file=state_file,
-            auto_flat_flag=auto_flag,
-            manual_flat_flag=manual_flag,
-            family_label_file=family_label_file,
-            flat_label_file=flat_label_file,
-            next_pos_file=next_pos_file,
-            allow_step=True,
-            allow_view_toggle=True,
-            allow_route_toggle=len(routes) > 1,
-            allow_refresh=True,
+            ui_state=ui_state,
+            routes=routes,
+            env=base_env,
+            catalogs={route_cfg.name: catalog},
+            quota_snapshot=quota,
+            quota_mtime_ns=initial_quota_mtime,
         )
 
         # Plain-text fallback resolver: supports direct "neon xh" / "opus low", "g" route switch, "r" refresh.
@@ -1186,12 +1371,28 @@ def run_interactive_picker(
             return None
 
         extra_text = "g 切路由 · r 同步" if len(routes) > 1 else "r 同步"
-        selected_key = select(
-            page,
-            bindings=bindings,
-            text_resolver=text_resolver,
-            extra_text_prompt=extra_text,
-        )
+        with _PickerServer(session, sock_path, env=base_env) as server:
+            bindings = DynamicBindings(
+                helper_command=helper_command,
+                state_file=state_file,
+                auto_flat_flag=auto_flag,
+                manual_flat_flag=manual_flag,
+                family_label_file=family_label_file,
+                flat_label_file=flat_label_file,
+                next_pos_file=next_pos_file,
+                socket_path=server.socket_path,
+                nc_executable=server.nc_executable,
+                allow_step=True,
+                allow_view_toggle=True,
+                allow_route_toggle=len(routes) > 1,
+                allow_refresh=True,
+            )
+            selected_key = select(
+                page,
+                bindings=bindings,
+                text_resolver=text_resolver,
+                extra_text_prompt=extra_text,
+            )
         final_ui = _load_ui_state(state_file)
 
     final_route_cfg = routes.get(final_ui["route"]) or route_cfg

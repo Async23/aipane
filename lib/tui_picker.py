@@ -55,6 +55,8 @@ class DynamicBindings:
     family_label_file: Path
     flat_label_file: Path
     next_pos_file: Path
+    socket_path: Path | None = None
+    nc_executable: str | None = None
     allow_step: bool = True
     allow_view_toggle: bool = True
     allow_route_toggle: bool = False
@@ -67,10 +69,10 @@ class DynamicBindings:
         "Enter 启动 · Esc 取消",
     )
     active_query_hint_wide: str = (
-        "Ctrl+J/K 选 · Opt+h/l 调档 · Enter 启动 · Esc 清空 · Ctrl+C 取消"
+        "Ctrl+J/K 选 · Ctrl+H/L 调档 · Enter 启动 · Esc 清空 · Ctrl+C 取消"
     )
     active_query_hint_narrow: tuple[str, str] = (
-        "Ctrl+J/K 选 · Opt+h/l 调档 · Enter 启动",
+        "Ctrl+J/K 选 · Ctrl+H/L 调档 · Enter 启动",
         "Esc 清空 · Ctrl+C 取消",
     )
 
@@ -178,55 +180,67 @@ def _build_dynamic_binds(bindings: DynamicBindings, subtitle: str) -> list[str]:
     manual_flag = _sh_quote(bindings.manual_flat_flag)
     fam_label = _sh_quote(bindings.family_label_file)
     flat_label = _sh_quote(bindings.flat_label_file)
+    use_socket = bool(bindings.socket_path and bindings.nc_executable)
+    sock = _sh_quote(bindings.socket_path) if use_socket else ""
+    nc = _sh_quote(bindings.nc_executable) if use_socket else ""
     binds: list[str] = []
 
+    def step_cmd(delta: int) -> str:
+        if use_socket:
+            return f"printf 'step\\037%s\\037{delta}\\037%s\\n' {{1}} \"$FZF_POS\" | {nc} -U {sock}"
+        return f'{helper} step --state {state} --key {{1}} --delta {delta} --pos "$FZF_POS"'
+
+    def render_cmd(view: str) -> str:
+        if use_socket:
+            return f"printf 'render\\037{view}\\n' | {nc} -U {sock}"
+        return f"{helper} render --state {state} --view {view}"
+
+    def toggle_view_cmd() -> str:
+        if use_socket:
+            return f"printf 'toggle-view\\037%s\\037%s\\037%s\\n' {{1}} \"$FZF_POS\" \"$FZF_QUERY\" | {nc} -U {sock}"
+        return f'{helper} toggle-view --state {state} --key {{1}} --pos "$FZF_POS" --query "$FZF_QUERY"'
+
+    def toggle_route_cmd() -> str:
+        if use_socket:
+            return f"printf 'toggle-route\\037%s\\n' \"$FZF_QUERY\" | {nc} -U {sock}"
+        return f'{helper} toggle-route --state {state} --query "$FZF_QUERY"'
+
+    def refresh_cmd() -> str:
+        if use_socket:
+            return f"printf 'refresh\\n' | {nc} -U {sock}"
+        return f"{helper} refresh --state {state}"
+
     if bindings.allow_step:
-        # Empty query: Ctrl+H/L (home-row compass with Ctrl+J/K) and ←/→ step
-        # effort in place. Non-empty query preserves Ctrl+H backward-delete-char
-        # and ←/→ cursor editing inside the search box.
-        binds.append(
-            '--bind=ctrl-h:transform:'
-            'if [ -n "$FZF_QUERY" ]; then printf "%s" "backward-delete-char"; '
-            f'else {helper} step --state {state} --key {{1}} --delta -1 --pos "$FZF_POS"; fi'
-        )
-        binds.append(
-            '--bind=ctrl-l:transform:'
-            'if [ -n "$FZF_QUERY" ]; then printf "%s" "clear-screen"; '
-            f'else {helper} step --state {state} --key {{1}} --delta 1 --pos "$FZF_POS"; fi'
-        )
+        # Unified home-row Ctrl+HJKL compass across both empty and active queries:
+        # Ctrl+H/L always step reasoning effort left/right while physical Delete
+        # (0x7f -> fzf bspace) edits the search box independently.
+        binds.append(f"--bind=ctrl-h:transform:{step_cmd(-1)}")
+        binds.append(f"--bind=ctrl-l:transform:{step_cmd(1)}")
+        # Arrow keys step effort on empty query and move cursor when typing.
         binds.append(
             '--bind=left:transform:'
             'if [ -n "$FZF_QUERY" ]; then printf "%s" "backward-char"; '
-            f'else {helper} step --state {state} --key {{1}} --delta -1 --pos "$FZF_POS"; fi'
+            f"else {step_cmd(-1)}; fi"
         )
         binds.append(
             '--bind=right:transform:'
             'if [ -n "$FZF_QUERY" ]; then printf "%s" "forward-char"; '
-            f'else {helper} step --state {state} --key {{1}} --delta 1 --pos "$FZF_POS"; fi'
+            f"else {step_cmd(1)}; fi"
         )
-        # Option+h/l (lowercase; tmux only claims shifted M-H/M-L) and Option+,/.
-        # adjust effort regardless of query text.
-        binds.append(
-            f'--bind=alt-h:transform:{helper} step --state {state} --key {{1}} --delta -1 --pos "$FZF_POS"'
-        )
-        binds.append(
-            f'--bind=alt-l:transform:{helper} step --state {state} --key {{1}} --delta 1 --pos "$FZF_POS"'
-        )
-        binds.append(
-            f'--bind=alt-,:transform:{helper} step --state {state} --key {{1}} --delta -1 --pos "$FZF_POS"'
-        )
-        binds.append(
-            f'--bind=alt-.:transform:{helper} step --state {state} --key {{1}} --delta 1 --pos "$FZF_POS"'
-        )
+        # Silent compatibility aliases (unadvertised to keep the UI mental model singular).
+        binds.append(f"--bind=alt-h:transform:{step_cmd(-1)}")
+        binds.append(f"--bind=alt-l:transform:{step_cmd(1)}")
+        binds.append(f"--bind=alt-,:transform:{step_cmd(-1)}")
+        binds.append(f"--bind=alt-.:transform:{step_cmd(1)}")
 
     if bindings.allow_view_toggle:
-        binds.append(
-            f'--bind=ctrl-t:transform:{helper} toggle-view --state {state} --key {{1}} --pos "$FZF_POS" --query "$FZF_QUERY"'
-        )
+        binds.append(f"--bind=ctrl-t:transform:{toggle_view_cmd()}")
         # Fast-path pure-/bin/sh check on query change: zero Python forks when
         # typing single-word family queries like "neon" or "opus"; expands once
         # to all variants on multi-word queries ("neon xh", "opus low") or
         # standalone effort keywords ("xhigh", "max"), and collapses back on clear.
+        render_flat_q = _sh_quote(render_cmd("flat"))
+        render_fam_q = _sh_quote(render_cmd("family"))
         change_script = (
             f'if [ -f {manual_flag} ]; then exit 0; fi; '
             'q=$(printf "%s" "$FZF_QUERY" | tr "[:upper:]" "[:lower:]"); '
@@ -241,29 +255,25 @@ def _build_dynamic_binds(bindings: DynamicBindings, subtitle: str) -> list[str]:
             f'if [ ! -f {auto_flag} ]; then '
             f': > {auto_flag}; '
             f'lbl=$(cat {flat_label} 2>/dev/null || printf " 选择模型 "); '
-            f'printf "reload-sync(%s render --state %s --view flat)+change-border-label(%s)" '
-            f'{_sh_quote(helper)} {_sh_quote(state)} "$lbl"; '
+            f'printf "reload-sync(%s)+change-border-label(%s)" {render_flat_q} "$lbl"; '
             'fi; '
             'else '
             f'if [ -f {auto_flag} ]; then '
             f'rm -f {auto_flag}; '
             f'lbl=$(cat {fam_label} 2>/dev/null || printf " 选择模型 "); '
-            f'printf "reload-sync(%s render --state %s --view family)+change-border-label(%s)" '
-            f'{_sh_quote(helper)} {_sh_quote(state)} "$lbl"; '
+            f'printf "reload-sync(%s)+change-border-label(%s)" {render_fam_q} "$lbl"; '
             'fi; '
             'fi'
         )
         binds.append(f"--bind=change:transform:{change_script}")
 
     if bindings.allow_route_toggle:
-        binds.append(
-            f'--bind=ctrl-g:transform:{helper} toggle-route --state {state} --query "$FZF_QUERY"'
-        )
+        binds.append(f"--bind=ctrl-g:transform:{toggle_route_cmd()}")
 
     if bindings.allow_refresh:
         binds.append(
             f"--bind=ctrl-r:change-header(正在同步最新模型列表…)"
-            f"+reload-sync({helper} refresh --state {state})"
+            f"+reload-sync({refresh_cmd()})"
             f"+change-header({subtitle})"
         )
 
@@ -284,7 +294,7 @@ def select_with_fzf(
         next_pos_q = _sh_quote(bindings.next_pos_file)
         load_bind = (
             f"--bind=load:transform:if [ -f {next_pos_q} ]; then "
-            f'p=$(cat {next_pos_q}); rm -f {next_pos_q}; '
+            f'read -r p < {next_pos_q} 2>/dev/null || true; rm -f {next_pos_q}; '
             f'if [ -n "$p" ]; then printf "pos(%s)" "$p"; fi; fi'
         )
     else:
