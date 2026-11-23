@@ -13,6 +13,7 @@ import re
 import shlex
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.parse
@@ -1087,10 +1088,15 @@ def codex_thread_identity(
     codex_home: str | os.PathLike[str],
     session_id: str,
 ) -> CodexThreadIdentity:
-    """Resolve a legacy notify thread to its root using rollout metadata."""
+    """Resolve a legacy notify thread to its root using shared rollout metadata."""
 
     if not session_id:
         return CodexThreadIdentity("", "unknown")
+    lib_dir = str(Path(__file__).resolve().parent)
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    import codex_sessions
+
     root = Path(codex_home).expanduser()
     current = session_id
     seen: set[str] = set()
@@ -1098,31 +1104,17 @@ def codex_thread_identity(
     identity_known = False
     while current and current not in seen:
         seen.add(current)
-        matches = list(root.glob(f"sessions/*/*/*/*-{current}.jsonl"))
-        metadata = None
-        for path in matches:
-            try:
-                with path.open(encoding="utf-8") as handle:
-                    first = json.loads(handle.readline())
-            except (OSError, ValueError):
-                continue
-            candidate = first.get("payload") if isinstance(first, dict) else None
-            if isinstance(candidate, dict) and candidate.get("id") == current:
-                metadata = candidate
+        matches = codex_sessions.find_session_rollouts(current, root, verify_header=True)
+        meta = None
+        for path in reversed(matches):
+            candidate = codex_sessions.read_rollout_meta(path, max_lines=1)
+            if candidate and candidate.get("sid") == current:
+                meta = candidate
                 identity_known = True
                 break
-        if metadata is None:
+        if meta is None:
             break
-        source = metadata.get("source")
-        if not isinstance(source, dict):
-            break
-        subagent = source.get("subagent") or source.get("sub_agent") or {}
-        if not isinstance(subagent, dict):
-            break
-        spawn = subagent.get("thread_spawn") or subagent.get("threadSpawn") or {}
-        if not isinstance(spawn, dict):
-            break
-        parent = spawn.get("parent_thread_id") or spawn.get("parentThreadId")
+        parent = meta.get("subagent_parent_id")
         if not isinstance(parent, str) or not parent:
             break
         is_subagent = True

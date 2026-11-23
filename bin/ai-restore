@@ -257,7 +257,7 @@ PY
 pi_session_exists() {
   local sid="$1" cwd="$2"
   local -a matches
-  matches=("$PI_SESSION_ROOT"/**/*_"$sid".jsonl(N))
+  matches=("$PI_SESSION_ROOT"/**/*_"$sid".jsonl(N) "$PI_SESSION_ROOT"/**/*_"$sid"_*.jsonl(N))
   (( ${#matches[@]} > 0 )) || return 1
   command -v python3 &>/dev/null || return 1
   python3 - "$sid" "$cwd" "${matches[@]}" <<'PY'
@@ -276,6 +276,7 @@ for path in paths:
     if (
         isinstance(header, dict)
         and header.get("type") == "session"
+        and "createdAt" not in header
         and header.get("id") == sid
         and isinstance(header.get("cwd"), str)
         and os.path.normcase(os.path.realpath(header["cwd"])) == expected_cwd
@@ -291,8 +292,30 @@ PY
 pi_session_id_exists() {
   local sid="$1"
   local -a matches
-  matches=("$PI_SESSION_ROOT"/**/*_"$sid".jsonl(N))
-  (( ${#matches[@]} > 0 ))
+  matches=("$PI_SESSION_ROOT"/**/*_"$sid".jsonl(N) "$PI_SESSION_ROOT"/**/*_"$sid"_*.jsonl(N))
+  (( ${#matches[@]} > 0 )) || return 1
+  command -v python3 &>/dev/null || return 0
+  python3 - "$sid" "${matches[@]}" <<'PY'
+import json
+import sys
+
+sid, *paths = sys.argv[1:]
+for path in paths:
+    try:
+        with open(path, encoding="utf-8") as session:
+            header = json.loads(session.readline())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        # Corrupt/unreadable file with this sid is still unsafe to recreate.
+        raise SystemExit(0)
+    if (
+        isinstance(header, dict)
+        and header.get("type") == "session"
+        and ("createdAt" in header or header.get("id") != sid)
+    ):
+        continue
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
 }
 
 # build_resume <tool> <full_cmd> <title> <coord_sid> <cwd>

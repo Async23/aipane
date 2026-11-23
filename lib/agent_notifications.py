@@ -2226,7 +2226,12 @@ def _codex_query_thread_metadata(
     if not thread_id:
         return {}
     codex_home = _codex_home(environment)
-    for path in (codex_home / "state_5.sqlite", codex_home / "sqlite" / "state_5.sqlite"):
+    lib_dir = str(Path(__file__).resolve().parent)
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    import codex_sessions
+
+    for path in codex_sessions.find_state_dbs(codex_home):
         if not path.is_file():
             continue
         try:
@@ -2285,7 +2290,12 @@ def _codex_root_thread_title(
     if not thread_id:
         return ""
     codex_home = _codex_home(environment)
-    for path in (codex_home / "state_5.sqlite", codex_home / "sqlite" / "state_5.sqlite"):
+    lib_dir = str(Path(__file__).resolve().parent)
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    import codex_sessions
+
+    for path in codex_sessions.find_state_dbs(codex_home):
         if not path.is_file():
             continue
         try:

@@ -1166,6 +1166,50 @@ class AgentNotificationsTests(unittest.TestCase):
         candidates = _codex_rollout_candidates(sid, {"CODEX_HOME": str(codex_home)})
         self.assertEqual([c.resolve() for c in candidates], [seg2.resolve(), seg1.resolve()])
 
+    def test_codex_state_db_lookup_supports_both_root_and_sqlite_subdir(self) -> None:
+        from contextlib import closing
+        from agent_notifications import _codex_query_thread_metadata, _codex_root_thread_title
+        import codex_sessions
+
+        sid_root = "55555555-5555-7555-8555-555555555555"
+        sid_sub = "66666666-6666-7666-8666-666666666666"
+        schema = (
+            "CREATE TABLE threads ("
+            "id TEXT PRIMARY KEY, title TEXT, first_user_message TEXT, "
+            "thread_source TEXT, source TEXT, agent_path TEXT, agent_nickname TEXT, "
+            "agent_role TEXT, model TEXT, reasoning_effort TEXT, rollout_path TEXT, updated_at INTEGER)"
+        )
+
+        # Case 1: state_6.sqlite at CODEX_HOME root
+        home_root = self.home / "codex-root-db"
+        home_root.mkdir(parents=True, exist_ok=True)
+        db_root = home_root / "state_6.sqlite"
+        with closing(sqlite3.connect(db_root)) as conn, conn:
+            conn.execute(schema)
+            conn.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (sid_root, "Root Title", "Root prompt", "cli", "cli", None, None, None, "gpt-6", "high", "/tmp/root.jsonl", 100),
+            )
+        meta_root = _codex_query_thread_metadata(sid_root, {"CODEX_HOME": str(home_root)})
+        self.assertEqual(meta_root.get("rollout_path"), "/tmp/root.jsonl")
+        self.assertEqual(_codex_root_thread_title(sid_root, {"CODEX_HOME": str(home_root)}), "Root Title")
+        self.assertEqual(codex_sessions.query_sqlite_rollout_path(sid_root, home_root), Path("/tmp/root.jsonl"))
+
+        # Case 2: sqlite/state_5.sqlite under CODEX_HOME/sqlite
+        home_sub = self.home / "codex-sub-db"
+        (home_sub / "sqlite").mkdir(parents=True, exist_ok=True)
+        db_sub = home_sub / "sqlite/state_5.sqlite"
+        with closing(sqlite3.connect(db_sub)) as conn, conn:
+            conn.execute(schema)
+            conn.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (sid_sub, "Sub Title", "Sub prompt", "cli", "cli", None, None, None, "gpt-6", "high", "/tmp/sub.jsonl", 100),
+            )
+        meta_sub = _codex_query_thread_metadata(sid_sub, {"CODEX_HOME": str(home_sub)})
+        self.assertEqual(meta_sub.get("rollout_path"), "/tmp/sub.jsonl")
+        self.assertEqual(_codex_root_thread_title(sid_sub, {"CODEX_HOME": str(home_sub)}), "Sub Title")
+        self.assertEqual(codex_sessions.query_sqlite_rollout_path(sid_sub, home_sub), Path("/tmp/sub.jsonl"))
+
 
 if __name__ == "__main__":
     unittest.main()

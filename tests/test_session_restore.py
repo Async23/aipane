@@ -797,6 +797,91 @@ class SessionRestoreTests(unittest.TestCase):
             self.assertEqual([(item["sid"], item["pane_id"]) for item in pending],
                              [(VALID_CODEX_SID, "%42")])
 
+    def test_restore_resumes_double_uuid_pi_session_with_cwd_verification(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            tmp_ok = tmp / "ok"
+            tmp_bad = tmp / "bad"
+            tmp_ok.mkdir()
+            tmp_bad.mkdir()
+            pi_dir = tmp / "pi-agent"
+            pi_sid = "87878787-8787-7787-8787-878787878787"
+            extra_uuid = "98989898-9898-7898-8898-989898989898"
+            project = pi_dir / "sessions" / "--fixture-project--"
+            project.mkdir(parents=True, exist_ok=True)
+            session_file = project / f"2026-11-23T09-01-27-117Z_{pi_sid}_{extra_uuid}.jsonl"
+            session_file.write_text(
+                json.dumps(
+                    {
+                        "type": "session",
+                        "version": 3,
+                        "id": pi_sid,
+                        "timestamp": "2026-11-23T09:01:27.117Z",
+                        "cwd": str(tmp_ok),
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            # Matching cwd -> resume (must NOT classify as recreated)
+            ok = self.run_restore(
+                tmp_ok,
+                coord={"sid": pi_sid, "tool": "p"},
+                title="pi",
+                saved_codex_ids=set(),
+                plan_json=True,
+                current_command="pi",
+                full_command="pi",
+                extra_env={"PI_CODING_AGENT_DIR": str(pi_dir)},
+            )
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            plan = json.loads(ok.stdout.strip().splitlines()[-1])
+            self.assertEqual(plan["kind"], "resume")
+            self.assertEqual(plan["sid"], pi_sid)
+
+            # Wrong cwd -> invalid (must NOT silently recreate over a durable session)
+            bad_cwd = self.run_restore(
+                tmp_bad,
+                coord={"sid": pi_sid, "tool": "p"},
+                title="pi",
+                saved_codex_ids=set(),
+                plan_json=True,
+                current_command="pi",
+                full_command="pi",
+                extra_env={"PI_CODING_AGENT_DIR": str(pi_dir)},
+            )
+            self.assertEqual(bad_cwd.returncode, 0, bad_cwd.stderr)
+            bad_plan = json.loads(bad_cwd.stdout.strip().splitlines()[-1])
+            self.assertEqual(bad_plan["kind"], "invalid")
+
+    def test_restore_accepts_codex_header_larger_than_512kb(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            big_header = json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": VALID_CODEX_SID,
+                        "base_instructions": "Z" * 540_000,
+                    },
+                }
+            )
+            result = self.run_restore(
+                tmp,
+                coord={"sid": VALID_CODEX_SID, "tool": "x"},
+                title="codex",
+                saved_codex_ids=set(),
+                saved_codex_records={
+                    f"sessions/2026/11/23/rollout-2026-11-23T10-00-00-{VALID_CODEX_SID}.jsonl": big_header
+                },
+                plan_json=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(result.stdout.strip().splitlines()[-1])
+            self.assertEqual(plan["kind"], "resume")
+            self.assertEqual(plan["sid"], VALID_CODEX_SID)
+
     def run_restore(
         self,
         tmp: Path,

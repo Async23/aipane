@@ -1789,6 +1789,67 @@ class AgentActivityTests(unittest.TestCase):
         self.assertEqual(adapter.wake_count, wake_count)
         self.assertEqual(adapter.read(pane.pane_id), snapshot)
 
+    def test_codex_thread_identity_handles_suffixed_archived_and_zst_rollouts(self):
+        import shutil
+        from agent_activity import CodexThreadIdentity, codex_thread_identity
+        import codex_sessions
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            codex_home = Path(raw_tmp) / ".codex"
+            root_sid = "11111111-1111-7111-8111-111111111111"
+            root_rid = "22222222-2222-7222-8222-222222222222"
+            child_sid = "33333333-3333-7333-8333-333333333333"
+            child_rid = "44444444-4444-7444-8444-444444444444"
+            zst_sid = "55555555-5555-7555-8555-555555555555"
+
+            # Root session exists only as a suffixed rollout
+            root_path = codex_home / "sessions/2026/11/23" / f"rollout-2026-11-23T10-00-00-{root_sid}_{root_rid}.jsonl"
+            root_path.parent.mkdir(parents=True, exist_ok=True)
+            root_path.write_text(
+                json.dumps({"type": "session_meta", "payload": {"id": root_sid, "source": "cli"}}) + "\n",
+                encoding="utf-8",
+            )
+            # Subagent session exists only as an archived suffixed rollout
+            child_path = codex_home / "archived_sessions" / f"rollout-2026-11-23T10-05-00-{child_sid}_{child_rid}.jsonl"
+            child_path.parent.mkdir(parents=True, exist_ok=True)
+            child_path.write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": child_sid,
+                            "source": {"subagent": {"thread_spawn": {"parent_thread_id": root_sid}}},
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(codex_thread_identity(codex_home, root_sid), CodexThreadIdentity(root_sid, "main"))
+            self.assertEqual(codex_thread_identity(codex_home, child_sid), CodexThreadIdentity(root_sid, "subagent"))
+
+            if shutil.which("zstd"):
+                zst_path = codex_home / "archived_sessions" / f"rollout-2026-11-23T10-06-00-{zst_sid}.jsonl.zst"
+                raw = (
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {
+                                "id": zst_sid,
+                                "source": {"subagent": {"thread_spawn": {"parent_thread_id": root_sid}}},
+                            },
+                        }
+                    )
+                    + "\n"
+                ).encode("utf-8")
+                subprocess.run(
+                    [codex_sessions.zstd_binary(), "-q", "-o", str(zst_path)],
+                    input=raw,
+                    check=True,
+                )
+                self.assertEqual(codex_thread_identity(codex_home, zst_sid), CodexThreadIdentity(root_sid, "subagent"))
+
 
 if __name__ == "__main__":
     unittest.main()
