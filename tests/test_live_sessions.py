@@ -70,7 +70,6 @@ def _make_raw_line(
             pane_active,
             window_active,
             cmd,
-            cwd,
             tty,
             title,
             sock,
@@ -78,6 +77,7 @@ def _make_raw_line(
             pane_pid,
             activity,
             in_mode,
+            cwd,
         )
     )
 
@@ -92,6 +92,19 @@ class LiveSessionsUnitTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def test_pane_format_queries_pane_current_path_last(self) -> None:
+        fmt = live_mod._pane_format()
+        fields = fmt.split(live_mod.FIELD_SEP)
+        self.assertEqual(len(fields), 17)
+        self.assertEqual(fields[-1], "#{pane_current_path}")
+        raw = _make_raw_line("%42", cwd="/Users/demo/CloudDrives/BaiduPan/sub dir", in_mode="1")
+        parsed = live_mod._parse_raw_pane(raw)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.pane_id, "%42")
+        self.assertEqual(parsed.cwd, "/Users/demo/CloudDrives/BaiduPan/sub dir")
+        self.assertTrue(parsed.pane_in_mode)
 
     def test_resolves_all_seven_agents_and_rejects_plain_node(self) -> None:
         agy_sid = "11111111-1111-4111-8111-111111111111"

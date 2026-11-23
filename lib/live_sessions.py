@@ -228,7 +228,6 @@ def _pane_format() -> str:
             "#{pane_active}",
             "#{window_active}",
             "#{pane_current_command}",
-            "#{pane_current_path}",
             "#{pane_tty}",
             "#{pane_title}",
             "#{socket_path}",
@@ -236,6 +235,9 @@ def _pane_format() -> str:
             "#{pane_pid}",
             f"#{{{ACTIVITY_RECORD_OPTION}}}",
             "#{pane_in_mode}",
+            # Keep #{pane_current_path} last: on tmux 3.8+, slow FUSE/cloud-mount
+            # cwd lookups exceeding FORMAT_TIME_LIMIT (100ms) truncate trailing tokens.
+            "#{pane_current_path}",
         )
     )
 
@@ -254,14 +256,14 @@ def _parse_raw_pane(line: str) -> RawPane | None:
         pane_active=fields[6] == "1",
         window_active=fields[7] == "1",
         current_command=fields[8],
-        cwd=fields[9],
-        pane_tty=fields[10],
-        pane_title=fields[11],
-        socket_path=fields[12],
-        server_pid=fields[13],
-        pane_pid=fields[14],
-        activity_record=fields[15],
-        pane_in_mode=fields[16] == "1",
+        cwd=fields[16],
+        pane_tty=fields[9],
+        pane_title=fields[10],
+        socket_path=fields[11],
+        server_pid=fields[12],
+        pane_pid=fields[13],
+        activity_record=fields[14],
+        pane_in_mode=fields[15] == "1",
     )
 
 
