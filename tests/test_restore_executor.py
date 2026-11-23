@@ -23,7 +23,7 @@ if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
 
 from recovery_plan import seal_plan
-from recovery import RestoreExecutor
+from recovery import Attempt, RestoreExecutionError, RestoreExecutor
 from dsh_sessions import is_dsh_command_line
 
 
@@ -622,6 +622,150 @@ class RestoreExecutorTests(unittest.TestCase):
              patch.object(executor.tmux, "pane_identity", return_value=None):
             self.assertTrue(executor.tool_running(item, "2.1.314"))
             self.assertTrue(executor.existing_tool_matches(item, "2.1.314"))
+
+    def test_foreground_processes_orders_group_leader_before_wrapped_children(self):
+        executor = RestoreExecutor({"AIPANE_STATE_DIR": str(self.state_dir),
+                                    "AIPANE_TMUX": str(self.fake_tmux)})
+        ps_output = textwrap.dedent(
+            """\
+            13557 54003 S+   npm exec @upstash/context7-mcp
+            13558 54003 S+   /opt/shopping-mcp
+            53845 53845 Ss   -zsh
+            54003 54003 S+   /Users/alfheim/.local/bin/agy --dangerously-skip-permissions
+            54009 54003 S+   /Applications/Pen.app/mcp-server
+            """
+        )
+        with patch.object(
+            executor.tmux,
+            "run",
+            return_value=subprocess.CompletedProcess(["tmux"], 0, "/dev/ttys109\n", ""),
+        ), patch("recovery.subprocess.run", return_value=subprocess.CompletedProcess(["ps"], 0, ps_output, "")) as ps_call:
+            listed = executor.tmux.foreground_processes("0:9.1")
+            first = executor.tmux.foreground_process("0:9.1")
+        self.assertEqual(
+            [pid for pid, _ in listed],
+            [54003, 13557, 13558, 54009],
+        )
+        self.assertEqual(first, (54003, "/Users/alfheim/.local/bin/agy --dangerously-skip-permissions"))
+        self.assertIn("pgid=", ps_call.call_args.args[0])
+
+    def test_agy_ownership_allows_own_process_behind_mcp_child_and_rejects_foreign(self):
+        executor = RestoreExecutor({"AIPANE_STATE_DIR": str(self.state_dir),
+                                    "AIPANE_TMUX": str(self.fake_tmux)})
+        item = {
+            "target": "0:9.1",
+            "tool": "agy",
+            "kind": "resume",
+            "restorable": True,
+            "cwd": str(self.tmp),
+            "command": f"agy --conversation {GROK_SID}",
+            "sid": GROK_SID,
+            "agy_home": str(self.tmp / ".gemini/antigravity-cli"),
+        }
+        processes = [
+            (13557, "npm exec @upstash/context7-mcp"),
+            (54003, "/Users/alfheim/.local/bin/agy --dangerously-skip-permissions"),
+        ]
+        with patch.object(executor.tmux, "foreground_processes", return_value=processes), \
+             patch("agy_sessions.session_writers", return_value={54003}):
+            executor.validate_session_ownership([item])
+        with patch.object(executor.tmux, "foreground_processes", return_value=processes), \
+             patch("agy_sessions.session_writers", return_value={54003, 99999}):
+            with self.assertRaisesRegex(RestoreExecutionError, "session conflict"):
+                executor.validate_session_ownership([item])
+
+    def test_codex_ownership_and_verify_find_codex_behind_mcp_child(self):
+        codex_home = self.tmp / ".codex"
+        executor = RestoreExecutor({
+            "AIPANE_STATE_DIR": str(self.state_dir),
+            "AIPANE_TMUX": str(self.fake_tmux),
+            "CODEX_HOME": str(codex_home),
+            "AI_RESTORE_VERIFY_STABILITY": "0.01",
+            "AI_RESTORE_POLL_INTERVAL": "0.01",
+        })
+        other_sid = "11111111-1111-4111-8111-111111111111"
+        item = {
+            "target": "0:4.1",
+            "tool": "codex",
+            "kind": "resume",
+            "restorable": True,
+            "cwd": str(self.tmp),
+            "command": f"codex resume {GROK_SID}",
+            "sid": GROK_SID,
+            "codex_home": str(codex_home),
+        }
+        processes = [
+            (12000, "chrome-devtools-mcp --headless"),
+            (50000, f"codex --yolo resume {GROK_SID}"),
+        ]
+        with patch.object(executor.tmux, "foreground_processes", return_value=processes):
+            with patch("recovery.session_writers", return_value={50000: [{"sid": GROK_SID}]}):
+                executor.validate_session_ownership([item])
+            with patch("recovery.session_writers", return_value={50000: [{"sid": other_sid}]}):
+                with self.assertRaisesRegex(RestoreExecutionError, "selected session changed"):
+                    executor.validate_session_ownership([item])
+            with patch(
+                "recovery.session_writers",
+                return_value={50000: [{"sid": GROK_SID}], 88888: [{"sid": GROK_SID}]},
+            ):
+                with self.assertRaisesRegex(RestoreExecutionError, "session conflict"):
+                    executor.validate_session_ownership([item])
+
+        checked_pids: list[int] = []
+
+        def fake_loaded(pid: int, sid: str, home: Path) -> bool:
+            checked_pids.append(pid)
+            return pid == 50000 and sid == GROK_SID and home == codex_home
+
+        attempt = Attempt(
+            item=dict(item),
+            verify_timeout=0.5,
+            grok_offset=None,
+            existing_process=False,
+            sent=True,
+        )
+        with patch.object(executor.tmux, "current_command", return_value="codex"), \
+             patch.object(executor.tmux, "capture_visible", return_value=""), \
+             patch.object(executor.tmux, "foreground_processes", return_value=processes), \
+             patch("recovery.codex_session_loaded", side_effect=fake_loaded):
+            verified, failures, blocked = executor.verify_round([attempt])
+        self.assertEqual((len(verified), failures, blocked), (1, {}, {}))
+        self.assertTrue(checked_pids)
+        self.assertEqual(set(checked_pids), {50000})
+
+    def test_existing_tool_and_dsh_retry_ignore_leading_mcp_child(self):
+        executor = RestoreExecutor({"AIPANE_STATE_DIR": str(self.state_dir),
+                                    "AIPANE_TMUX": str(self.fake_tmux)})
+        kimi_item = {"tool": "kimi", "target": "0:4.1", "sid": GROK_SID}
+        kimi_processes = [(10, "chrome-devtools-mcp"), (20, f"kimi --auto --session {GROK_SID}")]
+        with patch.object(executor.tmux, "foreground_processes", return_value=kimi_processes), \
+             patch.object(executor.tmux, "pane_identity", return_value=None):
+            self.assertTrue(executor.existing_tool_matches(kimi_item, "kimi"))
+
+        dsh_item = {
+            "target": "0:4.1",
+            "tool": "dsh",
+            "kind": "resume",
+            "restorable": True,
+            "cwd": str(self.tmp),
+            "command": f"dsh-tui --resume {GROK_SID}",
+            "sid": GROK_SID,
+            "pane_id": "%4",
+            "socket_path": "/private/tmp/tmux-test",
+            "server_pid": "4242",
+        }
+        dsh_processes = [
+            (10, "chrome-devtools-mcp"),
+            (20, "node /opt/@deepseek-harness-tui/dsh-tui/bin/dsh-tui.js"),
+        ]
+        with patch.object(executor.tmux, "pane_identity", return_value=("%4", "/private/tmp/tmux-test", "4242")), \
+             patch.object(executor.tmux, "current_command", return_value="node"), \
+             patch.object(executor.tmux, "foreground_processes", return_value=dsh_processes), \
+             patch.object(executor, "dsh_ready", return_value=False), \
+             patch.object(executor.tmux, "send", return_value=False):
+            attempt, error = executor.launch(dsh_item, interrupt_running=True)
+        self.assertIsNone(attempt)
+        self.assertEqual(error, "running Agent did not stop for retry")
 
     def test_codex_update_prompt_is_blocked_instead_of_verified(self):
         plan = {

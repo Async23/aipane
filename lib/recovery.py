@@ -248,7 +248,20 @@ class Tmux:
             return []
         try:
             processes = subprocess.run(
-                ["ps", "-t", tty, "-o", "pid=", "-o", "stat=", "-o", "command="],
+                [
+                    "ps",
+                    "-ww",
+                    "-t",
+                    tty,
+                    "-o",
+                    "pid=",
+                    "-o",
+                    "pgid=",
+                    "-o",
+                    "stat=",
+                    "-o",
+                    "command=",
+                ],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -257,12 +270,22 @@ class Tmux:
             return []
         if processes.returncode != 0:
             return []
-        foreground = []
+        leaders: list[tuple[int, str]] = []
+        others: list[tuple[int, str]] = []
         for line in processes.stdout.splitlines():
-            fields = line.strip().split(maxsplit=2)
-            if len(fields) == 3 and fields[0].isdigit() and "+" in fields[1]:
-                foreground.append((int(fields[0]), fields[2]))
-        return foreground
+            fields = line.strip().split(maxsplit=3)
+            if (
+                len(fields) == 4
+                and fields[0].isdigit()
+                and fields[1].isdigit()
+                and "+" in fields[2]
+            ):
+                entry = (int(fields[0]), fields[3])
+                if fields[0] == fields[1]:
+                    leaders.append(entry)
+                else:
+                    others.append(entry)
+        return [*leaders, *others]
 
     def capture_failure(self, target: str) -> str:
         completed = self.run("capture-pane", "-p", "-t", target, "-S", "-40")
@@ -603,9 +626,8 @@ class RestoreExecutor:
             return self.dsh_ready(item)
         if item["tool"] == "claude" and self.claude_resume_matches(item):
             return True
-        foreground = self.tmux.foreground_command(item["target"])
         sid = item.get("sid", "")
-        if sid and sid in foreground:
+        if sid and any(sid in command for _, command in self.tmux.foreground_processes(item["target"])):
             return True
         identity = self.tmux.pane_identity(item["target"])
         if not sid or identity is None or not self.registry_path.is_file():
@@ -667,6 +689,26 @@ class RestoreExecutor:
         return all(not item.get(key) or metadata.get(key) == item[key]
                    for key in ("agy_home", "agy_model", "agy_effort", "agy_mode", "agy_agent", "agy_route"))
 
+    def codex_foreground_loaded(self, target: str, sid: str, codex_home: Path) -> bool:
+        if not sid:
+            return False
+        matching: list[int] = []
+        fallback: list[int] = []
+        for pid, command in self.tmux.foreground_processes(target):
+            try:
+                args = shlex.split(command)
+            except ValueError:
+                args = command.split()
+            executable = Path(args[0]).name if args else ""
+            if command_matches("codex", executable):
+                matching.append(pid)
+            else:
+                fallback.append(pid)
+        return any(
+            codex_session_loaded(pid, sid, codex_home)
+            for pid in (matching or fallback)
+        )
+
     def pane_guard_matches(self, item: dict[str, Any]) -> bool:
         expected = (
             item.get("pane_id"),
@@ -691,7 +733,10 @@ class RestoreExecutor:
             if item["tool"] == "dsh" and current == "node":
                 # A retry may see another Node program occupying this pane.
                 # Missing readiness is not authority to interrupt arbitrary node.
-                matches_existing = matches_existing or is_dsh_command_line(self.tmux.foreground_command(target))
+                matches_existing = matches_existing or any(
+                    is_dsh_command_line(command)
+                    for _, command in self.tmux.foreground_processes(target)
+                )
             else:
                 matches_existing = True
         if matches_existing:
@@ -791,10 +836,11 @@ class RestoreExecutor:
                         continue
                     if item["tool"] == "codex":
                         visible = " ".join(self.tmux.capture_visible(target).split()).lower()
-                        process = self.tmux.foreground_process(target)
-                        codex_loaded = bool(process and codex_session_loaded(
-                            process[0], item.get("sid", ""), Path(item.get("codex_home") or self.codex_home),
-                        ))
+                        codex_loaded = self.codex_foreground_loaded(
+                            target,
+                            item.get("sid", ""),
+                            Path(item.get("codex_home") or self.codex_home),
+                        )
                         # Recheck runtime evidence after capturing the screen:
                         # loading may finish while that subprocess is running.
                         # Loaded history can also quote an old startup dialog.
@@ -1100,8 +1146,8 @@ class RestoreExecutor:
             if item["tool"] != "agy" or not item.get("sid"):
                 continue
             identity = session_identity(item, self.environment)
-            process = self.tmux.foreground_process(item["target"])
-            foreign = agy_writers(identity.sid, identity.store, self.environment) - ({process[0]} if process else set())
+            foreground_pids = {pid for pid, _ in self.tmux.foreground_processes(item["target"])}
+            foreign = agy_writers(identity.sid, identity.store, self.environment) - foreground_pids
             if foreign:
                 raise RestoreExecutionError(f"session conflict: Antigravity conversation {identity.sid} is already open in another foreground process")
         codex = [item for item in items if item["tool"] == "codex" and item.get("sid")]
@@ -1111,12 +1157,15 @@ class RestoreExecutor:
             if identity.store not in owners:
                 owners[identity.store] = session_writers(Path(identity.store))
             writers = owners[identity.store]
-            process = self.tmux.foreground_process(item["target"])
-            pid = process[0] if process else None
-            observed = {record["sid"] for record in writers.get(pid, [])}
+            foreground_pids = {pid for pid, _ in self.tmux.foreground_processes(item["target"])}
+            observed = {
+                record["sid"]
+                for pid in foreground_pids
+                for record in writers.get(pid, [])
+            }
             if observed and identity.sid not in observed:
                 raise RestoreExecutionError(f"Codex selected session changed in {item['target']}; refresh the restart plan")
-            foreign = [owner for owner, records in writers.items() if owner != pid
+            foreign = [owner for owner, records in writers.items() if owner not in foreground_pids
                        and any(record["sid"] == identity.sid for record in records)]
             if foreign:
                 raise RestoreExecutionError(
