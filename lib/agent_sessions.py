@@ -892,7 +892,7 @@ def _kimi_id_matches(file_sid: str, query_sid: str) -> bool:
 def _populate_rollout_index_from_files(
     codex_home: Path,
     files: list[SessionFile],
-    rollout_index: dict[str, Path],
+    rollout_index: dict[str, Any],
 ) -> None:
     sentinel = f"__scanned__:{codex_home}"
     for sf in files:
@@ -900,16 +900,14 @@ def _populate_rollout_index_from_files(
             continue
         _, rid = codex_sessions.extract_filename_ids(sf.path)
         if rid:
-            prev_rid = rollout_index.get(rid)
-            if prev_rid is None or codex_sessions.rollout_dedup_priority(
-                sf.path
-            ) < codex_sessions.rollout_dedup_priority(prev_rid):
-                rollout_index[rid] = sf.path
+            codex_sessions._add_rollout_index_candidate(rollout_index, rid, sf.path)
         stem_key = f"__stem__:{codex_sessions.rollout_plain_stem(sf.path)}"
         prev_stem = rollout_index.get(stem_key)
-        if prev_stem is None or codex_sessions.rollout_dedup_priority(
-            sf.path
-        ) < codex_sessions.rollout_dedup_priority(prev_stem):
+        if prev_stem is None or (
+            isinstance(prev_stem, Path)
+            and codex_sessions.rollout_dedup_priority(sf.path)
+            < codex_sessions.rollout_dedup_priority(prev_stem)
+        ):
             rollout_index[stem_key] = sf.path
     rollout_index[sentinel] = codex_home
 
@@ -1049,26 +1047,46 @@ def resolve_session_sources(
                                 seen_chain_rids.add(cur_rid)
                                 hb = cur_m["history_base"]
                                 base_rid = hb["rollout_id"]
-                                base_p = local_rindex.get(base_rid)
-                                if base_p is not None:
-                                    base_p = (
-                                        codex_sessions.resolve_alternate_rollout_path(
-                                            base_p, chome, rollout_index=local_rindex
-                                        )
-                                        or base_p
-                                    )
-                                if base_p is None or not base_p.is_file():
+                                base_cands = codex_sessions.find_rollouts_by_rollout_id(
+                                    base_rid, chome, rollout_index=local_rindex
+                                )
+                                if not base_cands:
                                     chain_complete = False
                                     break
-                                base_m = _cached_codex_meta(base_p, cache)
-                                if base_m is None:
+                                resolved_bases: list[tuple[Path, dict[str, Any]]] = []
+                                for bc in base_cands:
+                                    bp = (
+                                        codex_sessions.resolve_alternate_rollout_path(
+                                            bc, chome, rollout_index=local_rindex
+                                        )
+                                        or bc
+                                    )
+                                    if not bp.is_file():
+                                        continue
+                                    bm = _cached_codex_meta(bp, cache)
+                                    if bm is not None:
+                                        resolved_bases.append((bp, bm))
+                                if not resolved_bases:
+                                    chain_complete = False
+                                    break
+                                cur_seg_sid = cur_m["sid"]
+                                same_sid_bases = [x for x in resolved_bases if x[1]["sid"] == cur_seg_sid]
+                                if len(same_sid_bases) == 1:
+                                    base_p, base_m = same_sid_bases[0]
+                                elif len(resolved_bases) == 1:
+                                    base_p, base_m = resolved_bases[0]
+                                else:
                                     chain_complete = False
                                     break
                                 if base_m["sid"] == session_id:
                                     chain_paths.append(base_p)
                                 cur_p = base_p
                                 cur_m = base_m
-                        elif cur_m.get("ordinal") == 0:
+                        elif cur_m.get("ordinal") == 0 and not any(
+                            not codex_sessions.is_canonical_rollout_name(sf.path)
+                            and _meta_cache_key(sf.path) != _meta_cache_key(sqlite_head_path)
+                            for sf in raw_files
+                        ):
                             chain_complete = True
                         else:
                             chain_complete = False
@@ -1109,22 +1127,23 @@ def resolve_session_sources(
 
             if not fast_resolved:
                 by_ckey: dict[Any, list[SessionFile]] = {}
+                by_single_fn_sid: dict[str, list[SessionFile]] = {}
                 for sf in raw_files:
-                    if codex_sessions.is_canonical_rollout_name(sf.path):
-                        ckey = codex_sessions.rollout_canonical_key(sf.path, codex_home=chome)
-                        by_ckey.setdefault(ckey, []).append(sf)
+                    ckey = codex_sessions.rollout_canonical_key(sf.path, codex_home=chome)
+                    by_ckey.setdefault(ckey, []).append(sf)
+                    if codex_sessions.is_canonical_single_uuid_rollout(sf.path):
+                        fn_sid_s, _ = codex_sessions.extract_filename_ids(sf.path)
+                        if fn_sid_s:
+                            by_single_fn_sid.setdefault(fn_sid_s, []).append(sf)
                 colliding_keys: set[tuple[Path, int, int]] = set()
                 for group in by_ckey.values():
                     if len(group) > 1:
-                        parents = set()
                         for sf in group:
-                            try:
-                                parents.add(sf.path.parent.resolve())
-                            except OSError:
-                                parents.add(sf.path.parent)
-                        if len(parents) > 1:
-                            for sf in group:
-                                colliding_keys.add(_meta_cache_key(sf.path))
+                            colliding_keys.add(_meta_cache_key(sf.path))
+                for group in by_single_fn_sid.values():
+                    if len(group) > 1:
+                        for sf in group:
+                            colliding_keys.add(_meta_cache_key(sf.path))
 
                 for sf in raw_files:
                     if sf.session_id == session_id or f"-{session_id}" in sf.path.name:
@@ -1515,7 +1534,7 @@ def _plan_codex_sid_sources(
         if raw_path is None:
             return None
         resolved_cand = codex_sessions.resolve_alternate_rollout_path(
-            raw_path, codex_home, rollout_index=rollout_index
+            raw_path, codex_home, rollout_index=rollout_index, expected_sid=sid
         )
         if resolved_cand is None:
             warnings.append(f"{missing_code}: {label} path {raw_path} does not exist")
@@ -1555,16 +1574,22 @@ def _plan_codex_sid_sources(
 
     verified_sqlite: Path | None = None
     if codex_home is not None:
-        sqlite_raw, sqlite_err = codex_sessions.query_sqlite_rollout_path_detailed(sid, codex_home)
-        if sqlite_err:
-            warnings.append(f"codex_sqlite_query_failed: {sqlite_err}")
-        verified_sqlite = _check_anchor(
-            sqlite_raw,
-            missing_code="sqlite_rollout_missing",
-            missed_code="sqlite_rollout_missed_by_discovery",
-            conflict_code="sqlite_rollout_sid_conflict",
-            label="state sqlite rollout",
+        sqlite_rows, sqlite_errs = codex_sessions.query_sqlite_rollout_paths_detailed(
+            sid, codex_home
         )
+        for sqlite_err in sqlite_errs:
+            warnings.append(f"codex_sqlite_query_failed: {sqlite_err}")
+        for _, sqlite_raw in sqlite_rows:
+            cand_sqlite = _check_anchor(
+                sqlite_raw,
+                missing_code="sqlite_rollout_missing",
+                missed_code="sqlite_rollout_missed_by_discovery",
+                conflict_code="sqlite_rollout_sid_conflict",
+                label="state sqlite rollout",
+            )
+            if cand_sqlite is not None:
+                verified_sqlite = cand_sqlite
+                break
 
     if not candidate_paths:
         return [], warnings
@@ -1932,7 +1957,7 @@ def _finalize_range_checks(
                 f"disagrees with end_byte_offset={eb} in {path}"
             )
         elif eb is not None:
-            if byte_count >= eb and not chk.misaligned and not chk.saw_ord_at_or_after_eb:
+            if byte_count >= eb and not chk.misaligned and eo > 0:
                 if chk.max_ord_before_eb is not None and chk.max_ord_before_eb + 1 < eo:
                     warnings.append(
                         f"history_base_ordinal_truncated: expected ordinal up to {eo - 1} "
@@ -2722,23 +2747,29 @@ def _pull_misnamed_cold_predecessors(
     *,
     all_files: list[SessionFile] | None = None,
     codex_home: Path | None = None,
-    rollout_index: dict[str, Path] | None = None,
-) -> list[LogicalSession]:
+    rollout_index: dict[str, Any] | None = None,
+    sqlite_rows_by_sid: dict[str, list[Path]] | None = None,
+) -> tuple[list[LogicalSession], int]:
     """Attach cold segments belonging to hot Codex sessions without scanning unrelated cold headers.
 
-    1. Runs ONE batch SQLite lookup across all hot Codex SIDs (1 connection per DB)
-       and only resolves/reads headers for cold files not already attached.
-    2. When cold non-canonical/double-UUID files exist, follows explicit `history_base`
-       physical rollout IDs directly through an in-memory `cold_by_rid` index (O(chain)),
-       and falls back to scanning cold non-canonical files only for hot sessions with
-       `min_ord > 0` that lack a known `history_base`.
+    1. Reuses ONE batch SQLite lookup across all hot Codex SIDs (1 connection per DB,
+       checking DB versions highest-to-lowest) and only resolves/reads headers for cold
+       files not already attached.
+    2. Follows explicit `history_base` physical rollout IDs directly through an
+       in-memory `cold_by_rid` index (O(chain)) for hot sessions with non-single-UUID
+       segments (even when the cold predecessor itself is canonical single-UUID), while
+       keeping single-UUID hot `.zst` archives at 0 header reads.
+    3. Falls back to scanning cold non-canonical files only for hot sessions with
+       `min_ord > 0` that lack a known `history_base` when cold non-canonical files exist.
+
+    Returns `(merged_sessions, absorbed_cold_session_count)`.
     """
     if not cold_rough or not target_sessions:
-        return target_sessions
+        return target_sessions, 0
 
     hot_codex = [ls for ls in target_sessions if ls.agent == "codex"]
     if not hot_codex:
-        return target_sessions
+        return target_sessions, 0
 
     cold_codex_files: list[SessionFile] = []
     cold_by_key: dict[tuple[Path, int, int], SessionFile] = {}
@@ -2758,9 +2789,9 @@ def _pull_misnamed_cold_predecessors(
                 cold_noncanonical.append(sf)
 
     if not cold_codex_files:
-        return target_sessions
+        return target_sessions, 0
 
-    rindex: dict[str, Path] = rollout_index if rollout_index is not None else {}
+    rindex: dict[str, Any] = rollout_index if rollout_index is not None else {}
     if codex_home is not None and f"__scanned__:{codex_home}" not in rindex:
         idx_source = (
             all_files
@@ -2775,49 +2806,60 @@ def _pull_misnamed_cold_predecessors(
 
     extra_by_sid: dict[str, list[SessionFile]] = {}
     hot_seg_keys: dict[str, set[tuple[Path, int, int]]] = {}
+    pulled_cold_keys: set[tuple[Path, int, int]] = set()
 
-    sqlite_map = (
-        codex_sessions.query_sqlite_rollout_paths_batch(
+    if sqlite_rows_by_sid is not None:
+        sqlite_map = sqlite_rows_by_sid
+    elif codex_home is not None:
+        sqlite_map = codex_sessions.query_sqlite_rollout_paths_batch_all(
             [ls.session_id for ls in hot_codex], codex_home
         )
-        if codex_home is not None
-        else {}
-    )
+    else:
+        sqlite_map = {}
+
     for ls in hot_codex:
         seg_keys = {_meta_cache_key(sf.path) for sf in ls.segments}
         hot_seg_keys[ls.session_id] = seg_keys
-        sqlite_raw = sqlite_map.get(ls.session_id)
-        if sqlite_raw is None:
-            continue
-        raw_key = _meta_cache_key(sqlite_raw) if sqlite_raw.is_file() else None
-        if raw_key is not None and raw_key in seg_keys:
-            continue
-        resolved = codex_sessions.resolve_alternate_rollout_path(
-            sqlite_raw, codex_home, rollout_index=rindex
-        )
-        if resolved is None:
-            continue
-        rkey = _meta_cache_key(resolved)
-        if rkey in seg_keys:
-            continue
-        csf = cold_by_key.get(rkey)
-        if csf is not None:
+        for sqlite_raw in sqlite_map.get(ls.session_id, ()):
+            raw_key = _meta_cache_key(sqlite_raw) if sqlite_raw.is_file() else None
+            if raw_key is not None and raw_key in seg_keys:
+                break
+            resolved = codex_sessions.resolve_alternate_rollout_path(
+                sqlite_raw, codex_home, rollout_index=rindex, expected_sid=ls.session_id
+            )
+            if resolved is None:
+                continue
+            rkey = _meta_cache_key(resolved)
+            if rkey in seg_keys:
+                break
             rmeta = _cached_codex_meta(resolved, meta_cache)
             if rmeta and rmeta["sid"] == ls.session_id:
-                extra_by_sid.setdefault(ls.session_id, []).append(
-                    SessionFile(
-                        "codex",
-                        ls.session_id,
-                        csf.path,
-                        csf.mtime,
-                        csf.size_bytes,
-                        csf.is_subagent,
-                        csf.parent_id,
+                csf = cold_by_key.get(rkey)
+                if csf is not None:
+                    extra_by_sid.setdefault(ls.session_id, []).append(
+                        SessionFile(
+                            "codex",
+                            ls.session_id,
+                            csf.path,
+                            csf.mtime,
+                            csf.size_bytes,
+                            csf.is_subagent,
+                            csf.parent_id,
+                        )
                     )
-                )
-                seg_keys.add(rkey)
+                    seg_keys.add(rkey)
+                    pulled_cold_keys.add(rkey)
+                break
 
-    if cold_noncanonical:
+    hot_with_non_single = [
+        ls
+        for ls in hot_codex
+        if any(not codex_sessions.is_canonical_single_uuid_rollout(sf.path) for sf in ls.segments)
+        or ls.session_id in extra_by_sid
+    ]
+    hot_to_inspect = hot_codex if cold_noncanonical else hot_with_non_single
+
+    if hot_to_inspect:
         known_rids: set[str] = set(cold_by_rid.keys())
         if all_files is not None:
             for sf in all_files:
@@ -2834,7 +2876,7 @@ def _pull_misnamed_cold_predecessors(
                             known_rids.add(rid)
 
         orphan_sids: set[str] = set()
-        for ls in hot_codex:
+        for ls in hot_to_inspect:
             seg_keys = hot_seg_keys[ls.session_id]
             ords: list[int] = []
             has_known_hb = False
@@ -2878,11 +2920,12 @@ def _pull_misnamed_cold_predecessors(
                         )
                         extra_by_sid.setdefault(ls.session_id, []).append(attached)
                         seg_keys.add(ckey)
+                        pulled_cold_keys.add(ckey)
                         queue_segs.append(attached)
             if ords and min(ords) > 0 and not has_known_hb:
                 orphan_sids.add(ls.session_id)
 
-        if orphan_sids:
+        if orphan_sids and cold_noncanonical:
             for sf in cold_noncanonical:
                 meta = _cached_codex_meta(sf.path, meta_cache)
                 if meta and meta["sid"] in orphan_sids:
@@ -2900,9 +2943,17 @@ def _pull_misnamed_cold_predecessors(
                             )
                         )
                         hot_seg_keys.setdefault(meta["sid"], set()).add(skey)
+                        pulled_cold_keys.add(skey)
 
     if not extra_by_sid:
-        return target_sessions
+        return target_sessions, 0
+
+    absorbed_cold_sessions = 0
+    for cls in cold_rough:
+        if cls.agent == "codex" and cls.segments and all(
+            _meta_cache_key(sf.path) in pulled_cold_keys for sf in cls.segments
+        ):
+            absorbed_cold_sessions += 1
 
     merged: list[LogicalSession] = []
     for ls in target_sessions:
@@ -2914,7 +2965,7 @@ def _pull_misnamed_cold_predecessors(
             )
         else:
             merged.append(ls)
-    return merged
+    return merged, absorbed_cold_sessions
 
 
 def _verify_hot_logical_sessions(
@@ -2924,40 +2975,71 @@ def _verify_hot_logical_sessions(
     cold_rough: list[LogicalSession] | None = None,
     all_files: list[SessionFile] | None = None,
     codex_home: Path | None = None,
-    rollout_index: dict[str, Path] | None = None,
+    rollout_index: dict[str, Any] | None = None,
+    sqlite_rows_by_sid: dict[str, list[Path]] | None = None,
     days: int = 14,
     scan_all: bool = False,
     now: float | None = None,
 ) -> tuple[list[LogicalSession], int, int, int]:
-    """Verify hot headers, collapse hot cross-dir mirrors, and re-prune after splitting.
+    """Verify hot headers, collapse hot same-SID mirrors, and re-prune after splitting.
 
-    Returns `(sessions, total_hot, extra_skipped_sessions, dedup_dropped_files)`.
+    Returns `(sessions, total_hot, net_delta_skipped_sessions, dedup_dropped_files)`.
     """
     raw_hot_files = [sf for ls in hot_rough for sf in ls.segments]
     verified_files: list[SessionFile] = []
 
-    codex_canonical_groups: dict[Any, list[SessionFile]] = {}
+    codex_stem_groups: dict[Any, list[SessionFile]] = {}
+    single_uuid_by_fn_sid: dict[str, list[SessionFile]] = {}
     other_hot_files: list[SessionFile] = []
     for sf in raw_hot_files:
-        if sf.agent == "codex" and codex_sessions.is_canonical_rollout_name(sf.path):
+        if sf.agent == "codex":
             ckey = codex_sessions.rollout_canonical_key(sf.path, codex_home=codex_home)
-            codex_canonical_groups.setdefault(ckey, []).append(sf)
+            codex_stem_groups.setdefault(ckey, []).append(sf)
+            if codex_sessions.is_canonical_single_uuid_rollout(sf.path):
+                fn_sid_s, _ = codex_sessions.extract_filename_ids(sf.path)
+                if fn_sid_s:
+                    single_uuid_by_fn_sid.setdefault(fn_sid_s, []).append(sf)
         else:
             other_hot_files.append(sf)
 
+    dup_single_keys: set[tuple[Path, int, int]] = set()
+    for sgrp in single_uuid_by_fn_sid.values():
+        if len(sgrp) > 1:
+            for sf in sgrp:
+                dup_single_keys.add(_meta_cache_key(sf.path))
+
     dedup_dropped = 0
-    for group in codex_canonical_groups.values():
+    for group in codex_stem_groups.values():
         if len(group) == 1:
-            vsf = _verify_session_file_header(group[0], meta_cache)
-            if vsf is not None:
-                verified_files.append(vsf)
+            sf0 = group[0]
+            if _meta_cache_key(sf0.path) in dup_single_keys:
+                meta = _cached_codex_meta(sf0.path, meta_cache)
+                if meta and meta["sid"] != sf0.session_id:
+                    verified_files.append(
+                        SessionFile(
+                            "codex",
+                            meta["sid"],
+                            sf0.path,
+                            sf0.mtime,
+                            sf0.size_bytes,
+                            sf0.is_subagent,
+                            sf0.parent_id,
+                        )
+                    )
+                else:
+                    verified_files.append(sf0)
+            else:
+                vsf = _verify_session_file_header(sf0, meta_cache)
+                if vsf is not None:
+                    verified_files.append(vsf)
             continue
-        # Multiple hot files share a canonical rollout stem across directories:
+        # Multiple hot files share a plain/zst stem (same-dir or cross-dir canonical):
         # verify headers so same-SID mirrors collapse by priority while different-SID
-        # collisions both survive under their authoritative header SIDs.
-        by_sid: dict[str, SessionFile] = {}
+        # collisions (or verified vs unverifiable twins) both survive under verified SIDs.
+        by_slot: dict[tuple[str, bool], SessionFile] = {}
         for sf in group:
             meta = _cached_codex_meta(sf.path, meta_cache)
+            verified = meta is not None
             sid = meta["sid"] if meta else sf.session_id
             cand = (
                 sf
@@ -2966,21 +3048,61 @@ def _verify_hot_logical_sessions(
                     "codex", sid, sf.path, sf.mtime, sf.size_bytes, sf.is_subagent, sf.parent_id
                 )
             )
-            prev = by_sid.get(sid)
+            slot = (sid, verified)
+            prev = by_slot.get(slot)
             if prev is None:
-                by_sid[sid] = cand
+                by_slot[slot] = cand
             else:
                 dedup_dropped += 1
                 if codex_sessions.rollout_dedup_priority(
                     cand.path
                 ) < codex_sessions.rollout_dedup_priority(prev.path):
-                    by_sid[sid] = cand
-        verified_files.extend(by_sid.values())
+                    by_slot[slot] = cand
+        verified_files.extend(by_slot.values())
 
     for sf in other_hot_files:
         vsf = _verify_session_file_header(sf, meta_cache)
         if vsf is not None:
             verified_files.append(vsf)
+
+    # Re-attribute any hot canonical single-UUID file whose physical RID is explicitly
+    # referenced by another hot Codex segment's `history_base` (e.g. under `--all`,
+    # where a misnamed canonical single-UUID predecessor is already in `hot_rough`).
+    hot_codex_by_rid: dict[str, list[int]] = {}
+    for idx_v, sf in enumerate(verified_files):
+        if sf.agent == "codex" and codex_sessions.is_canonical_rollout_name(sf.path):
+            _, rid = codex_sessions.extract_filename_ids(sf.path)
+            if rid:
+                hot_codex_by_rid.setdefault(rid, []).append(idx_v)
+    if hot_codex_by_rid:
+        for idx_v in range(len(verified_files)):
+            sf = verified_files[idx_v]
+            if sf.agent != "codex" or codex_sessions.is_canonical_single_uuid_rollout(sf.path):
+                continue
+            meta = _cached_codex_meta(sf.path, meta_cache)
+            if not meta:
+                continue
+            hb = meta.get("history_base")
+            if not isinstance(hb, dict):
+                continue
+            base_rid = hb.get("rollout_id")
+            if not isinstance(base_rid, str) or not base_rid:
+                continue
+            for cand_idx in hot_codex_by_rid.get(base_rid, ()):
+                cand_sf = verified_files[cand_idx]
+                if cand_sf.session_id == meta["sid"]:
+                    continue
+                cmeta = _cached_codex_meta(cand_sf.path, meta_cache)
+                if cmeta and cmeta["sid"] == meta["sid"]:
+                    verified_files[cand_idx] = SessionFile(
+                        "codex",
+                        meta["sid"],
+                        cand_sf.path,
+                        cand_sf.mtime,
+                        cand_sf.size_bytes,
+                        cand_sf.is_subagent,
+                        cand_sf.parent_id,
+                    )
 
     all_verified = group_logical_sessions(verified_files, sort_segments=False, meta_cache=meta_cache)
     all_verified.sort(key=lambda s: s.mtime, reverse=True)
@@ -2988,16 +3110,38 @@ def _verify_hot_logical_sessions(
     effective_cold = list(cold_rough or [])
     if extra_skipped > 0:
         effective_cold.extend(all_verified[len(sessions) :])
+    absorbed_cold = 0
     if effective_cold:
-        sessions = _pull_misnamed_cold_predecessors(
+        sessions, absorbed_cold = _pull_misnamed_cold_predecessors(
             sessions,
             effective_cold,
             meta_cache,
             all_files=all_files,
             codex_home=codex_home,
             rollout_index=rollout_index,
+            sqlite_rows_by_sid=sqlite_rows_by_sid,
         )
-    return sessions, len(sessions), extra_skipped, dedup_dropped
+    return sessions, len(sessions), (extra_skipped - absorbed_cold), dedup_dropped
+
+
+def _pick_verified_sqlite_head_from_rows(
+    sid: str,
+    raw_paths: list[Path],
+    codex_home: Path,
+    *,
+    meta_cache: dict[Any, dict[str, Any] | None] | None = None,
+    rollout_index: dict[str, Any] | None = None,
+) -> Path | None:
+    for raw_p in raw_paths:
+        resolved = codex_sessions.resolve_alternate_rollout_path(
+            raw_p, codex_home, rollout_index=rollout_index, expected_sid=sid
+        )
+        if resolved is None:
+            continue
+        meta = _cached_codex_meta(resolved, meta_cache)
+        if meta is not None and meta["sid"] == sid:
+            return resolved
+    return None
 
 
 def _extract_logical_preview(
@@ -3005,11 +3149,28 @@ def _extract_logical_preview(
     *,
     home: Path | None = None,
     meta_cache: dict[Any, dict[str, Any] | None] | None = None,
-    rollout_index: dict[str, Path] | None = None,
+    rollout_index: dict[str, Any] | None = None,
+    sqlite_rows_by_sid: dict[str, list[Path]] | None = None,
 ) -> str:
     if ls.agent == "codex" and len(ls.segments) > 1:
         chome = _codex_home(home)
-        sqlite_path = codex_sessions.query_sqlite_rollout_path(ls.session_id, chome)
+        if sqlite_rows_by_sid is not None:
+            sqlite_path = _pick_verified_sqlite_head_from_rows(
+                ls.session_id,
+                sqlite_rows_by_sid.get(ls.session_id, []),
+                chome,
+                meta_cache=meta_cache,
+                rollout_index=rollout_index,
+            )
+        else:
+            sqlite_path, _ = codex_sessions.resolve_committed_head_detailed(
+                ls.session_id,
+                chome,
+                verify_header=True,
+                rollout_index=rollout_index,
+                meta_cache=meta_cache,
+                sqlite_only=True,
+            )
         effective, _, _ = codex_sessions.resolve_effective_lineage(
             ls.session_id,
             [s.path for s in ls.segments],
@@ -3067,26 +3228,57 @@ def list_sessions(
     hot_rough, skipped = prune_by_time(rough_logical, days, scan_all, now=now)
     cold_rough = rough_logical[len(hot_rough) :] if skipped > 0 else []
     chome = _codex_home(home) if "codex" in norm_agents else None
-    rindex: dict[str, Path] = {}
+    rindex: dict[str, Any] = {}
     if chome is not None:
         _populate_rollout_index_from_files(
             chome,
             [sf for sf in all_files if sf.agent == "codex"],
             rindex,
         )
-    selected, total_hot, extra_skipped, _ = _verify_hot_logical_sessions(
+    # Query all hot Codex SIDs in a single batch SQLite pass (1 connection per DB),
+    # reused across both cold-predecessor attachment and multi-segment preview.
+    hot_codex_sids_rough = [ls.session_id for ls in hot_rough if ls.agent == "codex"]
+    sqlite_rows_by_sid: dict[str, list[Path]] | None = None
+    if chome is not None and hot_codex_sids_rough and (
+        cold_rough or any(len(ls.segments) > 1 for ls in hot_rough if ls.agent == "codex")
+    ):
+        sqlite_rows_by_sid = codex_sessions.query_sqlite_rollout_paths_batch_all(
+            hot_codex_sids_rough, chome
+        )
+
+    selected, total_hot, delta_skipped, _ = _verify_hot_logical_sessions(
         hot_rough,
         meta_cache=meta_cache,
         cold_rough=cold_rough,
         all_files=all_files,
         codex_home=chome,
         rollout_index=rindex,
+        sqlite_rows_by_sid=sqlite_rows_by_sid,
         days=days,
         scan_all=scan_all,
         now=now,
     )
-    skipped += extra_skipped
+    skipped = max(0, skipped + delta_skipped)
     selected = selected[:limit]
+    # If header verification introduced a newly split hot multi-segment SID not in
+    # the rough batch, query ONLY those missing multi-segment SIDs in one batch.
+    if chome is not None:
+        missing_multi_sids = [
+            ls.session_id
+            for ls in selected
+            if ls.agent == "codex"
+            and len(ls.segments) > 1
+            and (sqlite_rows_by_sid is None or ls.session_id not in sqlite_rows_by_sid)
+        ]
+        if missing_multi_sids:
+            extra_rows = codex_sessions.query_sqlite_rollout_paths_batch_all(
+                missing_multi_sids, chome
+            )
+            if sqlite_rows_by_sid is None:
+                sqlite_rows_by_sid = extra_rows
+            else:
+                sqlite_rows_by_sid.update(extra_rows)
+
     items: list[dict[str, Any]] = []
     for ls in selected:
         if len(ls.segments) > 1 and ls.agent == "codex":
@@ -3105,7 +3297,11 @@ def list_sessions(
             "mtime": iso_local(ls.mtime),
             "size_bytes": ls.size_bytes,
             "preview": _extract_logical_preview(
-                ls, home=home, meta_cache=meta_cache, rollout_index=rindex
+                ls,
+                home=home,
+                meta_cache=meta_cache,
+                rollout_index=rindex,
+                sqlite_rows_by_sid=sqlite_rows_by_sid,
             ),
             "path": str(ls.latest_segment.path),
             "segment_count": len(ls.segments),
@@ -3452,14 +3648,24 @@ def read_session(
                 target_agent = fallback_agent
             elif fallback_agent in (None, "codex"):
                 chome = _codex_home(home, codex_home=pane_codex_home, environment=env)
-                sqlite_cand = codex_sessions.query_sqlite_rollout_path(session_id, chome)
-                alt = (
-                    codex_sessions.resolve_alternate_rollout_path(
-                        sqlite_cand, chome, rollout_index=rollout_index
-                    )
-                    if sqlite_cand is not None
-                    else None
+                alt, _ = codex_sessions.resolve_committed_head_detailed(
+                    session_id,
+                    chome,
+                    verify_header=True,
+                    rollout_index=rollout_index,
+                    meta_cache=meta_cache,
+                    sqlite_only=True,
                 )
+                if alt is None:
+                    sqlite_rows, _ = codex_sessions.query_sqlite_rollout_paths_detailed(
+                        session_id, chome
+                    )
+                    for _, sqlite_cand in sqlite_rows:
+                        alt = codex_sessions.resolve_alternate_rollout_path(
+                            sqlite_cand, chome, rollout_index=rollout_index, expected_sid=session_id
+                        )
+                        if alt is not None:
+                            break
                 if alt is not None:
                     sources = []
                     target_agent = "codex"
@@ -3888,30 +4094,42 @@ def _read_bounded_head_turns(
     return turns, hit_eof
 
 
+_ESCAPED_FIELD_VALUE_RE = re.compile(
+    rb'"(?:type|role|sessionUpdate)"\s*:\s*"[^"]*\\u'
+)
+
+
 def _line_may_be_turn(agent: str, raw: bytes) -> bool:
     """Cheap byte-level candidate pre-filter so trailing metadata lines do not evict turns."""
-    # Allow JSON Unicode escapes through to the real decoder so RFC 8259 escaped
-    # type/role strings are never silently dropped.
-    if b"\\u" in raw:
-        return True
     if agent == "codex":
-        return b'"response_item"' in raw and b'"message"' in raw
-    if agent == "dsh":
-        return (
+        if b'"response_item"' in raw and b'"message"' in raw:
+            return True
+    elif agent == "dsh":
+        if (
             b'"user/message"' in raw
             or b'"assistant/message"' in raw
             or b'"user\\/message"' in raw
             or b'"assistant\\/message"' in raw
-        )
-    if agent == "claude":
-        return b'"user"' in raw or b'"assistant"' in raw
-    if agent == "pi":
-        return b'"message"' in raw and (b'"user"' in raw or b'"assistant"' in raw)
-    if agent == "antigravity":
-        return b'"USER_INPUT"' in raw or b'"PLANNER_RESPONSE"' in raw
-    if agent == "kimi":
-        return b'"user"' in raw or b'"assistant"' in raw or b'"content.part"' in raw
-    return True
+        ):
+            return True
+    elif agent == "claude":
+        if b'"user"' in raw or b'"assistant"' in raw:
+            return True
+    elif agent == "pi":
+        if b'"message"' in raw and (b'"user"' in raw or b'"assistant"' in raw):
+            return True
+    elif agent == "antigravity":
+        if b'"USER_INPUT"' in raw or b'"PLANNER_RESPONSE"' in raw:
+            return True
+    elif agent == "kimi":
+        if b'"user"' in raw or b'"assistant"' in raw or b'"content.part"' in raw:
+            return True
+    else:
+        return True
+    # Only fall back to JSON decoding for `\uXXXX` escapes inside structural
+    # type/role fields, so ANSI escapes (`\u001b`) inside tool output never flood
+    # the bounded candidate ring and evict real turns.
+    return bool(b"\\u" in raw and _ESCAPED_FIELD_VALUE_RE.search(raw))
 
 
 def _read_bounded_tail_turns(
@@ -4133,12 +4351,24 @@ def render_preview(
             fallback_agent = normalize_agents([norm_agent])[0] if norm_agent else None
             if fallback_agent in (None, "codex"):
                 chome = _codex_home(home, environment=env)
-                sqlite_cand = codex_sessions.query_sqlite_rollout_path(sid_clean, chome)
-                alt = (
-                    codex_sessions.resolve_alternate_rollout_path(sqlite_cand, chome, rollout_index=rollout_index)
-                    if sqlite_cand is not None
-                    else None
+                alt, _ = codex_sessions.resolve_committed_head_detailed(
+                    sid_clean,
+                    chome,
+                    verify_header=True,
+                    rollout_index=rollout_index,
+                    meta_cache=meta_cache,
+                    sqlite_only=True,
                 )
+                if alt is None:
+                    sqlite_rows, _ = codex_sessions.query_sqlite_rollout_paths_detailed(
+                        sid_clean, chome
+                    )
+                    for _, sqlite_cand in sqlite_rows:
+                        alt = codex_sessions.resolve_alternate_rollout_path(
+                            sqlite_cand, chome, rollout_index=rollout_index, expected_sid=sid_clean
+                        )
+                        if alt is not None:
+                            break
                 if alt is not None:
                     primary_sources = []
                     target_agent = "codex"

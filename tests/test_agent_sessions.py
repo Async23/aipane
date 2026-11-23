@@ -1063,7 +1063,7 @@ class AgentSessionsTest(unittest.TestCase):
         p_lines = [
             json.dumps({"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-19T02:00:00Z", "payload": {"id": parent_sid}}) + "\n",
             json.dumps({"ordinal": 1, "type": "response_item", "timestamp": "2026-11-19T02:00:01Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Shared parent prefix"}]}}) + "\n",
-            json.dumps({"ordinal": 5, "type": "response_item", "timestamp": "2026-11-19T02:00:05Z", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Parent post-fork turn"}]}}) + "\n",
+            json.dumps({"ordinal": 2, "type": "response_item", "timestamp": "2026-11-19T02:00:05Z", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Parent post-fork turn"}]}}) + "\n",
         ]
         parent_seg.parent.mkdir(parents=True, exist_ok=True)
         parent_seg.write_text("".join(p_lines), encoding="utf-8")
@@ -1072,7 +1072,7 @@ class AgentSessionsTest(unittest.TestCase):
             fork_seg,
             [
                 {
-                    "ordinal": 5,
+                    "ordinal": 2,
                     "type": "session_meta",
                     "timestamp": "2026-11-20T03:00:00Z",
                     "payload": {
@@ -1080,12 +1080,12 @@ class AgentSessionsTest(unittest.TestCase):
                         "forked_from_id": parent_sid,
                         "history_base": {
                             "thread_id": parent_sid,
-                            "end_ordinal_exclusive": 5,
+                            "end_ordinal_exclusive": 2,
                             "end_byte_offset": end_byte,
                         },
                     },
                 },
-                {"ordinal": 6, "type": "response_item", "timestamp": "2026-11-20T03:00:01Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Forked branch turn"}]}},
+                {"ordinal": 3, "type": "response_item", "timestamp": "2026-11-20T03:00:01Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Forked branch turn"}]}},
             ],
         )
 
@@ -1562,13 +1562,14 @@ class AgentSessionsTest(unittest.TestCase):
             db.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid_a, str(p), int(self.now)))
 
         # 1. Atomic os.replace between static discovery and SQLite verification must NOT return B
-        orig_query = codex_sessions.query_sqlite_rollout_path_detailed
+        orig_query = codex_sessions.query_sqlite_rollout_paths_detailed
 
         def swap_before_sqlite(*args, **kwargs):
-            os.replace(wrong, p)
+            if wrong.exists():
+                os.replace(wrong, p)
             return orig_query(*args, **kwargs)
 
-        with mock.patch.object(codex_sessions, "query_sqlite_rollout_path_detailed", side_effect=swap_before_sqlite):
+        with mock.patch.object(codex_sessions, "query_sqlite_rollout_paths_detailed", side_effect=swap_before_sqlite):
             with self.assertRaisesRegex(FileNotFoundError, "sqlite_rollout_sid_conflict"):
                 mod.read_session(f"codex:{sid_a}", view="timeline", include_children=False, home=self.home)
 
@@ -2363,6 +2364,234 @@ class AgentSessionsTest(unittest.TestCase):
             self.assertTrue(ra["complete"])
             self.assertEqual([e["text"] for s in ra["sources"] for e in s["events"]], ["BASE", "HEAD"])
             self.assertEqual([c for c in spy_p.call_args_list if c.args and Path(c.args[0][0]).name == "zstd"], [])
+
+    def test_r5_spec_grandparent_fork_rid_collision_cold_single_continuity_and_multi_db(self) -> None:
+        from contextlib import closing
+        import sqlite3
+
+        sid_a = "00000001-aaaa-7bbb-8ccc-000000000001"
+        sid_b = "00000002-aaaa-7bbb-8ccc-000000000002"
+        sid_c = "00000003-aaaa-7bbb-8ccc-000000000003"
+        rid_1 = "00000004-aaaa-7bbb-8ccc-000000000004"
+        rid_2 = "00000005-aaaa-7bbb-8ccc-000000000005"
+        other = "00000006-aaaa-7bbb-8ccc-000000000006"
+
+        def seg(h: Path, s: str, r: str | None, day: int, start: int, labels: list[tuple[int, str]], *, hb=None, fork=None, fake=None, mode="paginated") -> Path:
+            ts = f"2026-11-{day:02d}T12:30:00Z"
+            p = h / f".codex/sessions/{day:02d}" / (f"rollout-2026-11-{day:02d}T12-30-00-{fake or s}" + (f"_{r}" if r else "") + ".jsonl")
+            meta = {"id": s, "timestamp": ts, "cwd": "/review", "source": "cli"}
+            if mode:
+                meta["history_mode"] = mode
+            if hb is not None:
+                meta["history_base"] = hb
+            if fork is not None:
+                meta["forked_from_id"] = fork
+            rows = [{"ordinal": start, "timestamp": ts, "type": "session_meta", "payload": meta}]
+            for o, txt in labels:
+                rows.append({"ordinal": o, "timestamp": ts, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": txt}]}})
+            write_jsonl(p, rows)
+            return p
+
+        def mk_hb(p: Path, r: str, end: int) -> dict:
+            eb = sum(len(l) for l in p.read_bytes().splitlines(True) if json.loads(l)["ordinal"] < end)
+            return {"thread_id": r, "end_ordinal_exclusive": end, "end_byte_offset": eb}
+
+        def set_db(h: Path, s: str, p: Path, ver: int = 5) -> None:
+            with closing(sqlite3.connect(h / f".codex/state_{ver}.sqlite")) as con, con:
+                con.execute("CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+                con.execute("INSERT OR REPLACE INTO threads VALUES (?, ?, ?)", (s, str(p), int(self.now)))
+
+        # 1. Valid 3-level (grandparent) fork A -> B -> C where C.forked_from_id == B and C.history_base.thread_id == A
+        h_gf = self.home / "r5-grandparent"
+        pa = seg(h_gf, sid_a, None, 1, 0, [(1, "INHERITED_A"), (2, "LATER_A")])
+        pb = seg(h_gf, sid_b, None, 2, 3, [(4, "B_OWN")], hb=mk_hb(pa, sid_a, 3), fork=sid_a)
+        pc = seg(h_gf, sid_c, None, 3, 2, [(3, "C_OWN")], hb=mk_hb(pa, sid_a, 2), fork=sid_b)
+        for s, p in ((sid_a, pa), (sid_b, pb), (sid_c, pc)):
+            set_db(h_gf, s, p)
+        rgf = mod.read_session(f"codex:{sid_c}", include_children=False, full=True, home=h_gf)
+        self.assertTrue(rgf["complete"], rgf["warnings"])
+        self.assertEqual([e["text"] for s in rgf["sources"] for e in s["events"]], ["INHERITED_A", "C_OWN"])
+
+        # 2. Same physical RID collision across two SIDs -> rollback picks own SID A, never B
+        h_rid = self.home / "r5-rid-col"
+        seg(h_rid, other, rid_1, 1, 0, [(1, "B_WRONG")])
+        good = seg(h_rid, sid_a, rid_1, 2, 0, [(1, "A_RIGHT")])
+        head = seg(h_rid, sid_a, rid_2, 3, 2, [(3, "A_LATER")], hb=mk_hb(good, rid_1, 2))
+        set_db(h_rid, sid_a, head)
+        rrid = mod.read_session(f"codex:{sid_a}", include_children=False, full=True, home=h_rid)
+        self.assertTrue(rrid["complete"], rrid["warnings"])
+        self.assertEqual([e["text"] for s in rrid["sources"] for e in s["events"]], ["A_RIGHT", "A_LATER"])
+
+        # 3. Known canonical single-UUID cold predecessor (both fake-named cold & fake-named hot) found in default & --all
+        for case_name, fake_cold, fake_hot, hb_rid in (
+            ("cold-fake", other, None, other),
+            ("hot-fake", None, other, sid_a),
+        ):
+            h_cs = self.home / f"r5-{case_name}"
+            cold_p = seg(h_cs, sid_a, None, 1, 0, [(1, "COLD_SINGLE_HIT")], fake=fake_cold)
+            old_t = self.now - 90 * 86400
+            os.utime(cold_p, (old_t, old_t))
+            hot_p = seg(h_cs, sid_a, rid_2, 23, 2, [(3, "HOT_TAIL")], fake=fake_hot, hb=mk_hb(cold_p, hb_rid, 2))
+            set_db(h_cs, sid_a, hot_p)
+            lc = mod.list_sessions(["codex"], days=1, home=h_cs, now=self.now)
+            self.assertEqual(lc["sessions"][0]["segment_count"], 2, case_name)
+            self.assertEqual(lc["scanned_scope"]["skipped_cold_sessions"], 0, case_name)
+            if shutil.which("rg"):
+                for scan_all in (False, True):
+                    fc = mod.find_sessions("COLD_SINGLE_HIT", ["codex"], days=1, scan_all=scan_all, home=h_cs, now=self.now)
+                    self.assertEqual([h["session_id"] for h in fc["hits"]], [sid_a], (case_name, scan_all))
+
+        # 4. Paginated continuity: child start ordinal mismatch, parent ordinal hole, non-zero root, and valid 0/0
+        h_cont = self.home / "r5-cont"
+        p_c = seg(h_cont, sid_a, None, 1, 0, [(1, "KEEP"), (2, "OUT")])
+        a_c = seg(h_cont, sid_b, None, 2, 9, [(10, "GAP")], hb=mk_hb(p_c, sid_a, 2), fork=sid_a)
+        set_db(h_cont, sid_b, a_c)
+        rc1 = mod.read_session(f"codex:{sid_b}", include_children=False, home=h_cont)
+        self.assertFalse(rc1["complete"])
+        self.assertTrue(any("history_base_start_ordinal_mismatch" in w for w in rc1["warnings"]))
+
+        h_hole = self.home / "r5-hole"
+        p_h = seg(h_hole, sid_a, None, 1, 0, [(1, "ONE"), (4, "FOUR"), (5, "FIVE")])
+        a_h = seg(h_hole, sid_b, None, 2, 3, [(4, "C4")], hb=mk_hb(p_h, sid_a, 3), fork=sid_a)
+        set_db(h_hole, sid_b, a_h)
+        rc2 = mod.read_session(f"codex:{sid_b}", include_children=False, home=h_hole)
+        self.assertFalse(rc2["complete"])
+        self.assertTrue(any("history_base_ordinal_truncated" in w for w in rc2["warnings"]))
+
+        h_nz = self.home / "r5-nzroot"
+        p_nz = seg(h_nz, sid_a, rid_1, 1, 5, [(6, "MID")])
+        a_nz = seg(h_nz, sid_a, rid_2, 2, 7, [(8, "END")], hb=mk_hb(p_nz, rid_1, 7))
+        set_db(h_nz, sid_a, a_nz)
+        rc3 = mod.read_session(f"codex:{sid_a}", include_children=False, home=h_nz)
+        self.assertFalse(rc3["complete"])
+        self.assertTrue(any("paginated_root_ordinal_nonzero" in w for w in rc3["warnings"]))
+
+        h_zz = self.home / "r5-zz"
+        p_zz = seg(h_zz, sid_a, None, 1, 0, [(1, "A1")])
+        a_zz = seg(h_zz, sid_b, None, 2, 0, [(1, "C1")], hb=mk_hb(p_zz, sid_a, 0), fork=sid_a)
+        set_db(h_zz, sid_b, a_zz)
+        rc4 = mod.read_session(f"codex:{sid_b}", include_children=False, home=h_zz)
+        self.assertTrue(rc4["complete"], rc4["warnings"])
+
+        # 5. Upper DB foreign + lower DB valid -> read/export/list all use lower DB committed head + warn
+        h_db = self.home / "r5-twodb"
+        p_ok = seg(h_db, sid_a, None, 1, 0, [(1, "COMMITTED")])
+        seg(h_db, sid_a, rid_1, 2, 0, [(1, "UNCOMMITTED")])
+        p_for = seg(h_db, other, None, 3, 0, [(1, "FOREIGN")])
+        set_db(h_db, sid_a, p_ok, ver=5)
+        set_db(h_db, sid_a, p_for, ver=9)
+        for inc in (True, False):
+            rdb = mod.read_session(f"codex:{sid_a}", include_children=inc, full=True, home=h_db)
+            self.assertFalse(rdb["complete"])
+            self.assertTrue(any("sqlite_rollout_sid_conflict" in w for w in rdb["warnings"]))
+            self.assertEqual([e["text"] for s in rdb["sources"] for e in s["events"]], ["COMMITTED"])
+        ldb = mod.list_sessions(["codex"], scan_all=True, home=h_db)
+        self.assertEqual(next(s for s in ldb["sessions"] if s["session_id"] == sid_a)["preview"], "COMMITTED")
+
+        # 6. Ordinal-0 SQLite head + opaque no-ordinal legacy file -> read --no-children keeps legacy file
+        h_mix = self.home / "r5-mixed"
+        p_op = h_mix / ".codex/sessions/16/opaque.jsonl"
+        write_jsonl(p_op, [{"type": "session_meta", "timestamp": "2026-11-16T10:00:00Z", "payload": {"id": sid_a, "timestamp": "2026-11-16T10:00:00Z"}}, {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "LEGACY_KEEP"}]}}])
+        q_res = seg(h_mix, sid_a, rid_1, 18, 0, [(1, "RESET")])
+        set_db(h_mix, sid_a, q_res)
+        rmix = mod.read_session(f"codex:{sid_a}", include_children=False, full=True, home=h_mix)
+        self.assertFalse(rmix["complete"])
+        self.assertEqual([e["text"] for s in rmix["sources"] for e in s["events"]], ["LEGACY_KEEP", "RESET"])
+
+        # 7. Same-dir plain & compressed with different SIDs (and unverifiable plain twin)
+        if shutil.which("zstd"):
+            h_pair = self.home / "r5-samedir-pair"
+            p_plain = h_pair / ".codex/sessions/one/session.jsonl"
+            p_zst = h_pair / ".codex/sessions/one/session.jsonl.zst"
+            write_jsonl(p_plain, [{"ordinal": 0, "type": "session_meta", "payload": {"id": sid_a}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "PLAIN_A"}]}}])
+            write_zstd_jsonl(p_zst, [{"ordinal": 0, "type": "session_meta", "payload": {"id": sid_b}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ZSTD_B"}]}}])
+            set_db(h_pair, sid_b, p_zst, ver=8)
+            lp = mod.list_sessions(["codex"], scan_all=True, home=h_pair)
+            self.assertEqual({s["session_id"] for s in lp["sessions"]}, {sid_a, sid_b})
+            p_plain.write_text(json.dumps({"type": "event_msg", "payload": {"type": "token_count"}}) + "\n", encoding="utf-8")
+            rb = mod.read_session(f"codex:{sid_b}", include_children=False, full=True, home=h_pair)
+            self.assertTrue(rb["complete"])
+            self.assertEqual([e["text"] for s in rb["sources"] for e in s["events"]], ["ZSTD_B"])
+
+    def test_r5_spec_two_fold_dst_iana_budget_ansi_dsh_and_batch_preview_db(self) -> None:
+        from contextlib import closing
+        import sqlite3
+        from unittest import mock
+        import uuid as _uuid
+        import zoneinfo
+        import codex_sessions
+
+        sid_a = "11111111-1111-7111-8111-111111111111"
+        r1 = "22222222-2222-7222-8222-222222222222"
+        r2 = "33333333-3333-7333-8333-333333333333"
+        r3 = "44444444-4444-7444-8444-444444444444"
+
+        # 1. Two missing-UTC segments across NY fall-back fold warn under both America/New_York and Asia/Shanghai
+        h_f = self.home / "r5-two-fold"
+        fdir = h_f / ".codex/sessions/2026/11/01"
+        write_jsonl(fdir / f"rollout-2026-11-01T00-00-00-{sid_a}.jsonl", [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-01T04:00:00Z", "payload": {"id": sid_a}}])
+        write_jsonl(fdir / f"rollout-2026-11-01T01-20-00-{sid_a}_{r1}.jsonl", [{"ordinal": 95, "type": "session_meta", "payload": {"id": sid_a}}])
+        write_jsonl(fdir / f"rollout-2026-11-01T01-30-00-{sid_a}_{r2}.jsonl", [{"ordinal": 90, "type": "session_meta", "payload": {"id": sid_a}}])
+        write_jsonl(fdir / f"rollout-2026-11-01T02-50-00-{sid_a}_{r3}.jsonl", [{"ordinal": 150, "type": "session_meta", "timestamp": "2026-11-01T07:50:00Z", "payload": {"id": sid_a}}])
+        for tz in ("America/New_York", "Asia/Shanghai"):
+            with mock.patch.dict(os.environ, {"TZ": tz}):
+                rf = mod.read_session(f"codex:{sid_a}", include_children=False, home=h_f)
+            self.assertFalse(rf["complete"], tz)
+            self.assertTrue(any("ambiguous_timestamp_order" in w for w in rf["warnings"]), tz)
+
+        # 2. Reading 20 foreign-TZ sessions across 20 distinct hours enumerates IANA zones at most once per year
+        h_tz = self.home / "r5-tz-budget"
+        codex_sessions._iana_year_fold_table.cache_clear()
+        for n in range(20):
+            s = str(_uuid.uuid4())
+            r = str(_uuid.uuid4())
+            hh1 = f"{n:02d}"
+            hh2 = f"{(n + 1) % 24:02d}"
+            write_jsonl(h_tz / f".codex/sessions/2026/07/04/rollout-2026-07-04T{hh1}-00-00-{s}.jsonl", [{"ordinal": 0, "type": "session_meta", "timestamp": f"2026-07-04T{hh1}:00:00Z", "payload": {"id": s}}])
+            write_jsonl(h_tz / f".codex/sessions/2026/07/04/rollout-2026-07-04T{hh2}-00-00-{s}_{r}.jsonl", [{"ordinal": 2, "type": "session_meta", "payload": {"id": s}}])
+        with (
+            mock.patch.dict(os.environ, {"TZ": "Asia/Shanghai"}),
+            mock.patch.object(zoneinfo, "available_timezones", wraps=zoneinfo.available_timezones) as spy_tz,
+        ):
+            ltz = mod.list_sessions(["codex"], scan_all=True, limit=20, home=h_tz)
+        self.assertEqual(ltz["count"], 20)
+        self.assertLessEqual(spy_tz.call_count, 1)
+
+        # 3. 140 ANSI-colored tool/result records (\u001b) do NOT evict real DSH turns in compressed preview
+        if shutil.which("zstd"):
+            h_ansi = self.home / "r5-ansi-dsh"
+            dsh_z = h_ansi / f".dsh/sessions/{sid_a}/session.v4.jsonl.zstd"
+            dsh_rows = [{"type": "session", "id": sid_a, "version": 4, "createdAt": 1000}]
+            dsh_rows.extend({"type": "assistant/message", "data": {"message": {"role": "assistant", "content": [{"type": "text", "text": f"TURN_{i:02d}"}]}}} for i in range(1, 23))
+            for i in range(140):
+                dsh_rows.append({"type": "tool/result", "data": {"message": {"role": "tool", "content": [{"type": "text", "text": "\x1b[31mfile\x1b[0m"}]}}})
+            write_zstd_jsonl(dsh_z, dsh_rows)
+            prev = mod.render_preview(kind="disk", agent="dsh", session_id=sid_a, home=h_ansi, environment={"HOME": str(h_ansi)})
+            self.assertIn("TURN_22", prev)
+            self.assertNotIn("tail preview truncated", prev)
+
+        # 4. Multi-segment list --limit 1 / 8 / 16 opens SQLite only ONCE (batched across cold-pull & preview)
+        h_batch = self.home / "r5-batch-db"
+        (h_batch / ".codex").mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(h_batch / ".codex/state_5.sqlite")) as con, con:
+            con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            for j in range(16):
+                s = str(_uuid.uuid4())
+                r = str(_uuid.uuid4())
+                p1 = h_batch / f".codex/sessions/2026/11/17/rollout-2026-11-17T10-{j:02d}-00-{s}.jsonl"
+                p2 = h_batch / f".codex/sessions/2026/11/18/rollout-2026-11-18T10-{j:02d}-00-{s}_{r}.jsonl"
+                write_jsonl(p1, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-17T10:00:00Z", "payload": {"id": s}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "SAMPLE"}]}}])
+                write_jsonl(p2, [{"ordinal": 2, "type": "session_meta", "timestamp": "2026-11-18T10:00:00Z", "payload": {"id": s, "history_base": {"thread_id": s, "end_ordinal_exclusive": 2, "end_byte_offset": p1.stat().st_size}}}, {"ordinal": 3, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "SAMPLE2"}]}}])
+                con.execute("INSERT INTO threads VALUES (?, ?, ?)", (s, str(p2), int(self.now)))
+        cold_p = h_batch / f".codex/sessions/2026/08/01/rollout-2026-08-01T10-00-00-{r3}.jsonl"
+        write_jsonl(cold_p, [{"ordinal": 0, "type": "session_meta", "payload": {"id": r3}}])
+        old_t = self.now - 86 * 86400
+        os.utime(cold_p, (old_t, old_t))
+        for lim in (1, 8, 16):
+            with mock.patch.object(sqlite3, "connect", wraps=sqlite3.connect) as spy_c:
+                lb = mod.list_sessions(["codex"], days=14, limit=lim, home=h_batch, now=self.now)
+            self.assertEqual(lb["count"], lim)
+            self.assertEqual(spy_c.call_count, 1, f"limit={lim} opened SQLite {spy_c.call_count} times")
 
 
 if __name__ == "__main__":
