@@ -2337,10 +2337,21 @@ def _codex_rollout_candidates(
         candidates.append(Path(rollout_path))
     if thread_id:
         codex_home = _codex_home(environment)
-        for root_name in ("sessions", "archived_sessions"):
-            root = codex_home / root_name
-            if root.is_dir():
-                candidates.extend(root.rglob(f"*-{thread_id}.jsonl"))
+        lib_dir = str(Path(__file__).resolve().parent)
+        if lib_dir not in sys.path:
+            sys.path.insert(0, lib_dir)
+        import codex_sessions
+
+        # Prefer newest rollout segments first so recent turns are found immediately.
+        candidates.extend(
+            reversed(
+                codex_sessions.find_session_rollouts(
+                    thread_id,
+                    codex_home,
+                    verify_header=False,
+                )
+            )
+        )
     return candidates
 
 

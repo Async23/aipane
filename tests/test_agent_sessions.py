@@ -448,6 +448,144 @@ class AgentSessionsTest(unittest.TestCase):
         self.assertEqual(a_att["source_uri"], media_src.as_uri())
         self.assertEqual(Path(a_att["path"]).read_bytes(), jpg_bytes)
 
+    def test_codex_suffixed_segments_archived_cross_day_children_and_large_meta(self) -> None:
+        sid = "12121212-1212-7212-8212-121212121212"
+        seg2_rollout = "34343434-3434-7434-8434-343434343434"
+        seg3_rollout = "56565656-5656-7656-8656-565656565656"
+        child_sid = "78787878-7878-7878-8878-787878787878"
+
+        # Segment 1: archived_sessions with >16KB session_meta header (28KB+ real-world size)
+        seg1 = self.home / ".codex" / "archived_sessions" / f"rollout-2026-11-10T10-00-00-{sid}.jsonl"
+        write_jsonl(
+            seg1,
+            [
+                {
+                    "ordinal": 0,
+                    "type": "session_meta",
+                    "timestamp": "2026-11-10T02:00:00Z",
+                    "payload": {"id": sid, "base_instructions": "X" * 28000},
+                },
+                {
+                    "ordinal": 1,
+                    "type": "response_item",
+                    "timestamp": "2026-11-10T02:00:01Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Segment 1 user message"}],
+                    },
+                },
+            ],
+        )
+        # Segment 2: suffixed rollout in sessions/2026/11/13
+        seg2 = (
+            self.home
+            / ".codex"
+            / "sessions"
+            / "2026"
+            / "11"
+            / "13"
+            / f"rollout-2026-11-13T14-51-42-{sid}_{seg2_rollout}.jsonl"
+        )
+        write_jsonl(
+            seg2,
+            [
+                {
+                    "ordinal": 10,
+                    "type": "session_meta",
+                    "timestamp": "2026-11-13T06:51:42Z",
+                    "payload": {"id": sid},
+                },
+                {
+                    "ordinal": 11,
+                    "type": "response_item",
+                    "timestamp": "2026-11-13T06:51:43Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Segment 2 reply"}],
+                    },
+                },
+            ],
+        )
+        # Segment 3: suffixed rollout on a later day
+        seg3 = (
+            self.home
+            / ".codex"
+            / "sessions"
+            / "2026"
+            / "11"
+            / "23"
+            / f"rollout-2026-11-23T09-46-00-{sid}_{seg3_rollout}.jsonl"
+        )
+        write_jsonl(
+            seg3,
+            [
+                {
+                    "ordinal": 20,
+                    "type": "session_meta",
+                    "timestamp": "2026-11-23T01:46:00Z",
+                    "payload": {"id": sid},
+                },
+                {
+                    "ordinal": 21,
+                    "type": "response_item",
+                    "timestamp": "2026-11-23T01:46:01Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Segment 3 latest reply"}],
+                    },
+                },
+            ],
+        )
+        # Cross-day child subagent with nested source.subagent.thread_spawn.parent_thread_id and >16KB header
+        child = (
+            self.home
+            / ".codex"
+            / "sessions"
+            / "2026"
+            / "11"
+            / "24"
+            / f"rollout-2026-11-24T01-00-00-{child_sid}.jsonl"
+        )
+        write_jsonl(
+            child,
+            [
+                {
+                    "ordinal": 0,
+                    "type": "session_meta",
+                    "timestamp": "2026-11-23T17:00:00Z",
+                    "payload": {
+                        "id": child_sid,
+                        "base_instructions": "Y" * 24000,
+                        "source": {"subagent": {"thread_spawn": {"parent_thread_id": sid}}},
+                    },
+                },
+                {
+                    "ordinal": 1,
+                    "type": "response_item",
+                    "timestamp": "2026-11-23T17:00:01Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Cross-day subagent reply"}],
+                    },
+                },
+            ],
+        )
+
+        res = mod.read_session(f"codex:{sid}", view="timeline", full=True, home=self.home)
+        paths = [Path(s["source_path"]) for s in res["sources"]]
+        self.assertEqual(paths, [seg1, seg2, seg3, child])
+        self.assertEqual(res["sources"][2]["events"][-1]["text"], "Segment 3 latest reply")
+        self.assertEqual(res["sources"][3]["session_id"], child_sid)
+        self.assertEqual(res["sources"][3]["parent"], sid)
+
+        # Suffixed rollout ID must NOT resolve as an independent session ID
+        with self.assertRaises(FileNotFoundError):
+            mod.read_session(f"codex:{seg3_rollout}", view="timeline", home=self.home)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -27,6 +27,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
+_LIB_DIR = str(Path(__file__).resolve().parent)
+if _LIB_DIR not in sys.path:
+    sys.path.insert(0, _LIB_DIR)
+
+import codex_sessions  # noqa: E402
+
 ALL_AGENTS = ("claude", "codex", "dsh", "grok", "pi", "kimi", "antigravity")
 AGENT_ALIASES = {
     "agy": "antigravity",
@@ -103,7 +109,7 @@ def agent_roots(agent: str, home: Path | None = None) -> list[tuple[Path, dict[s
     h = home or Path.home()
     if agent == "codex":
         base = Path(os.environ.get("CODEX_HOME") or (h / ".codex"))
-        return [(base / "sessions", {})]
+        return [(root, {}) for root in codex_sessions.codex_session_roots(base)]
     if agent == "claude":
         base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (h / ".claude"))
         return [(base / "projects", {})]
@@ -153,7 +159,11 @@ def discover_agent_files(agent: str, home: Path | None = None) -> list[SessionFi
                 if not p.is_file():
                     continue
                 m = UUID_RE.findall(p.stem)
-                sid = m[-1] if m else p.stem
+                if len(m) == 1 and p.stem.startswith("rollout-"):
+                    sid = m[0]
+                else:
+                    meta = codex_sessions.read_rollout_meta(p, max_lines=1)
+                    sid = meta["sid"] if meta else (m[0] if m else p.stem)
                 st = p.stat()
                 found.append(SessionFile("codex", sid, p, st.st_mtime, st.st_size))
 
@@ -475,8 +485,8 @@ def extract_preview(sf: SessionFile) -> str:
     return ""
 
 
-def read_first_json(path: Path) -> dict[str, Any] | None:
-    for line in read_head_lines(path, max_lines=3, max_bytes=16384):
+def read_first_json(path: Path, max_bytes: int = 524288) -> dict[str, Any] | None:
+    for line in read_head_lines(path, max_lines=3, max_bytes=max_bytes):
         line = line.strip()
         if not line:
             continue
@@ -486,6 +496,16 @@ def read_first_json(path: Path) -> dict[str, Any] | None:
                 return d
         except Exception:
             return None
+    return None
+
+
+def _codex_date_dir_key(path: Path) -> tuple[int, int, int] | None:
+    """Extract (YYYY, MM, DD) from `.../sessions/YYYY/MM/DD/file.jsonl` when present."""
+    parts = path.parts
+    if len(parts) >= 5 and parts[-5] == "sessions":
+        y, m, d = parts[-4], parts[-3], parts[-2]
+        if len(y) == 4 and len(m) == 2 and len(d) == 2 and y.isdigit() and m.isdigit() and d.isdigit():
+            return (int(y), int(m), int(d))
     return None
 
 
@@ -552,10 +572,54 @@ def resolve_session_sources(
         )
 
     target_agent = matched_agents[0]
-    # Primary sources first (non-subagent first, then path order)
-    matches.sort(key=lambda s: (s.is_subagent, str(s.path)))
+    if target_agent == "codex":
+        # Verify authoritative header session_id and sort segments earliest -> latest.
+        verified_pairs: list[tuple[dict[str, Any] | None, SessionFile]] = []
+        seen_resolved: set[Path] = set()
+        for m in matches:
+            try:
+                resolved = m.path.resolve()
+            except OSError:
+                resolved = m.path
+            if resolved in seen_resolved:
+                continue
+            meta = codex_sessions.read_rollout_meta(m.path, max_lines=1)
+            if meta is not None and meta["sid"] != session_id:
+                continue
+            seen_resolved.add(resolved)
+            verified_pairs.append((meta, m))
+        # Ensure we didn't miss any segment whose filename did not match fast-path heuristics.
+        h = home or Path.home()
+        codex_home = Path(os.environ.get("CODEX_HOME") or (h / ".codex"))
+        for extra_path in codex_sessions.find_session_rollouts(session_id, codex_home):
+            try:
+                resolved = extra_path.resolve()
+            except OSError:
+                resolved = extra_path
+            if resolved in seen_resolved:
+                continue
+            seen_resolved.add(resolved)
+            st = extra_path.stat()
+            meta = codex_sessions.read_rollout_meta(extra_path, max_lines=1)
+            verified_pairs.append(
+                (meta, SessionFile("codex", session_id, extra_path, st.st_mtime, st.st_size))
+            )
+        if not verified_pairs:
+            raise FileNotFoundError(f"session not found: {session_id}")
+        path_to_sf = {sf.path: sf for _, sf in verified_pairs}
+        ordered = codex_sessions.sort_rollout_entries([(meta, sf.path) for meta, sf in verified_pairs])
+        matches = [path_to_sf[p] for _, p in ordered]
+    else:
+        # Primary sources first (non-subagent first, then path order)
+        matches.sort(key=lambda s: (s.is_subagent, str(s.path)))
     result: list[SessionFile] = list(matches)
-    seen_paths: set[Path] = {m.path for m in result}
+    seen_paths: set[Path] = set()
+    for m in result:
+        seen_paths.add(m.path)
+        try:
+            seen_paths.add(m.path.resolve())
+        except OSError:
+            pass
 
     if not include_children:
         return result
@@ -590,36 +654,52 @@ def resolve_session_sources(
                     queue.append(child.session_id)
 
     elif target_agent == "codex":
-        # Check same-day directory and immediate siblings for parent_thread_id / forked_from_id
-        candidate_dirs = {m.path.parent for m in matches}
-        queue = [m.session_id for m in matches]
+        # Traverse child/forked sessions across day directories and archived_sessions.
+        # Only prune sessions/YYYY/MM/DD entries strictly older than the earliest parent date.
+        parent_dates = [_codex_date_dir_key(m.path) for m in matches]
+        min_parent_date = min(parent_dates) if parent_dates and all(d is not None for d in parent_dates) else None
+        queue = list(dict.fromkeys(m.session_id for m in matches))
         visited_ids = set(queue)
-        dir_files = [
-            sf for sf in all_agent_files if sf.path.parent in candidate_dirs and sf.path not in seen_paths
-        ]
-        headers: list[tuple[SessionFile, str]] = []
-        for sf in dir_files:
-            hdr = read_first_json(sf.path)
-            if not hdr or hdr.get("type") != "session_meta":
+        children_by_parent: dict[str, list[tuple[dict[str, Any] | None, SessionFile]]] = {}
+        for sf in all_agent_files:
+            try:
+                sf_resolved = sf.path.resolve()
+            except OSError:
+                sf_resolved = sf.path
+            if sf.path in seen_paths or sf_resolved in seen_paths:
                 continue
-            payload = hdr.get("payload") or {}
-            pid = (
-                payload.get("parent_thread_id")
-                or payload.get("forked_from_id")
-                or payload.get("parent_session_id")
-            )
+            if min_parent_date is not None:
+                cdate = _codex_date_dir_key(sf.path)
+                if cdate is not None and cdate < min_parent_date:
+                    continue
+            meta = codex_sessions.read_rollout_meta(sf.path, max_lines=1)
+            if not meta:
+                continue
+            pid = meta.get("parent_id")
             if isinstance(pid, str) and pid:
-                headers.append((sf, pid))
+                # Trust authoritative header sid on child segments too.
+                sf = SessionFile("codex", meta["sid"], sf.path, sf.mtime, sf.size_bytes, True, pid)
+                children_by_parent.setdefault(pid, []).append((meta, sf))
         while queue:
             cur = queue.pop(0)
-            for sf, pid in headers:
-                if pid == cur and sf.path not in seen_paths:
-                    sf.parent_id = pid
-                    result.append(sf)
-                    seen_paths.add(sf.path)
-                    if sf.session_id not in visited_ids:
-                        visited_ids.add(sf.session_id)
-                        queue.append(sf.session_id)
+            child_entries = children_by_parent.get(cur, [])
+            if not child_entries:
+                continue
+            path_to_child = {sf.path: sf for _, sf in child_entries}
+            for _, p in codex_sessions.sort_rollout_entries([(meta, sf.path) for meta, sf in child_entries]):
+                sf = path_to_child[p]
+                try:
+                    sf_resolved = sf.path.resolve()
+                except OSError:
+                    sf_resolved = sf.path
+                if sf.path in seen_paths or sf_resolved in seen_paths:
+                    continue
+                result.append(sf)
+                seen_paths.add(sf.path)
+                seen_paths.add(sf_resolved)
+                if sf.session_id not in visited_ids:
+                    visited_ids.add(sf.session_id)
+                    queue.append(sf.session_id)
 
     elif target_agent == "pi":
         candidate_dirs = {m.path.parent for m in matches}

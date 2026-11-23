@@ -1150,6 +1150,22 @@ class AgentNotificationsTests(unittest.TestCase):
         self.assertEqual(result.outcome, "failed")
         self.assertEqual(result.channel, "sender-missing")
 
+    def test_codex_rollout_candidates_include_suffixed_segments_newest_first(self) -> None:
+        from agent_notifications import _codex_rollout_candidates
+
+        codex_home = self.home / ".codex"
+        sid = "11111111-1111-7111-8111-111111111111"
+        r2 = "22222222-2222-7222-8222-222222222222"
+        seg1 = codex_home / "sessions/2026/11/10" / f"rollout-2026-11-10T10-00-00-{sid}.jsonl"
+        seg2 = codex_home / "sessions/2026/11/16" / f"rollout-2026-11-16T13-06-46-{sid}_{r2}.jsonl"
+        seg1.parent.mkdir(parents=True, exist_ok=True)
+        seg2.parent.mkdir(parents=True, exist_ok=True)
+        seg1.write_text(json.dumps({"ordinal": 0, "type": "session_meta", "payload": {"id": sid}}) + "\n", encoding="utf-8")
+        seg2.write_text(json.dumps({"ordinal": 100, "type": "session_meta", "payload": {"id": sid}}) + "\n", encoding="utf-8")
+
+        candidates = _codex_rollout_candidates(sid, {"CODEX_HOME": str(codex_home)})
+        self.assertEqual([c.resolve() for c in candidates], [seg2.resolve(), seg1.resolve()])
+
 
 if __name__ == "__main__":
     unittest.main()
