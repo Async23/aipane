@@ -1249,10 +1249,10 @@ class SessionRestoreTests(unittest.TestCase):
                 plan_p = json.loads(res_p.stdout.strip().splitlines()[-1])
                 self.assertEqual(plan_p["kind"], "resume", mode)
                 self.assertTrue(plan_p["restorable"], mode)
-                if mode in ("explicit_encoded_subdir", "opaque_renamed"):
-                    self.assertIn("--session ", plan_p["command"], mode)
-                else:
-                    self.assertIn("--session-id ", plan_p["command"], mode)
+                # Explicit PI_CODING_AGENT_SESSION_DIR and opaque/renamed layouts always
+                # pin `--session <verified_path>` so target shells without planner-only
+                # env vars or with duplicate SIDs open the exact verified file.
+                self.assertIn("--session ", plan_p["command"], mode)
                 if pi_bin.is_file():
                     rpc_args = shlex.split(plan_p["command"])[1:]
                     proc = subprocess.Popen(
@@ -1288,6 +1288,146 @@ class SessionRestoreTests(unittest.TestCase):
                             more, err = proc.communicate()
                     self.assertIn(f"PI_MARKER_{mode}".encode(), out + more, f"{mode}: err={err!r}")
                     self.assertNotIn(b"creating a new session", err, mode)
+
+    def test_r4_p1_codex_noncanonical_with_old_uuid_and_pi_duplicates_session_jsonl_settings_dir(self):
+        import select
+        import shlex
+        import time
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp).resolve()
+            home = root / "home"
+            home.mkdir()
+
+            # 1. Codex: non-canonical names carrying old argv UUID A but header B must keep B invalid
+            sid_a = "11111111-1111-7111-8111-111111111111"
+            sid_b = "22222222-2222-7222-8222-222222222222"
+            for idx_n, noncanon_name in enumerate((f"rollout-copy-{sid_a}.jsonl", f"rollout-{sid_a}-backup.jsonl")):
+                cwd_codex = root / f"codex-work-{idx_n}"
+                cwd_codex.mkdir()
+                body_b = (
+                    json.dumps({"type": "session_meta", "payload": {"id": sid_b, "cwd": str(cwd_codex)}}) + "\n"
+                    + json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "CURRENT_B"}]}}) + "\n"
+                )
+                res = self.run_restore(
+                    cwd_codex,
+                    coord={"sid": sid_b, "tool": "x"},
+                    title="codex",
+                    saved_codex_ids={sid_a},
+                    saved_codex_records={f"sessions/d/{noncanon_name}": body_b},
+                    plan_json=True,
+                    current_command="codex",
+                    full_command=f"codex resume {sid_a}",
+                    extra_env={"HOME": str(home)},
+                )
+                self.assertEqual(res.returncode, 0, res.stderr)
+                plan = json.loads(res.stdout.strip().splitlines()[-1])
+                self.assertEqual(plan["kind"], "invalid", noncanon_name)
+                self.assertEqual(plan["sid"], sid_b, noncanon_name)
+
+            # 2. Pi: duplicate SID in default native dir, session.jsonl, settings.json sessionDir,
+            #    and planner-only PI_CODING_AGENT_SESSION_DIR all pin `--session <verified_path>`.
+            pi_sid = "87878787-8787-7787-8787-878787878787"
+            pi_bin = Path("/opt/homebrew/bin/pi")
+
+            def write_pi(p: Path, cwd: Path, marker: str) -> None:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(
+                    json.dumps({"type": "session", "version": 3, "id": pi_sid, "cwd": str(cwd), "timestamp": "2026-11-23T09:01:27.117Z"}) + "\n"
+                    + json.dumps({"type": "message", "id": "abcdef12", "parentId": None, "timestamp": "2026-11-23T09:02:27.117Z", "message": {"role": "user", "content": [{"type": "text", "text": marker}], "timestamp": 1795400000000}}) + "\n",
+                    encoding="utf-8",
+                )
+
+            for layout in ("duplicate", "opaque_session", "settings_sessionDir", "planner_only_flat"):
+                case_dir = root / f"case-{layout}"
+                agent = case_dir / "pi"
+                work = case_dir / "work"
+                wrong = case_dir / "wrong"
+                for d in (agent, work, wrong):
+                    d.mkdir(parents=True)
+                native_dir = agent / "sessions" / self._pi_encoded_dir(work)
+                extra_env = {
+                    "HOME": str(home),
+                    "PI_CODING_AGENT_DIR": str(agent),
+                    "PI_OFFLINE": "1",
+                    "PI_SKIP_VERSION_CHECK": "1",
+                    "XDG_CONFIG_HOME": str(home / ".config"),
+                    "TERM": "dumb",
+                    "AIPANE_PI_LAUNCH_CMD": "pi",
+                }
+                if layout == "duplicate":
+                    write_pi(native_dir / f"2026-11-18T00-00-00-000Z_{pi_sid}.jsonl", wrong, "WRONG_CWD")
+                    good = native_dir / f"2026-11-23T00-00-00-000Z_{pi_sid}.jsonl"
+                elif layout == "opaque_session":
+                    good = agent / "sessions/--migrated--/session.jsonl"
+                elif layout == "settings_sessionDir":
+                    conf = case_dir / "configured"
+                    conf.mkdir()
+                    (agent / "settings.json").write_text(json.dumps({"sessionDir": str(conf)}), encoding="utf-8")
+                    good = native_dir / f"2026-11-23T00-00-00-000Z_{pi_sid}.jsonl"
+                else:
+                    flat = case_dir / "flat"
+                    flat.mkdir()
+                    extra_env["PI_CODING_AGENT_SESSION_DIR"] = str(flat)
+                    good = flat / f"2026-11-23T09-01-27-117Z_{pi_sid}.jsonl"
+                write_pi(good, work, "RIGHT_CWD")
+
+                q = self.run_restore(
+                    work,
+                    coord={"tool": "p", "sid": pi_sid},
+                    title="pi",
+                    saved_codex_ids=set(),
+                    full_command="pi",
+                    current_command="pi",
+                    plan_json=True,
+                    extra_env=extra_env,
+                )
+                self.assertEqual(q.returncode, 0, q.stderr)
+                plan = json.loads(q.stdout.strip().splitlines()[-1])
+                self.assertEqual(plan["kind"], "resume", layout)
+                self.assertTrue(plan["restorable"], layout)
+                self.assertIn("--session ", plan["command"], layout)
+                self.assertIn(str(good.resolve()), plan["command"], layout)
+
+                if pi_bin.is_file():
+                    rpc_args = shlex.split(plan["command"])[1:]
+                    # Drop planner-only PI_CODING_AGENT_SESSION_DIR to verify target shell independence
+                    target_env = {k: v for k, v in extra_env.items() if k != "PI_CODING_AGENT_SESSION_DIR"}
+                    target_env["PATH"] = os.environ["PATH"]
+                    proc = subprocess.Popen(
+                        [str(pi_bin), "--mode", "rpc", "--offline", "--no-extensions", "--no-skills", *rpc_args],
+                        cwd=work,
+                        env=target_env,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    try:
+                        assert proc.stdin is not None and proc.stdout is not None
+                        proc.stdin.write(b'{"type":"get_messages","id":"m"}\n')
+                        proc.stdin.flush()
+                        out = b""
+                        deadline = time.monotonic() + 8.0
+                        while time.monotonic() < deadline:
+                            ready, _, _ = select.select([proc.stdout], [], [], max(0.0, deadline - time.monotonic()))
+                            if not ready:
+                                break
+                            chunk = os.read(proc.stdout.fileno(), 65536)
+                            if not chunk:
+                                break
+                            out += chunk
+                            if b'"command":"get_messages"' in out:
+                                break
+                    finally:
+                        proc.terminate()
+                        try:
+                            more, err = proc.communicate(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            more, err = proc.communicate()
+                    self.assertIn(b"RIGHT_CWD", out + more, f"{layout}: err={err!r}")
+                    self.assertNotIn(b"WRONG_CWD", out + more, layout)
+                    self.assertNotIn(b"creating a new session", err, layout)
 
 
 if __name__ == "__main__":

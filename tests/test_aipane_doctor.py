@@ -497,6 +497,29 @@ class AipaneDoctorTests(unittest.TestCase):
         self.assertIn("codex_sqlite_sid_mismatch", result.stdout)
         self.assertIn("codex_sqlite_rollout_header_invalid", result.stdout)
 
+    def test_r4_p1_deleted_noncanonical_sqlite_head_not_substituted_by_same_basename_sibling(self) -> None:
+        import sqlite3
+        from contextlib import closing
+
+        self.configure_core()
+        codex_home = self.home / ".codex"
+        sid = "88888888-8888-7888-8888-888888888888"
+        old_shard = codex_home / "sessions/old-shard/session.jsonl"
+        new_shard = codex_home / "sessions/new-shard/session.jsonl"
+        old_shard.parent.mkdir(parents=True, exist_ok=True)
+        new_shard.parent.mkdir(parents=True, exist_ok=True)
+        old_shard.write_text(json.dumps({"ordinal": 0, "type": "session_meta", "payload": {"id": sid}}) + "\n", encoding="utf-8")
+        new_shard.write_text(json.dumps({"ordinal": 0, "type": "session_meta", "payload": {"id": sid}}) + "\n", encoding="utf-8")
+        with closing(sqlite3.connect(codex_home / "state_8.sqlite")) as conn, conn:
+            conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid, str(new_shard), int(time.time())))
+
+        self.assertEqual(self.run_doctor(CODEX_HOME=str(codex_home)).returncode, 0)
+        new_shard.unlink()
+        failed = self.run_doctor(CODEX_HOME=str(codex_home))
+        self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+        self.assertIn("codex_sqlite_rollout_missing", failed.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

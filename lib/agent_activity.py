@@ -2309,19 +2309,43 @@ class AgentActivity:
                 reported=True,
                 reason="legacy_codex_binding_missing",
             )
-        codex_home = Path(
-            self.environment.get("CODEX_HOME")
-            or Path(self.environment.get("HOME", str(Path.home()))) / ".codex"
-        ).expanduser()
         session_id = str(binding["sid"])
         lib_dir = str(Path(__file__).resolve().parent)
         if lib_dir not in sys.path:
             sys.path.insert(0, lib_dir)
         import codex_sessions
 
-        transcript = codex_sessions.resolve_committed_head(
+        pane_codex_home: Path | None = None
+        if pane.pane_tty:
+            live_cur = codex_sessions.current_session(
+                pane.pane_tty, preferred_sid=session_id
+            )
+            if live_cur and live_cur.get("codex_home"):
+                pane_codex_home = Path(str(live_cur["codex_home"])).expanduser()
+        if pane_codex_home is None and pane.pane_pid.isdigit():
+            pid_int = int(pane.pane_pid)
+            if pid_int != os.getpid() and codex_sessions.process_is_codex(pid_int):
+                proc_home = codex_sessions.process_codex_home(pid_int)
+                if proc_home:
+                    pane_codex_home = Path(proc_home).expanduser()
+        if pane_codex_home is None:
+            reg_home = binding.get("codex_home")
+            if isinstance(reg_home, str) and reg_home.strip():
+                pane_codex_home = Path(reg_home.strip()).expanduser()
+        codex_home = pane_codex_home or Path(
+            self.environment.get("CODEX_HOME")
+            or Path(self.environment.get("HOME", str(Path.home()))) / ".codex"
+        ).expanduser()
+
+        transcript, sqlite_conflict = codex_sessions.resolve_committed_head_detailed(
             session_id, codex_home, verify_header=False
         )
+        if sqlite_conflict:
+            return ActivityView(
+                state="unknown",
+                reported=True,
+                reason="legacy_codex_sqlite_conflict",
+            )
         if transcript is None:
             return ActivityView(
                 state="unknown",
@@ -2496,13 +2520,42 @@ class AgentActivity:
             except (OSError, sqlite3.Error):
                 exact = latest = projection = None
 
+        def _guard_idle(
+            state: str, reason: str, evidence_turn_id: str
+        ) -> tuple[str, str, str]:
+            if state != "idle":
+                return state, reason, evidence_turn_id
+            committed, sqlite_conflict = codex_sessions.resolve_committed_head_detailed(
+                str(session_id), codex_home, verify_header=False
+            )
+            if sqlite_conflict:
+                return "unknown", "codex_sqlite_conflict", evidence_turn_id
+            if (
+                committed is not None
+                and codex_sessions.path_identity_key(committed)
+                != codex_sessions.path_identity_key(transcript)
+            ):
+                c_state, c_reason, c_turn = self._resolve_codex_rollout(
+                    codex_home,
+                    committed,
+                    str(session_id),
+                    "",
+                    reported_at,
+                )
+                if c_state == "busy":
+                    return c_state, c_reason, c_turn
+                return "unknown", "codex_transcript_mismatch", evidence_turn_id
+            return state, reason, evidence_turn_id
+
         if is_compressed or not projection or projection[0] != transcript_size:
-            return self._resolve_codex_rollout(
-                codex_home,
-                transcript,
-                str(session_id),
-                str(turn_id),
-                reported_at,
+            return _guard_idle(
+                *self._resolve_codex_rollout(
+                    codex_home,
+                    transcript,
+                    str(session_id),
+                    str(turn_id),
+                    reported_at,
+                )
             )
         if latest is None and not turn_id:
             goal = self._goal_state(codex_home, str(session_id))
@@ -2510,14 +2563,16 @@ class AgentActivity:
                 return "busy", "codex_goal_active", ""
             if goal == "unknown":
                 return "unknown", "codex_goal_unknown", ""
-            return "idle", "codex_session_idle", ""
+            return _guard_idle("idle", "codex_session_idle", "")
         if (turn_id and exact is None) or latest is None:
-            return self._resolve_codex_rollout(
-                codex_home,
-                transcript,
-                str(session_id),
-                str(turn_id),
-                reported_at,
+            return _guard_idle(
+                *self._resolve_codex_rollout(
+                    codex_home,
+                    transcript,
+                    str(session_id),
+                    str(turn_id),
+                    reported_at,
+                )
             )
 
         latest_turn_id, _ordinal, status, completed_at = latest
@@ -2539,7 +2594,7 @@ class AgentActivity:
             return "busy", "codex_goal_active", str(latest_turn_id)
         if goal == "unknown":
             return "unknown", "codex_goal_unknown", str(latest_turn_id)
-        return "idle", f"codex_turn_{status}", str(latest_turn_id)
+        return _guard_idle("idle", f"codex_turn_{status}", str(latest_turn_id))
 
     def _resolve_codex_rollout(
         self,

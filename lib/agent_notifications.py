@@ -2342,38 +2342,67 @@ def _codex_rollout_candidates(
     environment: Mapping[str, str],
     rollout_path: str = "",
 ) -> list[Path]:
-    candidates: list[Path] = []
+    """Return identity-verified, effective committed rollouts for `thread_id` (newest first).
+
+    Never accepts headerless, oversized, malformed, or foreign-SID files, and when
+    a verified committed head exists, follows its effective lineage so uncommitted
+    sibling rollouts cannot inject foreign or stale Goal context.
+    """
     codex_home = _codex_home(environment)
     lib_dir = str(Path(__file__).resolve().parent)
     if lib_dir not in sys.path:
         sys.path.insert(0, lib_dir)
     import codex_sessions
 
+    verified_anchor: Path | None = None
     if rollout_path:
         raw_p = Path(rollout_path).expanduser()
         resolved = codex_sessions.resolve_alternate_rollout_path(raw_p, codex_home)
         if resolved is not None:
             meta, err = codex_sessions.read_rollout_meta_detailed(resolved, max_lines=1)
-            # Require verified SID identity; reject oversized/corrupt/unreadable headers
-            # and foreign SIDs. Allow headerless fixtures only when filename carries thread_id.
-            if not thread_id:
-                candidates.append(resolved)
-            elif err is None and meta is not None and meta.get("sid") == thread_id:
-                candidates.append(resolved)
-            elif err == "missing_meta" and thread_id in resolved.name:
-                candidates.append(resolved)
-    if thread_id:
-        # Prefer newest rollout segments first so recent turns are found immediately.
-        candidates.extend(
-            reversed(
-                codex_sessions.find_session_rollouts(
-                    thread_id,
-                    codex_home,
-                    verify_header=False,
-                )
-            )
+            if err is None and meta is not None and (not thread_id or meta.get("sid") == thread_id):
+                verified_anchor = resolved
+
+    if not thread_id:
+        return [verified_anchor] if verified_anchor is not None else []
+
+    if verified_anchor is None:
+        committed, conflict = codex_sessions.resolve_committed_head_detailed(
+            thread_id, codex_home, verify_header=True
         )
-    return candidates
+        if conflict:
+            return []
+        verified_anchor = committed
+
+    dir_rollouts = codex_sessions.find_session_rollouts(
+        thread_id,
+        codex_home,
+        verify_header=True,
+    )
+    all_cands: list[Path] = list(dir_rollouts)
+    if verified_anchor is not None and verified_anchor not in all_cands:
+        all_cands.append(verified_anchor)
+    if not all_cands:
+        return []
+
+    effective, _, _ = codex_sessions.resolve_effective_lineage(
+        thread_id,
+        all_cands,
+        sqlite_path=verified_anchor,
+        codex_home=codex_home,
+    )
+    ordered: list[Path] = []
+    for seg in reversed(effective):
+        seg_path = seg.get("path")
+        seg_meta = seg.get("meta")
+        if (
+            isinstance(seg_path, Path)
+            and isinstance(seg_meta, dict)
+            and seg_meta.get("sid") == thread_id
+            and seg_path not in ordered
+        ):
+            ordered.append(seg_path)
+    return ordered
 
 
 def _codex_query_goal(
@@ -2461,9 +2490,10 @@ def _codex_turn_has_goal_context(
         if codex_sessions.is_compressed_rollout(resolved):
             # Stream compressed rollouts forward in O(1) memory, resetting on each
             # task_started for turn_id so only the latest attempt of turn_id counts.
+            # Use strict=True so corrupt/trailing-garbage zstd streams never suppress alerts.
             found_goal = False
             try:
-                for line in codex_sessions.iter_rollout_lines(resolved):
+                for line in codex_sessions.iter_rollout_lines(resolved, strict=True):
                     if turn_id not in line:
                         continue
                     stripped = line.strip()
@@ -2492,6 +2522,7 @@ def _codex_turn_has_goal_context(
                         if _GOAL_CONTEXT_RE.search(text) or "<goal_context>" in text:
                             found_goal = True
             except OSError:
+                found_goal = False
                 continue
             if found_goal:
                 return True

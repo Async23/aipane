@@ -444,58 +444,14 @@ def _codex_rollout_meta(path_str: str) -> dict[str, str] | None:
     }
 
 
-def _extract_env_var_from_ps(ps_line: str, var_name: str) -> str:
-    """Extract an env var value from `ps eww -o command=` without splitting on spaces."""
-    if not ps_line or not var_name:
-        return ""
-    m = re.search(
-        rf"(?:^|\s){re.escape(var_name)}=(.*?)(?=\s+[A-Za-z_][A-Za-z0-9_]*=|$)",
-        ps_line.rstrip("\r\n"),
-    )
-    if not m:
-        return ""
-    return m.group(1).strip()
-
-
-def _read_process_ps_eww(pid: int) -> str:
-    if pid <= 0:
-        return ""
-    try:
-        res = subprocess.run(
-            ["ps", "eww", "-o", "command=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            timeout=1,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    if res.returncode != 0 or not res.stdout:
-        return ""
-    return res.stdout.rstrip("\r\n")
-
-
 def _process_env_var(pid: int, var_name: str) -> str:
-    """Best-effort read of an environment variable from a live process via `ps eww`."""
-    return _extract_env_var_from_ps(_read_process_ps_eww(pid), var_name)
+    """Read an environment variable from a live process via kernel envp (never argv)."""
+    return codex_sessions.process_env_var(pid, var_name)
 
 
 def _process_codex_home(pid: int) -> str:
-    """Resolve verified CODEX_HOME for a live Codex process via `ps eww`.
-
-    Returns resolved `CODEX_HOME` if set, else `<HOME>/.codex` when `HOME` is
-    visible in the process environment (confirming `CODEX_HOME` is unset), else `""`.
-    """
-    ps_line = _read_process_ps_eww(pid)
-    if not ps_line:
-        return ""
-    chome = _extract_env_var_from_ps(ps_line, "CODEX_HOME")
-    if chome:
-        return str(Path(chome).expanduser().resolve())
-    home_val = _extract_env_var_from_ps(ps_line, "HOME")
-    if home_val:
-        return str((Path(home_val).expanduser() / ".codex").resolve())
-    return ""
+    """Resolve verified CODEX_HOME for a live Codex process via kernel envp."""
+    return codex_sessions.process_codex_home(pid)
 
 
 def _pick_preferred_rollout_rec(
@@ -938,9 +894,14 @@ def _resolve_single_raw_pane(
             elif reg_rec.get("tool") in {"x", "codex"} and reg_rec.get("sid") == preferred:
                 sid = preferred
                 authority = "registry"
-                reg_chome = str(reg_rec.get("codex_home") or "")
-                if reg_chome:
-                    storage_root = str(Path(reg_chome).expanduser().resolve())
+                tty_pids = codex_tty_pids.get(pane.short_tty, [])
+                proc_chome = _process_codex_home(tty_pids[0]) if len(tty_pids) == 1 else ""
+                if proc_chome:
+                    storage_root = proc_chome
+                else:
+                    reg_chome = str(reg_rec.get("codex_home") or "")
+                    if reg_chome:
+                        storage_root = str(Path(reg_chome).expanduser().resolve())
             if sid and not storage_root and not active_path:
                 tty_pids = codex_tty_pids.get(pane.short_tty, [])
                 if len(tty_pids) == 1:

@@ -1911,6 +1911,111 @@ class AgentActivityTests(unittest.TestCase):
                 self.assertEqual(view_zst.state, "busy")
                 self.assertEqual(view_zst.evidence, "turn-busy-1")
 
+    def test_r4_p1_modern_and_legacy_codex_activity_guard_committed_head_multi_db_and_pane_root(self) -> None:
+        from contextlib import closing
+        import shutil
+        import sqlite3
+        import codex_sessions
+
+        sid = "89898989-1111-7898-8898-898989898989"
+        foreign_sid = "90909090-2222-7909-8909-909090909090"
+        rid_old = "aaaaaaaa-3333-7aaa-8aaa-aaaaaaaaaaaa"
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp).resolve()
+            home = root / "home"
+            codex_home = home / ".codex"
+            sdir = codex_home / "sessions/2026/11/23"
+            sdir.mkdir(parents=True, exist_ok=True)
+
+            # Active committed rollout running a new turn
+            committed = sdir / f"rollout-2026-11-23T00-00-01-{sid}.jsonl"
+            committed.write_text(
+                json.dumps({"ordinal": 0, "type": "session_meta", "payload": {"id": sid, "cwd": str(home), "source": "cli"}}) + "\n"
+                + json.dumps({"ordinal": 1, "type": "event_msg", "payload": {"type": "task_started", "turn_id": "active-new-turn"}}) + "\n",
+                encoding="utf-8",
+            )
+            with closing(sqlite3.connect(codex_home / "state_5.sqlite")) as conn, conn:
+                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+                conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid, str(committed), 1_795_400_000))
+
+            # 1. Structured hook pointed to an older rollout whose turn finished & was archived to .zst,
+            #    while SQLite committed head is running `active-new-turn`. Must stay BUSY (never IDLE).
+            past = sdir / f"rollout-2026-11-22T22-00-00-{sid}_{rid_old}.jsonl"
+            past.write_text(
+                json.dumps({"ordinal": 0, "type": "session_meta", "payload": {"id": sid, "cwd": str(home), "source": "cli"}}) + "\n"
+                + json.dumps({"ordinal": 1, "type": "event_msg", "payload": {"type": "task_started", "turn_id": "previous-turn"}}) + "\n"
+                + json.dumps({"ordinal": 2, "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "previous-turn", "completed_at": 1_795_400_100_000}}) + "\n",
+                encoding="utf-8",
+            )
+            if shutil.which("zstd"):
+                zpast = Path(f"{past}.zst")
+                subprocess.run([codex_sessions.zstd_binary(), "-q", "-o", str(zpast)], input=past.read_bytes(), check=True)
+                past.unlink()
+            pane_mod = PaneActivity(
+                pane_id="%9",
+                current_command="codex",
+                pane_tty="/dev/ttys099",
+                socket_path="/private/tmp/tmux-test",
+                server_pid="999",
+                pane_pid="9999",
+            )
+            mod_activity, _ = self.activity_for(
+                pane_mod,
+                environment={"HOME": str(home), "CODEX_HOME": str(codex_home)},
+            )
+            state, reason, ev_turn = mod_activity._resolve_codex(
+                {
+                    "session_id": sid,
+                    "turn_id": "previous-turn",
+                    "transcript_path": str(past),
+                    "codex_home": str(codex_home),
+                },
+                1_795_400_000_000,
+            )
+            self.assertEqual(state, "busy")
+            self.assertEqual(reason, "codex_rollout_turn_in_progress")
+            self.assertEqual(ev_turn, "active-new-turn")
+
+            # 2. Legacy multi-DB: higher state_10.sqlite points to foreign SID, missing file, or corrupt DB;
+            #    must still recover valid busy head from state_5.sqlite instead of flipping idle.
+            resolver, pane = self.legacy_resolver_and_pane(home, sid)
+            foreign_file = codex_home / "future/opaque.jsonl"
+            foreign_file.parent.mkdir(parents=True, exist_ok=True)
+            foreign_file.write_text(
+                json.dumps({"ordinal": 0, "type": "session_meta", "payload": {"id": foreign_sid}}) + "\n",
+                encoding="utf-8",
+            )
+            db10 = codex_home / "state_10.sqlite"
+            for bad_target in (foreign_file, foreign_file.parent / "absent.jsonl"):
+                db10.unlink(missing_ok=True)
+                with closing(sqlite3.connect(db10)) as conn, conn:
+                    conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+                    conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid, str(bad_target), 1_795_400_500))
+                view = resolver.inspect(pane.pane_id)
+                self.assertEqual(view.state, "busy", bad_target)
+                self.assertEqual(view.evidence, "active-new-turn")
+            db10.write_bytes(b"not a sqlite database")
+            self.assertEqual(resolver.inspect(pane.pane_id).state, "busy")
+            db10.unlink()
+
+            # 3. Caller's CODEX_HOME has an idle copy of `sid`, while pane binding points to busy `codex_home`.
+            caller_home = root / "reader profile"
+            caller_idle = caller_home / "sessions/2026/11/23" / f"rollout-2026-11-23T00-00-01-{sid}.jsonl"
+            caller_idle.parent.mkdir(parents=True, exist_ok=True)
+            caller_idle.write_text(
+                json.dumps({"ordinal": 0, "type": "session_meta", "payload": {"id": sid, "cwd": str(home), "source": "cli"}}) + "\n",
+                encoding="utf-8",
+            )
+            with closing(sqlite3.connect(caller_home / "state_5.sqlite")) as conn, conn:
+                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+                conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid, str(caller_idle), 1_795_400_000))
+            reg_path = Path(resolver.environment["AIPANE_REGISTRY"])
+            reg_rec = json.loads(reg_path.read_text(encoding="utf-8").strip())
+            reg_rec["codex_home"] = str(codex_home)
+            reg_path.write_text(json.dumps(reg_rec) + "\n", encoding="utf-8")
+            resolver.environment["CODEX_HOME"] = str(caller_home)
+            self.assertEqual(resolver.inspect(pane.pane_id).state, "busy")
+
 
 if __name__ == "__main__":
     unittest.main()

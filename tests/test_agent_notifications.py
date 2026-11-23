@@ -718,6 +718,14 @@ class AgentNotificationsTests(unittest.TestCase):
                 (
                     json.dumps(
                         {
+                            "type": "session_meta",
+                            "payload": {
+                                "id": "thread-goal",
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
                             "type": "event_msg",
                             "payload": {
                                 "type": "task_started",
@@ -1326,6 +1334,77 @@ class AgentNotificationsTests(unittest.TestCase):
             tracemalloc.stop()
             self.assertTrue(found)
             self.assertLess(peak, 2 * 1024 * 1024)
+
+    def test_r4_p2_codex_goal_rejects_unverified_uncommitted_and_corrupt_trailing_zstd(self) -> None:
+        from contextlib import closing
+        import shutil
+        import sqlite3
+        import subprocess
+        import codex_sessions
+        from agent_notifications import _codex_turn_has_goal_context
+
+        codex_home = self.home / ".codex"
+        sid_a = "81818181-1111-7818-8818-818181818181"
+        sid_b = "82828282-2222-7828-8828-828282828282"
+        sdir = codex_home / "sessions/2026/11/23"
+        sdir.mkdir(parents=True, exist_ok=True)
+        env = {"CODEX_HOME": str(codex_home)}
+
+        def goal_body(header: dict | None, text: str = "<goal_context>synthetic</goal_context>") -> str:
+            rows = []
+            if header is not None:
+                rows.append(header)
+            rows.extend(
+                [
+                    {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "cloned-turn"}},
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "internal_chat_message_metadata_passthrough": {"turn_id": "cloned-turn"},
+                            "content": [{"type": "input_text", "text": text}],
+                        },
+                    },
+                ]
+            )
+            return "".join(json.dumps(r) + "\n" for r in rows)
+
+        rollout = sdir / f"rollout-2026-11-23T00-00-00-{sid_a}.jsonl"
+        with closing(sqlite3.connect(codex_home / "state_9.sqlite")) as conn, conn:
+            conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid_a, str(rollout), 1_795_400_000))
+
+        # 1. Leading non-meta JSON line before foreign session_meta must NOT be trusted via filename.
+        rollout.write_text(
+            json.dumps({"type": "event_msg", "payload": {"type": "token_count"}}) + "\n"
+            + goal_body({"type": "session_meta", "payload": {"id": sid_b}}),
+            encoding="utf-8",
+        )
+        self.assertFalse(_codex_turn_has_goal_context(sid_a, "cloned-turn", env))
+
+        # 2. Completely headerless file carrying sid_a in filename must NOT suppress notifications.
+        rollout.write_text(goal_body(None), encoding="utf-8")
+        self.assertFalse(_codex_turn_has_goal_context(sid_a, "cloned-turn", env))
+
+        # 3. Committed rollout has ordinary user turn; uncommitted sibling with Goal context must NOT suppress.
+        rollout.write_text(
+            goal_body({"type": "session_meta", "payload": {"id": sid_a}}, text="regular question"),
+            encoding="utf-8",
+        )
+        uncommitted = sdir / f"rollout-2026-11-23T00-00-00-{sid_a}_{sid_b}.jsonl"
+        uncommitted.write_text(goal_body({"type": "session_meta", "payload": {"id": sid_a}}), encoding="utf-8")
+        self.assertFalse(_codex_turn_has_goal_context(sid_a, "cloned-turn", env))
+        uncommitted.unlink()
+
+        # 4. Valid compressed zstd frame followed by corrupt trailing garbage must NOT suppress.
+        if shutil.which("zstd"):
+            zdata = subprocess.check_output(
+                [codex_sessions.zstd_binary(), "-cq"],
+                input=goal_body({"type": "session_meta", "payload": {"id": sid_a}}).encode("utf-8"),
+            )
+            rollout.write_bytes(zdata + b"junkinvalid")
+            self.assertFalse(_codex_turn_has_goal_context(sid_a, "cloned-turn", env))
 
 
 if __name__ == "__main__":

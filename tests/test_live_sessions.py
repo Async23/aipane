@@ -324,8 +324,8 @@ class LiveSessionsUnitTests(unittest.TestCase):
         b_seg2.write_text(
             "\n".join(
                 [
-                    json.dumps({"ordinal": 10, "type": "session_meta", "timestamp": "2026-11-23T02:00:00Z", "payload": {"id": sid, "cwd": "/tmp/b", "history_base": {"thread_id": sid, "end_ordinal_exclusive": 10}}}),
-                    json.dumps({"ordinal": 11, "type": "response_item", "timestamp": "2026-11-23T02:00:01Z", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "CUSTOM_HOME_B_TAIL"}]}}),
+                    json.dumps({"ordinal": 2, "type": "session_meta", "timestamp": "2026-11-23T02:00:00Z", "payload": {"id": sid, "cwd": "/tmp/b", "history_base": {"thread_id": sid, "end_ordinal_exclusive": 2}}}),
+                    json.dumps({"ordinal": 3, "type": "response_item", "timestamp": "2026-11-23T02:00:01Z", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "CUSTOM_HOME_B_TAIL"}]}}),
                 ]
             )
             + "\n",
@@ -526,10 +526,37 @@ class LiveSessionsUnitTests(unittest.TestCase):
     def test_r3_p1_codex_home_with_spaces_and_registry_only_root_verification(self) -> None:
         from unittest import mock
 
-        # 1. ps eww parser preserves spaces inside CODEX_HOME (e.g. "Profile Work")
-        ps_sample = "codex-rv2 /tmp/a PATH=/usr/bin CODEX_HOME=/tmp/Profile Work HOME=/tmp/home TERM=xterm"
-        self.assertEqual(live_mod._extract_env_var_from_ps(ps_sample, "CODEX_HOME"), "/tmp/Profile Work")
-        self.assertEqual(live_mod._extract_env_var_from_ps(ps_sample, "HOME"), "/tmp/home")
+        # 1. Kernel envp reader preserves spaces in CODEX_HOME and ignores spoofed argv text
+        spaced_probe = self.home / "Profile Work"
+        spaced_probe.mkdir(parents=True, exist_ok=True)
+        child_env = {**os.environ, "CODEX_HOME": str(spaced_probe), "HOME": str(self.home)}
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(15)",
+                "look up CODEX_HOME=/foreign-profile in prompt",
+            ],
+            env=child_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            self.assertEqual(
+                live_mod._process_env_var(proc.pid, "CODEX_HOME"),
+                str(spaced_probe),
+            )
+            self.assertEqual(
+                live_mod._process_codex_home(proc.pid),
+                str(spaced_probe.resolve()),
+            )
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
 
         # 2. Registry-only Codex pane with unconfirmed storage_root must NOT fall back to default ~/.codex
         sid = "91919191-aaaa-4919-8919-919191919191"
@@ -583,6 +610,27 @@ class LiveSessionsUnitTests(unittest.TestCase):
             ok_res = sessions_mod.read_session(pane="%31", view="timeline", full=True, include_children=False, home=self.home, environment=env)
         self.assertTrue(ok_res["complete"])
         self.assertEqual([ev["text"] for s in ok_res["sources"] for ev in s["events"]], ["RIGHT_SPACED_CUSTOM"])
+
+        # 4. Live Codex PID env beats stale registry codex_home when they disagree
+        stale_root = self.home / "stale-profile"
+        stale_file = stale_root / "sessions/2026/11/23" / f"rollout-2026-11-23T10-00-00-{sid}.jsonl"
+        stale_file.parent.mkdir(parents=True, exist_ok=True)
+        stale_file.write_text(
+            json.dumps({"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T02:00:00Z", "payload": {"id": sid}}) + "\n"
+            + json.dumps({"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "STALE_REGISTRY_ROOT"}]}}) + "\n",
+            encoding="utf-8",
+        )
+        reg_path.write_text(
+            json.dumps({"sock": self.sock, "srv": self.srv, "pane": "%31", "tool": "x", "sid": sid, "codex_home": str(stale_root), "ts": int(time.time())}) + "\n",
+            encoding="utf-8",
+        )
+        with (
+            mock.patch.object(live_mod, "list_live_panes", side_effect=patched_reg_with_pid),
+            mock.patch.object(live_mod, "_process_codex_home", return_value=str(spaced_root.resolve())),
+        ):
+            fresh_res = sessions_mod.read_session(pane="%31", view="timeline", full=True, include_children=False, home=self.home, environment=env)
+        self.assertTrue(fresh_res["complete"])
+        self.assertEqual([ev["text"] for s in fresh_res["sources"] for ev in s["events"]], ["RIGHT_SPACED_CUSTOM"])
 
     def test_kimi_2x_discovery_preview_timeline_and_ref_prefix(self) -> None:
         raw_uuid = "aa4313fb-986d-4f74-8f8b-c5e14883633d"

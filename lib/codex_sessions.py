@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import datetime as dt
+import functools
 import json
 import os
 import re
 import shutil
 import sqlite3
+import struct
 import subprocess
+import sys
 import time
 from collections import deque
 from contextlib import closing
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 CODEX_SESSION_ROOT_NAMES = ("sessions", "archived_sessions")
 CODEX_ROLLOUT_SUFFIXES = (".jsonl", ".jsonl.zst")
@@ -26,6 +30,15 @@ _FILENAME_TS_RE = re.compile(
 )
 UUID_RE = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+_CANONICAL_SINGLE_UUID_RE = re.compile(
+    r"^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-"
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
+)
+_CANONICAL_ROLLOUT_STEM_RE = re.compile(
+    r"^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-"
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+    r"(?:_([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}))?$"
 )
 
 
@@ -77,6 +90,16 @@ def rollout_plain_stem(path: Path) -> str:
     return path.stem
 
 
+def is_canonical_single_uuid_rollout(path: Path) -> bool:
+    """True only for Codex's exact single-UUID filename `rollout-YYYY-MM-DDTHH-MM-SS-<uuid>.jsonl[.zst]`."""
+    return bool(_CANONICAL_SINGLE_UUID_RE.match(rollout_plain_stem(path)))
+
+
+def is_canonical_rollout_name(path: Path) -> bool:
+    """True only for Codex's exact canonical filename `rollout-YYYY-MM-DDTHH-MM-SS-<uuid>[_<uuid>].jsonl[.zst]`."""
+    return bool(_CANONICAL_ROLLOUT_STEM_RE.match(rollout_plain_stem(path)))
+
+
 def rollout_dedup_priority(path: Path) -> tuple[int, int, int, str]:
     """Canonical preference key: plain > compressed, real file > symlink, sessions/ > archived_sessions/."""
     is_comp = 1 if is_compressed_rollout(path) else 0
@@ -89,13 +112,12 @@ def rollout_canonical_key(path: Path, codex_home: Path | None = None) -> Path:
     """Key unifying plain `.jsonl` and compressed/archived `.jsonl.zst` of the same rollout.
 
     Cross-directory unification (`sessions/` <-> `archived_sessions/`) applies ONLY to
-    canonical `rollout-...-<uuid>` filenames. Non-canonical/opaque filenames (such as
-    `session.jsonl` in different date directories) stay scoped to their own directory
-    so distinct sessions are never collapsed.
+    exact canonical `rollout-YYYY-MM-DDTHH-MM-SS-<uuid>[_<uuid>]` filenames.
+    Non-canonical/opaque filenames stay scoped to their own directory so distinct
+    sessions are never collapsed.
     """
     stem = rollout_plain_stem(path)
-    _, fn_rid = extract_filename_ids(path)
-    if stem.startswith("rollout-") and fn_rid is not None:
+    if is_canonical_rollout_name(path):
         root_str = ""
         if codex_home is not None:
             try:
@@ -260,11 +282,13 @@ def _read_first_lines_raw(
     """Read up to `max_lines` raw lines from plain or zstd-compressed rollout."""
     if is_compressed_rollout(path):
         try:
-            proc = subprocess.Popen(
-                [zstd_binary(), "-dcqf", str(path)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
+            with path.open("rb") as fh:
+                proc = subprocess.Popen(
+                    [zstd_binary(), "-dcq"],
+                    stdin=fh,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
         except OSError:
             return [], "io_error"
         assert proc.stdout is not None
@@ -312,11 +336,13 @@ def _read_first_lines_raw(
 def iter_rollout_lines(path: Path, *, strict: bool = False) -> Iterator[str]:
     """Stream decoded text lines from a plain or zstd-compressed rollout."""
     if is_compressed_rollout(path):
-        proc = subprocess.Popen(
-            [zstd_binary(), "-dcqf", str(path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
+        with path.open("rb") as fh:
+            proc = subprocess.Popen(
+                [zstd_binary(), "-dcq"],
+                stdin=fh,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
         assert proc.stdout is not None
         completed = False
         try:
@@ -354,15 +380,20 @@ def iter_rollout_records_reverse(
 
     For zstd rollouts, retains only a bounded byte tail (`max_compressed_tail_bytes`)
     in a rolling deque so reading the tail of a large compressed rollout does not
-    materialize the entire decompressed log in Python memory.
+    materialize the entire decompressed log in Python memory. Note that `json.loads`
+    still requires decoding each individual line whole, so peak memory for a single
+    oversized record (e.g. an inline base64 image line) scales with that single line's
+    size.
     """
     if is_compressed_rollout(path):
         try:
-            proc = subprocess.Popen(
-                [zstd_binary(), "-dcqf", str(path)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
+            with path.open("rb") as fh:
+                proc = subprocess.Popen(
+                    [zstd_binary(), "-dcq"],
+                    stdin=fh,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
         except OSError:
             return
         assert proc.stdout is not None
@@ -568,6 +599,50 @@ def _local_tz_offset_seconds(fn_ts: str) -> float:
     return _local_tz_offsets_for_wall_clock(fn_ts)[0]
 
 
+@functools.lru_cache(maxsize=256)
+def _iana_dst_fold_offsets(year: int, month: int, day: int, hour: int, observed_off_sec: int) -> tuple[float, ...]:
+    """Return any alternate DST fold UTC offsets observed by IANA zones matching `observed_off_sec` at this local wall clock."""
+    try:
+        from zoneinfo import ZoneInfo, available_timezones
+    except Exception:
+        return ()
+    base = dt.datetime(year, month, day, hour, 30, 0)
+    alts: set[float] = set()
+    for name in available_timezones():
+        if name.startswith(("Etc/", "SystemV/")):
+            continue
+        try:
+            tz = ZoneInfo(name)
+            off0 = base.replace(tzinfo=tz, fold=0).utcoffset()
+            off1 = base.replace(tzinfo=tz, fold=1).utcoffset()
+        except Exception:
+            continue
+        if off0 is None or off1 is None:
+            continue
+        s0, s1 = off0.total_seconds(), off1.total_seconds()
+        if abs(s0 - s1) <= 120.0:
+            continue
+        if abs(s0 - observed_off_sec) <= 120.0:
+            alts.add(s1)
+        elif abs(s1 - observed_off_sec) <= 120.0:
+            alts.add(s0)
+    return tuple(sorted(alts))
+
+
+def _foreign_dst_fold_offsets(fn_ts: str, chosen_off: float) -> tuple[float, ...]:
+    try:
+        parsed = dt.datetime.fromisoformat(fn_ts)
+    except ValueError:
+        return ()
+    return _iana_dst_fold_offsets(
+        parsed.year,
+        parsed.month,
+        parsed.day,
+        parsed.hour,
+        int(round(chosen_off / 60.0) * 60),
+    )
+
+
 def sort_rollout_entries_with_warnings(
     entries: list[tuple[dict[str, Any] | None, Path]],
 ) -> tuple[list[tuple[dict[str, Any] | None, Path]], list[str]]:
@@ -576,9 +651,11 @@ def sort_rollout_entries_with_warnings(
     Normalizes UTC `session_meta.timestamp` and local-wall-clock canonical filename
     timestamps (`rollout-YYYY-MM-DDTHH-MM-SS`) onto a single UTC epoch timeline.
     Uses per-date local TZ rules when siblings match host TZ (exact across DST
-    transitions), or nearest-in-time sibling offset for logs from another timezone,
-    and flags `ambiguous_timestamp_order` when alternate plausible DST offsets
-    could flip relative segment order.
+    transitions), or nearest-in-time sibling offset + IANA DST-fold awareness for
+    logs from another timezone, and flags `ambiguous_timestamp_order` independently
+    for each missing-timestamp segment whenever alternate plausible DST offsets
+    could flip relative segment order — even if another segment in the group has
+    no timestamp.
     """
     if len(entries) <= 1:
         return list(entries), []
@@ -606,6 +683,14 @@ def sort_rollout_entries_with_warnings(
         for _, _, obs, l0, l1 in known_siblings
     )
 
+    # Identify any DST offset transition spans observed across all known siblings.
+    sibs_by_time = sorted(known_siblings, key=lambda s: s[1])
+    transition_windows: list[tuple[float, float, float, float]] = []
+    for k in range(len(sibs_by_time) - 1):
+        s_a, s_b = sibs_by_time[k], sibs_by_time[k + 1]
+        if abs(s_a[2] - s_b[2]) > 120.0:
+            transition_windows.append((s_a[1], s_b[1], s_a[2], s_b[2]))
+
     normalized_epochs: list[float | None] = []
     alt_epochs: list[list[float]] = []
 
@@ -626,18 +711,20 @@ def sort_rollout_entries_with_warnings(
                 nearest = min(known_siblings, key=lambda s: abs(s[1] - f_nv))
                 nearest_dist = abs(nearest[1] - f_nv)
                 chosen_off = nearest[2]
-                prev_sibs = [s for s in known_siblings if s[1] <= f_nv]
-                next_sibs = [s for s in known_siblings if s[1] >= f_nv]
-                prev_s = max(prev_sibs, key=lambda s: s[1]) if prev_sibs else None
-                next_s = min(next_sibs, key=lambda s: s[1]) if next_sibs else None
                 cand_offs = {chosen_off}
-                if prev_s is not None and next_s is not None and abs(prev_s[2] - next_s[2]) > 120.0:
-                    d_prev = abs(f_nv - prev_s[1])
-                    d_next = abs(next_s[1] - f_nv)
-                    if not (min(d_prev, d_next) <= 3600.0 and max(d_prev, d_next) > 43200.0):
-                        cand_offs.add(prev_s[2])
-                        cand_offs.add(next_s[2])
-                elif nearest_dist > 86400.0:
+                # Check if wall clock itself sits inside a real IANA DST fall-back fold
+                # for a timezone matching `chosen_off` (so NY fold logs warn even on Shanghai host).
+                for fold_alt in _foreign_dst_fold_offsets(f_ts, chosen_off):
+                    cand_offs.add(fold_alt)
+                # Check transition spans across ALL siblings (not just immediate prev/next).
+                for t_a, t_b, off_a, off_b in transition_windows:
+                    if (t_a - 7200.0) <= f_nv <= (t_b + 7200.0):
+                        d_a = abs(f_nv - t_a)
+                        d_b = abs(t_b - f_nv)
+                        if not (min(d_a, d_b) <= 3600.0 and max(d_a, d_b) > 43200.0):
+                            cand_offs.add(off_a)
+                            cand_offs.add(off_b)
+                if nearest_dist > 86400.0:
                     cand_offs.add(chosen_off - 3600.0)
                     cand_offs.add(chosen_off + 3600.0)
                 normalized_epochs.append(f_nv - chosen_off)
@@ -647,22 +734,24 @@ def sort_rollout_entries_with_warnings(
             alt_epochs.append([])
 
     warnings: list[str] = []
-    if all(ep is not None for ep in normalized_epochs):
-        for i, alts in enumerate(alt_epochs):
-            if len(alts) <= 1:
-                continue
-            lo, hi = min(alts), max(alts)
-            flips = any(
-                j != i
-                and normalized_epochs[j] is not None
-                and lo <= float(normalized_epochs[j]) <= hi
-                for j in range(len(entries))
+    # Evaluate per-entry DST ambiguity UNCONDITIONALLY even if another segment lacks a timestamp.
+    for i, alts in enumerate(alt_epochs):
+        if len(alts) <= 1:
+            continue
+        lo, hi = min(alts), max(alts)
+        flips = any(
+            j != i
+            and normalized_epochs[j] is not None
+            and lo <= float(normalized_epochs[j]) <= hi
+            for j in range(len(entries))
+        )
+        if flips:
+            warnings.append(
+                f"ambiguous_timestamp_order: segment {entries[i][1]} lacks session_meta.timestamp "
+                "across a DST or timezone boundary"
             )
-            if flips:
-                warnings.append(
-                    f"ambiguous_timestamp_order: segment {entries[i][1]} lacks session_meta.timestamp "
-                    "across a DST or timezone boundary"
-                )
+
+    if all(ep is not None for ep in normalized_epochs):
         ordered = [
             entry
             for _, entry in sorted(
@@ -717,11 +806,19 @@ def deduplicate_rollout_paths(
     paths: list[Path],
     *,
     codex_home: Path | None = None,
+    verify_cross_dir_collisions: bool = True,
+    collision_sids: dict[Path, str] | None = None,
 ) -> list[Path]:
     """Deduplicate physical files (symlinks + plain/compressed/archived sibling pairs).
 
     Prefers real plain `.jsonl` over `.jsonl.zst` (including `.jsonl` symlinks to
     `.jsonl.zst`), and prefers `sessions/` over `archived_sessions/`.
+
+    When `verify_cross_dir_collisions=False`, defers cross-directory canonical merging
+    so cold plain/archive mirrors never require header reads before time pruning.
+    When `verify_cross_dir_collisions=True` and two different directories share a
+    canonical filename with different header SIDs, both are kept and their verified
+    SIDs are recorded in `collision_sids`.
     """
     by_inode: dict[tuple[int, int], Path] = {}
     by_canonical: dict[Any, Path] = {}
@@ -742,12 +839,18 @@ def deduplicate_rollout_paths(
         by_inode[inode_key] = path
 
     for path in by_inode.values():
-        ckey = rollout_canonical_key(path, codex_home=codex_home)
+        if verify_cross_dir_collisions:
+            ckey: Any = rollout_canonical_key(path, codex_home=codex_home)
+        else:
+            try:
+                parent_r = path.parent.resolve()
+            except OSError:
+                parent_r = path.parent
+            ckey = parent_r / rollout_plain_stem(path)
         prev = by_canonical.get(ckey)
         if prev is None:
             by_canonical[ckey] = path
             continue
-        # Guard cross-directory canonical collisions by verifying header SID match.
         try:
             same_parent = prev.parent.resolve() == path.parent.resolve()
         except OSError:
@@ -756,6 +859,9 @@ def deduplicate_rollout_paths(
             m_prev = read_rollout_meta(prev, max_lines=1)
             m_curr = read_rollout_meta(path, max_lines=1)
             if m_prev and m_curr and m_prev["sid"] != m_curr["sid"]:
+                if collision_sids is not None:
+                    collision_sids[prev] = m_prev["sid"]
+                    collision_sids[path] = m_curr["sid"]
                 alt_key = (ckey, m_curr["sid"])
                 alt_prev = by_canonical.get(alt_key)
                 if alt_prev is None or rollout_dedup_priority(path) < rollout_dedup_priority(alt_prev):
@@ -767,7 +873,12 @@ def deduplicate_rollout_paths(
     return list(by_canonical.values())
 
 
-def iter_codex_rollout_files(codex_home: Path) -> list[Path]:
+def iter_codex_rollout_files(
+    codex_home: Path,
+    *,
+    verify_cross_dir_collisions: bool = True,
+    collision_sids: dict[Path, str] | None = None,
+) -> list[Path]:
     """Return deduplicated `.jsonl` and `.jsonl.zst` rollouts under `codex_home`."""
     raw: list[Path] = []
     for root in codex_session_roots(codex_home, existing_only=True):
@@ -777,7 +888,12 @@ def iter_codex_rollout_files(codex_home: Path) -> list[Path]:
                     raw.append(path)
             except OSError:
                 continue
-    return deduplicate_rollout_paths(raw, codex_home=codex_home)
+    return deduplicate_rollout_paths(
+        raw,
+        codex_home=codex_home,
+        verify_cross_dir_collisions=verify_cross_dir_collisions,
+        collision_sids=collision_sids,
+    )
 
 
 def build_rollout_id_index(paths: list[Path]) -> dict[str, Path]:
@@ -827,38 +943,67 @@ def find_session_rollouts(
     return [path for _, path in sort_rollout_entries(matched)]
 
 
+def resolve_committed_head_detailed(
+    sid: str,
+    codex_home: Path,
+    *,
+    verify_header: bool = True,
+    rollout_index: dict[str, Path] | None = None,
+    meta_cache: dict[Any, dict[str, Any] | None] | None = None,
+    sqlite_only: bool = False,
+) -> tuple[Path | None, bool]:
+    """Return `(committed_head, sqlite_conflict)` for `sid`.
+
+    Checks all `state_*.sqlite` databases from highest to lowest schema version.
+    If a higher-version DB points to a missing or foreign-SID rollout, continues
+    checking lower-version DBs for a valid committed head. If SQLite had rows for
+    `sid` and NONE resolved cleanly, returns `(None, True)` so callers fail closed
+    instead of falling back to an uncommitted rollback file.
+    """
+    if not sid:
+        return None, False
+    rows, _ = query_sqlite_rollout_paths_detailed(sid, codex_home)
+    saw_sqlite_row = False
+    for _, sqlite_path in rows:
+        saw_sqlite_row = True
+        resolved = resolve_alternate_rollout_path(
+            sqlite_path, codex_home, rollout_index=rollout_index
+        )
+        if resolved is None:
+            continue
+        ckey = path_identity_key(resolved)
+        if meta_cache is not None and ckey in meta_cache and meta_cache[ckey] is not None:
+            meta, err = meta_cache[ckey], None
+        else:
+            meta, err = read_rollout_meta_detailed(resolved, max_lines=1)
+            if meta_cache is not None and err is None and meta is not None:
+                meta_cache[ckey] = meta
+        if verify_header:
+            if err is None and meta is not None and meta["sid"] == sid:
+                return resolved, False
+        else:
+            if err is None and meta is not None:
+                if meta["sid"] == sid:
+                    return resolved, False
+            elif err == "missing_meta" and sid in resolved.name:
+                return resolved, False
+    if saw_sqlite_row:
+        return None, True
+    if sqlite_only:
+        return None, False
+    transcripts = find_session_rollouts(sid, codex_home, verify_header=verify_header)
+    return (transcripts[-1] if transcripts else None), False
+
+
 def resolve_committed_head(
     sid: str,
     codex_home: Path,
     *,
     verify_header: bool = True,
 ) -> Path | None:
-    """Return the authoritative committed rollout head for `sid`.
-
-    Checks verified `state_*.sqlite` first (preferring plain `.jsonl` over
-    `.jsonl.zst` via `resolve_alternate_rollout_path`) so an uncommitted
-    rollback segment written to disk before SQLite switches never overrides
-    committed history or busy/idle activity state. Falls back to the latest
-    segment from `find_session_rollouts` when SQLite has no verified entry.
-    """
-    if not sid:
-        return None
-    sqlite_path = query_sqlite_rollout_path(sid, codex_home)
-    if sqlite_path is not None:
-        resolved = resolve_alternate_rollout_path(sqlite_path, codex_home)
-        if resolved is not None:
-            meta, err = read_rollout_meta_detailed(resolved, max_lines=1)
-            if verify_header:
-                if err is None and meta is not None and meta["sid"] == sid:
-                    return resolved
-            else:
-                if err is None and meta is not None:
-                    if meta["sid"] == sid:
-                        return resolved
-                elif err == "missing_meta" and sid in resolved.name:
-                    return resolved
-    transcripts = find_session_rollouts(sid, codex_home, verify_header=verify_header)
-    return transcripts[-1] if transcripts else None
+    """Return the authoritative committed rollout head for `sid`."""
+    head, _ = resolve_committed_head_detailed(sid, codex_home, verify_header=verify_header)
+    return head
 
 
 def _populate_rollout_index_once(
@@ -869,12 +1014,13 @@ def _populate_rollout_index_once(
     if sentinel in rollout_index:
         return
     for path in iter_codex_rollout_files(codex_home):
-        _, fn_rid = extract_filename_ids(path)
-        if fn_rid and fn_rid not in rollout_index:
-            rollout_index[fn_rid] = path
-        stem_key = f"__stem__:{rollout_plain_stem(path)}"
-        if stem_key not in rollout_index:
-            rollout_index[stem_key] = path
+        if is_canonical_rollout_name(path):
+            _, fn_rid = extract_filename_ids(path)
+            if fn_rid and fn_rid not in rollout_index:
+                rollout_index[fn_rid] = path
+            stem_key = f"__stem__:{rollout_plain_stem(path)}"
+            if stem_key not in rollout_index:
+                rollout_index[stem_key] = path
     rollout_index[sentinel] = codex_home
 
 
@@ -903,6 +1049,8 @@ def find_rollout_by_rollout_id(
                     continue
     deduped = deduplicate_rollout_paths(raw_candidates, codex_home=codex_home)
     for path in deduped:
+        if not is_canonical_rollout_name(path):
+            continue
         _, fn_rid = extract_filename_ids(path)
         if fn_rid == rollout_id:
             return path
@@ -917,9 +1065,14 @@ def resolve_alternate_rollout_path(
 ) -> Path | None:
     """Resolve the authoritative on-disk representation for a rollout path.
 
-    Always prefers an existing plain `.jsonl` over a compressed `.jsonl.zst`
-    counterpart (matching upstream `compression.rs:924`), and searches across
-    `sessions/` and `archived_sessions/` when a file has moved or been compressed.
+    - For non-canonical / opaque names (e.g. `session.jsonl`), ONLY resolves
+      plain `.jsonl` <-> compressed `.jsonl.zst` counterparts in the EXACT same
+      directory so another directory's unrelated `session.jsonl` can never
+      silently replace a missing or compressed committed anchor.
+    - For canonical `rollout-YYYY-MM-DDTHH-MM-SS-<uuid>[_<uuid>]` names, prefers
+      an existing plain `.jsonl` over `.jsonl.zst` (matching upstream
+      `compression.rs:924`) when header SID matches (if `path` exists), and
+      searches `sessions/` <-> `archived_sessions/` by physical `rollout_id`.
     """
     home = codex_home
     if home is None:
@@ -927,41 +1080,52 @@ def resolve_alternate_rollout_path(
         home = Path(inferred) if inferred else None
 
     stem = rollout_plain_stem(path)
-    _, fn_rid = extract_filename_ids(path)
+    canonical = is_canonical_rollout_name(path)
+    _, fn_rid = extract_filename_ids(path) if canonical else (None, None)
     path_exists = path.is_file()
     path_is_comp = is_compressed_rollout(path) if path_exists else path.name.lower().endswith((".zst", ".zstd"))
 
-    # 1. If path is compressed (or points to compressed), check plain `.jsonl` counterparts FIRST!
+    def _plain_matches_existing(cand: Path) -> bool:
+        if not cand.is_file() or is_compressed_rollout(cand):
+            return False
+        if not path_exists:
+            return True
+        m_orig = read_rollout_meta(path, max_lines=1)
+        m_cand = read_rollout_meta(cand, max_lines=1)
+        if m_orig and m_cand and m_orig["sid"] != m_cand["sid"]:
+            return False
+        return True
+
+    # 1. If path is compressed (or points to compressed), check plain `.jsonl` counterparts FIRST.
     if path_is_comp:
         plain_sibling = path.with_name(stem + ".jsonl")
-        if plain_sibling.is_file() and not is_compressed_rollout(plain_sibling):
+        if _plain_matches_existing(plain_sibling):
             return plain_sibling
-        if home is not None:
+        if canonical and home is not None:
             if rollout_index is not None:
                 stem_cand = rollout_index.get(f"__stem__:{stem}")
-                if stem_cand and stem_cand.is_file() and not is_compressed_rollout(stem_cand):
+                if stem_cand and _plain_matches_existing(stem_cand):
                     return stem_cand
                 if fn_rid:
                     rid_cand = rollout_index.get(fn_rid)
-                    if rid_cand and rid_cand.is_file() and not is_compressed_rollout(rid_cand):
+                    if rid_cand and _plain_matches_existing(rid_cand):
                         return rid_cand
-            else:
-                if fn_rid:
-                    found = find_rollout_by_rollout_id(fn_rid, home)
-                    if found is not None and found.is_file() and not is_compressed_rollout(found):
-                        return found
+            elif fn_rid:
+                found = find_rollout_by_rollout_id(fn_rid, home)
+                if found is not None and _plain_matches_existing(found):
+                    return found
 
     if path_exists:
         return path
 
-    # 2. Path missing on disk: check compressed sibling in same directory
+    # 2. Path missing on disk: check compressed sibling in the EXACT same directory.
     if not path_is_comp and path.name.lower().endswith(".jsonl"):
         comp = path.with_name(path.name + ".zst")
         if comp.is_file():
             return comp
 
-    # 3. Search sessions/ <-> archived_sessions/ by stem or physical rollout_id
-    if home is not None:
+    # 3. Cross-directory lookup ONLY for canonical filenames carrying a physical rollout_id.
+    if canonical and home is not None:
         if rollout_index is not None:
             _populate_rollout_index_once(home, rollout_index)
             stem_cand = rollout_index.get(f"__stem__:{stem}")
@@ -1076,6 +1240,7 @@ def resolve_effective_lineage(
         cur_path: Path | None = head_path
         cur_end_ord: int | None = None
         cur_end_byte: int | None = None
+        cur_explicit_hb = False
 
         while cur_path is not None:
             cur_key = path_identity_key(cur_path)
@@ -1094,6 +1259,7 @@ def resolve_effective_lineage(
                     "role": role,
                     "end_ordinal_exclusive": cur_end_ord,
                     "end_byte_offset": cur_end_byte,
+                    "explicit_history_base": cur_explicit_hb,
                     "segment_sid": seg_sid,
                 }
             )
@@ -1120,10 +1286,24 @@ def resolve_effective_lineage(
                     f"missing_history_base_rollout: segment {cur_path} references missing base rollout {base_rid}"
                 )
                 break
+            base_meta = _meta(base_path)
+            declared_parent = cur_meta.get("parent_id") if cur_meta else None
+            if (
+                base_meta is not None
+                and isinstance(declared_parent, str)
+                and declared_parent
+                and base_meta["sid"] not in {seg_sid, declared_parent}
+            ):
+                warnings.append(
+                    f"history_base_parent_sid_mismatch: segment {cur_path} declares parent {declared_parent} "
+                    f"but base rollout {base_path} declares session_id={base_meta['sid']}"
+                )
+                break
             cur_path = base_path
-            cur_meta = _meta(base_path)
+            cur_meta = base_meta
             cur_end_ord = hb.get("end_ordinal_exclusive")
             cur_end_byte = hb.get("end_byte_offset")
+            cur_explicit_hb = True
 
         chain.reverse()
         used_keys = {path_identity_key(seg["path"]) for seg in chain}
@@ -1218,21 +1398,18 @@ def _latest_state_db(codex_home: Path) -> Path | None:
     return dbs[0] if dbs else None
 
 
-def query_sqlite_rollout_path_detailed(
+def query_sqlite_rollout_paths_detailed(
     sid: str,
     codex_home: Path,
-) -> tuple[Path | None, str | None]:
-    """Read-only lookup of Codex's recorded rollout_path for `sid`.
-
-    Returns `(path, error_message)` so callers can distinguish absent DB/row
-    from schema/read errors.
-    """
+) -> tuple[list[tuple[Path, Path]], list[str]]:
+    """Read-only lookup of all recorded `(db_path, rollout_path)` for `sid` across all state DBs."""
     if not sid:
-        return None, None
+        return [], []
     dbs = find_state_dbs(codex_home)
     if not dbs:
-        return None, None
-    last_error: str | None = None
+        return [], []
+    results: list[tuple[Path, Path]] = []
+    errors: list[str] = []
     for db_path in dbs:
         try:
             uri = f"{db_path.resolve().as_uri()}?mode=ro"
@@ -1242,11 +1419,61 @@ def query_sqlite_rollout_path_detailed(
                     (sid,),
                 ).fetchone()
                 if row and isinstance(row[0], str) and row[0].strip():
-                    return Path(row[0].strip()).expanduser(), None
+                    results.append((db_path, Path(row[0].strip()).expanduser()))
         except (OSError, sqlite3.Error, ValueError) as exc:
-            last_error = f"{db_path}: {exc}"
+            errors.append(f"{db_path}: {exc}")
             continue
-    return None, last_error
+    return results, errors
+
+
+def query_sqlite_rollout_paths_batch(
+    sids: Iterable[str],
+    codex_home: Path,
+) -> dict[str, Path]:
+    """Batch read-only lookup `{sid: rollout_path}` opening each `state_*.sqlite` at most once."""
+    unique_sids = list(dict.fromkeys(s for s in sids if isinstance(s, str) and s))
+    if not unique_sids:
+        return {}
+    dbs = find_state_dbs(codex_home)
+    if not dbs:
+        return {}
+    found: dict[str, Path] = {}
+    for db_path in dbs:
+        remaining = [s for s in unique_sids if s not in found]
+        if not remaining:
+            break
+        try:
+            uri = f"{db_path.resolve().as_uri()}?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True, timeout=0.25)) as conn:
+                for start in range(0, len(remaining), 400):
+                    chunk = remaining[start : start + 400]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = conn.execute(
+                        f"SELECT id, rollout_path FROM threads WHERE id IN ({placeholders}) "
+                        "AND rollout_path IS NOT NULL AND rollout_path != ''",
+                        chunk,
+                    ).fetchall()
+                    for tid, rpath in rows:
+                        if isinstance(tid, str) and tid and isinstance(rpath, str) and rpath.strip():
+                            found.setdefault(tid, Path(rpath.strip()).expanduser())
+        except (OSError, sqlite3.Error, ValueError):
+            continue
+    return found
+
+
+def query_sqlite_rollout_path_detailed(
+    sid: str,
+    codex_home: Path,
+) -> tuple[Path | None, str | None]:
+    """Read-only lookup of Codex's recorded rollout_path for `sid`.
+
+    Returns `(path, error_message)` so callers can distinguish absent DB/row
+    from schema/read errors.
+    """
+    rows, errors = query_sqlite_rollout_paths_detailed(sid, codex_home)
+    if rows:
+        return rows[0][1], None
+    return None, (errors[-1] if errors else None)
 
 
 def query_sqlite_rollout_path(sid: str, codex_home: Path) -> Path | None:
@@ -1331,17 +1558,18 @@ def session_is_known(sid: str, codex_home: Path) -> bool:
         return True
     if query_sqlite_rollout_path(sid, codex_home) is not None:
         return True
-    nonstandard_or_double: list[Path] = []
     for root in codex_session_roots(codex_home, existing_only=True):
         for suffix in CODEX_ROLLOUT_SUFFIXES:
             for pattern in (f"*-{sid}{suffix}", f"*-{sid}_*{suffix}"):
                 for path in root.rglob(pattern):
                     if path.is_file():
                         return True
-    for path in iter_codex_rollout_files(codex_home):
-        fn_sid, fn_rid = extract_filename_ids(path)
-        plain_stem = rollout_plain_stem(path)
-        if not (fn_sid and fn_sid == fn_rid and plain_stem.startswith("rollout-")):
+    collision_sids: dict[Path, str] = {}
+    nonstandard_or_double: list[Path] = []
+    for path in iter_codex_rollout_files(codex_home, collision_sids=collision_sids):
+        if collision_sids.get(path) == sid:
+            return True
+        if not is_canonical_single_uuid_rollout(path):
             nonstandard_or_double.append(path)
     for path in nonstandard_or_double:
         if rollout_matches_session(path, sid):
@@ -1349,32 +1577,134 @@ def session_is_known(sid: str, codex_home: Path) -> bool:
     return False
 
 
-def _extract_env_var_from_ps_line(ps_line: str, var_name: str) -> str:
-    if not ps_line or not var_name:
+_LIBC_DARWIN: Any = None
+
+
+def _read_process_exec_and_env(pid: int) -> tuple[str, dict[str, str]] | None:
+    """Read `(exec_path, envp)` for `pid` from kernel memory (strictly separate from argv).
+
+    On macOS uses `sysctl(CTL_KERN, KERN_PROCARGS2, pid)` which carries exact `argc`
+    and NUL-terminated boundaries between `exec_path`, `argv[0..argc-1]`, and `envp`,
+    so prompt text like `CODEX_HOME=/foreign` in `argv` can never spoof process env
+    and paths containing spaces (e.g. `Profile Work`) are preserved verbatim.
+    """
+    global _LIBC_DARWIN
+    if pid <= 0:
+        return None
+    if sys.platform == "darwin":
+        try:
+            if _LIBC_DARWIN is None:
+                _LIBC_DARWIN = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+            mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN=1, KERN_PROCARGS2=49
+            size = ctypes.c_size_t(0)
+            if _LIBC_DARWIN.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or size.value < 4:
+                return None
+            buf = ctypes.create_string_buffer(size.value)
+            if _LIBC_DARWIN.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+                return None
+            raw = buf.raw[: size.value]
+        except OSError:
+            return None
+        if len(raw) < 4:
+            return None
+        argc = struct.unpack_from("i", raw, 0)[0]
+        if argc < 0 or argc > 100_000:
+            return None
+        pos = 4
+        n = len(raw)
+        nul = raw.find(b"\x00", pos)
+        if nul < 0:
+            return None
+        exec_path = raw[pos:nul].decode("utf-8", errors="replace")
+        pos = nul
+        while pos < n and raw[pos] == 0:
+            pos += 1
+        for _ in range(argc):
+            if pos >= n:
+                return None
+            nul = raw.find(b"\x00", pos)
+            if nul < 0:
+                return None
+            pos = nul + 1
+        env: dict[str, str] = {}
+        while pos < n:
+            if raw[pos] == 0:
+                pos += 1
+                continue
+            nul = raw.find(b"\x00", pos)
+            if nul < 0:
+                entry = raw[pos:]
+                pos = n
+            else:
+                entry = raw[pos:nul]
+                pos = nul + 1
+            if b"=" not in entry:
+                break
+            k, v = entry.split(b"=", 1)
+            env[k.decode("utf-8", errors="replace")] = v.decode("utf-8", errors="replace")
+        return exec_path, env
+
+    # Linux fallback via /proc/<pid>/environ (NUL-separated, never includes argv)
+    try:
+        raw_env = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    try:
+        exec_path = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        exec_path = ""
+    env = {}
+    for entry in raw_env.split(b"\x00"):
+        if b"=" in entry:
+            k, v = entry.split(b"=", 1)
+            env[k.decode("utf-8", errors="replace")] = v.decode("utf-8", errors="replace")
+    return exec_path, env
+
+
+def read_process_env(pid: int) -> dict[str, str] | None:
+    info = _read_process_exec_and_env(pid)
+    return info[1] if info is not None else None
+
+
+def process_is_codex(pid: int) -> bool:
+    info = _read_process_exec_and_env(pid)
+    if info is None:
+        return False
+    name = Path(info[0]).name.lower()
+    return name in {"codex", "codexx"} or name.startswith("codex-")
+
+
+def process_env_var(pid: int, var_name: str) -> str:
+    if pid <= 0 or not var_name:
         return ""
-    m = re.search(
-        rf"(?:^|\s){re.escape(var_name)}=(.*?)(?=\s+[A-Za-z_][A-Za-z0-9_]*=|$)",
-        ps_line.rstrip("\r\n"),
-    )
-    return m.group(1).strip() if m else ""
+    env = read_process_env(pid)
+    if not env:
+        return ""
+    return env.get(var_name, "").strip()
+
+
+def process_codex_home(pid: int) -> str:
+    """Resolve verified CODEX_HOME for `pid` from kernel envp (never argv)."""
+    env = read_process_env(pid)
+    if not env:
+        return ""
+    chome = env.get("CODEX_HOME", "").strip()
+    if chome:
+        try:
+            return str(Path(chome).expanduser().resolve())
+        except OSError:
+            return chome
+    home_val = env.get("HOME", "").strip()
+    if home_val:
+        try:
+            return str((Path(home_val).expanduser() / ".codex").resolve())
+        except OSError:
+            return str(Path(home_val).expanduser() / ".codex")
+    return ""
 
 
 def _process_env_codex_home(pid: int) -> str:
-    if pid <= 0:
-        return ""
-    try:
-        res = subprocess.run(
-            ["ps", "eww", "-o", "command=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            timeout=1,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    if res.returncode != 0 or not res.stdout:
-        return ""
-    val = _extract_env_var_from_ps_line(res.stdout, "CODEX_HOME")
+    val = process_env_var(pid, "CODEX_HOME")
     if not val:
         return ""
     try:
