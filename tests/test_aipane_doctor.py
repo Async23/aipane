@@ -462,6 +462,41 @@ class AipaneDoctorTests(unittest.TestCase):
         self.assertIn("codex_sqlite_rollout_missing", result.stdout)
         self.assertIn("pi_header_invalid", result.stdout)
 
+    def test_r3_p2_doctor_verifies_sqlite_target_directly_and_flags_cold_invalid_header(self) -> None:
+        import sqlite3
+        from contextlib import closing
+
+        self.configure_core()
+        codex_home = self.home / ".codex"
+        sid_a = "55555555-5555-7555-8555-555555555555"
+        sid_b = "66666666-6666-7666-8666-666666666666"
+        sid_cold = "77777777-7777-7777-8777-777777777777"
+
+        # 1. Valid sibling exists in sessions/, while SQLite points to archived file declaring foreign sid_b
+        good = codex_home / "sessions/2026/11/23" / f"rollout-2026-11-23T10-00-00-{sid_a}.jsonl"
+        bad = codex_home / "archived_sessions" / f"rollout-2026-11-23T10-00-00-{sid_a}.jsonl"
+        good.parent.mkdir(parents=True, exist_ok=True)
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        good.write_text(json.dumps({"type": "session_meta", "payload": {"id": sid_a}}) + "\n", encoding="utf-8")
+        bad.write_text(json.dumps({"type": "session_meta", "payload": {"id": sid_b}}) + "\n", encoding="utf-8")
+
+        # 2. Recent SQLite row points to a cold file whose session_meta lacks payload.id
+        cold = codex_home / "sessions/2026/08/01" / f"rollout-2026-08-01T10-00-00-{sid_cold}.jsonl"
+        cold.parent.mkdir(parents=True, exist_ok=True)
+        cold.write_text(json.dumps({"type": "session_meta", "payload": {"source": "cli"}}) + "\n", encoding="utf-8")
+        old_ts = time.time() - 70 * 86400
+        os.utime(cold, (old_ts, old_ts))
+
+        with closing(sqlite3.connect(codex_home / "state_9.sqlite")) as conn, conn:
+            conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid_a, str(bad), int(time.time())))
+            conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid_cold, str(cold), int(time.time())))
+
+        result = self.run_doctor(CODEX_HOME=str(codex_home))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("codex_sqlite_sid_mismatch", result.stdout)
+        self.assertIn("codex_sqlite_rollout_header_invalid", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

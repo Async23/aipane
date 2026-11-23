@@ -523,6 +523,67 @@ class LiveSessionsUnitTests(unittest.TestCase):
         self.assertEqual(orphan_texts, ["ORPHAN_ONLY_TURN"])
         self.assertNotIn("COMMITTED_OPENING", orphan_texts)
 
+    def test_r3_p1_codex_home_with_spaces_and_registry_only_root_verification(self) -> None:
+        from unittest import mock
+
+        # 1. ps eww parser preserves spaces inside CODEX_HOME (e.g. "Profile Work")
+        ps_sample = "codex-rv2 /tmp/a PATH=/usr/bin CODEX_HOME=/tmp/Profile Work HOME=/tmp/home TERM=xterm"
+        self.assertEqual(live_mod._extract_env_var_from_ps(ps_sample, "CODEX_HOME"), "/tmp/Profile Work")
+        self.assertEqual(live_mod._extract_env_var_from_ps(ps_sample, "HOME"), "/tmp/home")
+
+        # 2. Registry-only Codex pane with unconfirmed storage_root must NOT fall back to default ~/.codex
+        sid = "91919191-aaaa-4919-8919-919191919191"
+        default_file = self.home / ".codex/sessions/2026/11/23" / f"rollout-2026-11-23T10-00-00-{sid}.jsonl"
+        default_file.parent.mkdir(parents=True, exist_ok=True)
+        default_file.write_text(
+            json.dumps({"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T02:00:00Z", "payload": {"id": sid}}) + "\n"
+            + json.dumps({"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "WRONG_DEFAULT"}]}}) + "\n",
+            encoding="utf-8",
+        )
+        reg_path = self.state_dir / "registry.jsonl"
+        reg_path.parent.mkdir(parents=True, exist_ok=True)
+        reg_path.write_text(
+            json.dumps({"sock": self.sock, "srv": self.srv, "pane": "%31", "tool": "x", "sid": sid, "ts": int(time.time())}) + "\n",
+            encoding="utf-8",
+        )
+        tmux_out = _make_raw_line("%31", pane_index="1", cmd="codex", tty="/dev/ttys031", title="Codex", sock=self.sock, srv=self.srv) + "\n"
+        env = {"HOME": str(self.home), "AIPANE_STATE_DIR": str(self.state_dir), "TMUX_PANE": "%31"}
+        real_list = live_mod.list_live_panes
+
+        def patched_reg(**kwargs):
+            kwargs.setdefault("tmux_runner", lambda a: subprocess.CompletedProcess(a, 0, stdout=tmux_out, stderr=""))
+            kwargs.setdefault("pgrep_runner", lambda a: [])
+            kwargs.setdefault("lsof_runner", lambda a: "")
+            return real_list(**kwargs)
+
+        with mock.patch.object(live_mod, "list_live_panes", side_effect=patched_reg):
+            with self.assertRaisesRegex(FileNotFoundError, "unknown_pane_storage_root"):
+                sessions_mod.read_session(pane="%31", view="timeline", full=True, include_children=False, home=self.home, environment=env)
+
+        # 3. When live Codex PID exposes CODEX_HOME (with spaces!), registry-only pane resolves custom root
+        spaced_root = self.home / "Profile Work"
+        spaced_file = spaced_root / "sessions/2026/11/23" / f"rollout-2026-11-23T10-00-00-{sid}.jsonl"
+        spaced_file.parent.mkdir(parents=True, exist_ok=True)
+        spaced_file.write_text(
+            json.dumps({"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T02:00:00Z", "payload": {"id": sid}}) + "\n"
+            + json.dumps({"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "RIGHT_SPACED_CUSTOM"}]}}) + "\n",
+            encoding="utf-8",
+        )
+
+        def patched_reg_with_pid(**kwargs):
+            kwargs.setdefault("tmux_runner", lambda a: subprocess.CompletedProcess(a, 0, stdout=tmux_out, stderr=""))
+            kwargs.setdefault("pgrep_runner", lambda a: [4031] if a[-1] == "codex" else [])
+            kwargs.setdefault("lsof_runner", lambda a: "p4031\nf0\nau\nn/dev/ttys031\n")
+            return real_list(**kwargs)
+
+        with (
+            mock.patch.object(live_mod, "list_live_panes", side_effect=patched_reg_with_pid),
+            mock.patch.object(live_mod, "_process_codex_home", return_value=str(spaced_root.resolve())),
+        ):
+            ok_res = sessions_mod.read_session(pane="%31", view="timeline", full=True, include_children=False, home=self.home, environment=env)
+        self.assertTrue(ok_res["complete"])
+        self.assertEqual([ev["text"] for s in ok_res["sources"] for ev in s["events"]], ["RIGHT_SPACED_CUSTOM"])
+
     def test_kimi_2x_discovery_preview_timeline_and_ref_prefix(self) -> None:
         raw_uuid = "aa4313fb-986d-4f74-8f8b-c5e14883633d"
         full_sid = f"session_{raw_uuid}"
