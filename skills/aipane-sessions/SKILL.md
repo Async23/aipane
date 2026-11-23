@@ -51,5 +51,5 @@ Use `aipane-sessions` (run `aipane-sessions --help` for full flags). All subcomm
 
 ## Scope (verified 2026-11-23)
 
-- Supported `--agent` values: `claude`, `codex` (multi-segment rollouts & `archived_sessions`), `dsh` (`.zstd` transparent), `grok`, `pi`, `kimi` (`~/.kimi-code` and `~/.kimi`), `antigravity` (alias `agy`; qualify IDE IDs as `ide/<id>`).
+- Supported `--agent` values: `claude`, `codex` (multi-segment rollouts, `.jsonl.zst`, `history_base` lineage, & `archived_sessions`), `dsh` (`.zstd` transparent), `grok`, `pi`, `kimi` (`~/.kimi-code` and `~/.kimi`), `antigravity` (alias `agy`; qualify IDE IDs as `ide/<id>`).
 - Zero-index design: no background indexer or database setup is required; narrow large histories with `--agent` or `--days` first.

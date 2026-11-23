@@ -395,6 +395,42 @@ class AipaneDoctorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("codex_sqlite_rollout_uncovered", result.stdout)
 
+    def test_session_storage_drift_catches_double_uuid_drift_oversized_header_and_sqlite_schema_error(self) -> None:
+        import sqlite3
+        from contextlib import closing
+        from session_fixtures import write_jsonl
+
+        self.configure_core()
+        codex_home = self.home / ".codex"
+        sid_a = "11111111-1111-7111-8111-111111111111"
+        sid_b = "22222222-2222-7222-8222-222222222222"
+        sid_c = "33333333-3333-7333-8333-333333333333"
+
+        # 1. Double-UUID filename says A_B, header says C
+        drift_file = codex_home / "sessions/2026/11/23" / f"rollout-2026-11-23T10-00-00-{sid_a}_{sid_b}.jsonl"
+        write_jsonl(drift_file, [{"type": "session_meta", "payload": {"id": sid_c}}])
+
+        # 2. Oversized >4MB header fails verification explicitly
+        huge_file = codex_home / "sessions/2026/11/23" / f"rollout-2026-11-23T10-01-00-{sid_c}.jsonl"
+        huge_file.parent.mkdir(parents=True, exist_ok=True)
+        huge_file.write_text(
+            json.dumps({"type": "session_meta", "payload": {"id": sid_c, "blob": "X" * (4 * 1024 * 1024 + 1024)}})
+            + "\n",
+            encoding="utf-8",
+        )
+
+        # 3. Broken schema in sqlite/state_5.sqlite fails explicitly instead of checked_sqlite=0
+        db_path = codex_home / "sqlite/state_5.sqlite"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(db_path)) as conn, conn:
+            conn.execute("CREATE TABLE other_table (x INTEGER)")
+
+        result = self.run_doctor(CODEX_HOME=str(codex_home))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("codex_sid_drift", result.stdout)
+        self.assertIn("codex_header_header_too_large", result.stdout)
+        self.assertIn("codex_sqlite_query_failed", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

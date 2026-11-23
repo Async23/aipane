@@ -119,6 +119,7 @@ class LivePaneSession:
     is_self: bool = False
     pane_in_mode: bool = False
     active_path: str = ""
+    storage_root: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -143,6 +144,8 @@ class LivePaneSession:
         }
         if self.active_path:
             out["active_path"] = self.active_path
+        if self.storage_root:
+            out["storage_root"] = self.storage_root
         return out
 
 
@@ -419,17 +422,35 @@ def _find_pids_by_name(
 
 
 def _codex_rollout_meta(path_str: str) -> dict[str, str] | None:
-    if "/sessions/" not in path_str and "/archived_sessions/" not in path_str:
-        return None
-    meta = codex_sessions.read_rollout_meta(Path(path_str), max_lines=1)
-    if not meta or not meta.get("codex_home"):
+    """Validate a writable JSONL opened by a confirmed Codex PID via its header.
+
+    Does NOT pre-filter on `/sessions/` or `/archived_sessions/` path segments
+    so future storage directories (e.g. `future_threads/`) are still detected
+    and propagated as `active_path` for completeness verification and doctor.
+    """
+    path = Path(path_str)
+    meta = codex_sessions.read_rollout_meta(path, max_lines=1)
+    if not meta:
         return None
     return {
         "sid": str(meta["sid"]),
         "cwd": str(meta["cwd"]),
-        "codex_home": str(meta["codex_home"]),
+        "codex_home": str(meta.get("codex_home") or ""),
         "rollout": path_str,
     }
+
+
+def _pick_newer_rollout_rec(prev: dict[str, str], curr: dict[str, str]) -> dict[str, str]:
+    """When one PID holds two writable FDs for the same (codex_home, sid), pick the newer segment."""
+    try:
+        prev_p = Path(prev["rollout"])
+        curr_p = Path(curr["rollout"])
+        prev_m = codex_sessions.read_rollout_meta(prev_p, max_lines=1)
+        curr_m = codex_sessions.read_rollout_meta(curr_p, max_lines=1)
+        ordered = codex_sessions.sort_rollout_entries([(prev_m, prev_p), (curr_m, curr_p)])
+        return curr if ordered[-1][1] == curr_p else prev
+    except OSError:
+        return curr
 
 
 def _build_codex_tty_map(
@@ -453,7 +474,9 @@ def _build_codex_tty_map(
         for jpath in entry["writable_jsonl"]:
             meta = _codex_rollout_meta(jpath)
             if meta is not None:
-                records[(meta["codex_home"], meta["sid"])] = meta
+                key = (meta["codex_home"], meta["sid"])
+                prev = records.get(key)
+                records[key] = meta if prev is None else _pick_newer_rollout_rec(prev, meta)
         if not records:
             continue
         for tty in entry["ttys"]:
@@ -754,6 +777,7 @@ def _resolve_single_raw_pane(
     title = ""
     cwd = pane.cwd
     active_path = ""
+    storage_root = ""
 
     # 1. Antigravity CLI
     if cmd == "agy":
@@ -779,17 +803,20 @@ def _resolve_single_raw_pane(
         if len(cands) == 1:
             sid = cands[0]["sid"]
             active_path = cands[0].get("rollout", "")
+            storage_root = cands[0].get("codex_home", "")
             authority = "codex_lsof"
         elif len(cands) > 1 and preferred:
             matched = [c for c in cands if c["sid"] == preferred]
             if len(matched) == 1:
                 sid = matched[0]["sid"]
                 active_path = matched[0].get("rollout", "")
+                storage_root = matched[0].get("codex_home", "")
                 authority = "codex_lsof"
         if not sid and preferred:
             if act_rec and isinstance(act_rec.get("root"), dict) and act_rec["root"].get("session_id") == preferred:
                 sid = preferred
                 active_path = str(act_rec["root"].get("transcript_path") or "")
+                storage_root = str(act_rec["root"].get("codex_home") or "")
                 authority = "codex_activity"
             elif reg_rec.get("tool") in {"x", "codex"} and reg_rec.get("sid") == preferred:
                 sid = preferred
@@ -872,6 +899,7 @@ def _resolve_single_raw_pane(
         is_self=(bool(current_pane_id) and pane.pane_id == current_pane_id),
         pane_in_mode=pane.pane_in_mode,
         active_path=active_path,
+        storage_root=storage_root,
     )
 
 

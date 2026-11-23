@@ -347,6 +347,7 @@ def inspect_session_storage_drift(
         (codex_home / "sessions").is_dir()
         or (codex_home / "archived_sessions").is_dir()
         or any(codex_home.glob("state_*.sqlite"))
+        or any((codex_home / "sqlite").glob("state_*.sqlite"))
         or (pi_dir / "sessions").is_dir()
     )
     if not has_session_data and not check_live_panes:

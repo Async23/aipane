@@ -284,6 +284,129 @@ class LiveSessionsUnitTests(unittest.TestCase):
         self.assertEqual(live_mod.resolve_pane_spec("0:1.4", panes, current_pane_id="%2").pane_id, "%4")
         self.assertEqual(live_mod.resolve_pane_spec("%6", panes, current_pane_id="%2").pane_id, "%6")
 
+    def test_codex_pane_propagates_custom_codex_home_and_detects_future_threads_end_to_end(self) -> None:
+        from unittest import mock
+
+        sid = "a4a4a4a4-a4a4-74a4-84a4-a4a4a4a4a4a4"
+        r2 = "b5b5b5b5-b5b5-75b5-85b5-b5b5b5b5b5b5"
+
+        # Default CODEX_HOME A has a different conversation using the same SID
+        default_home = self.home / ".codex"
+        default_seg = default_home / "sessions/2026/11/10" / f"rollout-2026-11-10T10-00-00-{sid}.jsonl"
+        default_seg.parent.mkdir(parents=True, exist_ok=True)
+        default_seg.write_text(
+            "\n".join(
+                [
+                    json.dumps({"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-10T02:00:00Z", "payload": {"id": sid, "cwd": "/tmp/a"}}),
+                    json.dumps({"ordinal": 1, "type": "response_item", "timestamp": "2026-11-10T02:00:01Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "WRONG_HOME_A_OPENING"}]}}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        # Custom CODEX_HOME B holds the real pane's 2 segments
+        custom_home = self.home / "custom-codex-b"
+        b_seg1 = custom_home / "sessions/2026/11/15" / f"rollout-2026-11-15T10-00-00-{sid}.jsonl"
+        b_seg2 = custom_home / "sessions/2026/11/23" / f"rollout-2026-11-23T10-00-00-{sid}_{r2}.jsonl"
+        b_seg1.parent.mkdir(parents=True, exist_ok=True)
+        b_seg2.parent.mkdir(parents=True, exist_ok=True)
+        b_seg1.write_text(
+            "\n".join(
+                [
+                    json.dumps({"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-15T02:00:00Z", "payload": {"id": sid, "cwd": "/tmp/b"}}),
+                    json.dumps({"ordinal": 1, "type": "response_item", "timestamp": "2026-11-15T02:00:01Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "CUSTOM_HOME_B_OPENING"}]}}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        b_seg2.write_text(
+            "\n".join(
+                [
+                    json.dumps({"ordinal": 10, "type": "session_meta", "timestamp": "2026-11-23T02:00:00Z", "payload": {"id": sid, "cwd": "/tmp/b", "history_base": {"thread_id": sid, "end_ordinal_exclusive": 10}}}),
+                    json.dumps({"ordinal": 11, "type": "response_item", "timestamp": "2026-11-23T02:00:01Z", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "CUSTOM_HOME_B_TAIL"}]}}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        # Second pane writes to an unrecognized future_threads/ directory under default_home
+        future_sid = "c6c6c6c6-c6c6-76c6-86c6-c6c6c6c6c6c6"
+        future_file = default_home / "future_threads/2026" / f"rollout-2026-11-23T11-00-00-{future_sid}.jsonl"
+        future_file.parent.mkdir(parents=True, exist_ok=True)
+        future_file.write_text(
+            "\n".join(
+                [
+                    json.dumps({"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T03:00:00Z", "payload": {"id": future_sid, "cwd": "/tmp/future"}}),
+                    json.dumps({"ordinal": 1, "type": "response_item", "timestamp": "2026-11-23T03:00:01Z", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "FUTURE_DIR_TURN"}]}}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        tmux_stdout = "\n".join(
+            [
+                _make_raw_line("%10", pane_index="1", cmd="codex", tty="/dev/ttys010", title="Codex B", sock=self.sock, srv=self.srv),
+                _make_raw_line("%11", pane_index="2", cmd="codex", tty="/dev/ttys011", title="Codex Future", sock=self.sock, srv=self.srv),
+            ]
+        )
+
+        def fake_tmux(args: list[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(args, 0, stdout=tmux_stdout + "\n", stderr="")
+
+        def fake_pgrep(args: list[str]) -> list[int]:
+            return [3010, 3011] if args[-1] == "codex" else []
+
+        def fake_lsof(args: list[str]) -> str:
+            pid_arg = args[args.index("-p") + 1]
+            out: list[str] = []
+            if "3010" in pid_arg:
+                out.extend(["p3010", "f0", "au", "n/dev/ttys010", "f9", "aw", f"n{b_seg2}"])
+            if "3011" in pid_arg:
+                out.extend(["p3011", "f0", "au", "n/dev/ttys011", "f9", "aw", f"n{future_file}"])
+            return "\n".join(out) + "\n"
+
+        env = {"HOME": str(self.home), "AIPANE_STATE_DIR": str(self.state_dir), "TMUX_PANE": "%10"}
+        real_list_live_panes = live_mod.list_live_panes
+
+        def patched_list_live_panes(**kwargs):
+            kwargs.setdefault("tmux_runner", fake_tmux)
+            kwargs.setdefault("pgrep_runner", fake_pgrep)
+            kwargs.setdefault("lsof_runner", fake_lsof)
+            kwargs.setdefault("process_exists", lambda pid: pid in {3010, 3011})
+            return real_list_live_panes(**kwargs)
+
+        with mock.patch.object(live_mod, "list_live_panes", side_effect=patched_list_live_panes):
+            panes = live_mod.list_live_panes(environment=env, home=self.home)
+            by_id = {p.pane_id: p for p in panes}
+            self.assertEqual(by_id["%10"].storage_root, str(custom_home.resolve()))
+            self.assertEqual(by_id["%11"].session_id, future_sid)
+            self.assertEqual(by_id["%11"].active_path, str(future_file))
+            self.assertEqual(by_id["%11"].storage_root, str(default_home.resolve()))
+
+            # 1. read --pane %10 must use custom_home B and NEVER mix default_home A
+            res_b = sessions_mod.read_session(pane="%10", view="timeline", full=True, include_children=False, home=self.home, environment=env)
+            self.assertTrue(res_b["complete"])
+            texts_b = [ev["text"] for s in res_b["sources"] for ev in s["events"]]
+            self.assertEqual(texts_b, ["CUSTOM_HOME_B_OPENING", "CUSTOM_HOME_B_TAIL"])
+            self.assertNotIn("WRONG_HOME_A_OPENING", texts_b)
+
+            # 2. read --pane %11 must recover future_threads/ file and mark complete=False
+            res_future = sessions_mod.read_session(pane="%11", view="timeline", full=True, include_children=False, home=self.home, environment=env)
+            self.assertFalse(res_future["complete"])
+            self.assertTrue(any("active_file_missed_by_discovery" in w for w in res_future["warnings"]))
+            self.assertEqual(res_future["sources"][0]["events"][0]["text"], "FUTURE_DIR_TURN")
+
+            # 3. doctor drift audit must check BOTH live panes and flag ONLY %11 as uncovered
+            audit = sessions_mod.audit_session_storage_drift(home=self.home, days=14, environment=env, check_live_panes=True)
+            self.assertEqual(audit["checked_live_panes"], 2)
+            uncovered = [i for i in audit["issues"] if i["code"] == "live_pane_active_path_uncovered"]
+            self.assertEqual(len(uncovered), 1)
+            self.assertIn(str(future_file), uncovered[0]["message"])
+
     def test_kimi_2x_discovery_preview_timeline_and_ref_prefix(self) -> None:
         raw_uuid = "aa4313fb-986d-4f74-8f8b-c5e14883633d"
         full_sid = f"session_{raw_uuid}"
