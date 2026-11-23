@@ -106,12 +106,25 @@ def rollout_matches_session(path: Path, sid: str) -> bool:
 
 
 def sort_rollout_entries(entries: list[tuple[dict[str, Any] | None, Path]]) -> list[tuple[dict[str, Any] | None, Path]]:
-    """Order rollout segments for the same session from earliest to latest.
+    """Order rollout segments for the same session from earliest to latest creation.
 
-    Uses `ordinal` when every segment provides it; otherwise falls back to
-    session_meta timestamp and path order so mixed legacy/new rollouts never
-    sort legacy (ordinal=None) segments after newer ones.
+    Uses `session_meta` timestamp first so consecutive rollbacks to an earlier
+    ordinal still preserve true causal creation order; falls back to `ordinal`
+    and path order when timestamps are absent.
     """
+    all_have_ts = bool(entries) and all(
+        meta is not None and bool(meta.get("timestamp"))
+        for meta, _ in entries
+    )
+    if all_have_ts:
+        return sorted(
+            entries,
+            key=lambda item: (
+                str(item[0]["timestamp"]),  # type: ignore[index]
+                int(item[0]["ordinal"]) if isinstance(item[0].get("ordinal"), int) else 0,  # type: ignore[union-attr]
+                str(item[1]),
+            ),
+        )
     all_have_ordinal = bool(entries) and all(
         meta is not None and isinstance(meta.get("ordinal"), int)
         for meta, _ in entries
@@ -121,7 +134,6 @@ def sort_rollout_entries(entries: list[tuple[dict[str, Any] | None, Path]]) -> l
             entries,
             key=lambda item: (
                 int(item[0]["ordinal"]),  # type: ignore[index]
-                str(item[0].get("timestamp") or ""),  # type: ignore[union-attr]
                 str(item[1]),
             ),
         )

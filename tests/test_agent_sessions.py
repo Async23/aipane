@@ -586,6 +586,202 @@ class AgentSessionsTest(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             mod.read_session(f"codex:{seg3_rollout}", view="timeline", home=self.home)
 
+    def test_logical_session_list_find_and_preview_aggregate_codex_segments(self) -> None:
+        if not shutil.which("rg"):
+            self.skipTest("rg is required")
+
+        sid = "21212121-2121-7121-8121-212121212121"
+        r2 = "32323232-3232-7232-8232-323232323232"
+        r3 = "43434343-4343-7343-8343-434343434343"
+
+        seg1 = self.home / ".codex/sessions/2026/10/15" / f"rollout-2026-10-15T10-00-00-{sid}.jsonl"
+        seg2 = self.home / ".codex/sessions/2026/11/01" / f"rollout-2026-11-01T10-00-00-{sid}_{r2}.jsonl"
+        seg3 = self.home / ".codex/sessions/2026/11/23" / f"rollout-2026-11-23T09-46-00-{sid}_{r3}.jsonl"
+
+        # seg1 has an opening screenshot (>256KB base64 payload) so preview must still recover the prompt
+        big_img = "data:image/png;base64," + ("A" * 300000)
+        write_jsonl(
+            seg1,
+            [
+                {"ordinal": 0, "type": "session_meta", "timestamp": "2026-10-15T02:00:00Z", "payload": {"id": sid}},
+                {
+                    "ordinal": 1,
+                    "type": "response_item",
+                    "timestamp": "2026-10-15T02:00:01Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_image", "image_url": big_img},
+                            {"type": "input_text", "text": "Initial prompt with EARLY_NEEDLE_ABC"},
+                        ],
+                    },
+                },
+            ],
+        )
+        write_jsonl(
+            seg2,
+            [
+                {"ordinal": 10, "type": "session_meta", "timestamp": "2026-11-01T02:00:00Z", "payload": {"id": sid}},
+                {
+                    "ordinal": 11,
+                    "type": "response_item",
+                    "timestamp": "2026-11-01T02:00:01Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Middle progress update"}],
+                    },
+                },
+            ],
+        )
+        write_jsonl(
+            seg3,
+            [
+                {"ordinal": 20, "type": "session_meta", "timestamp": "2026-11-23T01:46:00Z", "payload": {"id": sid}},
+                {
+                    "ordinal": 21,
+                    "type": "response_item",
+                    "timestamp": "2026-11-23T01:46:01Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "LATEST_TAIL_REPLY from segment 3"}],
+                    },
+                },
+            ],
+        )
+        # seg1 is 30 days old, seg2 is 20 days old, seg3 is active today
+        os.utime(seg1, (self.now - 30 * 86400, self.now - 30 * 86400))
+        os.utime(seg2, (self.now - 20 * 86400, self.now - 20 * 86400))
+        os.utime(seg3, (self.now - 60, self.now - 60))
+
+        listed = mod.list_sessions(agents=["codex"], days=14, home=self.home, now=self.now)
+        self.assertEqual(listed["count"], 1)
+        entry = listed["sessions"][0]
+        self.assertEqual(entry["session_id"], sid)
+        self.assertEqual(entry["segment_count"], 3)
+        self.assertEqual(entry["path"], str(seg3))
+        self.assertEqual(entry["paths"], [str(seg1), str(seg2), str(seg3)])
+        self.assertEqual(entry["size_bytes"], seg1.stat().st_size + seg2.stat().st_size + seg3.stat().st_size)
+        self.assertIn("Initial prompt", entry["preview"])
+
+        # find within 14 days must still search seg1 because the logical session is hot
+        found = mod.find_sessions("EARLY_NEEDLE_ABC", agents=["codex"], days=14, home=self.home, now=self.now)
+        self.assertEqual(found["count"], 1)
+        self.assertEqual(found["hits"][0]["session_id"], sid)
+        self.assertEqual(found["hits"][0]["path"], str(seg1))
+
+        # render_preview must show BOTH the opening turn from seg1 and latest reply from seg3
+        preview = mod.render_preview(kind="disk", agent="codex", session_id=sid, home=self.home)
+        self.assertIn("Initial prompt", preview)
+        self.assertIn("LATEST_TAIL_REPLY", preview)
+
+    def test_codex_ordinal_rollback_pruning_and_consecutive_deep_rollback(self) -> None:
+        sid = "54545454-5454-7454-8454-545454545454"
+        r2 = "65656565-6565-7565-8565-656565656565"
+        r3 = "76767676-7676-7676-8676-767676767676"
+
+        seg1 = self.home / ".codex/sessions/2026/11/20" / f"rollout-2026-11-20T10-00-00-{sid}.jsonl"
+        seg2 = self.home / ".codex/sessions/2026/11/20" / f"rollout-2026-11-20T10-05-00-{sid}_{r2}.jsonl"
+        seg3 = self.home / ".codex/sessions/2026/11/20" / f"rollout-2026-11-20T10-06-00-{sid}_{r3}.jsonl"
+
+        # Seg1: ord 0..100, where ord 90..100 will be superseded by seg3's deep rollback
+        write_jsonl(
+            seg1,
+            [
+                {"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-20T02:00:00Z", "payload": {"id": sid}},
+                {
+                    "ordinal": 10,
+                    "type": "response_item",
+                    "timestamp": "2026-11-20T02:00:01Z",
+                    "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Keep me"}]},
+                },
+                {
+                    "ordinal": 90,
+                    "type": "response_item",
+                    "timestamp": "2026-11-20T02:04:00Z",
+                    "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Rolled back 1"}]},
+                },
+                {
+                    "ordinal": 95,
+                    "type": "response_item",
+                    "timestamp": "2026-11-20T02:04:30Z",
+                    "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Rolled back 2"}]},
+                },
+            ],
+        )
+        # Seg2: created at 02:05 starting at ord 95 (will be completely superseded by seg3 starting at ord 90)
+        write_jsonl(
+            seg2,
+            [
+                {"ordinal": 95, "type": "session_meta", "timestamp": "2026-11-20T02:05:00Z", "payload": {"id": sid}},
+                {
+                    "ordinal": 96,
+                    "type": "response_item",
+                    "timestamp": "2026-11-20T02:05:01Z",
+                    "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Ghost turn in seg2"}]},
+                },
+            ],
+        )
+        # Seg3: created at 02:06 rolling back deeper to ord 90
+        write_jsonl(
+            seg3,
+            [
+                {"ordinal": 90, "type": "session_meta", "timestamp": "2026-11-20T02:06:00Z", "payload": {"id": sid}},
+                {
+                    "ordinal": 91,
+                    "type": "response_item",
+                    "timestamp": "2026-11-20T02:06:01Z",
+                    "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Surviving rewritten turn"}]},
+                },
+            ],
+        )
+
+        # Default timeline prunes rolled-back records
+        res = mod.read_session(f"codex:{sid}", view="timeline", full=True, home=self.home)
+        self.assertEqual([Path(s["source_path"]) for s in res["sources"]], [seg1, seg2, seg3])
+        all_texts = [ev["text"] for s in res["sources"] for ev in s["events"]]
+        self.assertEqual(all_texts, ["Keep me", "Surviving rewritten turn"])
+        self.assertEqual(res["sources"][0]["superseded_from_ordinal"], 90)
+        self.assertEqual(res["sources"][0]["superseded_records"], 2)
+        self.assertEqual(res["sources"][1]["superseded_from_ordinal"], 90)
+        self.assertEqual(res["sources"][1]["events"], [])
+
+        # Opt-in --include-superseded keeps all historical rolled-back turns
+        raw_res = mod.read_session(
+            f"codex:{sid}", view="timeline", full=True, include_superseded=True, home=self.home
+        )
+        raw_texts = [ev["text"] for s in raw_res["sources"] for ev in s["events"]]
+        self.assertIn("Ghost turn in seg2", raw_texts)
+        self.assertIn("Rolled back 1", raw_texts)
+
+        # Lossless export preserves all bytes and annotates ordinal metadata in manifest
+        exp_dir = self.home / "export-rollback"
+        exp = mod.read_session(f"codex:{sid}", view="export", output_dir=str(exp_dir), home=self.home)
+        msrcs = exp["manifest"]["sources"]
+        self.assertEqual(len(msrcs), 3)
+        self.assertEqual((msrcs[0]["ordinal_start"], msrcs[0]["ordinal_end"], msrcs[0]["superseded_from_ordinal"]), (0, 95, 90))
+        self.assertEqual((msrcs[1]["ordinal_start"], msrcs[1]["ordinal_end"], msrcs[1]["superseded_from_ordinal"]), (95, 96, 90))
+        self.assertEqual((msrcs[2]["ordinal_start"], msrcs[2]["ordinal_end"]), (90, 91))
+        self.assertNotIn("superseded_from_ordinal", msrcs[2])
+
+    def test_pi_multi_uuid_filename_uses_header_session_id(self) -> None:
+        pi_sid = "87878787-8787-7787-8787-878787878787"
+        extra_uuid = "98989898-9898-7898-8898-989898989898"
+        pip = self.home / ".pi/agent/sessions" / f"2026-11-23_{pi_sid}_{extra_uuid}.jsonl"
+        write_jsonl(
+            pip,
+            [
+                {"type": "session", "id": pi_sid, "timestamp": "2026-11-23T01:00:00Z"},
+                {"type": "message", "message": {"role": "user", "content": "Pi header identity test"}},
+            ],
+        )
+        res = mod.read_session(f"pi:{pi_sid}", view="timeline", home=self.home)
+        self.assertEqual(res["sources"][0]["events"][0]["text"], "Pi header identity test")
+        with self.assertRaises(FileNotFoundError):
+            mod.read_session(f"pi:{extra_uuid}", view="timeline", home=self.home)
+
 
 if __name__ == "__main__":
     unittest.main()

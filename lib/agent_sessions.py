@@ -84,6 +84,65 @@ class SessionFile:
     parent_id: str | None = None
 
 
+@dataclass
+class LogicalSession:
+    """A logical conversation aggregated across one or more physical storage files."""
+
+    agent: str
+    session_id: str
+    segments: list[SessionFile]
+    is_subagent: bool = False
+    parent_id: str | None = None
+
+    @property
+    def mtime(self) -> float:
+        return max(s.mtime for s in self.segments)
+
+    @property
+    def size_bytes(self) -> int:
+        return sum(s.size_bytes for s in self.segments)
+
+    @property
+    def first_segment(self) -> SessionFile:
+        return self.segments[0]
+
+    @property
+    def latest_segment(self) -> SessionFile:
+        return self.segments[-1]
+
+
+def group_logical_sessions(files: list[SessionFile]) -> list[LogicalSession]:
+    """Group physical storage files by logical (agent, session_id, is_subagent)."""
+    buckets: dict[tuple[str, str, bool], list[SessionFile]] = {}
+    for sf in files:
+        key = (sf.agent, sf.session_id, sf.is_subagent)
+        buckets.setdefault(key, []).append(sf)
+
+    sessions: list[LogicalSession] = []
+    for (agent, sid, is_sub), segs in buckets.items():
+        if len(segs) > 1:
+            if agent == "codex":
+                meta_pairs = [
+                    (codex_sessions.read_rollout_meta(sf.path, max_lines=1), sf.path)
+                    for sf in segs
+                ]
+                by_path = {sf.path: sf for sf in segs}
+                segs = [by_path[p] for _, p in codex_sessions.sort_rollout_entries(meta_pairs)]
+            else:
+                segs = sorted(segs, key=lambda s: (s.mtime, str(s.path)))
+        parent_id = next((s.parent_id for s in segs if s.parent_id), None)
+        sessions.append(
+            LogicalSession(
+                agent=agent,
+                session_id=sid,
+                segments=segs,
+                is_subagent=is_sub,
+                parent_id=parent_id,
+            )
+        )
+    return sessions
+
+
 def normalize_agents(raw: list[str] | None) -> list[str]:
     if not raw:
         return list(ALL_AGENTS)
@@ -243,7 +302,12 @@ def discover_agent_files(agent: str, home: Path | None = None) -> list[SessionFi
                 if not p.is_file():
                     continue
                 m = UUID_RE.findall(p.stem)
-                sid = m[-1] if m else p.stem
+                if len(m) == 1:
+                    sid = m[0]
+                else:
+                    hdr = read_first_json(p)
+                    hdr_id = hdr.get("id") if (hdr and hdr.get("type") == "session") else None
+                    sid = hdr_id if isinstance(hdr_id, str) and hdr_id else (m[0] if m else p.stem)
                 st = p.stat()
                 found.append(SessionFile("pi", sid, p, st.st_mtime, st.st_size))
 
@@ -285,8 +349,8 @@ def discover_agent_files(agent: str, home: Path | None = None) -> list[SessionFi
 
 
 def prune_by_time(
-    files: list[SessionFile], days: int, scan_all: bool, now: float | None = None
-) -> tuple[list[SessionFile], int]:
+    files: list[Any], days: int, scan_all: bool, now: float | None = None
+) -> tuple[list[Any], int]:
     files.sort(key=lambda s: s.mtime, reverse=True)
     if scan_all or days <= 0:
         return files, 0
@@ -339,6 +403,37 @@ def is_noise_user_text(text: str) -> bool:
 
 def zstd_binary() -> str:
     return shutil.which("zstd") or "/opt/homebrew/bin/zstd"
+
+
+def iter_head_lines(
+    path: Path, max_lines: int = 80, max_bytes: int = 8 * 1024 * 1024
+) -> Iterator[str]:
+    """Stream up to `max_lines` / `max_bytes` from the head of a session log.
+
+    Streaming line-by-line avoids reading full buffers on normal sessions while
+    still tolerating opening turns that embed multi-hundred-KB base64 screenshots.
+    """
+    if path.suffix == ".zstd":
+        for line in read_head_lines(path, max_lines=max_lines, max_bytes=min(max_bytes, 2 * 1024 * 1024)):
+            yield line
+        return
+    try:
+        read_bytes = 0
+        with path.open("rb") as f:
+            for _ in range(max_lines):
+                remaining = max_bytes - read_bytes
+                if remaining <= 0:
+                    break
+                raw = f.readline(remaining + 1)
+                if not raw:
+                    break
+                read_bytes += len(raw)
+                if len(raw) > remaining:
+                    # Line exceeded remaining byte budget; stop to avoid truncated JSON.
+                    break
+                yield raw.decode("utf-8", errors="replace")
+    except Exception:
+        return
 
 
 def read_head_lines(path: Path, max_lines: int = 80, max_bytes: int = 262144) -> list[str]:
@@ -425,7 +520,7 @@ def extract_preview(sf: SessionFile) -> str:
             except Exception:
                 pass
 
-    for line in read_head_lines(sf.path):
+    for line in iter_head_lines(sf.path):
         line = line.strip()
         if not line:
             continue
@@ -899,6 +994,38 @@ def _extract_line_attachments(
     return extracted
 
 
+def _compute_codex_segment_bounds(sources: list[SessionFile]) -> dict[Path, int | None]:
+    """Compute exclusive `superseded_from_ordinal` upper bounds per Codex segment.
+
+    When Codex rolls back/rewinds a turn and opens a suffixed rollout segment,
+    the new segment starts at an earlier ordinal than the previous segment's tail.
+    For each segment `i` within the same logical Codex session, any record with
+    `ordinal >= min(first_ordinal of later segments j > i)` has been superseded.
+    """
+    bounds: dict[Path, int | None] = {}
+    groups: dict[str, list[SessionFile]] = {}
+    for sf in sources:
+        if sf.agent == "codex":
+            groups.setdefault(sf.session_id, []).append(sf)
+
+    for segs in groups.values():
+        if len(segs) <= 1:
+            continue
+        first_ordinals: list[int | None] = []
+        for sf in segs:
+            meta = codex_sessions.read_rollout_meta(sf.path, max_lines=1)
+            ord_val = meta.get("ordinal") if meta else None
+            first_ordinals.append(ord_val if isinstance(ord_val, int) else None)
+        # Suffix minimum of later segments' starting ordinals
+        suffix_min: int | None = None
+        for idx in range(len(segs) - 1, -1, -1):
+            bounds[segs[idx].path] = suffix_min
+            cur_ord = first_ordinals[idx]
+            if cur_ord is not None:
+                suffix_min = cur_ord if suffix_min is None else min(suffix_min, cur_ord)
+    return bounds
+
+
 def export_sources(
     session_id: str,
     sources: list[SessionFile],
@@ -909,6 +1036,7 @@ def export_sources(
         raise FileExistsError(f"output directory already exists: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=False)
 
+    codex_bounds = _compute_codex_segment_bounds(sources)
     attachments_dir = output_dir / "attachments"
     manifest_sources: list[dict[str, Any]] = []
     for idx, sf in enumerate(sources, 1):
@@ -918,6 +1046,8 @@ def export_sources(
         byte_count = 0
         record_count = 0
         attachments_meta: list[dict[str, Any]] = []
+        ordinal_start: int | None = None
+        ordinal_end: int | None = None
         with out_path.open("wb") as dst:
             for line_no, line in enumerate(iter_decoded_lines(sf.path), 1):
                 encoded = line.encode("utf-8", errors="replace")
@@ -926,24 +1056,40 @@ def export_sources(
                 byte_count += len(encoded)
                 if line.strip():
                     record_count += 1
+                    if sf.agent == "codex" and '"ordinal"' in line:
+                        try:
+                            rec_obj = json.loads(line)
+                            ord_v = rec_obj.get("ordinal") if isinstance(rec_obj, dict) else None
+                            if isinstance(ord_v, int) and not isinstance(ord_v, bool):
+                                if ordinal_start is None or ord_v < ordinal_start:
+                                    ordinal_start = ord_v
+                                if ordinal_end is None or ord_v > ordinal_end:
+                                    ordinal_end = ord_v
+                        except Exception:
+                            pass
                     attachments_meta.extend(
                         _extract_line_attachments(line, idx, line_no, attachments_dir)
                     )
-        manifest_sources.append(
-            {
-                "source": {
-                    "agent": sf.agent,
-                    "session_id": sf.session_id,
-                    "path": str(sf.path),
-                    "parent": sf.parent_id,
-                },
-                "exported": str(out_path.resolve()),
-                "bytes": byte_count,
-                "records": record_count,
-                "sha256": hasher.hexdigest(),
-                "attachments": attachments_meta,
-            }
-        )
+        source_entry: dict[str, Any] = {
+            "source": {
+                "agent": sf.agent,
+                "session_id": sf.session_id,
+                "path": str(sf.path),
+                "parent": sf.parent_id,
+            },
+            "exported": str(out_path.resolve()),
+            "bytes": byte_count,
+            "records": record_count,
+            "sha256": hasher.hexdigest(),
+            "attachments": attachments_meta,
+        }
+        if ordinal_start is not None:
+            source_entry["ordinal_start"] = ordinal_start
+            source_entry["ordinal_end"] = ordinal_end
+        superseded_from = codex_bounds.get(sf.path)
+        if superseded_from is not None:
+            source_entry["superseded_from_ordinal"] = superseded_from
+        manifest_sources.append(source_entry)
 
     manifest = {
         "version": 1,
@@ -959,11 +1105,16 @@ def export_sources(
     return manifest
 
 
-def parse_timeline_events(
-    agent: str, path: Path, full: bool = False
-) -> tuple[list[dict[str, Any]], int]:
+def _parse_timeline_events_with_stats(
+    agent: str,
+    path: Path,
+    full: bool = False,
+    *,
+    max_ordinal_exclusive: int | None = None,
+) -> tuple[list[dict[str, Any]], int, int]:
     events: list[dict[str, Any]] = []
     total_records = 0
+    superseded_records = 0
 
     def fmt(text: str) -> str:
         return text.strip() if full else clean_preview(text, 300)
@@ -978,6 +1129,16 @@ def parse_timeline_events(
         except Exception:
             continue
         if not isinstance(rec, dict):
+            continue
+
+        if (
+            agent == "codex"
+            and max_ordinal_exclusive is not None
+            and isinstance(rec.get("ordinal"), int)
+            and not isinstance(rec.get("ordinal"), bool)
+            and rec["ordinal"] >= max_ordinal_exclusive
+        ):
+            superseded_records += 1
             continue
 
         ts = rec.get("timestamp") or rec.get("created_at") or rec.get("time") or ""
@@ -1272,6 +1433,19 @@ def parse_timeline_events(
             if "text" in ev:
                 ev["text"] = ev["text"].strip()
 
+    return events, total_records, superseded_records
+
+
+def parse_timeline_events(
+    agent: str,
+    path: Path,
+    full: bool = False,
+    *,
+    max_ordinal_exclusive: int | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    events, total_records, _ = _parse_timeline_events_with_stats(
+        agent, path, full=full, max_ordinal_exclusive=max_ordinal_exclusive
+    )
     return events, total_records
 
 
@@ -1285,6 +1459,14 @@ def window_snippet(line: str, start: int, end: int, radius: int = 120) -> str:
     if e < len(line):
         frag = frag + "…"
     return frag
+
+
+def _extract_logical_preview(ls: LogicalSession) -> str:
+    for seg in ls.segments:
+        preview = extract_preview(seg)
+        if preview:
+            return preview
+    return ""
 
 
 def list_sessions(
@@ -1303,19 +1485,23 @@ def list_sessions(
             if not sf.is_subagent:
                 all_files.append(sf)
 
-    hot, skipped = prune_by_time(all_files, days, scan_all, now=now)
-    selected = hot[:limit]
-    items = [
-        {
-            "agent": sf.agent,
-            "session_id": sf.session_id,
-            "mtime": iso_local(sf.mtime),
-            "size_bytes": sf.size_bytes,
-            "preview": extract_preview(sf),
-            "path": str(sf.path),
+    logical = group_logical_sessions(all_files)
+    hot, skipped = prune_by_time(logical, days, scan_all, now=now)
+    selected: list[LogicalSession] = hot[:limit]
+    items: list[dict[str, Any]] = []
+    for ls in selected:
+        item: dict[str, Any] = {
+            "agent": ls.agent,
+            "session_id": ls.session_id,
+            "mtime": iso_local(ls.mtime),
+            "size_bytes": ls.size_bytes,
+            "preview": _extract_logical_preview(ls),
+            "path": str(ls.latest_segment.path),
+            "segment_count": len(ls.segments),
         }
-        for sf in selected
-    ]
+        if len(ls.segments) > 1:
+            item["paths"] = [str(seg.path) for seg in ls.segments]
+        items.append(item)
     return {
         "command": "list",
         "count": len(items),
@@ -1350,7 +1536,15 @@ def find_sessions(
     for ag in norm_agents:
         all_files.extend(discover_agent_files(ag, home=home))
 
-    hot, skipped = prune_by_time(all_files, days, scan_all, now=now)
+    # Prune at logical-session granularity so older segments of an active
+    # multi-segment session remain searchable within the hot window.
+    logical = group_logical_sessions(all_files)
+    hot_logical, _ = prune_by_time(logical, days, scan_all, now=now)
+    hot: list[SessionFile] = []
+    for ls in hot_logical:
+        hot.extend(ls.segments)
+    hot.sort(key=lambda s: s.mtime, reverse=True)
+    skipped = len(all_files) - len(hot)
     by_path: dict[str, SessionFile] = {str(sf.path): sf for sf in hot}
 
     hits: list[dict[str, Any]] = []
@@ -1454,6 +1648,7 @@ def read_session(
     home: Path | None = None,
     pane: str | None = None,
     environment: dict[str, str] | None = None,
+    include_superseded: bool = False,
 ) -> dict[str, Any]:
     resolved_pane_info: dict[str, Any] | None = None
     if pane:
@@ -1507,27 +1702,36 @@ def read_session(
         return payload
 
     effective_max = max_events if max_events is not None else (None if full else 120)
+    codex_bounds = {} if include_superseded else _compute_codex_segment_bounds(sources)
     all_sources = []
     for sf in sources:
-        evs, records = parse_timeline_events(sf.agent, sf.path, full=full)
+        superseded_from = codex_bounds.get(sf.path)
+        evs, records, superseded_count = _parse_timeline_events_with_stats(
+            sf.agent,
+            sf.path,
+            full=full,
+            max_ordinal_exclusive=superseded_from,
+        )
         if effective_max is not None and effective_max > 0:
             truncated = len(evs) > effective_max
             out_events = evs[:effective_max]
         else:
             truncated = False
             out_events = evs
-        all_sources.append(
-            {
-                "agent": sf.agent,
-                "session_id": sf.session_id,
-                "parent": sf.parent_id,
-                "source_path": str(sf.path),
-                "records": records,
-                "total_timeline_events": len(evs),
-                "truncated": truncated,
-                "events": out_events,
-            }
-        )
+        src_entry: dict[str, Any] = {
+            "agent": sf.agent,
+            "session_id": sf.session_id,
+            "parent": sf.parent_id,
+            "source_path": str(sf.path),
+            "records": records,
+            "total_timeline_events": len(evs),
+            "truncated": truncated,
+            "events": out_events,
+        }
+        if superseded_from is not None:
+            src_entry["superseded_from_ordinal"] = superseded_from
+            src_entry["superseded_records"] = superseded_count
+        all_sources.append(src_entry)
     result: dict[str, Any] = {
         "command": "read",
         "view": "timeline",
@@ -1733,21 +1937,67 @@ def render_preview(
     header_parts.append(f"{bold}{cyan}{label}{reset}")
     header_parts.append(f"{dim}{'─' * 56}{reset}")
     try:
-        data = read_session(
+        primary_sources = resolve_session_sources(
             session_id=sid_clean,
             agent=norm_agent,
-            view="timeline",
             include_children=False,
-            max_events=24,
-            full=False,
             home=home,
         )
-        sources = data.get("sources") or []
-        events = sources[0].get("events", []) if sources else []
+        codex_bounds = _compute_codex_segment_bounds(primary_sources)
         body_lines: list[str] = []
-        shown = [e for e in events if e.get("kind") in ("user", "assistant")]
-        if len(shown) > 10:
-            shown = [*shown[:3], {"kind": "gap", "text": f"… {len(shown) - 8} turns omitted …"}, *shown[-5:]]
+        shown: list[dict[str, Any]] = []
+        if len(primary_sources) <= 2:
+            for sf in primary_sources:
+                evs, _, _ = _parse_timeline_events_with_stats(
+                    sf.agent,
+                    sf.path,
+                    full=False,
+                    max_ordinal_exclusive=codex_bounds.get(sf.path),
+                )
+                shown.extend(e for e in evs if e.get("kind") in ("user", "assistant"))
+            if len(shown) > 10:
+                shown = [*shown[:3], {"kind": "gap", "text": f"… {len(shown) - 8} turns omitted …"}, *shown[-5:]]
+        else:
+            head_turns: list[dict[str, Any]] = []
+            head_last_idx = 0
+            for idx, sf in enumerate(primary_sources):
+                head_last_idx = idx
+                evs, _, _ = _parse_timeline_events_with_stats(
+                    sf.agent,
+                    sf.path,
+                    full=False,
+                    max_ordinal_exclusive=codex_bounds.get(sf.path),
+                )
+                head_turns.extend(e for e in evs if e.get("kind") in ("user", "assistant"))
+                if len(head_turns) >= 3:
+                    break
+            remaining = primary_sources[head_last_idx + 1 :]
+            if not remaining:
+                shown = head_turns
+                if len(shown) > 10:
+                    shown = [*shown[:3], {"kind": "gap", "text": f"… {len(shown) - 8} turns omitted …"}, *shown[-5:]]
+            else:
+                tail_turns: list[dict[str, Any]] = []
+                tail_segs_read = 0
+                for sf in reversed(remaining):
+                    evs, _, _ = _parse_timeline_events_with_stats(
+                        sf.agent,
+                        sf.path,
+                        full=False,
+                        max_ordinal_exclusive=codex_bounds.get(sf.path),
+                    )
+                    seg_turns = [e for e in evs if e.get("kind") in ("user", "assistant")]
+                    tail_turns = [*seg_turns, *tail_turns]
+                    tail_segs_read += 1
+                    if len(tail_turns) >= 5:
+                        break
+                omitted_segs = max(0, len(remaining) - tail_segs_read)
+                gap_text = (
+                    f"… {omitted_segs} middle segment(s) omitted ({len(primary_sources)} segments total) …"
+                    if omitted_segs
+                    else f"… across {len(primary_sources)} segments …"
+                )
+                shown = [*head_turns[:3], {"kind": "gap", "text": gap_text}, *tail_turns[-5:]]
         for ev in shown:
             ek = ev.get("kind")
             txt = str(ev.get("text") or "").strip()
@@ -1802,6 +2052,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_read.add_argument("--view", choices=("timeline", "export"), default="timeline", help="Output mode (default: timeline)")
     p_read.add_argument("--full", action="store_true", help="Include full untruncated timeline text and all events")
     p_read.add_argument("--no-children", action="store_true", help="Do not follow child sessions")
+    p_read.add_argument(
+        "--include-superseded",
+        action="store_true",
+        help="Include rolled-back Codex records superseded by a later rollout segment",
+    )
     p_read.add_argument("--output-dir", help="Target export directory (must not exist)")
     p_read.add_argument(
         "--max-events",
@@ -1880,6 +2135,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_events=args.max_events,
                 full=args.full,
                 pane=args.pane,
+                include_superseded=args.include_superseded,
             )
     except (FileNotFoundError, FileExistsError, ValueError, RuntimeError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))
