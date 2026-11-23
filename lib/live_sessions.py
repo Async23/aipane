@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+import codex_sessions
 from agent_activity_contract import ACTIVITY_RECORD_OPTION
 
 FIELD_SEP = "\x1f"
@@ -117,9 +118,10 @@ class LivePaneSession:
     authority: str
     is_self: bool = False
     pane_in_mode: bool = False
+    active_path: str = ""
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "pane_id": self.pane_id,
             "coord": self.coord,
             "session_name": self.session_name,
@@ -139,6 +141,9 @@ class LivePaneSession:
             "cwd": self.cwd,
             "authority": self.authority,
         }
+        if self.active_path:
+            out["active_path"] = self.active_path
+        return out
 
 
 def _default_process_exists(pid: int) -> bool:
@@ -416,25 +421,15 @@ def _find_pids_by_name(
 def _codex_rollout_meta(path_str: str) -> dict[str, str] | None:
     if "/sessions/" not in path_str and "/archived_sessions/" not in path_str:
         return None
-    try:
-        path = Path(path_str)
-        parent_dir = next(
-            (anc for anc in path.parents if anc.name in {"sessions", "archived_sessions"}),
-            None,
-        )
-        if parent_dir is None:
-            return None
-        with path.open(encoding="utf-8") as fh:
-            meta = json.loads(fh.readline(65536))
-        payload = meta.get("payload") if isinstance(meta, dict) else None
-        if meta.get("type") != "session_meta" or not isinstance(payload, dict):
-            return None
-        sid = payload.get("id")
-        if not isinstance(sid, str) or not sid:
-            return None
-        return {"sid": sid, "cwd": str(payload.get("cwd", "")), "codex_home": str(parent_dir.parent)}
-    except (OSError, ValueError):
+    meta = codex_sessions.read_rollout_meta(Path(path_str), max_lines=1)
+    if not meta or not meta.get("codex_home"):
         return None
+    return {
+        "sid": str(meta["sid"]),
+        "cwd": str(meta["cwd"]),
+        "codex_home": str(meta["codex_home"]),
+        "rollout": path_str,
+    }
 
 
 def _build_codex_tty_map(
@@ -758,6 +753,7 @@ def _resolve_single_raw_pane(
     authority = ""
     title = ""
     cwd = pane.cwd
+    active_path = ""
 
     # 1. Antigravity CLI
     if cmd == "agy":
@@ -782,15 +778,18 @@ def _resolve_single_raw_pane(
         cands = codex_tty_map.get(pane.short_tty, [])
         if len(cands) == 1:
             sid = cands[0]["sid"]
+            active_path = cands[0].get("rollout", "")
             authority = "codex_lsof"
         elif len(cands) > 1 and preferred:
             matched = [c for c in cands if c["sid"] == preferred]
             if len(matched) == 1:
                 sid = matched[0]["sid"]
+                active_path = matched[0].get("rollout", "")
                 authority = "codex_lsof"
         if not sid and preferred:
             if act_rec and isinstance(act_rec.get("root"), dict) and act_rec["root"].get("session_id") == preferred:
                 sid = preferred
+                active_path = str(act_rec["root"].get("transcript_path") or "")
                 authority = "codex_activity"
             elif reg_rec.get("tool") in {"x", "codex"} and reg_rec.get("sid") == preferred:
                 sid = preferred
@@ -872,6 +871,7 @@ def _resolve_single_raw_pane(
         authority=authority,
         is_self=(bool(current_pane_id) and pane.pane_id == current_pane_id),
         pane_in_mode=pane.pane_in_mode,
+        active_path=active_path,
     )
 
 

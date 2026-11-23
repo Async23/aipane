@@ -782,6 +782,94 @@ class AgentSessionsTest(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             mod.read_session(f"pi:{extra_uuid}", view="timeline", home=self.home)
 
+    def test_completeness_flags_sqlite_and_live_pane_missed_files_instead_of_silent_true(self) -> None:
+        import sqlite3
+        from unittest import mock
+
+        sid = "91919191-9191-7191-8191-919191919191"
+        seg1 = self.home / ".codex/sessions/2026/11/10" / f"rollout-2026-11-10T10-00-00-{sid}.jsonl"
+        write_jsonl(
+            seg1,
+            [
+                {"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-10T02:00:00Z", "payload": {"id": sid}},
+                {
+                    "ordinal": 1,
+                    "type": "response_item",
+                    "timestamp": "2026-11-10T02:00:01Z",
+                    "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Old turn"}]},
+                },
+            ],
+        )
+
+        # Simulate upstream CLI writing a new segment into an unrecognized directory
+        untracked = self.home / ".codex/future_threads" / f"rollout-2026-11-23T09-46-00-{sid}.jsonl"
+        write_jsonl(
+            untracked,
+            [
+                {"ordinal": 10, "type": "session_meta", "timestamp": "2026-11-23T01:46:00Z", "payload": {"id": sid}},
+                {
+                    "ordinal": 11,
+                    "type": "response_item",
+                    "timestamp": "2026-11-23T01:46:01Z",
+                    "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Latest from untracked dir"}]},
+                },
+            ],
+        )
+
+        # 1. state_5.sqlite pointing to untracked rollout triggers complete=False + warning + recovery read
+        db_path = self.home / ".codex/state_5.sqlite"
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid, str(untracked), int(self.now)))
+
+        res = mod.read_session(f"codex:{sid}", view="timeline", full=True, home=self.home)
+        self.assertFalse(res["complete"])
+        self.assertTrue(any("sqlite_rollout_missed_by_discovery" in w for w in res["warnings"]))
+        self.assertEqual(res["sources"][-1]["events"][-1]["text"], "Latest from untracked dir")
+
+        # Export manifest also reflects complete=False and warnings
+        exp_dir = self.home / "export-warn"
+        exp = mod.read_session(f"codex:{sid}", view="export", output_dir=str(exp_dir), home=self.home)
+        self.assertFalse(exp["complete"])
+        self.assertFalse(exp["manifest"]["complete"])
+        self.assertTrue(exp["manifest"]["warnings"])
+
+        # Remove sqlite so we isolate live pane active_path detection next
+        db_path.unlink()
+
+        # 2. Live pane active_path outside static discovery triggers active_file_missed_by_discovery
+        import live_sessions
+
+        fake_pane = live_sessions.LivePaneSession(
+            pane_id="%99",
+            coord="0:3.1",
+            session_name="0",
+            window_id="@2",
+            window_index="3",
+            window_name="work",
+            pane_index="1",
+            pane_active=False,
+            window_active=True,
+            current_command="codex",
+            cwd=str(self.home),
+            pane_tty="/dev/ttys001",
+            pane_title="Codex",
+            agent="codex",
+            agent_alias="codex",
+            session_id=sid,
+            title="Codex",
+            authority="codex_lsof",
+            active_path=str(untracked),
+        )
+        with (
+            mock.patch.object(live_sessions, "list_live_panes", return_value=[fake_pane]),
+            mock.patch.object(live_sessions, "resolve_pane_spec", return_value=fake_pane),
+        ):
+            pane_res = mod.read_session(pane="1", view="timeline", full=True, home=self.home, environment={"HOME": str(self.home)})
+        self.assertFalse(pane_res["complete"])
+        self.assertTrue(any("active_file_missed_by_discovery" in w for w in pane_res["warnings"]))
+        self.assertEqual(pane_res["sources"][-1]["events"][-1]["text"], "Latest from untracked dir")
+
 
 if __name__ == "__main__":
     unittest.main()

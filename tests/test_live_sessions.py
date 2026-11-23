@@ -260,6 +260,8 @@ class LiveSessionsUnitTests(unittest.TestCase):
                          ("antigravity", agy_sid, "AGY Runtime Title", "agy_runtime"))
         self.assertEqual((by_id["%2"].agent, by_id["%2"].session_id, by_id["%2"].is_self, by_id["%2"].authority),
                          ("codex", codex_sid, True, "codex_lsof"))
+        self.assertEqual(by_id["%2"].active_path, str(codex_rollout))
+        self.assertEqual(by_id["%2"].as_dict()["active_path"], str(codex_rollout))
         self.assertEqual((by_id["%3"].agent, by_id["%3"].session_id, by_id["%3"].authority),
                          ("claude", claude_sid, "claude_sessions"))
         self.assertEqual((by_id["%4"].agent, by_id["%4"].session_id, by_id["%4"].authority),

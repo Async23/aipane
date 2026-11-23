@@ -164,11 +164,15 @@ def iso_local(ts: float) -> str:
     return dt.datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
 
 
+def _codex_home(home: Path | None = None) -> Path:
+    h = home or Path.home()
+    return Path(os.environ.get("CODEX_HOME") or (h / ".codex")).expanduser()
+
+
 def agent_roots(agent: str, home: Path | None = None) -> list[tuple[Path, dict[str, Any]]]:
     h = home or Path.home()
     if agent == "codex":
-        base = Path(os.environ.get("CODEX_HOME") or (h / ".codex"))
-        return [(root, {}) for root in codex_sessions.codex_session_roots(base)]
+        return [(root, {}) for root in codex_sessions.codex_session_roots(_codex_home(home))]
     if agent == "claude":
         base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (h / ".claude"))
         return [(base / "projects", {})]
@@ -684,8 +688,7 @@ def resolve_session_sources(
             seen_resolved.add(resolved)
             verified_pairs.append((meta, m))
         # Ensure we didn't miss any segment whose filename did not match fast-path heuristics.
-        h = home or Path.home()
-        codex_home = Path(os.environ.get("CODEX_HOME") or (h / ".codex"))
+        codex_home = _codex_home(home)
         for extra_path in codex_sessions.find_session_rollouts(session_id, codex_home):
             try:
                 resolved = extra_path.resolve()
@@ -1026,11 +1029,91 @@ def _compute_codex_segment_bounds(sources: list[SessionFile]) -> dict[Path, int 
     return bounds
 
 
+def _verify_session_completeness(
+    session_id: str,
+    target_agent: str,
+    sources: list[SessionFile],
+    *,
+    home: Path | None = None,
+    expected_active_path: Path | None = None,
+) -> tuple[bool, list[str], list[SessionFile]]:
+    """Cross-check discovered sources against runtime anchors and Codex sqlite.
+
+    Returns (complete, warnings, augmented_sources). Any mismatch sets
+    `complete = False` and emits an explicit warning instead of silently
+    returning a partial history; readable missed files are still appended to
+    the primary segment chain so callers can see the latest messages.
+    """
+    warnings: list[str] = []
+    primary = [sf for sf in sources if not sf.is_subagent]
+    children = [sf for sf in sources if sf.is_subagent]
+
+    known_resolved: set[Path] = set()
+    for sf in sources:
+        known_resolved.add(sf.path)
+        try:
+            known_resolved.add(sf.path.resolve())
+        except OSError:
+            pass
+
+    def _incorporate_missed(
+        candidate: Path, code: str, label: str, *, warn_if_missing: bool
+    ) -> None:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if candidate in known_resolved or resolved in known_resolved:
+            return
+        if not candidate.is_file():
+            if warn_if_missing:
+                warnings.append(f"{code}: {label} path {candidate} does not exist")
+            return
+        warnings.append(f"{code}: {label} path {candidate} was not covered by static discovery")
+        known_resolved.add(candidate)
+        known_resolved.add(resolved)
+        try:
+            st = candidate.stat()
+            primary.append(SessionFile(target_agent, session_id, candidate, st.st_mtime, st.st_size))
+        except OSError as exc:
+            warnings.append(f"unreadable_source: {candidate} ({exc})")
+
+    if expected_active_path is not None:
+        _incorporate_missed(
+            expected_active_path,
+            "active_file_missed_by_discovery",
+            "live pane active",
+            warn_if_missing=True,
+        )
+
+    if target_agent == "codex":
+        sqlite_path = codex_sessions.query_sqlite_rollout_path(session_id, _codex_home(home))
+        if sqlite_path is not None:
+            _incorporate_missed(
+                sqlite_path,
+                "sqlite_rollout_missed_by_discovery",
+                "state sqlite rollout",
+                warn_if_missing=False,
+            )
+        if len(primary) > 1:
+            meta_pairs = [
+                (codex_sessions.read_rollout_meta(sf.path, max_lines=1), sf.path)
+                for sf in primary
+            ]
+            by_path = {sf.path: sf for sf in primary}
+            primary = [by_path[p] for _, p in codex_sessions.sort_rollout_entries(meta_pairs)]
+
+    return (len(warnings) == 0), warnings, [*primary, *children]
+
+
 def export_sources(
     session_id: str,
     sources: list[SessionFile],
     output_dir: Path,
     include_children: bool,
+    *,
+    complete: bool = True,
+    warnings: list[str] | None = None,
 ) -> dict[str, Any]:
     if output_dir.exists():
         raise FileExistsError(f"output directory already exists: {output_dir}")
@@ -1095,7 +1178,8 @@ def export_sources(
         "version": 1,
         "session_id": session_id,
         "include_children": include_children,
-        "complete": True,
+        "complete": complete,
+        "warnings": list(warnings or []),
         "sources": manifest_sources,
     }
     manifest_path = output_dir / "manifest.json"
@@ -1651,6 +1735,7 @@ def read_session(
     include_superseded: bool = False,
 ) -> dict[str, Any]:
     resolved_pane_info: dict[str, Any] | None = None
+    expected_active_path: Path | None = None
     if pane:
         import live_sessions
 
@@ -1669,18 +1754,37 @@ def read_session(
             )
         session_id = target_pane.session_id
         agent = agent or target_pane.agent
+        if target_pane.active_path:
+            expected_active_path = Path(target_pane.active_path).expanduser()
         resolved_pane_info = target_pane.as_dict()
 
     if not session_id:
         raise ValueError("session_id or --pane is required")
 
     session_id, agent = parse_session_ref(session_id, agent)
-    sources = resolve_session_sources(
-        session_id=session_id,
-        agent=agent,
-        include_children=include_children,
+    try:
+        sources = resolve_session_sources(
+            session_id=session_id,
+            agent=agent,
+            include_children=include_children,
+            home=home,
+        )
+    except FileNotFoundError:
+        if expected_active_path is not None and expected_active_path.is_file() and agent:
+            sources = []
+        else:
+            raise
+
+    target_agent = sources[0].agent if sources else str(agent or "")
+    complete, warnings, sources = _verify_session_completeness(
+        session_id,
+        target_agent,
+        sources,
         home=home,
+        expected_active_path=expected_active_path,
     )
+    if not sources:
+        raise FileNotFoundError(f"session not found: {session_id}")
 
     if view == "export":
         if output_dir:
@@ -1689,12 +1793,21 @@ def read_session(
             stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
             safe_id = session_id.replace("/", "_")
             out_dir = Path(f"/tmp/aipane-sessions-{safe_id}-{stamp}")
-        manifest = export_sources(session_id, sources, out_dir, include_children)
+        manifest = export_sources(
+            session_id,
+            sources,
+            out_dir,
+            include_children,
+            complete=complete,
+            warnings=warnings,
+        )
         payload: dict[str, Any] = {
             "command": "read",
             "view": "export",
             "output_dir": str(out_dir.resolve()),
             "manifest_path": str((out_dir / "manifest.json").resolve()),
+            "complete": complete,
+            "warnings": warnings,
             "manifest": manifest,
         }
         if resolved_pane_info is not None:
@@ -1706,12 +1819,17 @@ def read_session(
     all_sources = []
     for sf in sources:
         superseded_from = codex_bounds.get(sf.path)
-        evs, records, superseded_count = _parse_timeline_events_with_stats(
-            sf.agent,
-            sf.path,
-            full=full,
-            max_ordinal_exclusive=superseded_from,
-        )
+        try:
+            evs, records, superseded_count = _parse_timeline_events_with_stats(
+                sf.agent,
+                sf.path,
+                full=full,
+                max_ordinal_exclusive=superseded_from,
+            )
+        except (OSError, RuntimeError) as exc:
+            complete = False
+            warnings.append(f"unreadable_source: {sf.path} ({exc})")
+            continue
         if effective_max is not None and effective_max > 0:
             truncated = len(evs) > effective_max
             out_events = evs[:effective_max]
@@ -1737,7 +1855,8 @@ def read_session(
         "view": "timeline",
         "full": full,
         "session_id": session_id,
-        "complete": True,
+        "complete": complete,
+        "warnings": warnings,
         "sources": all_sources,
     }
     if resolved_pane_info is not None:
