@@ -1545,6 +1545,327 @@ class AgentSessionsTest(unittest.TestCase):
         self.assertEqual(found_top["hits"][0]["session_id"], a_sid)
         self.assertEqual(found_top["hits"][0]["path"], str(a1))
 
+    def test_r2_p1_3_os_replace_same_path_caught_before_sqlite_and_during_open_stream(self) -> None:
+        from contextlib import closing
+        import sqlite3
+        from unittest import mock
+        import codex_sessions
+
+        sid_a = "81818181-aaaa-7181-8181-818181818181"
+        sid_b = "82828282-bbbb-7282-8282-828282828282"
+        p = self.home / ".codex/sessions/2026/11/23" / f"rollout-2026-11-23T10-00-00-{sid_a}.jsonl"
+        wrong = self.home / "staging" / f"rollout-2026-11-23T10-00-00-{sid_b}.jsonl"
+        write_jsonl(p, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T02:00:00Z", "payload": {"id": sid_a}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Original A"}]}}])
+        write_jsonl(wrong, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T02:00:00Z", "payload": {"id": sid_b}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "FOREIGN_B_CONTENT"}]}}])
+        with closing(sqlite3.connect(self.home / ".codex/state_5.sqlite")) as db, db:
+            db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            db.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid_a, str(p), int(self.now)))
+
+        # 1. Atomic os.replace between static discovery and SQLite verification must NOT return B
+        orig_query = codex_sessions.query_sqlite_rollout_path_detailed
+
+        def swap_before_sqlite(*args, **kwargs):
+            os.replace(wrong, p)
+            return orig_query(*args, **kwargs)
+
+        with mock.patch.object(codex_sessions, "query_sqlite_rollout_path_detailed", side_effect=swap_before_sqlite):
+            with self.assertRaisesRegex(FileNotFoundError, "sqlite_rollout_sid_conflict"):
+                mod.read_session(f"codex:{sid_a}", view="timeline", include_children=False, home=self.home)
+
+        # 2. Atomic os.replace right before open-stream parse/export must ALSO reject B
+        write_jsonl(p, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T02:00:00Z", "payload": {"id": sid_a}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Original A"}]}}])
+        write_jsonl(wrong, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T02:00:00Z", "payload": {"id": sid_b}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "FOREIGN_B_CONTENT"}]}}])
+        real_iter = mod.iter_raw_bytes_lines
+
+        def swap_before_open(path: Path):
+            if path == p and wrong.exists():
+                os.replace(wrong, p)
+            return real_iter(path)
+
+        with mock.patch.object(mod, "iter_raw_bytes_lines", side_effect=swap_before_open):
+            tl = mod.read_session(f"codex:{sid_a}", view="timeline", include_children=False, home=self.home)
+        self.assertFalse(tl["complete"])
+        self.assertTrue(any("source_sid_changed_during_read" in w for w in tl["warnings"]))
+        self.assertEqual(tl["sources"], [])
+
+    def test_r2_p1_4_fork_cutoff_truncation_midline_and_include_superseded_isolation(self) -> None:
+        parent_sid = "83838383-aaaa-7383-8383-838383838383"
+        fork_sid = "84848484-bbbb-7484-8484-848484848484"
+        pp = self.home / ".codex/sessions/2026/11/20" / f"rollout-2026-11-20T10-00-00-{parent_sid}.jsonl"
+        fc = self.home / ".codex/sessions/2026/11/21" / f"rollout-2026-11-21T10-00-00-{fork_sid}.jsonl"
+        lines = [
+            json.dumps({"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-20T02:00:00Z", "payload": {"id": parent_sid}}) + "\n",
+            json.dumps({"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "SHARED_PREFIX"}]}}) + "\n",
+            json.dumps({"ordinal": 2, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "PARENT_AFTER_FORK"}]}}) + "\n",
+        ]
+        pp.parent.mkdir(parents=True, exist_ok=True)
+        pp.write_text("".join(lines), encoding="utf-8")
+        exact_cutoff = len((lines[0] + lines[1]).encode("utf-8"))
+        write_jsonl(
+            fc,
+            [
+                {"ordinal": 2, "type": "session_meta", "timestamp": "2026-11-21T02:00:00Z", "payload": {"id": fork_sid, "forked_from_id": parent_sid, "history_base": {"thread_id": parent_sid, "end_ordinal_exclusive": 2, "end_byte_offset": exact_cutoff}}},
+                {"ordinal": 3, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "CHILD_TURN"}]}},
+            ],
+        )
+
+        # 1. --include-superseded on fork MUST NOT leak PARENT_AFTER_FORK
+        sup = mod.read_session(f"codex:{fork_sid}", view="timeline", full=True, include_children=False, include_superseded=True, home=self.home)
+        self.assertTrue(sup["complete"])
+        self.assertEqual([ev["text"] for s in sup["sources"] for ev in s["events"]], ["SHARED_PREFIX", "CHILD_TURN"])
+
+        # 2. Mid-line byte offset excludes straddling line and marks complete=False
+        mid_cutoff = len(lines[0].encode("utf-8")) + 10
+        write_jsonl(
+            fc,
+            [
+                {"ordinal": 2, "type": "session_meta", "timestamp": "2026-11-21T02:00:00Z", "payload": {"id": fork_sid, "forked_from_id": parent_sid, "history_base": {"thread_id": parent_sid, "end_ordinal_exclusive": 2, "end_byte_offset": mid_cutoff}}},
+                {"ordinal": 3, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "CHILD_TURN"}]}},
+            ],
+        )
+        mid = mod.read_session(f"codex:{fork_sid}", view="timeline", full=True, include_children=False, home=self.home)
+        self.assertFalse(mid["complete"])
+        self.assertTrue(any("history_base_byte_boundary_misaligned" in w for w in mid["warnings"]))
+        self.assertEqual([ev["text"] for s in mid["sources"] for ev in s["events"]], ["CHILD_TURN"])
+
+        # 3. Parent truncated at complete JSONL boundary shorter than exact_cutoff marks complete=False in timeline & export
+        write_jsonl(
+            fc,
+            [
+                {"ordinal": 2, "type": "session_meta", "timestamp": "2026-11-21T02:00:00Z", "payload": {"id": fork_sid, "forked_from_id": parent_sid, "history_base": {"thread_id": parent_sid, "end_ordinal_exclusive": 2, "end_byte_offset": exact_cutoff}}},
+                {"ordinal": 3, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "CHILD_TURN"}]}},
+            ],
+        )
+        pp.write_text(lines[0], encoding="utf-8")
+        trunc = mod.read_session(f"codex:{fork_sid}", view="timeline", full=True, include_children=False, home=self.home)
+        self.assertFalse(trunc["complete"])
+        self.assertTrue(any("history_base_parent_truncated" in w for w in trunc["warnings"]))
+        exp = mod.read_session(f"codex:{fork_sid}", view="export", include_children=False, output_dir=str(self.home / "exp-trunc"), home=self.home)
+        self.assertFalse(exp["complete"])
+        self.assertFalse(exp["manifest"]["complete"])
+
+    def test_r2_p1_5_child_continuations_sqlite_parent_children_and_3level_fork_dedup(self) -> None:
+        from contextlib import closing
+        import sqlite3
+
+        # 1. Parent with child whose seg2 omits parent_thread_id + 3-level fork A -> B -> C dedup
+        sid_a = "85858585-aaaa-7585-8585-858585858585"
+        sid_b = "86868686-bbbb-7686-8686-868686868686"
+        rid_b2 = "87878787-cccc-7787-8787-878787878787"
+        sid_c = "88888888-dddd-7888-8888-888888888888"
+
+        pa = self.home / ".codex/sessions/2026/11/20" / f"rollout-2026-11-20T10-00-00-{sid_a}.jsonl"
+        pb1 = self.home / ".codex/sessions/2026/11/21" / f"rollout-2026-11-21T10-00-00-{sid_b}.jsonl"
+        pb2 = self.home / ".codex/sessions/2026/11/22" / f"rollout-2026-11-22T10-00-00-{sid_b}_{rid_b2}.jsonl"
+        pc = self.home / ".codex/sessions/2026/11/23" / f"rollout-2026-11-23T10-00-00-{sid_c}.jsonl"
+        write_jsonl(pa, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-20T02:00:00Z", "payload": {"id": sid_a}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "A_TURN"}]}}])
+        write_jsonl(pb1, [{"ordinal": 2, "type": "session_meta", "timestamp": "2026-11-21T02:00:00Z", "payload": {"id": sid_b, "forked_from_id": sid_a, "history_base": {"thread_id": sid_a, "end_ordinal_exclusive": 2, "end_byte_offset": pa.stat().st_size}}}, {"ordinal": 3, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "B1_TURN"}]}}])
+        write_jsonl(pb2, [{"ordinal": 4, "type": "session_meta", "timestamp": "2026-11-22T02:00:00Z", "payload": {"id": sid_b, "history_base": {"thread_id": sid_b, "end_ordinal_exclusive": 4, "end_byte_offset": pb1.stat().st_size}}}, {"ordinal": 5, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "B2_CONTINUATION"}]}}])
+        write_jsonl(pc, [{"ordinal": 6, "type": "session_meta", "timestamp": "2026-11-23T02:00:00Z", "payload": {"id": sid_c, "forked_from_id": sid_b, "history_base": {"thread_id": rid_b2, "end_ordinal_exclusive": 6, "end_byte_offset": pb2.stat().st_size}}}, {"ordinal": 7, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "C_GRANDCHILD"}]}}])
+
+        res = mod.read_session(f"codex:{sid_a}", view="timeline", full=True, include_children=True, home=self.home)
+        self.assertTrue(res["complete"])
+        self.assertEqual([ev["text"] for s in res["sources"] for ev in s["events"]], ["A_TURN", "B1_TURN", "B2_CONTINUATION", "C_GRANDCHILD"])
+        # No source may declare itself as its own parent, and physical files are not duplicated
+        self.assertEqual(len(res["sources"]), 4)
+        for s in res["sources"]:
+            self.assertNotEqual(s["session_id"], s["parent"])
+
+        exp = mod.read_session(f"codex:{sid_a}", view="export", include_children=True, output_dir=str(self.home / "exp-3level"), home=self.home)
+        self.assertEqual(len(exp["manifest"]["sources"]), 4)
+        self.assertTrue(exp["manifest"]["sources"][0].get("inherited_ranges"))
+
+        # 2. SQLite-only parent in future_threads/ still discovers child in sessions/
+        p_only = "89898989-aaaa-7989-8989-898989898989"
+        c_std = "90909090-bbbb-7090-8090-909090909090"
+        pf = self.home / ".codex/future_threads" / f"rollout-2026-11-23T10-00-00-{p_only}.jsonl"
+        cs = self.home / ".codex/sessions/2026/11/23" / f"rollout-2026-11-23T10-05-00-{c_std}.jsonl"
+        write_jsonl(pf, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T02:00:00Z", "payload": {"id": p_only}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "SQLITE_PARENT"}]}}])
+        write_jsonl(cs, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T02:05:00Z", "payload": {"id": c_std, "source": {"subagent": {"thread_spawn": {"parent_thread_id": p_only}}}}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "STD_CHILD"}]}}])
+        with closing(sqlite3.connect(self.home / ".codex/state_5.sqlite")) as db, db:
+            db.execute("CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            db.execute("INSERT OR REPLACE INTO threads VALUES (?, ?, ?)", (p_only, str(pf), int(self.now)))
+        res_sq = mod.read_session(f"codex:{p_only}", view="timeline", full=True, include_children=True, home=self.home)
+        self.assertEqual([ev["text"] for s in res_sq["sources"] for ev in s["events"]], ["SQLITE_PARENT", "STD_CHILD"])
+
+    def test_r2_p1_6_mixed_local_filename_and_utc_meta_timestamps_order_correctly(self) -> None:
+        sid = "91919191-aaaa-7191-8191-919191919191"
+        r2 = "92929292-bbbb-7292-8292-929292929292"
+        r3 = "93939393-cccc-7393-8393-939393939393"
+        # Local UTC+8 filenames 10:00, 10:05, 10:06; UTC headers 02:00Z and 02:06Z; middle omits header timestamp
+        s1 = self.home / ".codex/sessions/2026/11/23" / f"rollout-2026-11-23T10-00-00-{sid}.jsonl"
+        s2 = self.home / ".codex/sessions/2026/11/23" / f"rollout-2026-11-23T10-05-00-{sid}_{r2}.jsonl"
+        s3 = self.home / ".codex/sessions/2026/11/23" / f"rollout-2026-11-23T10-06-00-{sid}_{r3}.jsonl"
+        write_jsonl(s1, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T02:00:00Z", "payload": {"id": sid}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "base"}]}}])
+        write_jsonl(s2, [{"ordinal": 95, "type": "session_meta", "payload": {"id": sid}}, {"ordinal": 96, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "obsolete95"}]}}])
+        write_jsonl(s3, [{"ordinal": 90, "type": "session_meta", "timestamp": "2026-11-23T02:06:00Z", "payload": {"id": sid}}, {"ordinal": 91, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "current90"}]}}])
+
+        res = mod.read_session(f"codex:{sid}", view="timeline", full=True, include_children=False, home=self.home)
+        self.assertTrue(res["complete"])
+        self.assertEqual([ev["text"] for s in res["sources"] for ev in s["events"]], ["base", "current90"])
+
+    def test_r2_p1_7_and_p2_6_plain_over_sqlite_zst_archived_dedup_and_jsonl_symlink_to_zst(self) -> None:
+        from contextlib import closing
+        import sqlite3
+
+        if not shutil.which("zstd"):
+            self.skipTest("zstd is required")
+
+        sid = "94949494-aaaa-7494-8494-949494949494"
+        plain = self.home / ".codex/sessions/2026/11/23" / f"rollout-2026-11-23T10-00-00-{sid}.jsonl"
+        zst = Path(str(plain) + ".zst")
+        old_recs = [
+            {"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T02:00:00Z", "payload": {"id": sid}},
+            {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "OLD_TURN"}]}},
+        ]
+        write_zstd_jsonl(zst, old_recs)
+        write_jsonl(plain, [*old_recs, {"ordinal": 2, "type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "PLAIN_NEWER_TURN"}]}}])
+
+        # SQLite points to existing .zst while newer plain .jsonl exists -> plain .jsonl MUST win
+        with closing(sqlite3.connect(self.home / ".codex/state_5.sqlite")) as db, db:
+            db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            db.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid, str(zst), int(self.now)))
+
+        res = mod.read_session(f"codex:{sid}", view="timeline", full=True, include_children=False, home=self.home)
+        self.assertTrue(res["complete"])
+        self.assertFalse(res["sources"][0]["source_path"].endswith(".zst"))
+        self.assertEqual([ev["text"] for s in res["sources"] for ev in s["events"]], ["OLD_TURN", "PLAIN_NEWER_TURN"])
+
+        # Cross-directory plain (sessions/) vs archived .zst (archived_sessions/) dedupes to 1 segment
+        arch_zst = self.home / ".codex/archived_sessions" / zst.name
+        write_zstd_jsonl(arch_zst, old_recs)
+        zst.unlink()
+        listed = mod.list_sessions(agents=["codex"], scan_all=True, home=self.home)
+        self.assertEqual(listed["sessions"][0]["segment_count"], 1)
+
+        # Symlink named .jsonl pointing to .jsonl.zst is detected as zstd and readable
+        sid_sym = "95959595-bbbb-7595-8595-959595959595"
+        real_zst = self.home / ".codex/archived_sessions" / f"rollout-2026-11-23T11-00-00-{sid_sym}.jsonl.zst"
+        write_zstd_jsonl(
+            real_zst,
+            [
+                {"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T03:00:00Z", "payload": {"id": sid_sym}},
+                {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "SYMLINK_ZST_TURN"}]}},
+            ],
+        )
+        compat_link = self.home / ".codex/sessions/2026/11/23" / f"rollout-2026-11-23T11-00-00-{sid_sym}.jsonl"
+        compat_link.symlink_to(real_zst)
+        res_sym = mod.read_session(f"codex:{sid_sym}", view="timeline", full=True, include_children=False, home=self.home)
+        self.assertTrue(res_sym["complete"])
+        self.assertEqual([ev["text"] for s in res_sym["sources"] for ev in s["events"]], ["SYMLINK_ZST_TURN"])
+
+        # Also test a standalone .jsonl symlink pointing to an out-of-tree .jsonl.zst (no archived_sessions copy)
+        sid_sym2 = "95959595-cccc-7595-8595-959595959595"
+        ext_zst = self.home / "external_store" / f"rollout-2026-11-23T11-05-00-{sid_sym2}.jsonl.zst"
+        write_zstd_jsonl(
+            ext_zst,
+            [
+                {"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T03:05:00Z", "payload": {"id": sid_sym2}},
+                {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "STANDALONE_SYMLINK_ZST"}]}},
+            ],
+        )
+        solo_link = self.home / ".codex/sessions/2026/11/23" / f"rollout-2026-11-23T11-05-00-{sid_sym2}.jsonl"
+        solo_link.symlink_to(ext_zst)
+        res_solo = mod.read_session(f"codex:{sid_sym2}", view="timeline", full=True, include_children=False, home=self.home)
+        self.assertTrue(res_solo["complete"])
+        self.assertEqual([ev["text"] for s in res_solo["sources"] for ev in s["events"]], ["STANDALONE_SYMLINK_ZST"])
+
+    def test_r2_p2_2_to_p2_5_export_malformed_query_consistency_preview_and_scan_cost(self) -> None:
+        from collections import Counter
+        import io
+        from contextlib import redirect_stderr
+        from unittest import mock
+        import codex_sessions
+
+        # 1. Export flags malformed trailing line consistently with timeline
+        sid_m = "96969696-aaaa-7696-8696-969696969696"
+        pm = self.home / ".codex/sessions/2026/11/23" / f"rollout-2026-11-23T10-00-00-{sid_m}.jsonl"
+        pm.parent.mkdir(parents=True, exist_ok=True)
+        pm.write_text(
+            json.dumps({"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T02:00:00Z", "payload": {"id": sid_m}}) + "\n"
+            + json.dumps({"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "GOOD"}]}}) + "\n"
+            + '{"unfinished":',
+            encoding="utf-8",
+        )
+        exp_m = mod.read_session(f"codex:{sid_m}", view="export", include_children=False, output_dir=str(self.home / "exp-bad-tail"), home=self.home)
+        self.assertFalse(exp_m["complete"])
+        self.assertFalse(exp_m["manifest"]["complete"])
+        self.assertTrue(any("malformed_record_lines" in w for w in exp_m["manifest"]["warnings"]))
+
+        # 2. Non-standard filename works identically with and without --no-children
+        sid_ns = "97979797-aaaa-7797-8797-979797979797"
+        pns = self.home / ".codex/sessions/2026/11/23/custom_log_name.jsonl"
+        write_jsonl(pns, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T02:00:00Z", "payload": {"id": sid_ns}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "NONSTANDARD_TURN"}]}}])
+        r_with = mod.read_session(f"codex:{sid_ns}", view="timeline", include_children=True, home=self.home)
+        r_no = mod.read_session(f"codex:{sid_ns}", view="timeline", include_children=False, home=self.home)
+        self.assertEqual(r_with["sources"][0]["events"][0]["text"], "NONSTANDARD_TURN")
+        self.assertEqual(r_no["sources"][0]["events"][0]["text"], "NONSTANDARD_TURN")
+
+        # 3. Rolled-back sole prompt -> list.preview is empty (not retracted prompt)
+        sid_rb = "98989898-aaaa-7898-8898-989898989898"
+        rb_rid = "99999999-bbbb-7999-8999-999999999999"
+        rb1 = self.home / ".codex/sessions/2026/11/20" / f"rollout-2026-11-20T10-00-00-{sid_rb}.jsonl"
+        rb2 = self.home / ".codex/sessions/2026/11/21" / f"rollout-2026-11-21T10-00-00-{sid_rb}_{rb_rid}.jsonl"
+        write_jsonl(rb1, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-20T02:00:00Z", "payload": {"id": sid_rb}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "RETRACTED_SOLE"}]}}])
+        write_jsonl(rb2, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-21T02:00:00Z", "payload": {"id": sid_rb}}])
+        listed_rb = mod.list_sessions(agents=["codex"], scan_all=True, home=self.home)
+        self.assertEqual(next(s for s in listed_rb["sessions"] if s["session_id"] == sid_rb)["preview"], "")
+
+        # 4. 5 MiB trailing metadata line -> render_preview still recovers last 5 turns
+        sid_big = "a1a1a1a1-cccc-71a1-81a1-a1a1a1a1a1a1"
+        pbig = self.home / ".codex/sessions/2026/11/23" / f"rollout-2026-11-23T12-00-00-{sid_big}.jsonl"
+        with pbig.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T04:00:00Z", "payload": {"id": sid_big}}) + "\n")
+            for i in range(1, 21):
+                fh.write(json.dumps({"ordinal": i, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": f"MT_TURN_{i:02d}"}]}}) + "\n")
+            fh.write(json.dumps({"type": "event_msg", "payload": {"type": "token_count", "blob": "x" * (5 * 1024 * 1024)}}) + "\n")
+        prev_big = mod.render_preview(kind="disk", agent="codex", session_id=sid_big, home=self.home)
+        self.assertIn("MT_TURN_01", prev_big)
+        self.assertIn("MT_TURN_20", prev_big)
+
+        # 5. Legacy Kimi bare role record works in render_preview
+        kimi_sid = "session_a2a2a2a2-aaaa-42a2-82a2-a2a2a2a2a2a2"
+        kp = self.home / ".kimi-code/sessions" / kimi_sid / "wire.jsonl"
+        write_jsonl(kp, [{"role": "user", "content": "KIMI_LEGACY_PREVIEW"}])
+        prev_k = mod.render_preview(kind="disk", agent="kimi", session_id=kimi_sid, home=self.home)
+        self.assertIn("KIMI_LEGACY_PREVIEW", prev_k)
+
+        # 6. 10-stage fork does not trigger per-hop rglob storms, and lazy list --limit 1 opens <=2 headers
+        fork_home = self.home / "scan-cost-home"
+        ids = [f"b00000{i:02d}-aaaa-7000-8000-b000000000{i:02d}" for i in range(10)]
+        prev_p = fork_home / ".codex/sessions/2026/11/01" / f"rollout-2026-11-01T10-00-00-{ids[0]}.jsonl"
+        write_jsonl(prev_p, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-01T02:00:00Z", "payload": {"id": ids[0]}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ROOT"}]}}])
+        for j in range(1, len(ids)):
+            cur_p = fork_home / f".codex/sessions/2026/11/{j+1:02d}" / f"rollout-2026-11-{j+1:02d}T10-00-00-{ids[j]}.jsonl"
+            write_jsonl(cur_p, [{"ordinal": j * 2, "type": "session_meta", "timestamp": f"2026-11-{j+1:02d}T02:00:00Z", "payload": {"id": ids[j], "history_base": {"thread_id": ids[j - 1], "end_ordinal_exclusive": j * 2, "end_byte_offset": prev_p.stat().st_size}}}, {"ordinal": j * 2 + 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": f"HOP_{j}"}]}}])
+            prev_p = cur_p
+        rglob_calls = Counter()
+        real_rglob = Path.rglob
+
+        def spy_rglob(path_self: Path, pat: str, *args, **kwargs):
+            rglob_calls[str(path_self)] += 1
+            return real_rglob(path_self, pat, *args, **kwargs)
+
+        with mock.patch.object(Path, "rglob", spy_rglob):
+            fork10 = mod.read_session(f"codex:{ids[-1]}", view="timeline", include_children=False, home=fork_home)
+        self.assertTrue(fork10["complete"])
+        self.assertEqual(len(fork10["sources"]), 10)
+        self.assertLessEqual(rglob_calls[str(fork_home / ".codex/sessions")], 2)
+
+        # 7. Compressed DSH preview uses bounded JSON parsing and produces zero stderr warnings
+        if shutil.which("zstd"):
+            dsh_sid = "c3c3c3c3-aaaa-43c3-83c3-c3c3c3c3c3c3"
+            dz = self.home / ".dsh/sessions" / dsh_sid / "session.v4.jsonl.zstd"
+            dsh_rows = [{"type": "session", "id": dsh_sid, "version": 4, "createdAt": 100}]
+            dsh_rows.extend({"type": "assistant/message", "data": {"content": f"DSH_T_{i}"}} for i in range(2000))
+            write_zstd_jsonl(dz, dsh_rows)
+            err_buf = io.StringIO()
+            with redirect_stderr(err_buf), mock.patch.object(mod.json, "loads", wraps=mod.json.loads) as jloads:
+                prev_dsh = mod.render_preview(kind="disk", agent="dsh", session_id=dsh_sid, home=self.home)
+            self.assertIn("DSH_T_1999", prev_dsh)
+            self.assertLess(jloads.call_count, 300)
+            self.assertNotIn("zstd decode failed", err_buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -430,6 +431,36 @@ class AipaneDoctorTests(unittest.TestCase):
         self.assertIn("codex_sid_drift", result.stdout)
         self.assertIn("codex_header_header_too_large", result.stdout)
         self.assertIn("codex_sqlite_query_failed", result.stdout)
+
+    def test_r2_p2_2_doctor_catches_missing_recent_sqlite_row_shadowed_db_and_corrupt_pi_header(self) -> None:
+        import sqlite3
+        from contextlib import closing
+
+        self.configure_core()
+        codex_home = self.home / ".codex"
+        codex_home.mkdir(parents=True, exist_ok=True)
+        sid = "44444444-4444-7444-8444-444444444444"
+
+        # Higher-version state_6.sqlite is empty; state_5.sqlite has a recent row pointing to missing file
+        with closing(sqlite3.connect(codex_home / "state_6.sqlite")) as conn, conn:
+            conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+        with closing(sqlite3.connect(codex_home / "state_5.sqlite")) as conn, conn:
+            conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            conn.execute(
+                "INSERT INTO threads VALUES (?, ?, ?)",
+                (sid, str(codex_home / "sessions/deleted-recent.jsonl"), int(time.time())),
+            )
+
+        # Corrupt Pi session header missing id must fail doctor
+        pi_dir = self.home / ".pi/agent"
+        bad_pi = pi_dir / "sessions/--demo--" / f"2026-11-23_{sid}.jsonl"
+        bad_pi.parent.mkdir(parents=True, exist_ok=True)
+        bad_pi.write_text("{corrupt json\n", encoding="utf-8")
+
+        result = self.run_doctor(CODEX_HOME=str(codex_home), PI_CODING_AGENT_DIR=str(pi_dir))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("codex_sqlite_rollout_missing", result.stdout)
+        self.assertIn("pi_header_invalid", result.stdout)
 
 
 if __name__ == "__main__":

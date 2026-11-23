@@ -24,7 +24,8 @@ import sys
 import time
 import urllib.parse
 import uuid
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
@@ -118,6 +119,7 @@ class _SourcePlan:
     role: str = "effective"  # "effective" | "inherited_prefix" | "superseded"
     end_ordinal_exclusive: int | None = None
     end_byte_offset: int | None = None
+    inherited_ranges: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _path_cache_key(path: Path) -> Path:
@@ -127,13 +129,17 @@ def _path_cache_key(path: Path) -> Path:
         return path
 
 
+def _meta_cache_key(path: Path) -> tuple[Path, int, int]:
+    return codex_sessions.path_identity_key(path)
+
+
 def _cached_codex_meta(
     path: Path,
-    meta_cache: dict[Path, dict[str, Any] | None] | None,
+    meta_cache: dict[Any, dict[str, Any] | None] | None,
 ) -> dict[str, Any] | None:
     if meta_cache is None:
         return codex_sessions.read_rollout_meta(path, max_lines=1)
-    key = _path_cache_key(path)
+    key = _meta_cache_key(path)
     if key not in meta_cache:
         meta_cache[key] = codex_sessions.read_rollout_meta(path, max_lines=1)
     return meta_cache[key]
@@ -145,10 +151,10 @@ def _dedup_session_files(files: list[SessionFile]) -> list[SessionFile]:
 
     def _priority(sf: SessionFile) -> tuple[int, int, int, str]:
         p = sf.path
-        is_comp = 1 if p.suffix in {".zst", ".zstd"} else 0
-        is_arch = 1 if "archived_sessions" in p.parts else 0
+        is_comp = 1 if codex_sessions.is_compressed_rollout(p) else 0
         is_sym = 1 if p.is_symlink() else 0
-        return (is_comp, is_arch, is_sym, str(p))
+        is_arch = 1 if "archived_sessions" in p.parts else 0
+        return (is_comp, is_sym, is_arch, str(p))
 
     for sf in files:
         try:
@@ -538,7 +544,7 @@ def zstd_binary() -> str:
 
 
 def _is_zstd_path(path: Path) -> bool:
-    return path.suffix.lower() in {".zstd", ".zst"}
+    return codex_sessions.is_compressed_rollout(path)
 
 
 def iter_head_lines(
@@ -554,7 +560,7 @@ def iter_head_lines(
         cap = min(max_bytes, 4 * 1024 * 1024)
         try:
             proc = subprocess.Popen(
-                [zstd_binary(), "-dcq", str(path)],
+                [zstd_binary(), "-dcqf", str(path)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
@@ -615,23 +621,41 @@ def iter_raw_bytes_lines(path: Path) -> Iterator[bytes]:
     """Yield raw line bytes (preserving exact CRLF/LF line endings) for plain or zstd files."""
     if _is_zstd_path(path):
         proc = subprocess.Popen(
-            [zstd_binary(), "-dcq", str(path)],
+            [zstd_binary(), "-dcqf", str(path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
         assert proc.stdout is not None
+        completed = False
         try:
             for raw in proc.stdout:
                 yield raw
+            completed = True
         finally:
-            proc.stdout.close()
-            rc = proc.wait()
-            stderr_bytes = proc.stderr.read() if proc.stderr else b""
-            if proc.stderr:
-                proc.stderr.close()
-            if rc != 0:
-                stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
-                raise RuntimeError(f"zstd decode failed for {path}: {stderr}")
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
+            if not completed:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                if proc.stderr:
+                    try:
+                        proc.stderr.close()
+                    except OSError:
+                        pass
+            else:
+                rc = proc.wait()
+                stderr_bytes = proc.stderr.read() if proc.stderr else b""
+                if proc.stderr:
+                    proc.stderr.close()
+                if rc != 0:
+                    stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+                    raise RuntimeError(f"zstd decode failed for {path}: {stderr}")
     else:
         with path.open("rb") as f:
             for raw in f:
@@ -797,6 +821,89 @@ def _kimi_id_matches(file_sid: str, query_sid: str) -> bool:
     return bool(f_bare) and f_bare == q_bare
 
 
+def _populate_rollout_index_from_files(
+    codex_home: Path,
+    files: list[SessionFile],
+    rollout_index: dict[str, Path],
+) -> None:
+    sentinel = f"__scanned__:{codex_home}"
+    for sf in files:
+        _, rid = codex_sessions.extract_filename_ids(sf.path)
+        if rid and rid not in rollout_index:
+            rollout_index[rid] = sf.path
+        stem_key = f"__stem__:{codex_sessions.rollout_plain_stem(sf.path)}"
+        if stem_key not in rollout_index:
+            rollout_index[stem_key] = sf.path
+    rollout_index[sentinel] = codex_home
+
+
+def _collect_codex_children_by_sid(
+    seed_sids: list[str],
+    all_codex_files: list[SessionFile],
+    seen_keys: set[tuple[Path, int, int]],
+    meta_cache: dict[Any, dict[str, Any] | None],
+) -> list[SessionFile]:
+    """Discover child Codex SIDs via BFS and collect ALL segments for each child SID."""
+    files_by_sid: dict[str, list[tuple[dict[str, Any] | None, SessionFile]]] = {}
+    child_sids_by_parent: dict[str, list[str]] = {}
+    parent_for_child: dict[str, str] = {}
+
+    for sf in all_codex_files:
+        skey = _meta_cache_key(sf.path)
+        if skey in seen_keys:
+            continue
+        meta = _cached_codex_meta(sf.path, meta_cache)
+        if not meta:
+            continue
+        actual_sid = meta["sid"]
+        files_by_sid.setdefault(actual_sid, []).append((meta, sf))
+        pid = meta.get("parent_id")
+        if isinstance(pid, str) and pid and pid != actual_sid:
+            bucket = child_sids_by_parent.setdefault(pid, [])
+            if actual_sid not in bucket:
+                bucket.append(actual_sid)
+            parent_for_child.setdefault(actual_sid, pid)
+
+    discovered: list[SessionFile] = []
+    queue = list(dict.fromkeys(seed_sids))
+    visited_sids = set(queue)
+    while queue:
+        cur = queue.pop(0)
+        child_sids = child_sids_by_parent.get(cur, [])
+        if not child_sids:
+            continue
+        # Order child SIDs by their earliest segment creation time
+        child_order_entries: list[tuple[dict[str, Any] | None, Path, str]] = []
+        for csid in child_sids:
+            segs = files_by_sid.get(csid, [])
+            if not segs:
+                continue
+            ordered_segs = codex_sessions.sort_rollout_entries([(m, sf.path) for m, sf in segs])
+            first_meta, first_path = ordered_segs[0]
+            child_order_entries.append((first_meta, first_path, csid))
+        ordered_firsts = codex_sessions.sort_rollout_entries([(m, p) for m, p, _ in child_order_entries])
+        first_path_to_csid = {p: csid for _, p, csid in child_order_entries}
+        for _, first_path in ordered_firsts:
+            csid = first_path_to_csid[first_path]
+            if csid in visited_sids:
+                continue
+            visited_sids.add(csid)
+            queue.append(csid)
+            segs = files_by_sid.get(csid, [])
+            by_path = {sf.path: sf for _, sf in segs}
+            pid = parent_for_child.get(csid, cur)
+            for _, seg_path in codex_sessions.sort_rollout_entries([(m, sf.path) for m, sf in segs]):
+                orig_sf = by_path[seg_path]
+                skey = _meta_cache_key(orig_sf.path)
+                if skey in seen_keys:
+                    continue
+                seen_keys.add(skey)
+                discovered.append(
+                    SessionFile("codex", csid, orig_sf.path, orig_sf.mtime, orig_sf.size_bytes, True, pid)
+                )
+    return discovered
+
+
 def resolve_session_sources(
     session_id: str,
     agent: str | None = None,
@@ -805,7 +912,8 @@ def resolve_session_sources(
     *,
     codex_home: Path | None = None,
     environment: Mapping[str, str] | None = None,
-    meta_cache: dict[Path, dict[str, Any] | None] | None = None,
+    meta_cache: dict[Any, dict[str, Any] | None] | None = None,
+    rollout_index: dict[str, Path] | None = None,
 ) -> list[SessionFile]:
     session_id, agent = parse_session_ref(session_id, agent)
     agents = normalize_agents([agent]) if agent else list(ALL_AGENTS)
@@ -825,9 +933,45 @@ def resolve_session_sources(
                 verify_headers=False,
             )
             by_agent[ag] = raw_files
+            if rollout_index is not None:
+                _populate_rollout_index_from_files(chome, raw_files, rollout_index)
+            nonstandard: list[SessionFile] = []
+            double_uuid_rest: list[SessionFile] = []
             for sf in raw_files:
+                fn_sid, fn_rid = codex_sessions.extract_filename_ids(sf.path)
+                plain_stem = codex_sessions.rollout_plain_stem(sf.path)
                 if sf.session_id == session_id or f"-{session_id}" in sf.path.name:
                     matches.append(sf)
+                elif fn_sid is None or not plain_stem.startswith("rollout-"):
+                    nonstandard.append(sf)
+                elif fn_sid != fn_rid:
+                    double_uuid_rest.append(sf)
+            # Non-standard filenames have no reliable filename SID: always inspect their headers
+            # so `--no-children` matches the same primary files as default `read`.
+            for sf in nonstandard:
+                meta = _cached_codex_meta(sf.path, cache)
+                if meta and meta["sid"] == session_id:
+                    matches.append(sf)
+            # Check whether verified matches are missing a predecessor (e.g. cold misnamed
+            # double-UUID file when only a continuation segment with ordinal > 0 matched).
+            need_misnamed_fallback = not matches
+            if not need_misnamed_fallback and double_uuid_rest:
+                matched_metas = [_cached_codex_meta(m.path, cache) for m in matches]
+                ords = [m["ordinal"] for m in matched_metas if m and isinstance(m.get("ordinal"), int)]
+                has_resolved_hb = any(
+                    m
+                    and isinstance(m.get("history_base"), dict)
+                    and rollout_index is not None
+                    and m["history_base"]["rollout_id"] in rollout_index
+                    for m in matched_metas
+                )
+                if ords and min(ords) > 0 and not has_resolved_hb:
+                    need_misnamed_fallback = True
+            if need_misnamed_fallback and double_uuid_rest:
+                for sf in double_uuid_rest:
+                    meta = _cached_codex_meta(sf.path, cache)
+                    if meta and meta["sid"] == session_id:
+                        matches.append(sf)
             continue
         files = discover_agent_files(
             ag,
@@ -838,6 +982,9 @@ def resolve_session_sources(
             meta_cache=cache,
         )
         by_agent[ag] = files
+        if ag == "codex" and rollout_index is not None:
+            chome = _codex_home(home, codex_home=codex_home, environment=environment)
+            _populate_rollout_index_from_files(chome, files, rollout_index)
         for sf in files:
             if sf.session_id == session_id or (
                 ag == "kimi" and not sf.is_subagent and _kimi_id_matches(sf.session_id, session_id)
@@ -855,17 +1002,16 @@ def resolve_session_sources(
 
     target_agent = matched_agents[0]
     if target_agent == "codex":
-        # Verify authoritative header session_id and sort segments earliest -> latest.
         verified_pairs: list[tuple[dict[str, Any] | None, SessionFile]] = []
-        seen_resolved: set[Path] = set()
+        seen_keys: set[tuple[Path, int, int]] = set()
         for m in matches:
-            resolved = _path_cache_key(m.path)
-            if resolved in seen_resolved:
+            mkey = _meta_cache_key(m.path)
+            if mkey in seen_keys:
                 continue
             meta = _cached_codex_meta(m.path, cache)
             if meta is not None and meta["sid"] != session_id:
                 continue
-            seen_resolved.add(resolved)
+            seen_keys.add(mkey)
             verified_pairs.append(
                 (
                     meta,
@@ -886,13 +1032,14 @@ def resolve_session_sources(
         ordered = codex_sessions.sort_rollout_entries([(meta, sf.path) for meta, sf in verified_pairs])
         matches = [path_to_sf[p] for _, p in ordered]
     else:
-        # Primary sources first (non-subagent first, then path order)
         matches.sort(key=lambda s: (s.is_subagent, str(s.path)))
     result: list[SessionFile] = list(matches)
     seen_paths: set[Path] = set()
+    seen_inode_keys: set[tuple[Path, int, int]] = set()
     for m in result:
         seen_paths.add(m.path)
         seen_paths.add(_path_cache_key(m.path))
+        seen_inode_keys.add(_meta_cache_key(m.path))
 
     if not include_children:
         return result
@@ -906,7 +1053,6 @@ def resolve_session_sources(
                 seen_paths.add(sf.path)
 
     elif target_agent == "dsh":
-        # BFS over parentSession header field
         parent_map: dict[str, list[SessionFile]] = {}
         for sf in all_agent_files:
             if sf.path in seen_paths:
@@ -927,41 +1073,14 @@ def resolve_session_sources(
                     queue.append(child.session_id)
 
     elif target_agent == "codex":
-        # Traverse child/forked sessions across all day directories and archived_sessions
-        # without date-based pruning (child local date can precede parent due to UTC/timezone
-        # or parent rollback segments living in later date directories).
-        queue = list(dict.fromkeys(m.session_id for m in matches))
-        visited_ids = set(queue)
-        children_by_parent: dict[str, list[tuple[dict[str, Any] | None, SessionFile]]] = {}
-        for sf in all_agent_files:
-            sf_resolved = _path_cache_key(sf.path)
-            if sf.path in seen_paths or sf_resolved in seen_paths:
-                continue
-            meta = _cached_codex_meta(sf.path, cache)
-            if not meta:
-                continue
-            pid = meta.get("parent_id")
-            if isinstance(pid, str) and pid:
-                # Trust authoritative header sid on child segments too.
-                sf = SessionFile("codex", meta["sid"], sf.path, sf.mtime, sf.size_bytes, True, pid)
-                children_by_parent.setdefault(pid, []).append((meta, sf))
-        while queue:
-            cur = queue.pop(0)
-            child_entries = children_by_parent.get(cur, [])
-            if not child_entries:
-                continue
-            path_to_child = {sf.path: sf for _, sf in child_entries}
-            for _, p in codex_sessions.sort_rollout_entries([(meta, sf.path) for meta, sf in child_entries]):
-                sf = path_to_child[p]
-                sf_resolved = _path_cache_key(sf.path)
-                if sf.path in seen_paths or sf_resolved in seen_paths:
-                    continue
-                result.append(sf)
-                seen_paths.add(sf.path)
-                seen_paths.add(sf_resolved)
-                if sf.session_id not in visited_ids:
-                    visited_ids.add(sf.session_id)
-                    queue.append(sf.session_id)
+        result.extend(
+            _collect_codex_children_by_sid(
+                [m.session_id for m in matches],
+                all_agent_files,
+                seen_inode_keys,
+                cache,
+            )
+        )
 
     elif target_agent == "pi":
         candidate_dirs = {m.path.parent for m in matches}
@@ -1166,11 +1285,11 @@ def _validate_anchor_identity(
     agent: str,
     expected_sid: str,
     *,
-    meta_cache: dict[Path, dict[str, Any] | None] | None = None,
+    meta_cache: dict[Any, dict[str, Any] | None] | None = None,
 ) -> tuple[bool, str | None]:
     """Verify that a runtime/SQLite anchor file actually belongs to `(agent, expected_sid)`."""
     if agent == "codex":
-        key = _path_cache_key(path)
+        key = _meta_cache_key(path)
         if meta_cache is not None and key in meta_cache and meta_cache[key] is not None:
             meta = meta_cache[key]
         else:
@@ -1196,19 +1315,20 @@ def _plan_codex_sid_sources(
     sid: str,
     static_files: list[SessionFile],
     *,
-    codex_home: Path,
+    codex_home: Path | None,
     expected_active_path: Path | None,
     is_subagent: bool,
     parent_id: str | None,
     include_superseded: bool,
-    meta_cache: dict[Path, dict[str, Any] | None],
+    meta_cache: dict[Any, dict[str, Any] | None],
     rollout_index: dict[str, Path],
+    covered_plan_by_key: dict[tuple[Path, int, int], _SourcePlan],
 ) -> tuple[list[_SourcePlan], list[str]]:
     """Verify anchors & resolve the authoritative Codex lineage for one SID."""
     warnings: list[str] = []
-    known_resolved: set[Path] = {_path_cache_key(sf.path) for sf in static_files}
+    known_keys: set[tuple[Path, int, int]] = {_meta_cache_key(sf.path) for sf in static_files}
     candidate_paths: list[Path] = [sf.path for sf in static_files]
-    sf_by_resolved: dict[Path, SessionFile] = {_path_cache_key(sf.path): sf for sf in static_files}
+    sf_by_key: dict[tuple[Path, int, int], SessionFile] = {_meta_cache_key(sf.path): sf for sf in static_files}
 
     def _check_anchor(
         raw_path: Path | None,
@@ -1220,7 +1340,9 @@ def _plan_codex_sid_sources(
     ) -> Path | None:
         if raw_path is None:
             return None
-        resolved_cand = codex_sessions.resolve_alternate_rollout_path(raw_path, codex_home)
+        resolved_cand = codex_sessions.resolve_alternate_rollout_path(
+            raw_path, codex_home, rollout_index=rollout_index
+        )
         if resolved_cand is None:
             warnings.append(f"{missing_code}: {label} path {raw_path} does not exist")
             return None
@@ -1232,16 +1354,16 @@ def _plan_codex_sid_sources(
                 f"{conflict_code}: {label} path {resolved_cand} failed identity check ({err_reason})"
             )
             return None
-        cand_key = _path_cache_key(resolved_cand)
-        if cand_key not in known_resolved:
+        cand_key = _meta_cache_key(resolved_cand)
+        if cand_key not in known_keys:
             warnings.append(
                 f"{missed_code}: {label} path {resolved_cand} was not covered by static discovery"
             )
-            known_resolved.add(cand_key)
+            known_keys.add(cand_key)
             candidate_paths.append(resolved_cand)
             try:
                 st = resolved_cand.stat()
-                sf_by_resolved[cand_key] = SessionFile(
+                sf_by_key[cand_key] = SessionFile(
                     "codex", sid, resolved_cand, st.st_mtime, st.st_size, is_subagent, parent_id
                 )
             except OSError as exc:
@@ -1257,16 +1379,18 @@ def _plan_codex_sid_sources(
         label="live pane active",
     )
 
-    sqlite_raw, sqlite_err = codex_sessions.query_sqlite_rollout_path_detailed(sid, codex_home)
-    if sqlite_err:
-        warnings.append(f"codex_sqlite_query_failed: {sqlite_err}")
-    verified_sqlite = _check_anchor(
-        sqlite_raw,
-        missing_code="sqlite_rollout_missing",
-        missed_code="sqlite_rollout_missed_by_discovery",
-        conflict_code="sqlite_rollout_sid_conflict",
-        label="state sqlite rollout",
-    )
+    verified_sqlite: Path | None = None
+    if codex_home is not None:
+        sqlite_raw, sqlite_err = codex_sessions.query_sqlite_rollout_path_detailed(sid, codex_home)
+        if sqlite_err:
+            warnings.append(f"codex_sqlite_query_failed: {sqlite_err}")
+        verified_sqlite = _check_anchor(
+            sqlite_raw,
+            missing_code="sqlite_rollout_missing",
+            missed_code="sqlite_rollout_missed_by_discovery",
+            conflict_code="sqlite_rollout_sid_conflict",
+            label="state sqlite rollout",
+        )
 
     if not candidate_paths:
         return [], warnings
@@ -1285,13 +1409,27 @@ def _plan_codex_sid_sources(
     plans: list[_SourcePlan] = []
     for seg in effective:
         p = seg["path"]
-        pkey = _path_cache_key(p)
+        pkey = _meta_cache_key(p)
+        role = str(seg.get("role") or "effective")
         if seg.get("meta") is None:
             _, hdr_err = codex_sessions.read_rollout_meta_detailed(p, max_lines=1)
             warnings.append(
                 f"codex_header_{hdr_err or 'missing_meta'}: unable to verify session_meta header in {p}"
             )
-        sf = sf_by_resolved.get(pkey)
+        # If an inherited prefix is ALREADY covered by an ancestor SID in this read
+        # (e.g., reading a parent together with its forked children), record the
+        # inherited range on the ancestor plan instead of duplicating the file.
+        if role == "inherited_prefix" and pkey in covered_plan_by_key:
+            existing = covered_plan_by_key[pkey]
+            existing.inherited_ranges.append(
+                {
+                    "inherited_by": sid,
+                    "end_ordinal_exclusive": seg.get("end_ordinal_exclusive"),
+                    "end_byte_offset": seg.get("end_byte_offset"),
+                }
+            )
+            continue
+        sf = sf_by_key.get(pkey)
         if sf is None:
             try:
                 st = p.stat()
@@ -1299,26 +1437,36 @@ def _plan_codex_sid_sources(
                 warnings.append(f"unreadable_source: {p} ({exc})")
                 continue
             seg_sid = str(seg.get("segment_sid") or sid)
-            sf = SessionFile("codex", seg_sid, p, st.st_mtime, st.st_size, is_subagent, parent_id)
-        plans.append(
-            _SourcePlan(
-                sf=sf,
-                role=str(seg.get("role") or "effective"),
-                end_ordinal_exclusive=seg.get("end_ordinal_exclusive"),
-                end_byte_offset=seg.get("end_byte_offset"),
-            )
+            if role == "inherited_prefix":
+                seg_parent = (seg.get("meta") or {}).get("parent_id")
+                if seg_parent == seg_sid:
+                    seg_parent = None
+                sf = SessionFile("codex", seg_sid, p, st.st_mtime, st.st_size, False, seg_parent)
+            else:
+                sf = SessionFile("codex", seg_sid, p, st.st_mtime, st.st_size, is_subagent, parent_id)
+        plan = _SourcePlan(
+            sf=sf,
+            role=role,
+            end_ordinal_exclusive=seg.get("end_ordinal_exclusive"),
+            end_byte_offset=seg.get("end_byte_offset"),
         )
+        plans.append(plan)
+        covered_plan_by_key.setdefault(pkey, plan)
     if include_superseded:
         for up in unlinked:
-            ukey = _path_cache_key(up)
-            sf = sf_by_resolved.get(ukey)
+            ukey = _meta_cache_key(up)
+            if ukey in covered_plan_by_key:
+                continue
+            sf = sf_by_key.get(ukey)
             if sf is None:
                 try:
                     st = up.stat()
                 except OSError:
                     continue
                 sf = SessionFile("codex", sid, up, st.st_mtime, st.st_size, is_subagent, parent_id)
-            plans.append(_SourcePlan(sf=sf, role="superseded"))
+            plan = _SourcePlan(sf=sf, role="superseded")
+            plans.append(plan)
+            covered_plan_by_key.setdefault(ukey, plan)
     return plans, warnings
 
 
@@ -1329,10 +1477,12 @@ def _plan_session_sources(
     *,
     home: Path | None = None,
     codex_home: Path | None = None,
+    unknown_codex_home: bool = False,
     environment: Mapping[str, str] | None = None,
     expected_active_path: Path | None = None,
     include_superseded: bool = False,
-    meta_cache: dict[Path, dict[str, Any] | None] | None = None,
+    meta_cache: dict[Any, dict[str, Any] | None] | None = None,
+    rollout_index: dict[str, Path] | None = None,
 ) -> tuple[bool, list[str], list[_SourcePlan]]:
     """Build verified, lineage-ordered source plans for `read_session`."""
     warnings: list[str] = []
@@ -1341,7 +1491,7 @@ def _plan_session_sources(
     if target_agent != "codex":
         plans = [_SourcePlan(sf=sf) for sf in sources]
         if expected_active_path is not None:
-            known = {_path_cache_key(sf.path) for sf in sources}
+            known = {_meta_cache_key(sf.path) for sf in sources}
             if not expected_active_path.is_file():
                 warnings.append(
                     f"active_file_missing: live pane active path {expected_active_path} does not exist"
@@ -1354,7 +1504,7 @@ def _plan_session_sources(
                     warnings.append(
                         f"active_file_sid_conflict: live pane active path {expected_active_path} failed identity check ({err_reason})"
                     )
-                elif _path_cache_key(expected_active_path) not in known:
+                elif _meta_cache_key(expected_active_path) not in known:
                     warnings.append(
                         f"active_file_missed_by_discovery: live pane active path {expected_active_path} was not covered by static discovery"
                     )
@@ -1371,8 +1521,14 @@ def _plan_session_sources(
                         warnings.append(f"unreadable_source: {expected_active_path} ({exc})")
         return (len(warnings) == 0), warnings, plans
 
-    chome = _codex_home(home, codex_home=codex_home, environment=environment)
-    # Group static Codex sources by logical SID in encounter order (primary first, then each child)
+    chome: Path | None = (
+        None if unknown_codex_home else _codex_home(home, codex_home=codex_home, environment=environment)
+    )
+    if unknown_codex_home:
+        warnings.append(
+            f"unknown_pane_storage_root: could not confirm CODEX_HOME for live pane active path {expected_active_path}"
+        )
+
     sid_order: list[str] = []
     sid_files: dict[str, list[SessionFile]] = {}
     sid_meta: dict[str, tuple[bool, str | None]] = {}
@@ -1387,13 +1543,14 @@ def _plan_session_sources(
         sid_files[session_id] = []
         sid_meta[session_id] = (False, None)
 
-    rollout_index: dict[str, Path] = {}
+    rindex: dict[str, Path] = rollout_index if rollout_index is not None else {}
     for sf in sources:
         _, rid = codex_sessions.extract_filename_ids(sf.path)
-        if rid and rid not in rollout_index:
-            rollout_index[rid] = sf.path
+        if rid and rid not in rindex:
+            rindex[rid] = sf.path
 
     all_plans: list[_SourcePlan] = []
+    covered_plan_by_key: dict[tuple[Path, int, int], _SourcePlan] = {}
     for sid in sid_order:
         is_sub, pid = sid_meta[sid]
         sid_plans, sid_warnings = _plan_codex_sid_sources(
@@ -1405,12 +1562,33 @@ def _plan_session_sources(
             parent_id=pid,
             include_superseded=include_superseded,
             meta_cache=cache,
-            rollout_index=rollout_index,
+            rollout_index=rindex,
+            covered_plan_by_key=covered_plan_by_key,
         )
         warnings.extend(sid_warnings)
         all_plans.extend(sid_plans)
 
     return (len(warnings) == 0), warnings, all_plans
+
+
+def _check_stream_header_sid(
+    agent: str,
+    rec: dict[str, Any],
+    expected_sid: str | None,
+) -> str | None:
+    """Return an error reason if an open stream's header SID conflicts with `expected_sid`."""
+    if not expected_sid:
+        return None
+    if agent == "codex" and rec.get("type") == "session_meta":
+        payload = rec.get("payload")
+        actual = payload.get("id") if isinstance(payload, dict) else None
+        if isinstance(actual, str) and actual and actual != expected_sid:
+            return f"expected {expected_sid}, stream header declares {actual}"
+    elif agent == "pi" and rec.get("type") == "session" and not _is_dsh_session_header(rec):
+        actual = rec.get("id")
+        if isinstance(actual, str) and actual and actual != expected_sid:
+            return f"expected {expected_sid}, stream header declares {actual}"
+    return None
 
 
 def export_sources(
@@ -1427,6 +1605,8 @@ def export_sources(
         raise FileExistsError(f"output directory already exists: {output_dir}")
 
     plans = source_plans if source_plans is not None else [_SourcePlan(sf=sf) for sf in sources]
+    out_warnings = list(warnings or [])
+    out_complete = bool(complete)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     tmp_dir = output_dir.parent / f".tmp-{output_dir.name}-{uuid.uuid4().hex[:8]}"
     tmp_dir.mkdir(parents=True, exist_ok=False)
@@ -1445,33 +1625,113 @@ def export_sources(
             hasher = hashlib.sha256()
             byte_count = 0
             record_count = 0
+            malformed_lines = 0
             attachments_meta: list[dict[str, Any]] = []
             ordinal_start: int | None = None
             ordinal_end: int | None = None
+            sid_conflict_reason: str | None = None
+            misaligned_byte_boundary = False
+            checked_header = False
+
             with tmp_out_path.open("wb") as dst:
                 for line_no, raw_bytes in enumerate(iter_raw_bytes_lines(sf.path), 1):
+                    line_start = byte_count
+                    line_end = line_start + len(raw_bytes)
+                    line = raw_bytes.decode("utf-8", errors="replace")
+                    stripped = line.strip()
+                    rec_obj: dict[str, Any] | None = None
+                    if stripped:
+                        try:
+                            parsed = json.loads(stripped)
+                            if isinstance(parsed, dict):
+                                rec_obj = parsed
+                            else:
+                                malformed_lines += 1
+                        except Exception:
+                            malformed_lines += 1
+
+                    # Open-stream SID check prevents TOCTOU `os.replace` from exporting foreign content.
+                    if not checked_header and rec_obj is not None:
+                        checked_header = True
+                        conflict = _check_stream_header_sid(sf.agent, rec_obj, sf.session_id)
+                        if conflict is not None:
+                            sid_conflict_reason = conflict
+                            break
+
                     dst.write(raw_bytes)
                     hasher.update(raw_bytes)
-                    byte_count += len(raw_bytes)
-                    line = raw_bytes.decode("utf-8", errors="replace")
-                    if line.strip():
+                    byte_count = line_end
+
+                    if (
+                        plan.end_byte_offset is not None
+                        and line_start < plan.end_byte_offset < line_end
+                    ):
+                        misaligned_byte_boundary = True
+
+                    if stripped:
                         record_count += 1
-                        if sf.agent == "codex" and '"ordinal"' in line:
-                            try:
-                                rec_obj = json.loads(line)
-                                ord_v = rec_obj.get("ordinal") if isinstance(rec_obj, dict) else None
-                                if isinstance(ord_v, int) and not isinstance(ord_v, bool):
-                                    if ordinal_start is None or ord_v < ordinal_start:
-                                        ordinal_start = ord_v
-                                    if ordinal_end is None or ord_v > ordinal_end:
-                                        ordinal_end = ord_v
-                            except Exception:
-                                pass
+                        ord_v = (
+                            rec_obj.get("ordinal")
+                            if (sf.agent == "codex" and isinstance(rec_obj, dict))
+                            else None
+                        )
+                        if isinstance(ord_v, int) and not isinstance(ord_v, bool):
+                            if ordinal_start is None or ord_v < ordinal_start:
+                                ordinal_start = ord_v
+                            if ordinal_end is None or ord_v > ordinal_end:
+                                ordinal_end = ord_v
+
+                        within_range = True
+                        if plan.end_byte_offset is not None and line_start >= plan.end_byte_offset:
+                            within_range = False
+                        if (
+                            plan.end_byte_offset is not None
+                            and line_start < plan.end_byte_offset < line_end
+                        ):
+                            within_range = False
+                        if (
+                            sf.agent == "codex"
+                            and plan.end_ordinal_exclusive is not None
+                            and isinstance(ord_v, int)
+                            and not isinstance(ord_v, bool)
+                            and ord_v >= plan.end_ordinal_exclusive
+                        ):
+                            within_range = False
+
                         extracted = _extract_line_attachments(line, idx, line_no, tmp_attachments_dir)
                         for entry in extracted:
                             rel_name = Path(entry["path"]).name
                             entry["path"] = str(final_attachments_dir / rel_name)
+                            if plan.end_ordinal_exclusive is not None or plan.end_byte_offset is not None:
+                                entry["within_effective_range"] = within_range
                         attachments_meta.extend(extracted)
+
+            if sid_conflict_reason is not None:
+                tmp_out_path.unlink(missing_ok=True)
+                out_complete = False
+                out_warnings.append(
+                    f"source_sid_changed_during_read: skipped {sf.path} ({sid_conflict_reason})"
+                )
+                continue
+
+            if malformed_lines > 0:
+                out_complete = False
+                out_warnings.append(
+                    f"malformed_record_lines: found {malformed_lines} malformed/truncated line(s) in {sf.path}"
+                )
+            if misaligned_byte_boundary:
+                out_complete = False
+                out_warnings.append(
+                    f"history_base_byte_boundary_misaligned: end_byte_offset={plan.end_byte_offset} "
+                    f"falls inside a JSONL line in {sf.path}"
+                )
+            if plan.end_byte_offset is not None and byte_count < plan.end_byte_offset:
+                out_complete = False
+                out_warnings.append(
+                    f"history_base_parent_truncated: expected at least {plan.end_byte_offset} bytes "
+                    f"in {sf.path}, got {byte_count}"
+                )
+
             source_entry: dict[str, Any] = {
                 "source": {
                     "agent": sf.agent,
@@ -1493,14 +1753,16 @@ def export_sources(
                 source_entry["superseded_from_ordinal"] = plan.end_ordinal_exclusive
             if plan.end_byte_offset is not None:
                 source_entry["end_byte_offset"] = plan.end_byte_offset
+            if plan.inherited_ranges:
+                source_entry["inherited_ranges"] = plan.inherited_ranges
             manifest_sources.append(source_entry)
 
         manifest = {
             "version": 1,
             "session_id": session_id,
             "include_children": include_children,
-            "complete": complete,
-            "warnings": list(warnings or []),
+            "complete": out_complete,
+            "warnings": out_warnings,
             "sources": manifest_sources,
         }
         (tmp_dir / "manifest.json").write_text(
@@ -1522,16 +1784,20 @@ def _parse_timeline_events_with_stats(
     *,
     max_ordinal_exclusive: int | None = None,
     max_byte_offset_exclusive: int | None = None,
-) -> tuple[list[dict[str, Any]], int, int, int]:
+    expected_sid: str | None = None,
+) -> tuple[list[dict[str, Any]], int, int, int, list[str]]:
     events: list[dict[str, Any]] = []
     total_records = 0
     superseded_records = 0
     malformed_lines = 0
+    parse_warnings: list[str] = []
 
     def fmt(text: str) -> str:
         return text.strip() if full else clean_preview(text, 300)
 
     byte_offset = 0
+    checked_header = False
+    misaligned_warned = False
     for idx, raw_bytes in enumerate(iter_raw_bytes_lines(path), 1):
         line_start = byte_offset
         byte_offset += len(raw_bytes)
@@ -1539,6 +1805,20 @@ def _parse_timeline_events_with_stats(
         if not line:
             continue
         total_records += 1
+
+        if (
+            max_byte_offset_exclusive is not None
+            and line_start < max_byte_offset_exclusive < byte_offset
+        ):
+            if not misaligned_warned:
+                misaligned_warned = True
+                parse_warnings.append(
+                    f"history_base_byte_boundary_misaligned: end_byte_offset={max_byte_offset_exclusive} "
+                    f"falls inside a JSONL line in {path}"
+                )
+            superseded_records += 1
+            continue
+
         if max_byte_offset_exclusive is not None and line_start >= max_byte_offset_exclusive:
             superseded_records += 1
             continue
@@ -1550,6 +1830,15 @@ def _parse_timeline_events_with_stats(
         if not isinstance(rec, dict):
             malformed_lines += 1
             continue
+
+        if not checked_header:
+            checked_header = True
+            conflict = _check_stream_header_sid(agent, rec, expected_sid)
+            if conflict is not None:
+                parse_warnings.append(
+                    f"source_sid_changed_during_read: skipped {path} ({conflict})"
+                )
+                return [], total_records, superseded_records, malformed_lines, parse_warnings
 
         if (
             agent == "codex"
@@ -1868,7 +2157,13 @@ def _parse_timeline_events_with_stats(
             if "text" in ev:
                 ev["text"] = ev["text"].strip()
 
-    return events, total_records, superseded_records, malformed_lines
+    if max_byte_offset_exclusive is not None and byte_offset < max_byte_offset_exclusive:
+        parse_warnings.append(
+            f"history_base_parent_truncated: expected at least {max_byte_offset_exclusive} bytes "
+            f"in {path}, got {byte_offset}"
+        )
+
+    return events, total_records, superseded_records, malformed_lines, parse_warnings
 
 
 def parse_timeline_events(
@@ -1879,7 +2174,7 @@ def parse_timeline_events(
     max_ordinal_exclusive: int | None = None,
     max_byte_offset_exclusive: int | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
-    events, total_records, _, _ = _parse_timeline_events_with_stats(
+    events, total_records, _, _, _ = _parse_timeline_events_with_stats(
         agent,
         path,
         full=full,
@@ -1901,47 +2196,150 @@ def window_snippet(line: str, start: int, end: int, radius: int = 120) -> str:
     return frag
 
 
+def _verify_session_file_header(
+    sf: SessionFile,
+    meta_cache: dict[Any, dict[str, Any] | None],
+) -> SessionFile | None:
+    """Verify authoritative header SID for non-canonical/multi-UUID Codex or Pi files."""
+    if sf.agent == "codex":
+        fn_sid, fn_rid = codex_sessions.extract_filename_ids(sf.path)
+        plain_stem = codex_sessions.rollout_plain_stem(sf.path)
+        if not (fn_sid and fn_sid == fn_rid and plain_stem.startswith("rollout-")):
+            meta = _cached_codex_meta(sf.path, meta_cache)
+            if meta and meta["sid"] != sf.session_id:
+                return SessionFile(
+                    "codex", meta["sid"], sf.path, sf.mtime, sf.size_bytes, sf.is_subagent, sf.parent_id
+                )
+    elif sf.agent == "pi":
+        m = UUID_RE.findall(sf.path.stem)
+        if len(m) != 1:
+            hdr = read_first_json(sf.path)
+            if _is_dsh_session_header(hdr):
+                return None
+            hdr_id = hdr.get("id") if (hdr and hdr.get("type") == "session") else None
+            if isinstance(hdr_id, str) and hdr_id and hdr_id != sf.session_id:
+                return SessionFile(
+                    "pi", hdr_id, sf.path, sf.mtime, sf.size_bytes, sf.is_subagent, sf.parent_id
+                )
+    return sf
+
+
+def _pull_misnamed_cold_predecessors(
+    target_sessions: list[LogicalSession],
+    cold_rough: list[LogicalSession],
+    meta_cache: dict[Any, dict[str, Any] | None],
+) -> list[LogicalSession]:
+    """If a hot Codex session only has continuation segments (`min_ord > 0`), check cold
+    double-UUID/non-standard files once so misnamed cold predecessors are not dropped."""
+    if not cold_rough or not target_sessions:
+        return target_sessions
+    orphan_sids: set[str] = set()
+    for ls in target_sessions:
+        if ls.agent != "codex":
+            continue
+        ords: list[int] = []
+        for sf in ls.segments:
+            meta = _cached_codex_meta(sf.path, meta_cache)
+            if meta and isinstance(meta.get("ordinal"), int):
+                ords.append(meta["ordinal"])
+        if ords and min(ords) > 0:
+            orphan_sids.add(ls.session_id)
+    if not orphan_sids:
+        return target_sessions
+
+    extra_by_sid: dict[str, list[SessionFile]] = {}
+    for cls in cold_rough:
+        if cls.agent != "codex":
+            continue
+        for sf in cls.segments:
+            fn_sid, fn_rid = codex_sessions.extract_filename_ids(sf.path)
+            plain_stem = codex_sessions.rollout_plain_stem(sf.path)
+            if fn_sid and fn_sid == fn_rid and plain_stem.startswith("rollout-"):
+                continue
+            meta = _cached_codex_meta(sf.path, meta_cache)
+            if meta and meta["sid"] in orphan_sids:
+                extra_by_sid.setdefault(meta["sid"], []).append(
+                    SessionFile("codex", meta["sid"], sf.path, sf.mtime, sf.size_bytes, sf.is_subagent, sf.parent_id)
+                )
+    if not extra_by_sid:
+        return target_sessions
+
+    merged: list[LogicalSession] = []
+    for ls in target_sessions:
+        extras = extra_by_sid.get(ls.session_id) if ls.agent == "codex" else None
+        if extras:
+            segs = _dedup_session_files([*ls.segments, *extras])
+            merged.append(
+                LogicalSession(ls.agent, ls.session_id, segs, ls.is_subagent, ls.parent_id)
+            )
+        else:
+            merged.append(ls)
+    return merged
+
+
 def _verify_hot_logical_sessions(
     hot_rough: list[LogicalSession],
     *,
-    meta_cache: dict[Path, dict[str, Any] | None],
-) -> list[LogicalSession]:
-    """Verify headers only for sessions that survived time-window pruning."""
+    meta_cache: dict[Any, dict[str, Any] | None],
+    cold_rough: list[LogicalSession] | None = None,
+    lazy_limit: int | None = None,
+) -> tuple[list[LogicalSession], int]:
+    """Verify headers for hot sessions, stopping early when `lazy_limit` is set."""
+    if lazy_limit is not None and lazy_limit > 0 and len(hot_rough) > lazy_limit:
+        # Process rough sessions in descending mtime order and stop once we have
+        # at least `lazy_limit` verified top sessions whose mtimes beat all remaining
+        # unverified sessions (and merge any same-SID collisions among seen files).
+        verified_by_key: dict[tuple[str, str, bool], list[SessionFile]] = {}
+        processed = 0
+        for idx, ls in enumerate(hot_rough):
+            for sf in ls.segments:
+                vsf = _verify_session_file_header(sf, meta_cache)
+                if vsf is not None:
+                    verified_by_key.setdefault((vsf.agent, vsf.session_id, vsf.is_subagent), []).append(vsf)
+            processed = idx + 1
+            if len(verified_by_key) >= lazy_limit:
+                next_mtime = hot_rough[idx + 1].mtime if idx + 1 < len(hot_rough) else -1.0
+                top_mtimes = sorted(
+                    (max(s.mtime for s in segs) for segs in verified_by_key.values()),
+                    reverse=True,
+                )
+                if len(top_mtimes) >= lazy_limit and top_mtimes[lazy_limit - 1] > next_mtime:
+                    break
+        # Pull any additional rough segments whose rough SID matches a selected verified SID
+        selected_sids = {sid for _, sid, _ in verified_by_key}
+        for ls in hot_rough[processed:]:
+            if ls.session_id in selected_sids:
+                for sf in ls.segments:
+                    vsf = _verify_session_file_header(sf, meta_cache)
+                    if vsf is not None and vsf.session_id in selected_sids:
+                        verified_by_key.setdefault((vsf.agent, vsf.session_id, vsf.is_subagent), []).append(vsf)
+        all_verified = [sf for segs in verified_by_key.values() for sf in segs]
+        sessions = group_logical_sessions(all_verified, sort_segments=False, meta_cache=meta_cache)
+        sessions.sort(key=lambda s: s.mtime, reverse=True)
+        selected = sessions[:lazy_limit]
+        if cold_rough:
+            selected = _pull_misnamed_cold_predecessors(selected, cold_rough, meta_cache)
+        estimated_total = len(sessions) + max(0, len(hot_rough) - processed)
+        return selected, estimated_total
+
     verified_files: list[SessionFile] = []
     for ls in hot_rough:
         for sf in ls.segments:
-            if sf.agent == "codex":
-                fn_sid, fn_rid = codex_sessions.extract_filename_ids(sf.path)
-                plain_stem = codex_sessions.rollout_plain_stem(sf.path)
-                if not (fn_sid and fn_sid == fn_rid and plain_stem.startswith("rollout-")):
-                    meta = _cached_codex_meta(sf.path, meta_cache)
-                    if meta and meta["sid"] != sf.session_id:
-                        sf = SessionFile(
-                            "codex", meta["sid"], sf.path, sf.mtime, sf.size_bytes, sf.is_subagent, sf.parent_id
-                        )
-            elif sf.agent == "pi":
-                m = UUID_RE.findall(sf.path.stem)
-                if len(m) != 1:
-                    hdr = read_first_json(sf.path)
-                    if _is_dsh_session_header(hdr):
-                        continue
-                    hdr_id = hdr.get("id") if (hdr and hdr.get("type") == "session") else None
-                    if isinstance(hdr_id, str) and hdr_id and hdr_id != sf.session_id:
-                        sf = SessionFile(
-                            "pi", hdr_id, sf.path, sf.mtime, sf.size_bytes, sf.is_subagent, sf.parent_id
-                        )
-            verified_files.append(sf)
-    # Keep unsorted until after limit slicing so we only sort selected sessions.
+            vsf = _verify_session_file_header(sf, meta_cache)
+            if vsf is not None:
+                verified_files.append(vsf)
     sessions = group_logical_sessions(verified_files, sort_segments=False, meta_cache=meta_cache)
     sessions.sort(key=lambda s: s.mtime, reverse=True)
-    return sessions
+    if cold_rough:
+        sessions = _pull_misnamed_cold_predecessors(sessions, cold_rough, meta_cache)
+    return sessions, len(sessions)
 
 
 def _extract_logical_preview(
     ls: LogicalSession,
     *,
     home: Path | None = None,
-    meta_cache: dict[Path, dict[str, Any] | None] | None = None,
+    meta_cache: dict[Any, dict[str, Any] | None] | None = None,
 ) -> str:
     if ls.agent == "codex" and len(ls.segments) > 1:
         chome = _codex_home(home)
@@ -1953,10 +2351,10 @@ def _extract_logical_preview(
             codex_home=chome,
             meta_cache=meta_cache,
         )
-        by_path = {_path_cache_key(s.path): s for s in ls.segments}
+        by_key = {_meta_cache_key(s.path): s for s in ls.segments}
         for seg in effective:
             p = seg["path"]
-            sf = by_path.get(_path_cache_key(p))
+            sf = by_key.get(_meta_cache_key(p))
             if sf is None:
                 try:
                     st = p.stat()
@@ -1970,6 +2368,9 @@ def _extract_logical_preview(
             )
             if preview:
                 return preview
+        # Effective lineage is authoritative: if all opening prompts were rolled
+        # back, return "" instead of falling back to superseded segments.
+        return ""
     for seg in ls.segments:
         preview = extract_preview(seg)
         if preview:
@@ -1987,7 +2388,7 @@ def list_sessions(
 ) -> dict[str, Any]:
     t0 = time.monotonic()
     norm_agents = normalize_agents(agents)
-    meta_cache: dict[Path, dict[str, Any] | None] = {}
+    meta_cache: dict[Any, dict[str, Any] | None] = {}
     all_files: list[SessionFile] = []
     for ag in norm_agents:
         for sf in discover_agent_files(ag, home=home, verify_headers=False):
@@ -1997,8 +2398,11 @@ def list_sessions(
     # First prune by logical-session mtime with zero header reads on cold files.
     rough_logical = group_logical_sessions(all_files, sort_segments=False)
     hot_rough, skipped = prune_by_time(rough_logical, days, scan_all, now=now)
-    hot = _verify_hot_logical_sessions(hot_rough, meta_cache=meta_cache)
-    selected: list[LogicalSession] = hot[:limit]
+    cold_rough = rough_logical[len(hot_rough) :] if skipped > 0 else []
+    selected, total_hot = _verify_hot_logical_sessions(
+        hot_rough, meta_cache=meta_cache, cold_rough=cold_rough, lazy_limit=limit
+    )
+    selected = selected[:limit]
     items: list[dict[str, Any]] = []
     for ls in selected:
         if len(ls.segments) > 1 and ls.agent == "codex":
@@ -2026,12 +2430,12 @@ def list_sessions(
     return {
         "command": "list",
         "count": len(items),
-        "truncated": len(hot) > len(items),
+        "truncated": total_hot > len(items),
         "scanned_scope": {
             "agents": norm_agents,
             "days": None if scan_all else days,
             "all": scan_all,
-            "matched_sessions_in_window": len(hot),
+            "matched_sessions_in_window": total_hot,
             "skipped_cold_sessions": skipped,
             "elapsed_ms": int((time.monotonic() - t0) * 1000),
         },
@@ -2053,15 +2457,18 @@ def find_sessions(
 ) -> dict[str, Any]:
     t0 = time.monotonic()
     norm_agents = normalize_agents(agents)
-    meta_cache: dict[Path, dict[str, Any] | None] = {}
+    meta_cache: dict[Any, dict[str, Any] | None] = {}
     all_files: list[SessionFile] = []
     for ag in norm_agents:
         all_files.extend(discover_agent_files(ag, home=home, verify_headers=False))
 
     # Prune at logical-session granularity without opening cold files.
     rough_logical = group_logical_sessions(all_files, sort_segments=False)
-    hot_rough, _ = prune_by_time(rough_logical, days, scan_all, now=now)
-    hot_logical = _verify_hot_logical_sessions(hot_rough, meta_cache=meta_cache)
+    hot_rough, skipped_sessions = prune_by_time(rough_logical, days, scan_all, now=now)
+    cold_rough = rough_logical[len(hot_rough) :] if skipped_sessions > 0 else []
+    hot_logical, _ = _verify_hot_logical_sessions(
+        hot_rough, meta_cache=meta_cache, cold_rough=cold_rough
+    )
     logical_mtime_by_path: dict[str, float] = {}
     hot: list[SessionFile] = []
     for ls in hot_logical:
@@ -2182,6 +2589,7 @@ def read_session(
     resolved_pane_info: dict[str, Any] | None = None
     expected_active_path: Path | None = None
     pane_codex_home: Path | None = None
+    unknown_pane_codex_home = False
     env = dict(os.environ if environment is None else environment)
 
     if pane:
@@ -2209,49 +2617,76 @@ def read_session(
         agent = target_pane.agent
         if target_pane.active_path:
             expected_active_path = Path(target_pane.active_path).expanduser()
-        if target_pane.agent == "codex" and target_pane.storage_root:
-            pane_codex_home = Path(target_pane.storage_root).expanduser()
+        if target_pane.agent == "codex":
+            if target_pane.storage_root:
+                pane_codex_home = Path(target_pane.storage_root).expanduser()
+            elif expected_active_path is not None:
+                inferred = codex_sessions.infer_codex_home(expected_active_path)
+                if inferred:
+                    pane_codex_home = Path(inferred)
+                else:
+                    # Do NOT fall back to default ~/.codex and risk mixing another
+                    # CODEX_HOME's same-SID history with this pane's active file.
+                    unknown_pane_codex_home = True
         resolved_pane_info = target_pane.as_dict()
 
     if not session_id:
         raise ValueError("session_id or --pane is required")
 
     session_id, agent = parse_session_ref(session_id, agent)
-    meta_cache: dict[Path, dict[str, Any] | None] = {}
-    try:
-        sources = resolve_session_sources(
-            session_id=session_id,
-            agent=agent,
-            include_children=include_children,
-            home=home,
-            codex_home=pane_codex_home,
-            environment=env,
-            meta_cache=meta_cache,
-        )
-    except FileNotFoundError:
-        # Before declaring absence, check live pane anchor or Codex state_*.sqlite
-        # so files stored in a newly introduced directory can still be recovered.
-        fallback_agent = normalize_agents([agent])[0] if agent else None
-        if expected_active_path is not None and fallback_agent:
-            sources = []
-            target_agent = fallback_agent
-        elif fallback_agent in (None, "codex"):
-            chome = _codex_home(home, codex_home=pane_codex_home, environment=env)
-            sqlite_cand = codex_sessions.query_sqlite_rollout_path(session_id, chome)
-            alt = (
-                codex_sessions.resolve_alternate_rollout_path(sqlite_cand, chome)
-                if sqlite_cand is not None
-                else None
+    meta_cache: dict[Any, dict[str, Any] | None] = {}
+    rollout_index: dict[str, Path] = {}
+
+    if unknown_pane_codex_home:
+        sources: list[SessionFile] = []
+        target_agent = "codex"
+    else:
+        try:
+            sources = resolve_session_sources(
+                session_id=session_id,
+                agent=agent,
+                include_children=include_children,
+                home=home,
+                codex_home=pane_codex_home,
+                environment=env,
+                meta_cache=meta_cache,
+                rollout_index=rollout_index,
             )
-            if alt is not None:
+        except FileNotFoundError:
+            fallback_agent = normalize_agents([agent])[0] if agent else None
+            if expected_active_path is not None and fallback_agent:
                 sources = []
-                target_agent = "codex"
+                target_agent = fallback_agent
+            elif fallback_agent in (None, "codex"):
+                chome = _codex_home(home, codex_home=pane_codex_home, environment=env)
+                sqlite_cand = codex_sessions.query_sqlite_rollout_path(session_id, chome)
+                alt = (
+                    codex_sessions.resolve_alternate_rollout_path(
+                        sqlite_cand, chome, rollout_index=rollout_index
+                    )
+                    if sqlite_cand is not None
+                    else None
+                )
+                if alt is not None:
+                    sources = []
+                    target_agent = "codex"
+                else:
+                    raise
             else:
                 raise
+            # Even when primary was only recovered via SQLite/live anchor, still
+            # discover standard-directory children when include_children=True.
+            if target_agent == "codex" and include_children:
+                chome = _codex_home(home, codex_home=pane_codex_home, environment=env)
+                all_codex = discover_agent_files(
+                    "codex", home=home, codex_home=chome, environment=env, verify_headers=False
+                )
+                _populate_rollout_index_from_files(chome, all_codex, rollout_index)
+                sources.extend(
+                    _collect_codex_children_by_sid([session_id], all_codex, set(), meta_cache)
+                )
         else:
-            raise
-    else:
-        target_agent = sources[0].agent
+            target_agent = sources[0].agent
 
     complete, warnings, plans = _plan_session_sources(
         session_id,
@@ -2259,10 +2694,12 @@ def read_session(
         sources,
         home=home,
         codex_home=pane_codex_home,
+        unknown_codex_home=unknown_pane_codex_home,
         environment=env,
         expected_active_path=expected_active_path,
         include_superseded=(include_superseded or view == "export"),
         meta_cache=meta_cache,
+        rollout_index=rollout_index,
     )
     if not plans:
         detail = f" ({'; '.join(warnings)})" if warnings else ""
@@ -2291,8 +2728,8 @@ def read_session(
             "view": "export",
             "output_dir": str(out_dir.resolve()),
             "manifest_path": str((out_dir / "manifest.json").resolve()),
-            "complete": complete,
-            "warnings": warnings,
+            "complete": manifest["complete"],
+            "warnings": manifest["warnings"],
             "manifest": manifest,
         }
         if resolved_pane_info is not None:
@@ -2303,20 +2740,29 @@ def read_session(
     all_sources = []
     for plan in plans:
         sf = plan.sf
-        bound_ord = None if include_superseded else plan.end_ordinal_exclusive
-        bound_byte = None if include_superseded else plan.end_byte_offset
+        # Never clear fork cutoffs on inherited parent prefixes even under --include-superseded:
+        # parent messages written after the fork never belonged to the forked session.
+        preserve_bounds = plan.role == "inherited_prefix"
+        bound_ord = plan.end_ordinal_exclusive if (preserve_bounds or not include_superseded) else None
+        bound_byte = plan.end_byte_offset if (preserve_bounds or not include_superseded) else None
         try:
-            evs, records, superseded_count, malformed_count = _parse_timeline_events_with_stats(
+            evs, records, superseded_count, malformed_count, parse_warnings = _parse_timeline_events_with_stats(
                 sf.agent,
                 sf.path,
                 full=full,
                 max_ordinal_exclusive=bound_ord,
                 max_byte_offset_exclusive=bound_byte,
+                expected_sid=sf.session_id,
             )
         except (OSError, RuntimeError) as exc:
             complete = False
             warnings.append(f"unreadable_source: {sf.path} ({exc})")
             continue
+        if parse_warnings:
+            complete = False
+            warnings.extend(parse_warnings)
+            if any("source_sid_changed_during_read" in w for w in parse_warnings):
+                continue
         if malformed_count > 0:
             complete = False
             warnings.append(
@@ -2345,6 +2791,8 @@ def read_session(
             src_entry["superseded_records"] = superseded_count
         if bound_byte is not None:
             src_entry["end_byte_offset"] = bound_byte
+        if plan.inherited_ranges:
+            src_entry["inherited_ranges"] = plan.inherited_ranges
         all_sources.append(src_entry)
     result: dict[str, Any] = {
         "command": "read",
@@ -2571,6 +3019,12 @@ def _extract_turn_from_record(agent: str, rec: dict[str, Any], line_no: int) -> 
                     txt = str(part.get("text") or "")
                     if txt.strip():
                         return {"line": line_no, "kind": "assistant", "text": clean_preview(txt, 300)}
+        else:
+            role = rec.get("role")
+            if role in ("user", "assistant"):
+                txt = extract_text_from_content(rec.get("content"))
+                if txt.strip() and (role != "user" or not is_noise_user_text(txt)):
+                    return {"line": line_no, "kind": role, "text": clean_preview(txt, 300)}
     return None
 
 
@@ -2583,7 +3037,7 @@ def _read_bounded_head_turns(
     """Read up to `limit` opening turns, returning `(turns, hit_eof)`."""
     sf = plan.sf
     if sf.agent == "grok":
-        evs, _, _, _ = _parse_timeline_events_with_stats(sf.agent, sf.path, full=False)
+        evs, _, _, _, _ = _parse_timeline_events_with_stats(sf.agent, sf.path, full=False)
         turns = [e for e in evs if e.get("kind") in ("user", "assistant")]
         return turns[:limit], len(turns) <= limit
 
@@ -2594,6 +3048,8 @@ def _read_bounded_head_turns(
         line_start = byte_offset
         byte_offset += len(raw)
         if plan.end_byte_offset is not None and line_start >= plan.end_byte_offset:
+            break
+        if plan.end_byte_offset is not None and line_start < plan.end_byte_offset < byte_offset:
             break
         if idx > max_lines:
             hit_eof = False
@@ -2628,12 +3084,16 @@ def _read_bounded_tail_turns(
     plan: _SourcePlan,
     limit: int,
     *,
-    tail_window_bytes: int = 512 * 1024,
-) -> list[dict[str, Any]]:
-    """Read up to `limit` latest effective turns using bounded tail-seek on large plain logs."""
+    chunk_bytes: int = 512 * 1024,
+    max_scan_bytes: int = 16 * 1024 * 1024,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Read up to `limit` latest effective turns, returning `(turns, truncated_by_budget)`."""
     sf = plan.sf
-    if sf.agent == "grok" or _is_zstd_path(sf.path):
-        evs, _, _, _ = _parse_timeline_events_with_stats(
+    if limit <= 0:
+        return [], False
+
+    if sf.agent == "grok":
+        evs, _, _, _, _ = _parse_timeline_events_with_stats(
             sf.agent,
             sf.path,
             full=False,
@@ -2641,35 +3101,28 @@ def _read_bounded_tail_turns(
             max_byte_offset_exclusive=plan.end_byte_offset,
         )
         turns = [e for e in evs if e.get("kind") in ("user", "assistant")]
-        return turns[-limit:] if limit > 0 else []
+        return turns[-limit:], False
 
-    try:
-        file_size = sf.path.stat().st_size
-    except OSError:
-        return []
-    end_pos = min(file_size, plan.end_byte_offset) if plan.end_byte_offset is not None else file_size
-    if end_pos <= 0:
-        return []
-
-    # Try bounded tail window first (512KB, then 2MB) before falling back to full scan.
-    windows = (tail_window_bytes, 4 * tail_window_bytes) if end_pos > tail_window_bytes else (end_pos,)
-    for win in windows:
-        start_pos = max(0, end_pos - win)
+    if _is_zstd_path(sf.path):
+        # Keep a fixed-size deque of trailing raw lines so compressed logs do not
+        # JSON-decode tens of thousands of earlier records just to show the last 5 turns.
+        ring: deque[tuple[int, bytes]] = deque(maxlen=max(limit * 32, 256))
+        byte_offset = 0
         try:
-            with sf.path.open("rb") as fh:
-                fh.seek(start_pos)
-                chunk = fh.read(end_pos - start_pos)
-        except OSError:
-            return []
-        raw_lines = chunk.splitlines()
-        if start_pos > 0 and raw_lines:
-            # Drop potentially partial first line after mid-file seek
-            raw_lines = raw_lines[1:]
-        turns: list[dict[str, Any]] = []
-        for idx, raw in enumerate(raw_lines, 1):
+            for idx, raw in enumerate(iter_raw_bytes_lines(sf.path), 1):
+                line_start = byte_offset
+                byte_offset += len(raw)
+                if plan.end_byte_offset is not None and line_start >= plan.end_byte_offset:
+                    break
+                if plan.end_byte_offset is not None and line_start < plan.end_byte_offset < byte_offset:
+                    break
+                if raw.strip():
+                    ring.append((idx, raw))
+        except (OSError, RuntimeError):
+            return [], False
+        rev_turns: list[dict[str, Any]] = []
+        for idx, raw in reversed(ring):
             line = raw.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
             try:
                 rec = json.loads(line)
             except Exception:
@@ -2686,20 +3139,83 @@ def _read_bounded_tail_turns(
                 continue
             ev = _extract_turn_from_record(sf.agent, rec, idx)
             if ev is not None:
-                turns.append(ev)
-        if len(turns) >= limit or start_pos == 0:
-            return turns[-limit:]
-    if end_pos > 4 * 1024 * 1024:
-        return turns[-limit:]
-    evs, _, _, _ = _parse_timeline_events_with_stats(
-        sf.agent,
-        sf.path,
-        full=False,
-        max_ordinal_exclusive=plan.end_ordinal_exclusive,
-        max_byte_offset_exclusive=plan.end_byte_offset,
-    )
-    turns = [e for e in evs if e.get("kind") in ("user", "assistant")]
-    return turns[-limit:]
+                rev_turns.append(ev)
+                if len(rev_turns) >= limit:
+                    break
+        rev_turns.reverse()
+        return rev_turns, False
+
+    try:
+        file_size = sf.path.stat().st_size
+    except OSError:
+        return [], False
+    end_pos = min(file_size, plan.end_byte_offset) if plan.end_byte_offset is not None else file_size
+    if end_pos <= 0:
+        return [], False
+
+    # Step backwards in bounded chunks so a huge trailing metadata/screenshot line
+    # (e.g. 5 MiB token_count) is stepped cleanly without parsing the entire file.
+    rev_turns = []
+    scanned = 0
+    pos = end_pos
+    pending = b""
+    truncated_by_budget = False
+    try:
+        with sf.path.open("rb") as fh:
+            while pos > 0 and len(rev_turns) < limit:
+                if scanned >= max_scan_bytes:
+                    truncated_by_budget = True
+                    break
+                step = min(chunk_bytes, pos, max_scan_bytes - scanned)
+                pos -= step
+                scanned += step
+                fh.seek(pos)
+                data = fh.read(step) + pending
+                parts = data.split(b"\n")
+                pending = parts[0]
+                for raw in reversed(parts[1:]):
+                    stripped_b = raw.strip()
+                    if not stripped_b:
+                        continue
+                    try:
+                        rec = json.loads(stripped_b.decode("utf-8", errors="replace"))
+                    except Exception:
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    if (
+                        sf.agent == "codex"
+                        and plan.end_ordinal_exclusive is not None
+                        and isinstance(rec.get("ordinal"), int)
+                        and not isinstance(rec.get("ordinal"), bool)
+                        and rec["ordinal"] >= plan.end_ordinal_exclusive
+                    ):
+                        continue
+                    ev = _extract_turn_from_record(sf.agent, rec, 0)
+                    if ev is not None:
+                        rev_turns.append(ev)
+                        if len(rev_turns) >= limit:
+                            break
+            if pos == 0 and len(rev_turns) < limit and pending.strip():
+                try:
+                    rec = json.loads(pending.decode("utf-8", errors="replace").strip())
+                    if isinstance(rec, dict) and not (
+                        sf.agent == "codex"
+                        and plan.end_ordinal_exclusive is not None
+                        and isinstance(rec.get("ordinal"), int)
+                        and not isinstance(rec.get("ordinal"), bool)
+                        and rec["ordinal"] >= plan.end_ordinal_exclusive
+                    ):
+                        ev = _extract_turn_from_record(sf.agent, rec, 1)
+                        if ev is not None:
+                            rev_turns.append(ev)
+                except Exception:
+                    pass
+    except OSError:
+        return [], False
+
+    rev_turns.reverse()
+    return rev_turns[-limit:], (truncated_by_budget and len(rev_turns) < limit)
 
 
 def render_preview(
@@ -2760,16 +3276,36 @@ def render_preview(
     header_parts.append(f"{bold}{cyan}{label}{reset}")
     header_parts.append(f"{dim}{'─' * 56}{reset}")
     try:
-        meta_cache: dict[Path, dict[str, Any] | None] = {}
-        primary_sources = resolve_session_sources(
-            session_id=sid_clean,
-            agent=norm_agent,
-            include_children=False,
-            home=home,
-            environment=env,
-            meta_cache=meta_cache,
-        )
-        target_agent = primary_sources[0].agent
+        meta_cache: dict[Any, dict[str, Any] | None] = {}
+        rollout_index: dict[str, Path] = {}
+        try:
+            primary_sources = resolve_session_sources(
+                session_id=sid_clean,
+                agent=norm_agent,
+                include_children=False,
+                home=home,
+                environment=env,
+                meta_cache=meta_cache,
+                rollout_index=rollout_index,
+            )
+            target_agent = primary_sources[0].agent
+        except FileNotFoundError:
+            fallback_agent = normalize_agents([norm_agent])[0] if norm_agent else None
+            if fallback_agent in (None, "codex"):
+                chome = _codex_home(home, environment=env)
+                sqlite_cand = codex_sessions.query_sqlite_rollout_path(sid_clean, chome)
+                alt = (
+                    codex_sessions.resolve_alternate_rollout_path(sqlite_cand, chome, rollout_index=rollout_index)
+                    if sqlite_cand is not None
+                    else None
+                )
+                if alt is not None:
+                    primary_sources = []
+                    target_agent = "codex"
+                else:
+                    raise
+            else:
+                raise
         _, _, plans = _plan_session_sources(
             sid_clean,
             target_agent,
@@ -2778,9 +3314,11 @@ def render_preview(
             environment=env,
             include_superseded=False,
             meta_cache=meta_cache,
+            rollout_index=rollout_index,
         )
         body_lines: list[str] = []
         shown: list[dict[str, Any]] = []
+        tail_truncated = False
         if len(plans) == 1:
             head_turns, hit_eof = _read_bounded_head_turns(plans[0], 11)
             if hit_eof:
@@ -2788,12 +3326,11 @@ def render_preview(
                 if len(shown) > 10:
                     shown = [*shown[:3], {"kind": "gap", "text": f"… {len(shown) - 8} turns omitted …"}, *shown[-5:]]
             else:
-                tail_turns = _read_bounded_tail_turns(plans[0], 5)
-                shown = [*head_turns[:3], {"kind": "gap", "text": "… middle turns omitted …"}, *tail_turns]
+                tail_turns, tail_truncated = _read_bounded_tail_turns(plans[0], 5)
+                gap_msg = "… tail preview truncated (large non-text records) …" if tail_truncated else "… middle turns omitted …"
+                shown = [*head_turns[:3], {"kind": "gap", "text": gap_msg}, *tail_turns]
         elif plans:
-            # Read bounded opening turns across segments; if all segments hit EOF
-            # within 10 turns we already have the exact turn list without rescanning.
-            head_turns: list[dict[str, Any]] = []
+            head_turns = []
             hit_eof_all = True
             for plan in plans:
                 need = 11 - len(head_turns)
@@ -2816,16 +3353,20 @@ def render_preview(
                         *head_turns[-5:],
                     ]
             else:
-                # Walk backwards across ALL segments so metadata-only trailing segments
-                # still fall back to real turns in earlier segments.
-                tail_turns: list[dict[str, Any]] = []
+                tail_turns = []
                 for plan in reversed(plans):
                     need = 5 - len(tail_turns)
                     if need <= 0:
                         break
-                    seg_tail = _read_bounded_tail_turns(plan, need)
+                    seg_tail, seg_trunc = _read_bounded_tail_turns(plan, need)
+                    if seg_trunc:
+                        tail_truncated = True
                     tail_turns = [*seg_tail, *tail_turns]
-                gap_text = f"… across {len(plans)} segments …"
+                gap_text = (
+                    f"… across {len(plans)} segments (tail preview truncated) …"
+                    if tail_truncated
+                    else f"… across {len(plans)} segments …"
+                )
                 shown = [*head_turns[:3], {"kind": "gap", "text": gap_text}, *tail_turns[-5:]]
 
         for ev in shown:
@@ -2857,13 +3398,13 @@ def audit_session_storage_drift(
     Independently compares filename-derived IDs against authoritative headers,
     flags unreadable/oversized/malformed headers and SQLite query failures,
     verifies Codex state_*.sqlite rollout coverage (including compressed or
-    archived counterparts), and optionally checks live tmux panes against
-    their own storage_root.
+    archived counterparts and missing recent rows), validates Pi headers, and
+    optionally checks live tmux panes against their own storage_root.
     """
     env = dict(os.environ if environment is None else environment)
     resolved_home = (home or Path(env.get("HOME", str(Path.home())))).expanduser()
     issues: list[dict[str, str]] = []
-    meta_cache: dict[Path, dict[str, Any] | None] = {}
+    meta_cache: dict[Any, dict[str, Any] | None] = {}
 
     codex_home = _codex_home(resolved_home, environment=env)
     codex_files = discover_agent_files(
@@ -2877,9 +3418,11 @@ def audit_session_storage_drift(
 
     codex_by_resolved: dict[Path, SessionFile] = {}
     codex_by_canonical: dict[Path, SessionFile] = {}
+    rollout_index: dict[str, Path] = {}
+    _populate_rollout_index_from_files(codex_home, codex_files, rollout_index)
     for sf in codex_files:
         codex_by_resolved[_path_cache_key(sf.path)] = sf
-        codex_by_canonical[codex_sessions.rollout_canonical_key(sf.path)] = sf
+        codex_by_canonical[codex_sessions.rollout_canonical_key(sf.path, codex_home=codex_home)] = sf
 
     for sf in hot_codex:
         fn_sid, _ = codex_sessions.extract_filename_ids(sf.path)
@@ -2893,7 +3436,7 @@ def audit_session_storage_drift(
                 }
             )
             continue
-        meta_cache[_path_cache_key(sf.path)] = meta
+        meta_cache[_meta_cache_key(sf.path)] = meta
         if fn_sid is not None and meta["sid"] != fn_sid:
             issues.append(
                 {
@@ -2920,12 +3463,24 @@ def audit_session_storage_drift(
 
     checked_sqlite = 0
     for tid, rpath in recent_sqlite:
-        actual = codex_sessions.resolve_alternate_rollout_path(rpath, codex_home)
-        if actual is None:
-            continue
         checked_sqlite += 1
+        actual = codex_sessions.resolve_alternate_rollout_path(
+            rpath, codex_home, rollout_index=rollout_index
+        )
+        if actual is None:
+            issues.append(
+                {
+                    "severity": "error",
+                    "code": "codex_sqlite_rollout_missing",
+                    "message": (
+                        f"Codex state sqlite thread {tid} points to missing rollout {rpath} "
+                        "(no plain, compressed, or archived counterpart found)"
+                    ),
+                }
+            )
+            continue
         r_resolved = _path_cache_key(actual)
-        r_canonical = codex_sessions.rollout_canonical_key(actual)
+        r_canonical = codex_sessions.rollout_canonical_key(actual, codex_home=codex_home)
         matched = codex_by_resolved.get(r_resolved) or codex_by_canonical.get(r_canonical)
         if matched is None:
             issues.append(
@@ -2961,19 +3516,27 @@ def audit_session_storage_drift(
         hdr = read_first_json(sf.path)
         if _is_dsh_session_header(hdr):
             continue
-        if hdr and hdr.get("type") == "session":
-            hdr_id = hdr.get("id")
-            if isinstance(hdr_id, str) and hdr_id and fn_sid and hdr_id != fn_sid:
-                issues.append(
-                    {
-                        "severity": "error",
-                        "code": "pi_sid_drift",
-                        "message": (
-                            f"{sf.path}: filename session_id={fn_sid} "
-                            f"differs from session header id={hdr_id}"
-                        ),
-                    }
-                )
+        if not hdr or hdr.get("type") != "session" or not isinstance(hdr.get("id"), str) or not hdr.get("id"):
+            issues.append(
+                {
+                    "severity": "error",
+                    "code": "pi_header_invalid",
+                    "message": f"{sf.path}: missing or invalid Pi session header",
+                }
+            )
+            continue
+        hdr_id = hdr["id"]
+        if fn_sid and hdr_id != fn_sid:
+            issues.append(
+                {
+                    "severity": "error",
+                    "code": "pi_sid_drift",
+                    "message": (
+                        f"{sf.path}: filename session_id={fn_sid} "
+                        f"differs from session header id={hdr_id}"
+                    ),
+                }
+            )
 
     checked_live = 0
     if check_live_panes:
