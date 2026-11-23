@@ -1246,6 +1246,87 @@ class AgentNotificationsTests(unittest.TestCase):
         self.assertFalse(root_meta.get("is_subagent"))
         self.assertFalse(_codex_turn_has_goal_context(root_sid, "turn-goal-1", env, rollout_path=str(sub_zst)))
 
+    def test_r3_p2_notifications_reject_oversized_or_idless_foreign_headers_and_stream_compressed_goal(self) -> None:
+        import shutil
+        import tracemalloc
+        from agent_notifications import _codex_turn_has_goal_context
+        import codex_sessions
+
+        codex_home = self.home / ".codex"
+        sid_a = "73737373-1111-7373-8373-737373737373"
+        sid_b = "74747474-2222-7474-8474-747474747474"
+        sdir = codex_home / "sessions/2026/11/23"
+        sdir.mkdir(parents=True, exist_ok=True)
+        env = {"CODEX_HOME": str(codex_home)}
+
+        def build_rollout(header_obj: dict) -> str:
+            return "".join(
+                json.dumps(r) + "\n"
+                for r in (
+                    header_obj,
+                    {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-foreign"}},
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "internal_chat_message_metadata_passthrough": {"turn_id": "turn-foreign"},
+                            "content": [{"type": "input_text", "text": "<goal_context>foreign</goal_context>"}],
+                        },
+                    },
+                )
+            )
+
+        # 1. >4 MiB header declaring foreign sid_b (even if filename carries sid_a) must be rejected.
+        oversized = sdir / f"rollout-2026-11-23T01-00-00-{sid_a}.jsonl"
+        oversized.write_text(
+            build_rollout({"type": "session_meta", "payload": {"id": sid_b, "pad": "x" * (4 * 1024 * 1024)}}),
+            encoding="utf-8",
+        )
+        self.assertFalse(_codex_turn_has_goal_context(sid_a, "turn-foreign", env, rollout_path=str(oversized)))
+
+        # 2. session_meta missing payload.id must be rejected as invalid_meta.
+        oversized.write_text(
+            build_rollout({"type": "session_meta", "payload": {"source": {"subagent": {"thread_spawn": {"parent_thread_id": sid_b}}}}}),
+            encoding="utf-8",
+        )
+        self.assertFalse(_codex_turn_has_goal_context(sid_a, "turn-foreign", env, rollout_path=str(oversized)))
+        oversized.unlink()
+
+        # 3. Compressed large rollout Goal lookup streams in O(1) memory.
+        if shutil.which("zstd"):
+            big_raw = sdir / f"rollout-2026-11-23T02-00-00-{sid_a}.jsonl"
+            with big_raw.open("wb") as fh:
+                fh.write((json.dumps({"type": "session_meta", "payload": {"id": sid_a}}) + "\n").encode())
+                pad = (json.dumps({"type": "event_msg", "payload": {"type": "token_count", "pad": "m" * 4000}}) + "\n").encode()
+                for _ in range(1600):
+                    fh.write(pad)
+                fh.write(
+                    (
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-tail"},
+                                    "content": [{"type": "input_text", "text": "<goal_context>Active</goal_context>"}],
+                                },
+                            }
+                        )
+                        + "\n"
+                    ).encode()
+                )
+            big_zst = big_raw.with_name(big_raw.name + ".zst")
+            subprocess.run([codex_sessions.zstd_binary(), "-q", "-o", str(big_zst), str(big_raw)], check=True)
+            big_raw.unlink()
+            tracemalloc.start()
+            found = _codex_turn_has_goal_context(sid_a, "turn-tail", env)
+            _, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            self.assertTrue(found)
+            self.assertLess(peak, 2 * 1024 * 1024)
+
 
 if __name__ == "__main__":
     unittest.main()

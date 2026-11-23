@@ -333,11 +333,15 @@ def _load_registry_latest(
                 sid = rec.get("sid")
                 tool = rec.get("tool")
                 if isinstance(pane, str) and pane and isinstance(sid, str) and sid:
-                    result[pane] = {
+                    entry_rec = {
                         "sid": sid,
                         "tool": str(tool or ""),
                         "cwd": str(rec.get("cwd", "")),
                     }
+                    ch = rec.get("codex_home")
+                    if isinstance(ch, str) and ch:
+                        entry_rec["codex_home"] = ch
+                    result[pane] = entry_rec
     except OSError:
         return {}
     return result
@@ -440,9 +444,21 @@ def _codex_rollout_meta(path_str: str) -> dict[str, str] | None:
     }
 
 
-def _process_env_var(pid: int, var_name: str) -> str:
-    """Best-effort read of an environment variable from a live process via `ps eww`."""
-    if pid <= 0 or not var_name:
+def _extract_env_var_from_ps(ps_line: str, var_name: str) -> str:
+    """Extract an env var value from `ps eww -o command=` without splitting on spaces."""
+    if not ps_line or not var_name:
+        return ""
+    m = re.search(
+        rf"(?:^|\s){re.escape(var_name)}=(.*?)(?=\s+[A-Za-z_][A-Za-z0-9_]*=|$)",
+        ps_line.rstrip("\r\n"),
+    )
+    if not m:
+        return ""
+    return m.group(1).strip()
+
+
+def _read_process_ps_eww(pid: int) -> str:
+    if pid <= 0:
         return ""
     try:
         res = subprocess.run(
@@ -456,12 +472,29 @@ def _process_env_var(pid: int, var_name: str) -> str:
         return ""
     if res.returncode != 0 or not res.stdout:
         return ""
-    prefix = f"{var_name}="
-    for token in res.stdout.split():
-        if token.startswith(prefix):
-            val = token[len(prefix) :].strip()
-            if val:
-                return val
+    return res.stdout.rstrip("\r\n")
+
+
+def _process_env_var(pid: int, var_name: str) -> str:
+    """Best-effort read of an environment variable from a live process via `ps eww`."""
+    return _extract_env_var_from_ps(_read_process_ps_eww(pid), var_name)
+
+
+def _process_codex_home(pid: int) -> str:
+    """Resolve verified CODEX_HOME for a live Codex process via `ps eww`.
+
+    Returns resolved `CODEX_HOME` if set, else `<HOME>/.codex` when `HOME` is
+    visible in the process environment (confirming `CODEX_HOME` is unset), else `""`.
+    """
+    ps_line = _read_process_ps_eww(pid)
+    if not ps_line:
+        return ""
+    chome = _extract_env_var_from_ps(ps_line, "CODEX_HOME")
+    if chome:
+        return str(Path(chome).expanduser().resolve())
+    home_val = _extract_env_var_from_ps(ps_line, "HOME")
+    if home_val:
+        return str((Path(home_val).expanduser() / ".codex").resolve())
     return ""
 
 
@@ -499,22 +532,29 @@ def _pick_preferred_rollout_rec(
         return curr
 
 
-def _build_codex_tty_map(
+def _collect_codex_tty_state(
     codex_panes: list[RawPane],
     *,
     pgrep_runner: Callable[[list[str]], list[int]] | None = None,
     lsof_runner: Callable[[list[str]], str] | None = None,
-) -> dict[str, list[dict[str, str]]]:
+) -> tuple[dict[str, list[dict[str, str]]], dict[str, list[int]]]:
     if not codex_panes:
-        return {}
+        return {}, {}
     names = tuple(sorted({p.current_command for p in codex_panes if p.current_command} | {"codex"}))
     pids = _find_pids_by_name(names, pgrep_runner=pgrep_runner)
     if not pids:
-        return {}
+        return {}, {}
     lsof_data = _run_lsof_batch(pids, lsof_runner=lsof_runner)
     tty_map: dict[str, list[dict[str, str]]] = {}
+    tty_pids: dict[str, list[int]] = {}
     for pid, entry in lsof_data.items():
-        if not entry["ttys"] or not entry["writable_jsonl"]:
+        if not entry["ttys"]:
+            continue
+        for tty in entry["ttys"]:
+            pid_bucket = tty_pids.setdefault(tty, [])
+            if pid not in pid_bucket:
+                pid_bucket.append(pid)
+        if not entry["writable_jsonl"]:
             continue
         pid_codex_home: str | None = None
         records: dict[tuple[str, str], dict[str, str]] = {}
@@ -536,6 +576,18 @@ def _build_codex_tty_map(
             for rec in records.values():
                 if rec not in bucket:
                     bucket.append(rec)
+    return tty_map, tty_pids
+
+
+def _build_codex_tty_map(
+    codex_panes: list[RawPane],
+    *,
+    pgrep_runner: Callable[[list[str]], list[int]] | None = None,
+    lsof_runner: Callable[[list[str]], str] | None = None,
+) -> dict[str, list[dict[str, str]]]:
+    tty_map, _ = _collect_codex_tty_state(
+        codex_panes, pgrep_runner=pgrep_runner, lsof_runner=lsof_runner
+    )
     return tty_map
 
 
@@ -810,6 +862,7 @@ def _resolve_single_raw_pane(
     current_pane_id: str,
     registry: Mapping[str, dict[str, str]],
     codex_tty_map: Mapping[str, list[dict[str, str]]],
+    codex_tty_pids: Mapping[str, list[int]],
     claude_by_target: Mapping[str, dict[str, Any]],
     claude_by_pane: Mapping[str, dict[str, Any]],
     dsh_by_pane: Mapping[str, dict[str, Any]],
@@ -885,6 +938,13 @@ def _resolve_single_raw_pane(
             elif reg_rec.get("tool") in {"x", "codex"} and reg_rec.get("sid") == preferred:
                 sid = preferred
                 authority = "registry"
+                reg_chome = str(reg_rec.get("codex_home") or "")
+                if reg_chome:
+                    storage_root = str(Path(reg_chome).expanduser().resolve())
+            if sid and not storage_root and not active_path:
+                tty_pids = codex_tty_pids.get(pane.short_tty, [])
+                if len(tty_pids) == 1:
+                    storage_root = _process_codex_home(tty_pids[0])
 
     # 3. Claude Code
     elif _is_claude_cmd(cmd):
@@ -998,7 +1058,9 @@ def list_live_panes(
     pi_explicit = [p for p in raw_panes if _is_pi_cmd(p.current_command)]
     node_or_dsh = [p for p in raw_panes if _is_dsh_cmd(p.current_command) or p.current_command.lower() == "node"]
 
-    codex_tty_map = _build_codex_tty_map(codex_panes, pgrep_runner=pgrep_runner, lsof_runner=lsof_runner)
+    codex_tty_map, codex_tty_pids = _collect_codex_tty_state(
+        codex_panes, pgrep_runner=pgrep_runner, lsof_runner=lsof_runner
+    )
     claude_by_target, claude_by_pane = (
         _load_claude_sessions(env, resolved_home, exists_fn) if claude_panes else ({}, {})
     )
@@ -1037,6 +1099,7 @@ def list_live_panes(
             current_pane_id=current_pane_id,
             registry=registry,
             codex_tty_map=codex_tty_map,
+            codex_tty_pids=codex_tty_pids,
             claude_by_target=claude_by_target,
             claude_by_pane=claude_by_pane,
             dsh_by_pane=dsh_by_pane,

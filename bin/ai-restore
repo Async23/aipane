@@ -257,34 +257,53 @@ PY
 
 # pi_session_resolve <uuid> <cwd> — resolve a durable Pi session whose header
 # identifies both the requested id and the pane's project cwd.
-# Prints "native\t<path>" when the file lives in Pi's default encoded-cwd dir
-# (so `pi --session-id <id>` opens it directly), or "path\t<path>" when the
-# verified file lives in a different subdir (requiring `pi --session <path>`).
+# Prints "native\t<path>" when the file lives in Pi's exact native discovery
+# directory (flat $PI_CODING_AGENT_SESSION_DIR when explicitly set, or
+# $PI_SESSION_ROOT/--<encoded-cwd>-- otherwise) so `pi --session-id <id>` opens
+# it directly; prints "path\t<path>" when the verified file lives elsewhere
+# (requiring `pi --session <path>`).
 pi_session_resolve() {
   local sid="$1" cwd="$2"
-  local -a matches
-  matches=("$PI_SESSION_ROOT"/**/*_"$sid".jsonl(N) "$PI_SESSION_ROOT"/**/*_"$sid"_*.jsonl(N))
-  (( ${#matches[@]} > 0 )) || return 1
+  local default_sessions="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/sessions"
+  local explicit_dir="${PI_CODING_AGENT_SESSION_DIR:-}"
   command -v python3 &>/dev/null || return 1
-  python3 - "$sid" "$cwd" "$PI_SESSION_ROOT" "${matches[@]}" <<'PY'
+  python3 - "$sid" "$cwd" "$PI_SESSION_ROOT" "$default_sessions" "$explicit_dir" <<'PY'
 import json
 import os
 import re
 import sys
+from pathlib import Path
 
-sid, cwd, sessions_root, *paths = sys.argv[1:]
+sid, cwd, primary_root, default_root, explicit_dir = sys.argv[1:6]
 expected_cwd = os.path.normcase(os.path.realpath(cwd))
 resolved_cwd = os.path.realpath(cwd)
-safe_dir = "--" + re.sub(r"[/\\:]", "-", re.sub(r"^[/\\]", "", resolved_cwd)) + "--"
-native_dir = os.path.normcase(os.path.realpath(os.path.join(sessions_root, safe_dir)))
+if explicit_dir:
+    native_dir = os.path.normcase(os.path.realpath(explicit_dir))
+else:
+    safe_dir = "--" + re.sub(r"[/\\:]", "-", re.sub(r"^[/\\]", "", resolved_cwd)) + "--"
+    native_dir = os.path.normcase(os.path.realpath(os.path.join(primary_root, safe_dir)))
 
-fallback_match = None
-for path in paths:
+dsh_re = re.compile(r"^session(?:\.v\d+)?\.jsonl(?:\.zstd)?$")
+
+roots: list[Path] = []
+for raw_root in (primary_root, default_root):
+    if not raw_root:
+        continue
+    p = Path(raw_root).expanduser()
+    if p.is_dir():
+        try:
+            rp = p.resolve()
+        except OSError:
+            rp = p
+        if rp not in roots:
+            roots.append(rp)
+
+def _check(path: Path) -> str | None:
     try:
-        with open(path, encoding="utf-8") as session:
+        with path.open(encoding="utf-8") as session:
             header = json.loads(session.readline())
     except (OSError, UnicodeError, json.JSONDecodeError):
-        continue
+        return None
     if (
         isinstance(header, dict)
         and header.get("type") == "session"
@@ -293,12 +312,48 @@ for path in paths:
         and isinstance(header.get("cwd"), str)
         and os.path.normcase(os.path.realpath(header["cwd"])) == expected_cwd
     ):
-        parent = os.path.normcase(os.path.realpath(os.path.dirname(path)))
-        if parent == native_dir:
-            print(f"native\t{os.path.realpath(path)}")
+        return os.path.realpath(str(path))
+    return None
+
+seen: set[Path] = set()
+fast_matches: list[Path] = []
+for root in roots:
+    for pat in (f"*_{sid}.jsonl", f"*_{sid}_*.jsonl"):
+        try:
+            for cand in root.rglob(pat):
+                if cand.is_file() and cand not in seen:
+                    seen.add(cand)
+                    fast_matches.append(cand)
+        except OSError:
+            continue
+
+fallback_match: str | None = None
+for cand in fast_matches:
+    matched = _check(cand)
+    if matched is not None:
+        if os.path.normcase(os.path.dirname(matched)) == native_dir:
+            print(f"native\t{matched}")
             raise SystemExit(0)
         if fallback_match is None:
-            fallback_match = os.path.realpath(path)
+            fallback_match = matched
+
+if fallback_match is None:
+    for root in roots:
+        try:
+            all_jsonl = root.rglob("*.jsonl")
+        except OSError:
+            continue
+        for cand in all_jsonl:
+            if cand in seen or dsh_re.match(cand.name) or not cand.is_file():
+                continue
+            seen.add(cand)
+            matched = _check(cand)
+            if matched is not None:
+                if os.path.normcase(os.path.dirname(matched)) == native_dir:
+                    print(f"native\t{matched}")
+                    raise SystemExit(0)
+                if fallback_match is None:
+                    fallback_match = matched
 
 if fallback_match is not None:
     print(f"path\t{fallback_match}")
@@ -312,29 +367,78 @@ PY
 # belongs to another cwd or has a broken header (unsafe to recreate).
 pi_session_id_exists() {
   local sid="$1"
-  local -a matches
-  matches=("$PI_SESSION_ROOT"/**/*_"$sid".jsonl(N) "$PI_SESSION_ROOT"/**/*_"$sid"_*.jsonl(N))
-  (( ${#matches[@]} > 0 )) || return 1
-  command -v python3 &>/dev/null || return 0
-  python3 - "$sid" "${matches[@]}" <<'PY'
+  local default_sessions="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/sessions"
+  command -v python3 &>/dev/null || return 1
+  python3 - "$sid" "$PI_SESSION_ROOT" "$default_sessions" <<'PY'
 import json
+import re
 import sys
+from pathlib import Path
 
-sid, *paths = sys.argv[1:]
-for path in paths:
+sid, primary_root, default_root = sys.argv[1:4]
+dsh_re = re.compile(r"^session(?:\.v\d+)?\.jsonl(?:\.zstd)?$")
+
+roots: list[Path] = []
+for raw_root in (primary_root, default_root):
+    if not raw_root:
+        continue
+    p = Path(raw_root).expanduser()
+    if p.is_dir():
+        try:
+            rp = p.resolve()
+        except OSError:
+            rp = p
+        if rp not in roots:
+            roots.append(rp)
+
+seen: set[Path] = set()
+for root in roots:
+    for pat in (f"*_{sid}.jsonl", f"*_{sid}_*.jsonl"):
+        try:
+            cands = list(root.rglob(pat))
+        except OSError:
+            continue
+        for cand in cands:
+            if not cand.is_file() or cand in seen:
+                continue
+            seen.add(cand)
+            try:
+                with cand.open(encoding="utf-8") as session:
+                    header = json.loads(session.readline())
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                # Corrupt/unreadable file carrying this sid is unsafe to recreate.
+                raise SystemExit(0)
+            if isinstance(header, dict) and header.get("type") == "session":
+                if "createdAt" in header and "timestamp" not in header:
+                    continue
+                hdr_id = header.get("id")
+                if isinstance(hdr_id, str) and hdr_id and hdr_id != sid:
+                    continue
+            raise SystemExit(0)
+
+# Fallback: check opaque filenames whose Pi session header declares `id == sid`.
+for root in roots:
     try:
-        with open(path, encoding="utf-8") as session:
-            header = json.loads(session.readline())
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        # Corrupt/unreadable file with this sid is still unsafe to recreate.
-        raise SystemExit(0)
-    if isinstance(header, dict) and header.get("type") == "session":
-        if "createdAt" in header and "timestamp" not in header:
+        all_jsonl = root.rglob("*.jsonl")
+    except OSError:
+        continue
+    for cand in all_jsonl:
+        if cand in seen or dsh_re.match(cand.name) or not cand.is_file():
             continue
-        hdr_id = header.get("id")
-        if isinstance(hdr_id, str) and hdr_id and hdr_id != sid:
+        seen.add(cand)
+        try:
+            with cand.open(encoding="utf-8") as session:
+                header = json.loads(session.readline())
+        except (OSError, UnicodeError, json.JSONDecodeError):
             continue
-    raise SystemExit(0)
+        if (
+            isinstance(header, dict)
+            and header.get("type") == "session"
+            and not ("createdAt" in header and "timestamp" not in header)
+            and header.get("id") == sid
+        ):
+            raise SystemExit(0)
+
 raise SystemExit(1)
 PY
 }

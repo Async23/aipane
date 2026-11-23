@@ -2353,9 +2353,14 @@ def _codex_rollout_candidates(
         raw_p = Path(rollout_path).expanduser()
         resolved = codex_sessions.resolve_alternate_rollout_path(raw_p, codex_home)
         if resolved is not None:
-            meta = codex_sessions.read_rollout_meta(resolved, max_lines=1)
-            # Reject a SQLite rollout_path that explicitly declares a different SID.
-            if not thread_id or meta is None or meta.get("sid") == thread_id:
+            meta, err = codex_sessions.read_rollout_meta_detailed(resolved, max_lines=1)
+            # Require verified SID identity; reject oversized/corrupt/unreadable headers
+            # and foreign SIDs. Allow headerless fixtures only when filename carries thread_id.
+            if not thread_id:
+                candidates.append(resolved)
+            elif err is None and meta is not None and meta.get("sid") == thread_id:
+                candidates.append(resolved)
+            elif err == "missing_meta" and thread_id in resolved.name:
                 candidates.append(resolved)
     if thread_id:
         # Prefer newest rollout segments first so recent turns are found immediately.
@@ -2435,6 +2440,11 @@ def _codex_turn_has_goal_context(
 ) -> bool:
     if not thread_id or not turn_id:
         return False
+    lib_dir = str(Path(__file__).resolve().parent)
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    import codex_sessions
+
     seen: set[Path] = set()
     for candidate in _codex_rollout_candidates(
         thread_id,
@@ -2448,6 +2458,44 @@ def _codex_turn_has_goal_context(
         if resolved in seen or not resolved.is_file():
             continue
         seen.add(resolved)
+        if codex_sessions.is_compressed_rollout(resolved):
+            # Stream compressed rollouts forward in O(1) memory, resetting on each
+            # task_started for turn_id so only the latest attempt of turn_id counts.
+            found_goal = False
+            try:
+                for line in codex_sessions.iter_rollout_lines(resolved):
+                    if turn_id not in line:
+                        continue
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        record = json.loads(stripped)
+                    except ValueError:
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+                    payload = record.get("payload") or {}
+                    if not isinstance(payload, dict):
+                        continue
+                    if (
+                        record.get("type") == "event_msg"
+                        and payload.get("type") == "task_started"
+                        and payload.get("turn_id") == turn_id
+                    ):
+                        found_goal = False
+                    elif record.get("type") == "response_item" and payload.get("role") == "user":
+                        metadata = payload.get("internal_chat_message_metadata_passthrough") or {}
+                        if not isinstance(metadata, dict) or metadata.get("turn_id") != turn_id:
+                            continue
+                        text = _codex_response_item_text(payload)
+                        if _GOAL_CONTEXT_RE.search(text) or "<goal_context>" in text:
+                            found_goal = True
+            except OSError:
+                continue
+            if found_goal:
+                return True
+            continue
         for record in _iter_jsonl_reverse(resolved):
             if not isinstance(record, dict):
                 continue

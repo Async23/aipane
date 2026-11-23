@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import subprocess
 import time
+from collections import deque
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Iterator
@@ -76,19 +77,35 @@ def rollout_plain_stem(path: Path) -> str:
     return path.stem
 
 
+def rollout_dedup_priority(path: Path) -> tuple[int, int, int, str]:
+    """Canonical preference key: plain > compressed, real file > symlink, sessions/ > archived_sessions/."""
+    is_comp = 1 if is_compressed_rollout(path) else 0
+    is_sym = 1 if path.is_symlink() else 0
+    is_arch = 1 if "archived_sessions" in path.parts else 0
+    return (is_comp, is_sym, is_arch, str(path))
+
+
 def rollout_canonical_key(path: Path, codex_home: Path | None = None) -> Path:
-    """Key unifying plain `.jsonl` and compressed/archived `.jsonl.zst` of the same rollout."""
+    """Key unifying plain `.jsonl` and compressed/archived `.jsonl.zst` of the same rollout.
+
+    Cross-directory unification (`sessions/` <-> `archived_sessions/`) applies ONLY to
+    canonical `rollout-...-<uuid>` filenames. Non-canonical/opaque filenames (such as
+    `session.jsonl` in different date directories) stay scoped to their own directory
+    so distinct sessions are never collapsed.
+    """
     stem = rollout_plain_stem(path)
-    root_str = ""
-    if codex_home is not None:
-        try:
-            root_str = str(codex_home.expanduser().resolve())
-        except OSError:
-            root_str = str(codex_home)
-    else:
-        root_str = infer_codex_home(path)
-    if root_str:
-        return Path(root_str) / stem
+    _, fn_rid = extract_filename_ids(path)
+    if stem.startswith("rollout-") and fn_rid is not None:
+        root_str = ""
+        if codex_home is not None:
+            try:
+                root_str = str(codex_home.expanduser().resolve())
+            except OSError:
+                root_str = str(codex_home)
+        else:
+            root_str = infer_codex_home(path)
+        if root_str:
+            return Path(root_str) / stem
     try:
         parent = path.parent.resolve()
     except OSError:
@@ -292,7 +309,7 @@ def _read_first_lines_raw(
         return [], "io_error"
 
 
-def iter_rollout_lines(path: Path) -> Iterator[str]:
+def iter_rollout_lines(path: Path, *, strict: bool = False) -> Iterator[str]:
     """Stream decoded text lines from a plain or zstd-compressed rollout."""
     if is_compressed_rollout(path):
         proc = subprocess.Popen(
@@ -314,10 +331,12 @@ def iter_rollout_lines(path: Path) -> Iterator[str]:
             if not completed:
                 proc.terminate()
             try:
-                proc.wait(timeout=1)
+                rc = proc.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 proc.kill()
-                proc.wait()
+                rc = proc.wait()
+        if strict and completed and rc != 0:
+            raise OSError(f"zstd decode failed with exit code {rc} for {path}")
         return
 
     with path.open("rb") as fh:
@@ -325,22 +344,56 @@ def iter_rollout_lines(path: Path) -> Iterator[str]:
             yield raw.decode("utf-8", errors="replace")
 
 
-def iter_rollout_records_reverse(path: Path, chunk_size: int = 64 * 1024) -> Iterator[dict[str, Any]]:
-    """Yield parsed JSON dict records from end to start, supporting plain & zstd rollouts."""
+def iter_rollout_records_reverse(
+    path: Path,
+    chunk_size: int = 64 * 1024,
+    *,
+    max_compressed_tail_bytes: int = 2 * 1024 * 1024,
+) -> Iterator[dict[str, Any]]:
+    """Yield parsed JSON dict records from end to start, supporting plain & zstd rollouts.
+
+    For zstd rollouts, retains only a bounded byte tail (`max_compressed_tail_bytes`)
+    in a rolling deque so reading the tail of a large compressed rollout does not
+    materialize the entire decompressed log in Python memory.
+    """
     if is_compressed_rollout(path):
         try:
-            lines = list(iter_rollout_lines(path))
+            proc = subprocess.Popen(
+                [zstd_binary(), "-dcqf", str(path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
         except OSError:
             return
-        for raw_line in reversed(lines):
-            stripped = raw_line.strip()
-            if not stripped:
-                continue
+        assert proc.stdout is not None
+        tail: deque[bytes] = deque()
+        buffered = 0
+        try:
+            for raw_b in proc.stdout:
+                if not raw_b.strip():
+                    continue
+                tail.append(raw_b)
+                buffered += len(raw_b)
+                while len(tail) > 1 and buffered > max_compressed_tail_bytes:
+                    buffered -= len(tail.popleft())
+        except OSError:
+            return
+        finally:
             try:
-                obj = json.loads(stripped)
+                proc.stdout.close()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        for raw_b in reversed(tail):
+            try:
+                obj = json.loads(raw_b.decode("utf-8"))
                 if isinstance(obj, dict):
                     yield obj
-            except ValueError:
+            except (UnicodeDecodeError, ValueError):
                 continue
         return
 
@@ -406,10 +459,10 @@ def read_rollout_meta_detailed(
             continue
         payload = metadata.get("payload")
         if not isinstance(payload, dict):
-            return None, "missing_meta"
+            return None, "invalid_meta"
         sid = payload.get("id")
         if not isinstance(sid, str) or not sid:
-            return None, "missing_meta"
+            return None, "invalid_meta"
         ordinal = metadata.get("ordinal")
         if not isinstance(ordinal, int) or isinstance(ordinal, bool):
             ordinal = None
@@ -482,36 +535,60 @@ def _parse_naive_filename_epoch(fn_ts: str) -> float | None:
     return parsed.replace(tzinfo=dt.timezone.utc).timestamp()
 
 
-def _local_tz_offset_seconds(fn_ts: str) -> float:
+def _local_tz_offsets_for_wall_clock(fn_ts: str) -> tuple[float, float]:
+    """Return `(fold0_offset_sec, fold1_offset_sec)` in host/TZ local timezone."""
     try:
-        parsed = dt.datetime.fromisoformat(fn_ts).astimezone()
-        off = parsed.utcoffset()
-        if off is not None:
-            return off.total_seconds()
+        base = dt.datetime.fromisoformat(fn_ts)
     except ValueError:
-        pass
-    return 0.0
+        return 0.0, 0.0
+    tz_env = os.environ.get("TZ", "").strip()
+    if tz_env:
+        try:
+            from zoneinfo import ZoneInfo
+
+            tz_obj = ZoneInfo(tz_env.lstrip(":"))
+            off0 = base.replace(tzinfo=tz_obj, fold=0).utcoffset()
+            off1 = base.replace(tzinfo=tz_obj, fold=1).utcoffset()
+            s0 = off0.total_seconds() if off0 is not None else 0.0
+            s1 = off1.total_seconds() if off1 is not None else s0
+            return s0, s1
+        except Exception:
+            pass
+    try:
+        off0 = base.replace(fold=0).astimezone().utcoffset()
+        off1 = base.replace(fold=1).astimezone().utcoffset()
+        s0 = off0.total_seconds() if off0 is not None else 0.0
+        s1 = off1.total_seconds() if off1 is not None else s0
+        return s0, s1
+    except ValueError:
+        return 0.0, 0.0
 
 
-def sort_rollout_entries(
+def _local_tz_offset_seconds(fn_ts: str) -> float:
+    return _local_tz_offsets_for_wall_clock(fn_ts)[0]
+
+
+def sort_rollout_entries_with_warnings(
     entries: list[tuple[dict[str, Any] | None, Path]],
-) -> list[tuple[dict[str, Any] | None, Path]]:
-    """Order rollout segments for the same session from earliest to latest creation.
+) -> tuple[list[tuple[dict[str, Any] | None, Path]], list[str]]:
+    """Order rollout segments earliest-to-latest and report ambiguous DST ordering.
 
     Normalizes UTC `session_meta.timestamp` and local-wall-clock canonical filename
-    timestamps (`rollout-YYYY-MM-DDTHH-MM-SS`) onto a single UTC epoch timeline so
-    mixed UTC/local entries in non-UTC timezones (e.g. Asia/Shanghai UTC+8) still
-    preserve true causal creation order.
+    timestamps (`rollout-YYYY-MM-DDTHH-MM-SS`) onto a single UTC epoch timeline.
+    Uses per-date local TZ rules when siblings match host TZ (exact across DST
+    transitions), or nearest-in-time sibling offset for logs from another timezone,
+    and flags `ambiguous_timestamp_order` when alternate plausible DST offsets
+    could flip relative segment order.
     """
     if len(entries) <= 1:
-        return list(entries)
+        return list(entries), []
 
     meta_epochs: list[float | None] = []
     fn_strings: list[str] = []
     fn_naives: list[float | None] = []
-    offsets: list[float] = []
+    known_siblings: list[tuple[int, float, float, float, float]] = []
 
-    for meta, path in entries:
+    for idx, (meta, path) in enumerate(entries):
         m_ts = str(meta.get("timestamp") or "") if meta else ""
         m_ep = _parse_iso_utc_epoch(m_ts)
         f_ts = (str(meta.get("filename_ts") or "") if meta else "") or extract_filename_ts(path)
@@ -520,26 +597,73 @@ def sort_rollout_entries(
         fn_strings.append(f_ts)
         fn_naives.append(f_nv)
         if m_ep is not None and f_nv is not None:
-            # Round to nearest minute to absorb sub-second clock/write jitter.
-            offsets.append(round((f_nv - m_ep) / 60.0) * 60.0)
+            obs_off = round((f_nv - m_ep) / 60.0) * 60.0
+            loc0, loc1 = _local_tz_offsets_for_wall_clock(f_ts)
+            known_siblings.append((idx, f_nv, obs_off, loc0, loc1))
 
-    inferred_offset: float | None = None
-    if offsets:
-        offsets_sorted = sorted(offsets)
-        inferred_offset = offsets_sorted[len(offsets_sorted) // 2]
+    all_match_local = bool(known_siblings) and all(
+        min(abs(obs - l0), abs(obs - l1)) <= 120.0
+        for _, _, obs, l0, l1 in known_siblings
+    )
 
     normalized_epochs: list[float | None] = []
+    alt_epochs: list[list[float]] = []
+
     for m_ep, f_ts, f_nv in zip(meta_epochs, fn_strings, fn_naives):
         if m_ep is not None:
             normalized_epochs.append(m_ep)
+            alt_epochs.append([m_ep])
         elif f_nv is not None:
-            off = inferred_offset if inferred_offset is not None else _local_tz_offset_seconds(f_ts)
-            normalized_epochs.append(f_nv - off)
+            if all_match_local or not known_siblings:
+                loc0, loc1 = _local_tz_offsets_for_wall_clock(f_ts)
+                ep0 = f_nv - loc0
+                normalized_epochs.append(ep0)
+                if abs(loc0 - loc1) > 120.0:
+                    alt_epochs.append([f_nv - loc0, f_nv - loc1])
+                else:
+                    alt_epochs.append([ep0])
+            else:
+                nearest = min(known_siblings, key=lambda s: abs(s[1] - f_nv))
+                nearest_dist = abs(nearest[1] - f_nv)
+                chosen_off = nearest[2]
+                prev_sibs = [s for s in known_siblings if s[1] <= f_nv]
+                next_sibs = [s for s in known_siblings if s[1] >= f_nv]
+                prev_s = max(prev_sibs, key=lambda s: s[1]) if prev_sibs else None
+                next_s = min(next_sibs, key=lambda s: s[1]) if next_sibs else None
+                cand_offs = {chosen_off}
+                if prev_s is not None and next_s is not None and abs(prev_s[2] - next_s[2]) > 120.0:
+                    d_prev = abs(f_nv - prev_s[1])
+                    d_next = abs(next_s[1] - f_nv)
+                    if not (min(d_prev, d_next) <= 3600.0 and max(d_prev, d_next) > 43200.0):
+                        cand_offs.add(prev_s[2])
+                        cand_offs.add(next_s[2])
+                elif nearest_dist > 86400.0:
+                    cand_offs.add(chosen_off - 3600.0)
+                    cand_offs.add(chosen_off + 3600.0)
+                normalized_epochs.append(f_nv - chosen_off)
+                alt_epochs.append([f_nv - off for off in sorted(cand_offs)])
         else:
             normalized_epochs.append(None)
+            alt_epochs.append([])
 
+    warnings: list[str] = []
     if all(ep is not None for ep in normalized_epochs):
-        return [
+        for i, alts in enumerate(alt_epochs):
+            if len(alts) <= 1:
+                continue
+            lo, hi = min(alts), max(alts)
+            flips = any(
+                j != i
+                and normalized_epochs[j] is not None
+                and lo <= float(normalized_epochs[j]) <= hi
+                for j in range(len(entries))
+            )
+            if flips:
+                warnings.append(
+                    f"ambiguous_timestamp_order: segment {entries[i][1]} lacks session_meta.timestamp "
+                    "across a DST or timezone boundary"
+                )
+        ordered = [
             entry
             for _, entry in sorted(
                 zip(normalized_epochs, entries),
@@ -552,21 +676,23 @@ def sort_rollout_entries(
                 ),
             )
         ]
+        return ordered, warnings
 
     all_have_ordinal = all(
         meta is not None and isinstance(meta.get("ordinal"), int)
         for meta, _ in entries
     )
     if all_have_ordinal:
-        return sorted(
+        ordered = sorted(
             entries,
             key=lambda item: (
                 int(item[0]["ordinal"]),  # type: ignore[index]
                 str(item[1]),
             ),
         )
+        return ordered, warnings
 
-    return [
+    ordered = [
         entry
         for _, entry in sorted(
             zip(normalized_epochs, entries),
@@ -577,6 +703,14 @@ def sort_rollout_entries(
             ),
         )
     ]
+    return ordered, warnings
+
+
+def sort_rollout_entries(
+    entries: list[tuple[dict[str, Any] | None, Path]],
+) -> list[tuple[dict[str, Any] | None, Path]]:
+    ordered, _ = sort_rollout_entries_with_warnings(entries)
+    return ordered
 
 
 def deduplicate_rollout_paths(
@@ -590,13 +724,7 @@ def deduplicate_rollout_paths(
     `.jsonl.zst`), and prefers `sessions/` over `archived_sessions/`.
     """
     by_inode: dict[tuple[int, int], Path] = {}
-    by_canonical: dict[Path, Path] = {}
-
-    def _priority(p: Path) -> tuple[int, int, int, str]:
-        is_comp = 1 if is_compressed_rollout(p) else 0
-        is_sym = 1 if p.is_symlink() else 0
-        is_arch = 1 if "archived_sessions" in p.parts else 0
-        return (is_comp, is_sym, is_arch, str(p))
+    by_canonical: dict[Any, Path] = {}
 
     for path in paths:
         try:
@@ -608,7 +736,7 @@ def deduplicate_rollout_paths(
         inode_key = (st.st_dev, st.st_ino)
         prev = by_inode.get(inode_key)
         if prev is not None:
-            if _priority(path) < _priority(prev):
+            if rollout_dedup_priority(path) < rollout_dedup_priority(prev):
                 by_inode[inode_key] = path
             continue
         by_inode[inode_key] = path
@@ -616,7 +744,24 @@ def deduplicate_rollout_paths(
     for path in by_inode.values():
         ckey = rollout_canonical_key(path, codex_home=codex_home)
         prev = by_canonical.get(ckey)
-        if prev is None or _priority(path) < _priority(prev):
+        if prev is None:
+            by_canonical[ckey] = path
+            continue
+        # Guard cross-directory canonical collisions by verifying header SID match.
+        try:
+            same_parent = prev.parent.resolve() == path.parent.resolve()
+        except OSError:
+            same_parent = prev.parent == path.parent
+        if not same_parent:
+            m_prev = read_rollout_meta(prev, max_lines=1)
+            m_curr = read_rollout_meta(path, max_lines=1)
+            if m_prev and m_curr and m_prev["sid"] != m_curr["sid"]:
+                alt_key = (ckey, m_curr["sid"])
+                alt_prev = by_canonical.get(alt_key)
+                if alt_prev is None or rollout_dedup_priority(path) < rollout_dedup_priority(alt_prev):
+                    by_canonical[alt_key] = path
+                continue
+        if rollout_dedup_priority(path) < rollout_dedup_priority(prev):
             by_canonical[ckey] = path
 
     return list(by_canonical.values())
@@ -669,14 +814,51 @@ def find_session_rollouts(
     deduped = deduplicate_rollout_paths(raw_candidates, codex_home=codex_home)
     matched: list[tuple[dict[str, Any] | None, Path]] = []
     for path in deduped:
-        meta = read_rollout_meta(path, max_lines=1)
+        meta, err = read_rollout_meta_detailed(path, max_lines=1)
         if verify_header:
-            if not meta or meta["sid"] != sid:
+            if err is not None or not meta or meta["sid"] != sid:
                 continue
-        elif meta is not None and meta["sid"] != sid:
-            continue
+        else:
+            if err in ("header_too_large", "invalid_json", "invalid_meta", "io_error"):
+                continue
+            if meta is not None and meta["sid"] != sid:
+                continue
         matched.append((meta, path))
     return [path for _, path in sort_rollout_entries(matched)]
+
+
+def resolve_committed_head(
+    sid: str,
+    codex_home: Path,
+    *,
+    verify_header: bool = True,
+) -> Path | None:
+    """Return the authoritative committed rollout head for `sid`.
+
+    Checks verified `state_*.sqlite` first (preferring plain `.jsonl` over
+    `.jsonl.zst` via `resolve_alternate_rollout_path`) so an uncommitted
+    rollback segment written to disk before SQLite switches never overrides
+    committed history or busy/idle activity state. Falls back to the latest
+    segment from `find_session_rollouts` when SQLite has no verified entry.
+    """
+    if not sid:
+        return None
+    sqlite_path = query_sqlite_rollout_path(sid, codex_home)
+    if sqlite_path is not None:
+        resolved = resolve_alternate_rollout_path(sqlite_path, codex_home)
+        if resolved is not None:
+            meta, err = read_rollout_meta_detailed(resolved, max_lines=1)
+            if verify_header:
+                if err is None and meta is not None and meta["sid"] == sid:
+                    return resolved
+            else:
+                if err is None and meta is not None:
+                    if meta["sid"] == sid:
+                        return resolved
+                elif err == "missing_meta" and sid in resolved.name:
+                    return resolved
+    transcripts = find_session_rollouts(sid, codex_home, verify_header=verify_header)
+    return transcripts[-1] if transcripts else None
 
 
 def _populate_rollout_index_once(
@@ -840,7 +1022,7 @@ def resolve_effective_lineage(
             continue
         same_sid_entries.append((m, p))
 
-    ordered_entries = sort_rollout_entries(same_sid_entries)
+    ordered_entries, sort_warnings = sort_rollout_entries_with_warnings(same_sid_entries)
     if not ordered_entries:
         return [], [], []
 
@@ -880,6 +1062,10 @@ def resolve_effective_lineage(
         committed_head = None
 
     head_meta, head_path = committed_head if committed_head is not None else ordered_entries[-1]
+    if sort_warnings and (
+        committed_head is None or head_meta is None or head_meta.get("history_base") is None
+    ):
+        warnings.extend(sort_warnings)
 
     # Path A: Head participates in Codex's explicit `history_base` lineage chain
     if head_meta is not None and head_meta.get("history_base") is not None:
@@ -917,6 +1103,11 @@ def resolve_effective_lineage(
             if hb.get("invalid_bounds"):
                 warnings.append(
                     f"invalid_history_base_bounds: segment {cur_path} declared invalid history_base bounds"
+                )
+            elif hb.get("end_ordinal_exclusive") is None and hb.get("end_byte_offset") is None:
+                warnings.append(
+                    f"history_base_missing_bounds: segment {cur_path} references base rollout {hb['rollout_id']} "
+                    "without exclusive ordinal or byte bounds"
                 )
             base_rid = hb["rollout_id"]
             base_path = local_rindex.get(base_rid)
@@ -1130,8 +1321,9 @@ def session_exists(sid: str, codex_home: Path) -> bool:
 def session_is_known(sid: str, codex_home: Path) -> bool:
     """Return True if `sid` exists durably OR has a recorded SQLite/rollout entry.
 
-    Used by recovery so a corrupt or missing rollout for a bound session `B`
-    marks `B` invalid instead of silently falling back to a stale argv `A`.
+    Used by recovery so a corrupt, missing, or non-standard-named rollout for a
+    bound session `B` marks `B` invalid instead of silently falling back to a
+    stale argv `A`.
     """
     if not sid:
         return False
@@ -1139,13 +1331,56 @@ def session_is_known(sid: str, codex_home: Path) -> bool:
         return True
     if query_sqlite_rollout_path(sid, codex_home) is not None:
         return True
+    nonstandard_or_double: list[Path] = []
     for root in codex_session_roots(codex_home, existing_only=True):
         for suffix in CODEX_ROLLOUT_SUFFIXES:
             for pattern in (f"*-{sid}{suffix}", f"*-{sid}_*{suffix}"):
                 for path in root.rglob(pattern):
                     if path.is_file():
                         return True
+    for path in iter_codex_rollout_files(codex_home):
+        fn_sid, fn_rid = extract_filename_ids(path)
+        plain_stem = rollout_plain_stem(path)
+        if not (fn_sid and fn_sid == fn_rid and plain_stem.startswith("rollout-")):
+            nonstandard_or_double.append(path)
+    for path in nonstandard_or_double:
+        if rollout_matches_session(path, sid):
+            return True
     return False
+
+
+def _extract_env_var_from_ps_line(ps_line: str, var_name: str) -> str:
+    if not ps_line or not var_name:
+        return ""
+    m = re.search(
+        rf"(?:^|\s){re.escape(var_name)}=(.*?)(?=\s+[A-Za-z_][A-Za-z0-9_]*=|$)",
+        ps_line.rstrip("\r\n"),
+    )
+    return m.group(1).strip() if m else ""
+
+
+def _process_env_codex_home(pid: int) -> str:
+    if pid <= 0:
+        return ""
+    try:
+        res = subprocess.run(
+            ["ps", "eww", "-o", "command=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=1,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if res.returncode != 0 or not res.stdout:
+        return ""
+    val = _extract_env_var_from_ps_line(res.stdout, "CODEX_HOME")
+    if not val:
+        return ""
+    try:
+        return str(Path(val).expanduser().resolve())
+    except OSError:
+        return val
 
 
 def _open_sessions(arguments: list[str], codex_home: Path | None) -> dict[int, list[dict]]:
@@ -1162,6 +1397,7 @@ def _open_sessions(arguments: list[str], codex_home: Path | None) -> dict[int, l
     if not result.stdout or result.returncode not in (0, 1):
         return {}
     sessions: dict[int, list[dict]] = {}
+    pid_env_cache: dict[int, str] = {}
     pid, writable = 0, False
     for line in result.stdout.splitlines():
         if line.startswith("p"):
@@ -1184,8 +1420,14 @@ def _open_sessions(arguments: list[str], codex_home: Path | None) -> dict[int, l
                 else:
                     inferred = infer_codex_home(path)
                     if not inferred:
+                        if pid not in pid_env_cache:
+                            pid_env_cache[pid] = _process_env_codex_home(pid)
+                        inferred = pid_env_cache[pid]
+                    if not inferred:
                         continue
                     storage = Path(inferred)
+                    if not path.is_relative_to(storage):
+                        continue
                 meta = read_rollout_meta(path, max_lines=1)
                 if not meta:
                     continue

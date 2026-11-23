@@ -1861,6 +1861,56 @@ class AgentActivityTests(unittest.TestCase):
                 conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sqlite_sid, str(future_p), 1_795_400_000))
             self.assertEqual(codex_thread_identity(codex_home, sqlite_sid), CodexThreadIdentity(sqlite_sid, "main"))
 
+    def test_r3_p1_legacy_codex_activity_respects_committed_sqlite_head_and_zstd(self) -> None:
+        from contextlib import closing
+        import shutil
+        import sqlite3
+        import codex_sessions
+
+        sid = "88888888-8888-7888-8888-888888888888"
+        rid = "99999999-9999-7999-8999-999999999999"
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            home = Path(raw_tmp)
+            codex_home = home / ".codex"
+            sdir = codex_home / "sessions/2026/11/23"
+            sdir.mkdir(parents=True, exist_ok=True)
+            committed = sdir / f"rollout-2026-11-23T00-00-01-{sid}.jsonl"
+            committed.write_text(
+                json.dumps({"ordinal": 0, "type": "session_meta", "payload": {"id": sid, "cwd": str(home), "source": "cli"}}) + "\n"
+                + json.dumps({"ordinal": 1, "type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-busy-1"}}) + "\n",
+                encoding="utf-8",
+            )
+            with closing(sqlite3.connect(codex_home / "state_8.sqlite")) as conn, conn:
+                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+                conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid, str(committed), 1_795_400_000))
+
+            # Uncommitted header-only rollback segment must NOT flip committed busy pane to idle.
+            uncommitted = sdir / f"rollout-2026-11-23T00-00-02-{sid}_{rid}.jsonl"
+            uncommitted.write_text(
+                json.dumps({"ordinal": 0, "type": "session_meta", "payload": {"id": sid, "cwd": str(home), "source": "cli"}}) + "\n",
+                encoding="utf-8",
+            )
+            resolver, pane = self.legacy_resolver_and_pane(home, sid)
+            view = resolver.inspect(pane.pane_id)
+            self.assertEqual(view.state, "busy")
+            self.assertEqual(view.evidence, "turn-busy-1")
+
+            # Compressing & archiving the committed rollout must still resolve as busy, not unknown.
+            if shutil.which("zstd"):
+                arch = codex_home / "archived_sessions"
+                arch.mkdir(parents=True, exist_ok=True)
+                zst = arch / f"{committed.name}.zst"
+                subprocess.run(
+                    [codex_sessions.zstd_binary(), "-q", "-o", str(zst)],
+                    input=committed.read_bytes(),
+                    check=True,
+                )
+                committed.unlink()
+                uncommitted.unlink()
+                view_zst = resolver.inspect(pane.pane_id)
+                self.assertEqual(view_zst.state, "busy")
+                self.assertEqual(view_zst.evidence, "turn-busy-1")
+
 
 if __name__ == "__main__":
     unittest.main()

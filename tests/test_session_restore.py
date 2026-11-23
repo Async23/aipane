@@ -1162,6 +1162,133 @@ class SessionRestoreTests(unittest.TestCase):
         }) + "\n", encoding="utf-8")
         return session
 
+    def test_r3_p1_codex_nonstandard_filename_invalid_and_pi_explicit_session_dir_and_opaque(self):
+        import select
+        import shlex
+        import time
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp).resolve()
+            home = root / "home"
+            home.mkdir()
+
+            # 1. Codex bound to B stored under non-standard filename must stay invalid (never fall back to argv A)
+            cwd_codex = root / "codex-work"
+            cwd_codex.mkdir()
+            sid_a = "11111111-1111-7111-8111-111111111111"
+            sid_b = "22222222-2222-7222-8222-222222222222"
+            nonstd_record = (
+                json.dumps({"type": "session_meta", "payload": {"id": sid_b, "cwd": str(cwd_codex)}}) + "\n"
+                + json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "THIS_IS_B"}]}}) + "\n"
+            )
+            res_c = self.run_restore(
+                cwd_codex,
+                coord={"sid": sid_b, "tool": "x"},
+                title="codex",
+                saved_codex_ids={sid_a},
+                saved_codex_records={"sessions/2026/11/23/custom_log_name.jsonl": nonstd_record},
+                plan_json=True,
+                current_command="codex",
+                full_command=f"codex resume {sid_a}",
+                extra_env={"HOME": str(home)},
+            )
+            self.assertEqual(res_c.returncode, 0, res_c.stderr)
+            plan_c = json.loads(res_c.stdout.strip().splitlines()[-1])
+            self.assertEqual(plan_c["kind"], "invalid")
+            self.assertFalse(plan_c["restorable"])
+            self.assertEqual(plan_c["sid"], sid_b)
+
+            # 2. Pi explicit PI_CODING_AGENT_SESSION_DIR (encoded subdir -> --session <path>; flat -> --session-id)
+            #    AND opaque.jsonl in renamed folder (-> --session <path>)
+            pi_sid = "89898989-8989-7898-8898-898989898989"
+            pi_rid = "97979797-9797-7979-8979-979797979797"
+            pi_bin = Path("/opt/homebrew/bin/pi")
+            for mode in ("explicit_encoded_subdir", "flat_override", "opaque_renamed"):
+                work = root / f"pi-{mode}"
+                work.mkdir()
+                pi_agent = root / f"agent-{mode}"
+                sessions = pi_agent / "sessions"
+                if mode == "explicit_encoded_subdir":
+                    target_dir = sessions / self._pi_encoded_dir(work)
+                    fname = f"2026-11-23T09-01-27-117Z_{pi_sid}_{pi_rid}.jsonl"
+                elif mode == "flat_override":
+                    target_dir = sessions
+                    fname = f"2026-11-23T09-01-27-117Z_{pi_sid}_{pi_rid}.jsonl"
+                else:
+                    target_dir = sessions / "--renamed--"
+                    fname = "opaque.jsonl"
+                target_dir.mkdir(parents=True, exist_ok=True)
+                fpath = target_dir / fname
+                fpath.write_text(
+                    json.dumps({"type": "session", "version": 3, "id": pi_sid, "cwd": str(work), "timestamp": "2026-11-23T09:01:27.117Z"}) + "\n"
+                    + json.dumps({"type": "message", "id": "abcdef01", "parentId": None, "timestamp": "2026-11-23T09:02:27.117Z", "message": {"role": "user", "content": [{"type": "text", "text": f"PI_MARKER_{mode}"}], "timestamp": 1795400000000}}) + "\n",
+                    encoding="utf-8",
+                )
+                extra = {
+                    "HOME": str(home),
+                    "PI_CODING_AGENT_DIR": str(pi_agent),
+                    "PI_OFFLINE": "1",
+                    "PI_SKIP_VERSION_CHECK": "1",
+                    "XDG_CONFIG_HOME": str(home / ".config"),
+                    "TERM": "dumb",
+                    "AIPANE_PI_LAUNCH_CMD": "pi",
+                }
+                if mode in ("explicit_encoded_subdir", "flat_override"):
+                    extra["PI_CODING_AGENT_SESSION_DIR"] = str(sessions)
+                res_p = self.run_restore(
+                    work,
+                    coord={"sid": pi_sid, "tool": "p"},
+                    title="pi",
+                    saved_codex_ids=set(),
+                    plan_json=True,
+                    current_command="pi",
+                    full_command="pi",
+                    extra_env=extra,
+                )
+                self.assertEqual(res_p.returncode, 0, res_p.stderr)
+                plan_p = json.loads(res_p.stdout.strip().splitlines()[-1])
+                self.assertEqual(plan_p["kind"], "resume", mode)
+                self.assertTrue(plan_p["restorable"], mode)
+                if mode in ("explicit_encoded_subdir", "opaque_renamed"):
+                    self.assertIn("--session ", plan_p["command"], mode)
+                else:
+                    self.assertIn("--session-id ", plan_p["command"], mode)
+                if pi_bin.is_file():
+                    rpc_args = shlex.split(plan_p["command"])[1:]
+                    proc = subprocess.Popen(
+                        [str(pi_bin), "--mode", "rpc", "--offline", "--no-extensions", "--no-skills", *rpc_args],
+                        cwd=work,
+                        env={**extra, "PATH": os.environ["PATH"]},
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    try:
+                        assert proc.stdin is not None and proc.stdout is not None
+                        proc.stdin.write(b'{"type":"get_messages","id":"m"}\n')
+                        proc.stdin.flush()
+                        out = b""
+                        deadline = time.monotonic() + 8.0
+                        while time.monotonic() < deadline:
+                            ready, _, _ = select.select([proc.stdout], [], [], max(0.0, deadline - time.monotonic()))
+                            if not ready:
+                                break
+                            chunk = os.read(proc.stdout.fileno(), 65536)
+                            if not chunk:
+                                break
+                            out += chunk
+                            if b'"command":"get_messages"' in out:
+                                break
+                    finally:
+                        proc.terminate()
+                        try:
+                            more, err = proc.communicate(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            more, err = proc.communicate()
+                    self.assertIn(f"PI_MARKER_{mode}".encode(), out + more, f"{mode}: err={err!r}")
+                    self.assertNotIn(b"creating a new session", err, mode)
+
 
 if __name__ == "__main__":
     unittest.main()

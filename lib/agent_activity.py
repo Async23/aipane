@@ -1104,15 +1104,18 @@ def codex_thread_identity(
     identity_known = False
     while current and current not in seen:
         seen.add(current)
+        committed = codex_sessions.resolve_committed_head(
+            current, root, verify_header=True
+        )
         matches = codex_sessions.find_session_rollouts(current, root, verify_header=True)
-        if not matches:
-            sqlite_path = codex_sessions.query_sqlite_rollout_path(current, root)
-            if sqlite_path is not None:
-                resolved = codex_sessions.resolve_alternate_rollout_path(sqlite_path, root)
-                if resolved is not None:
-                    matches = [resolved]
+        ordered_paths: list[Path] = []
+        if committed is not None:
+            ordered_paths.append(committed)
+        for p in reversed(matches):
+            if p not in ordered_paths:
+                ordered_paths.append(p)
         meta = None
-        for path in reversed(matches):
+        for path in ordered_paths:
             candidate = codex_sessions.read_rollout_meta(path, max_lines=1)
             if candidate and candidate.get("sid") == current:
                 meta = candidate
@@ -2316,16 +2319,10 @@ class AgentActivity:
             sys.path.insert(0, lib_dir)
         import codex_sessions
 
-        transcripts = codex_sessions.find_session_rollouts(
+        transcript = codex_sessions.resolve_committed_head(
             session_id, codex_home, verify_header=False
         )
-        if not transcripts:
-            sqlite_path = codex_sessions.query_sqlite_rollout_path(session_id, codex_home)
-            if sqlite_path is not None:
-                resolved = codex_sessions.resolve_alternate_rollout_path(sqlite_path, codex_home)
-                if resolved is not None and codex_sessions.rollout_matches_session(resolved, session_id):
-                    transcripts = [resolved]
-        if not transcripts:
+        if transcript is None:
             return ActivityView(
                 state="unknown",
                 reported=True,
@@ -2334,7 +2331,7 @@ class AgentActivity:
         root = {
             "session_id": session_id,
             "turn_id": "",
-            "transcript_path": str(transcripts[-1]),
+            "transcript_path": str(transcript),
             "codex_home": str(codex_home),
         }
         state, reason, evidence_turn_id = self._resolve_codex(root, marker_at)
@@ -2437,6 +2434,15 @@ class AgentActivity:
 
         codex_home = Path(str(home_value)).expanduser()
         transcript = Path(str(transcript_value)).expanduser()
+        lib_dir = str(Path(__file__).resolve().parent)
+        if lib_dir not in sys.path:
+            sys.path.insert(0, lib_dir)
+        import codex_sessions
+
+        if not transcript.is_file():
+            alt = codex_sessions.resolve_alternate_rollout_path(transcript, codex_home)
+            if alt is not None:
+                transcript = alt
         if not _path_within(transcript, codex_home) or not transcript.is_file():
             return "unknown", "codex_transcript_mismatch", str(turn_id)
         history_path = codex_home / "thread_history_1.sqlite"
@@ -2448,7 +2454,8 @@ class AgentActivity:
         exact = None
         latest = None
         projection = None
-        if history_path.is_file():
+        is_compressed = codex_sessions.is_compressed_rollout(transcript)
+        if history_path.is_file() and not is_compressed:
             try:
                 uri = f"file:{history_path.resolve()}?mode=ro"
                 connection = sqlite3.connect(uri, uri=True, timeout=0.1)
@@ -2489,7 +2496,7 @@ class AgentActivity:
             except (OSError, sqlite3.Error):
                 exact = latest = projection = None
 
-        if not projection or projection[0] != transcript_size:
+        if is_compressed or not projection or projection[0] != transcript_size:
             return self._resolve_codex_rollout(
                 codex_home,
                 transcript,
@@ -2544,42 +2551,25 @@ class AgentActivity:
         *,
         max_bytes: int = 2_097_152,
     ) -> tuple[str, str, str]:
-        try:
-            with transcript.open("rb") as handle:
-                handle.seek(0, os.SEEK_END)
-                size = handle.tell()
-                start = max(0, size - max_bytes)
-                handle.seek(start)
-                data = handle.read()
-        except OSError:
-            return "unknown", "codex_rollout_unavailable", expected_turn_id
-        if start:
-            separator = data.find(b"\n")
-            if separator < 0:
-                return "unknown", "codex_rollout_window_incomplete", expected_turn_id
-            data = data[separator + 1 :]
+        lib_dir = str(Path(__file__).resolve().parent)
+        if lib_dir not in sys.path:
+            sys.path.insert(0, lib_dir)
+        import codex_sessions
 
         latest: tuple[str, str, int | None] | None = None
         saw_expected = not expected_turn_id
-        lines = data.split(b"\n")
-        if lines and not lines[-1]:
-            lines.pop()
-        for raw_line in lines:
-            if not raw_line.strip():
-                continue
-            try:
-                record = json.loads(raw_line)
-            except (UnicodeDecodeError, ValueError):
-                return "unknown", "codex_rollout_truncated", expected_turn_id
+
+        def _consume_record(record: object) -> None:
+            nonlocal latest, saw_expected
             if not isinstance(record, dict) or record.get("type") != "event_msg":
-                continue
+                return
             payload = record.get("payload")
             if not isinstance(payload, dict):
-                continue
+                return
             event = payload.get("type")
             turn_id = payload.get("turn_id")
             if not isinstance(turn_id, str) or not turn_id:
-                continue
+                return
             if turn_id == expected_turn_id:
                 saw_expected = True
             if event == "task_started":
@@ -2596,6 +2586,48 @@ class AgentActivity:
                     "failed" if payload.get("error") else "completed",
                     _milliseconds(payload.get("completed_at")),
                 )
+
+        if codex_sessions.is_compressed_rollout(transcript):
+            start = 0
+            try:
+                for text_line in codex_sessions.iter_rollout_lines(transcript, strict=True):
+                    stripped = text_line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        record = json.loads(stripped)
+                    except ValueError:
+                        return "unknown", "codex_rollout_truncated", expected_turn_id
+                    _consume_record(record)
+            except OSError:
+                return "unknown", "codex_rollout_unavailable", expected_turn_id
+        else:
+            try:
+                with transcript.open("rb") as handle:
+                    handle.seek(0, os.SEEK_END)
+                    size = handle.tell()
+                    start = max(0, size - max_bytes)
+                    handle.seek(start)
+                    data = handle.read()
+            except OSError:
+                return "unknown", "codex_rollout_unavailable", expected_turn_id
+            if start:
+                separator = data.find(b"\n")
+                if separator < 0:
+                    return "unknown", "codex_rollout_window_incomplete", expected_turn_id
+                data = data[separator + 1 :]
+
+            lines = data.split(b"\n")
+            if lines and not lines[-1]:
+                lines.pop()
+            for raw_line in lines:
+                if not raw_line.strip():
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                except (UnicodeDecodeError, ValueError):
+                    return "unknown", "codex_rollout_truncated", expected_turn_id
+                _consume_record(record)
 
         if latest is None and not expected_turn_id and start == 0:
             goal = self._goal_state(codex_home, session_id)
