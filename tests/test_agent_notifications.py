@@ -1406,6 +1406,78 @@ class AgentNotificationsTests(unittest.TestCase):
             rollout.write_bytes(zdata + b"junkinvalid")
             self.assertFalse(_codex_turn_has_goal_context(sid_a, "cloned-turn", env))
 
+    def test_r5_p2_bounded_goal_ignores_superseded_ancestor_tail_and_cross_segment_retry(self) -> None:
+        from contextlib import closing
+        import shutil
+        import sqlite3
+        import subprocess
+        import codex_sessions
+        from agent_notifications import _codex_turn_has_goal_context
+
+        codex_home = self.home / ".codex"
+        sid_a = "83838383-1111-7838-8838-838383838383"
+        rid_b = "84848484-2222-7848-8848-848484848484"
+        sdir = codex_home / "sessions/2026/11/23"
+        sdir.mkdir(parents=True, exist_ok=True)
+        env = {"CODEX_HOME": str(codex_home)}
+        turn = "replayed-turn"
+
+        def rows(*items: dict) -> bytes:
+            return "".join(json.dumps(x) + "\n" for x in items).encode("utf-8")
+
+        def meta(o: int, **extra: object) -> dict:
+            return {"ordinal": o, "type": "session_meta", "payload": {"id": sid_a, **extra}}
+
+        def start(o: int) -> dict:
+            return {"ordinal": o, "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn}}
+
+        def msg(o: int, text: str) -> dict:
+            return {
+                "ordinal": o,
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "internal_chat_message_metadata_passthrough": {"turn_id": turn},
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            }
+
+        p = sdir / f"rollout-2026-11-23T00-00-00-{sid_a}.jsonl"
+        c = sdir / f"rollout-2026-11-23T00-10-00-{sid_a}_{rid_b}.jsonl"
+        keep = rows(meta(0, timestamp="2026-11-23T00:00:00Z"), msg(1, "unrelated1"))
+        full_p = keep + rows(start(2), msg(3, "<goal_context>OLD GOAL REMOVED</goal_context>"))
+        p.write_bytes(full_p)
+        c.write_bytes(
+            rows(
+                meta(2, timestamp="2026-11-23T00:10:00Z", history_base={"thread_id": sid_a, "end_ordinal_exclusive": 2, "end_byte_offset": len(keep)}),
+                msg(3, "REGULAR CURRENT INPUT WITHOUT RE-START"),
+            )
+        )
+        with closing(sqlite3.connect(codex_home / "state_9.sqlite")) as conn, conn:
+            conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid_a, str(c), 1_795_400_000))
+
+        # 1. Superseded Goal tail past end_byte_offset/end_ordinal_exclusive (plain & compressed) must NOT match
+        self.assertFalse(_codex_turn_has_goal_context(sid_a, turn, env))
+        if shutil.which("zstd"):
+            pz = p.with_name(p.name + ".zst")
+            pz.write_bytes(subprocess.check_output([codex_sessions.zstd_binary(), "-cq"], input=full_p))
+            p.unlink()
+            self.assertFalse(_codex_turn_has_goal_context(sid_a, turn, env))
+            pz.unlink()
+            p.write_bytes(full_p)
+
+        # 2. Old Goal inside valid inherited range, but current segment re-started `turn` with regular input
+        c.write_bytes(
+            rows(
+                meta(4, timestamp="2026-11-23T00:10:00Z", history_base={"thread_id": sid_a, "end_ordinal_exclusive": 4, "end_byte_offset": len(full_p)}),
+                start(5),
+                msg(6, "REGULAR CURRENT RETRY"),
+            )
+        )
+        self.assertFalse(_codex_turn_has_goal_context(sid_a, turn, env))
+
 
 if __name__ == "__main__":
     unittest.main()

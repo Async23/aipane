@@ -449,9 +449,9 @@ def _process_env_var(pid: int, var_name: str) -> str:
     return codex_sessions.process_env_var(pid, var_name)
 
 
-def _process_codex_home(pid: int) -> str:
+def _process_codex_home(pid: int, cwd: str = "") -> str:
     """Resolve verified CODEX_HOME for a live Codex process via kernel envp."""
-    return codex_sessions.process_codex_home(pid)
+    return codex_sessions.process_codex_home(pid, cwd=cwd or None)
 
 
 def _pick_preferred_rollout_rec(
@@ -895,17 +895,21 @@ def _resolve_single_raw_pane(
                 sid = preferred
                 authority = "registry"
                 tty_pids = codex_tty_pids.get(pane.short_tty, [])
-                proc_chome = _process_codex_home(tty_pids[0]) if len(tty_pids) == 1 else ""
+                proc_chome = _process_codex_home(tty_pids[0], cwd=pane.cwd) if len(tty_pids) == 1 else ""
                 if proc_chome:
                     storage_root = proc_chome
                 else:
                     reg_chome = str(reg_rec.get("codex_home") or "")
                     if reg_chome:
-                        storage_root = str(Path(reg_chome).expanduser().resolve())
+                        reg_p = Path(reg_chome).expanduser()
+                        if reg_p.is_absolute():
+                            storage_root = str(reg_p.resolve())
+                        elif pane.cwd and Path(pane.cwd).is_absolute():
+                            storage_root = str((Path(pane.cwd) / reg_p).resolve())
             if sid and not storage_root and not active_path:
                 tty_pids = codex_tty_pids.get(pane.short_tty, [])
                 if len(tty_pids) == 1:
-                    storage_root = _process_codex_home(tty_pids[0])
+                    storage_root = _process_codex_home(tty_pids[0], cwd=pane.cwd)
 
     # 3. Claude Code
     elif _is_claude_cmd(cmd):

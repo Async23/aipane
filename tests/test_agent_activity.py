@@ -2016,6 +2016,72 @@ class AgentActivityTests(unittest.TestCase):
             resolver.environment["CODEX_HOME"] = str(caller_home)
             self.assertEqual(resolver.inspect(pane.pane_id).state, "busy")
 
+    def test_r5_p1_higher_db_missing_header_and_no_db_active_idle_guard(self) -> None:
+        from contextlib import closing
+        import sqlite3
+
+        sid = "89898989-4444-7898-8898-898989898989"
+        foreign_sid = "90909090-5555-7909-8909-909090909090"
+        rid_extra = "bbbbbbbb-6666-7bbb-8bbb-bbbbbbbbbbbb"
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp).resolve()
+            home = root / "home"
+            codex_home = home / ".codex"
+            sdir = codex_home / "sessions/2026/11/23"
+            sdir.mkdir(parents=True, exist_ok=True)
+
+            # 1. Higher state_10.sqlite points to same-SID filename whose line 1 is token_count
+            #    (missing_meta, line 2 foreign SID); lower state_5.sqlite points to busy head -> BUSY.
+            busy_p = sdir / f"rollout-2026-11-23T00-00-01-{sid}.jsonl"
+            busy_p.write_text(
+                json.dumps({"ordinal": 0, "type": "session_meta", "payload": {"id": sid, "cwd": str(home), "source": "cli"}}) + "\n"
+                + json.dumps({"ordinal": 1, "type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-live"}}) + "\n",
+                encoding="utf-8",
+            )
+            bad_p = sdir / f"rollout-2026-11-23T01-00-00-{sid}_{rid_extra}.jsonl"
+            bad_p.write_text(
+                json.dumps({"type": "event_msg", "payload": {"type": "token_count"}}) + "\n"
+                + json.dumps({"type": "session_meta", "payload": {"id": foreign_sid}}) + "\n",
+                encoding="utf-8",
+            )
+            with closing(sqlite3.connect(codex_home / "state_5.sqlite")) as conn, conn:
+                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+                conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid, str(busy_p), 1_795_400_000))
+            with closing(sqlite3.connect(codex_home / "state_10.sqlite")) as conn, conn:
+                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+                conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid, str(bad_p), 1_795_400_500))
+            resolver, pane = self.legacy_resolver_and_pane(home, sid)
+            view = resolver.inspect(pane.pane_id)
+            self.assertEqual(view.state, "busy")
+            self.assertEqual(view.evidence, "turn-live")
+
+            # 2. Structured hook completed on active transcript with NO SQLite DB; unrelated newer
+            #    sibling carrying open task_started must NOT override verified idle state.
+            (codex_home / "state_5.sqlite").unlink()
+            (codex_home / "state_10.sqlite").unlink()
+            done_p = busy_p
+            done_p.write_text(
+                json.dumps({"ordinal": 0, "type": "session_meta", "payload": {"id": sid, "cwd": str(home), "source": "cli"}}) + "\n"
+                + json.dumps({"ordinal": 1, "type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-done"}}) + "\n"
+                + json.dumps({"ordinal": 2, "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-done", "completed_at": 1_795_400_200_000}}) + "\n",
+                encoding="utf-8",
+            )
+            bad_p.write_text(
+                json.dumps({"ordinal": 0, "type": "session_meta", "payload": {"id": sid, "cwd": str(home), "source": "cli"}}) + "\n"
+                + json.dumps({"ordinal": 1, "type": "event_msg", "payload": {"type": "task_started", "turn_id": "stale-uncommitted"}}) + "\n",
+                encoding="utf-8",
+            )
+            mod_activity, _ = self.activity_for(
+                PaneActivity(pane_id="%9", current_command="codex", pane_tty="/dev/ttys099", socket_path="/private/tmp/tmux-test", server_pid="999", pane_pid="9999"),
+                environment={"HOME": str(home), "CODEX_HOME": str(codex_home)},
+            )
+            st, reason, _ = mod_activity._resolve_codex(
+                {"session_id": sid, "turn_id": "turn-done", "transcript_path": str(done_p), "codex_home": str(codex_home)},
+                1_795_400_000_000,
+            )
+            self.assertEqual(st, "idle")
+            self.assertEqual(reason, "codex_rollout_turn_completed")
+
 
 if __name__ == "__main__":
     unittest.main()

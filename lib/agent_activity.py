@@ -2005,7 +2005,7 @@ class AgentActivity:
                 "transcript_path": (
                     transcript_path if isinstance(transcript_path, str) else ""
                 ),
-                "codex_home": str(Path(codex_home).expanduser()),
+                "codex_home": str(Path(codex_home).expanduser().absolute()),
             }
         elif is_kimi_command(pane.current_command):
             kimi_home = self.environment.get("KIMI_CODE_HOME") or str(
@@ -2331,7 +2331,13 @@ class AgentActivity:
         if pane_codex_home is None:
             reg_home = binding.get("codex_home")
             if isinstance(reg_home, str) and reg_home.strip():
-                pane_codex_home = Path(reg_home.strip()).expanduser()
+                reg_path = Path(reg_home.strip()).expanduser()
+                if reg_path.is_absolute():
+                    pane_codex_home = reg_path
+                elif pane.pane_pid.isdigit():
+                    proc_cwd = codex_sessions.process_cwd(int(pane.pane_pid))
+                    if proc_cwd:
+                        pane_codex_home = (Path(proc_cwd) / reg_path).resolve()
         codex_home = pane_codex_home or Path(
             self.environment.get("CODEX_HOME")
             or Path(self.environment.get("HOME", str(Path.home()))) / ".codex"
@@ -2464,7 +2470,9 @@ class AgentActivity:
         import codex_sessions
 
         if not transcript.is_file():
-            alt = codex_sessions.resolve_alternate_rollout_path(transcript, codex_home)
+            alt = codex_sessions.resolve_alternate_rollout_path(
+                transcript, codex_home, expected_sid=str(session_id)
+            )
             if alt is not None:
                 transcript = alt
         if not _path_within(transcript, codex_home) or not transcript.is_file():
@@ -2526,7 +2534,7 @@ class AgentActivity:
             if state != "idle":
                 return state, reason, evidence_turn_id
             committed, sqlite_conflict = codex_sessions.resolve_committed_head_detailed(
-                str(session_id), codex_home, verify_header=False
+                str(session_id), codex_home, verify_header=True, sqlite_only=True
             )
             if sqlite_conflict:
                 return "unknown", "codex_sqlite_conflict", evidence_turn_id

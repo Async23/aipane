@@ -2337,12 +2337,12 @@ def _codex_root_thread_title(
     return ""
 
 
-def _codex_rollout_candidates(
+def _codex_effective_segments(
     thread_id: str,
     environment: Mapping[str, str],
     rollout_path: str = "",
-) -> list[Path]:
-    """Return identity-verified, effective committed rollouts for `thread_id` (newest first).
+) -> list[dict[str, object]]:
+    """Return verified effective lineage segments (earliest to latest) with bounds.
 
     Never accepts headerless, oversized, malformed, or foreign-SID files, and when
     a verified committed head exists, follows its effective lineage so uncommitted
@@ -2357,14 +2357,20 @@ def _codex_rollout_candidates(
     verified_anchor: Path | None = None
     if rollout_path:
         raw_p = Path(rollout_path).expanduser()
-        resolved = codex_sessions.resolve_alternate_rollout_path(raw_p, codex_home)
+        resolved = codex_sessions.resolve_alternate_rollout_path(
+            raw_p, codex_home, expected_sid=thread_id or None
+        )
         if resolved is not None:
             meta, err = codex_sessions.read_rollout_meta_detailed(resolved, max_lines=1)
             if err is None and meta is not None and (not thread_id or meta.get("sid") == thread_id):
                 verified_anchor = resolved
 
     if not thread_id:
-        return [verified_anchor] if verified_anchor is not None else []
+        return (
+            [{"path": verified_anchor, "end_ordinal_exclusive": None, "end_byte_offset": None}]
+            if verified_anchor is not None
+            else []
+        )
 
     if verified_anchor is None:
         committed, conflict = codex_sessions.resolve_committed_head_detailed(
@@ -2391,18 +2397,38 @@ def _codex_rollout_candidates(
         sqlite_path=verified_anchor,
         codex_home=codex_home,
     )
-    ordered: list[Path] = []
-    for seg in reversed(effective):
+    ordered: list[dict[str, object]] = []
+    seen_paths: set[Path] = set()
+    for seg in effective:
         seg_path = seg.get("path")
         seg_meta = seg.get("meta")
         if (
             isinstance(seg_path, Path)
             and isinstance(seg_meta, dict)
             and seg_meta.get("sid") == thread_id
-            and seg_path not in ordered
+            and seg_path not in seen_paths
         ):
-            ordered.append(seg_path)
+            seen_paths.add(seg_path)
+            ordered.append(
+                {
+                    "path": seg_path,
+                    "end_ordinal_exclusive": seg.get("end_ordinal_exclusive"),
+                    "end_byte_offset": seg.get("end_byte_offset"),
+                }
+            )
     return ordered
+
+
+def _codex_rollout_candidates(
+    thread_id: str,
+    environment: Mapping[str, str],
+    rollout_path: str = "",
+) -> list[Path]:
+    return [
+        seg["path"]
+        for seg in reversed(_codex_effective_segments(thread_id, environment, rollout_path))
+        if isinstance(seg.get("path"), Path)
+    ]
 
 
 def _codex_query_goal(
@@ -2475,11 +2501,20 @@ def _codex_turn_has_goal_context(
     import codex_sessions
 
     seen: set[Path] = set()
-    for candidate in _codex_rollout_candidates(
-        thread_id,
-        environment,
-        rollout_path,
+    for seg in reversed(
+        _codex_effective_segments(
+            thread_id,
+            environment,
+            rollout_path,
+        )
     ):
+        candidate = seg.get("path")
+        if not isinstance(candidate, Path):
+            continue
+        end_ord = seg.get("end_ordinal_exclusive")
+        end_byte = seg.get("end_byte_offset")
+        end_ord_int = end_ord if isinstance(end_ord, int) and not isinstance(end_ord, bool) else None
+        end_byte_int = end_byte if isinstance(end_byte, int) and not isinstance(end_byte, bool) else None
         try:
             resolved = candidate.resolve()
         except OSError:
@@ -2488,12 +2523,21 @@ def _codex_turn_has_goal_context(
             continue
         seen.add(resolved)
         if codex_sessions.is_compressed_rollout(resolved):
-            # Stream compressed rollouts forward in O(1) memory, resetting on each
-            # task_started for turn_id so only the latest attempt of turn_id counts.
+            # Stream compressed rollouts forward in O(1) memory, honoring effective
+            # byte/ordinal bounds and resetting on each task_started for turn_id.
             # Use strict=True so corrupt/trailing-garbage zstd streams never suppress alerts.
             found_goal = False
+            saw_task_started = False
+            byte_pos = 0
             try:
-                for line in codex_sessions.iter_rollout_lines(resolved, strict=True):
+                for raw_b in codex_sessions.iter_rollout_bytes_lines(resolved, strict=True):
+                    line_start = byte_pos
+                    byte_pos += len(raw_b)
+                    if end_byte_int is not None and (
+                        line_start >= end_byte_int or (line_start < end_byte_int < byte_pos)
+                    ):
+                        break
+                    line = raw_b.decode("utf-8", errors="replace")
                     if turn_id not in line:
                         continue
                     stripped = line.strip()
@@ -2505,6 +2549,14 @@ def _codex_turn_has_goal_context(
                         continue
                     if not isinstance(record, dict):
                         continue
+                    rec_ord = record.get("ordinal")
+                    if (
+                        end_ord_int is not None
+                        and isinstance(rec_ord, int)
+                        and not isinstance(rec_ord, bool)
+                        and rec_ord >= end_ord_int
+                    ):
+                        continue
                     payload = record.get("payload") or {}
                     if not isinstance(payload, dict):
                         continue
@@ -2513,6 +2565,7 @@ def _codex_turn_has_goal_context(
                         and payload.get("type") == "task_started"
                         and payload.get("turn_id") == turn_id
                     ):
+                        saw_task_started = True
                         found_goal = False
                     elif record.get("type") == "response_item" and payload.get("role") == "user":
                         metadata = payload.get("internal_chat_message_metadata_passthrough") or {}
@@ -2526,9 +2579,22 @@ def _codex_turn_has_goal_context(
                 continue
             if found_goal:
                 return True
+            if saw_task_started:
+                # Latest attempt of turn_id started in this segment without Goal context.
+                return False
             continue
-        for record in _iter_jsonl_reverse(resolved):
+        for record in codex_sessions.iter_rollout_records_reverse(
+            resolved, max_bytes=end_byte_int
+        ):
             if not isinstance(record, dict):
+                continue
+            rec_ord = record.get("ordinal")
+            if (
+                end_ord_int is not None
+                and isinstance(rec_ord, int)
+                and not isinstance(rec_ord, bool)
+                and rec_ord >= end_ord_int
+            ):
                 continue
             payload = record.get("payload") or {}
             if not isinstance(payload, dict):
@@ -2545,7 +2611,9 @@ def _codex_turn_has_goal_context(
                 and payload.get("type") == "task_started"
                 and payload.get("turn_id") == turn_id
             ):
-                break
+                # Latest attempt of turn_id started here without Goal context — do not
+                # inspect older ancestor segments for a superseded earlier attempt.
+                return False
     return False
 
 

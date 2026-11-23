@@ -1429,6 +1429,203 @@ class SessionRestoreTests(unittest.TestCase):
                     self.assertNotIn(b"WRONG_CWD", out + more, layout)
                     self.assertNotIn(b"creating a new session", err, layout)
 
+    def test_r5_p1_codex_multi_db_distinct_ts_bad_date_and_pi_settings_precedence(self):
+        from contextlib import closing
+        import select
+        import shlex
+        import sqlite3
+        import time
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp).resolve()
+            home = root / "home"
+            home.mkdir()
+            sid_a = "11111111-1111-7111-8111-111111111111"
+            sid_b = "22222222-2222-7222-8222-222222222222"
+
+            # 1. Codex: lower DB valid opaque B + higher DB missing -> still resumes B
+            cwd1 = root / "codex-db"
+            cwd1.mkdir()
+            body_b = (
+                json.dumps({"type": "session_meta", "ordinal": 0, "payload": {"id": sid_b, "cwd": str(cwd1)}}) + "\n"
+                + json.dumps({"type": "response_item", "ordinal": 1, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "CURRENT_B"}]}}) + "\n"
+            )
+            codex_home = cwd1 / "codex"
+            opaque_p = codex_home / "sessions/d/opaque.jsonl"
+            opaque_p.parent.mkdir(parents=True, exist_ok=True)
+            opaque_p.write_text(body_b, encoding="utf-8")
+            with closing(sqlite3.connect(codex_home / "state_8.sqlite")) as conn, conn:
+                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+                conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid_b, str(opaque_p), int(time.time())))
+            with closing(sqlite3.connect(codex_home / "state_9.sqlite")) as conn, conn:
+                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+                conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid_b, str(codex_home / "sessions/d/missing.jsonl"), int(time.time())))
+            res_db = self.run_restore(
+                cwd1,
+                coord={"sid": sid_b, "tool": "x", "codex_home": str(codex_home)},
+                title="codex",
+                saved_codex_ids={sid_a},
+                plan_json=True,
+                current_command="codex",
+                full_command=f"codex resume {sid_a}",
+                extra_env={"HOME": str(home)},
+            )
+            self.assertEqual(res_db.returncode, 0, res_db.stderr)
+            plan_db = json.loads(res_db.stdout.strip().splitlines()[-1])
+            self.assertEqual(plan_db["kind"], "resume")
+            self.assertEqual(plan_db["sid"], sid_b)
+
+            # 2. Codex: distinct-timestamp filename A with header B, AND impossible date 2026-13-42T99-99-99 -> invalid B
+            for idx_n, fname in enumerate(
+                (f"rollout-2026-11-23T00-10-09-{sid_a}.jsonl", f"rollout-2026-13-42T99-99-99-{sid_a}.jsonl")
+            ):
+                cwd_c = root / f"codex-ts-{idx_n}"
+                cwd_c.mkdir()
+                res_c = self.run_restore(
+                    cwd_c,
+                    coord={"sid": sid_b, "tool": "x"},
+                    title="codex",
+                    saved_codex_ids={sid_a},
+                    saved_codex_records={f"sessions/d/{fname}": body_b},
+                    plan_json=True,
+                    current_command="codex",
+                    full_command=f"codex resume {sid_a}",
+                    extra_env={"HOME": str(home)},
+                )
+                self.assertEqual(res_c.returncode, 0, res_c.stderr)
+                plan_c = json.loads(res_c.stdout.strip().splitlines()[-1])
+                self.assertEqual(plan_c["kind"], "invalid", fname)
+                self.assertEqual(plan_c["sid"], sid_b, fname)
+
+            # 3. Pi: project relative sessionDir > global settings > default sessions, resolved against project cwd
+            pi_sid = "87878787-8787-7787-8787-878787878787"
+            pi_agent = root / "pi-agent"
+            project = root / "project"
+            caller = root / "caller"
+            global_dir = root / "global-store"
+            for d in (pi_agent, project, caller, global_dir, project / "relstore", caller / "relstore"):
+                d.mkdir(parents=True, exist_ok=True)
+            default_dir = pi_agent / "sessions" / self._pi_encoded_dir(project)
+            default_dir.mkdir(parents=True, exist_ok=True)
+            fname = f"2026-11-23T09-01-27-117Z_{pi_sid}.jsonl"
+
+            def seed_pi(folder: Path, marker: str) -> Path:
+                p = folder / fname
+                p.write_text(
+                    json.dumps({"type": "session", "version": 3, "id": pi_sid, "cwd": str(project), "timestamp": "2026-11-23T09:01:27.117Z"}) + "\n"
+                    + json.dumps({"type": "message", "id": "aabbccdd", "parentId": None, "timestamp": "2026-11-23T09:02:27.117Z", "message": {"role": "user", "content": [{"type": "text", "text": marker}], "timestamp": 1795400000000}}) + "\n",
+                    encoding="utf-8",
+                )
+                return p
+
+            seed_pi(default_dir, "STALE_DEFAULT")
+            global_file = seed_pi(global_dir, "GLOBAL_ACTIVE")
+            project_file = seed_pi(project / "relstore", "PROJECT_ACTIVE")
+            seed_pi(caller / "relstore", "CALLER_SHADOW")
+
+            (pi_agent / "settings.json").write_text(json.dumps({"sessionDir": str(global_dir)}), encoding="utf-8")
+            (project / ".pi").mkdir(parents=True, exist_ok=True)
+            (project / ".pi/settings.json").write_text(json.dumps({"sessionDir": "relstore"}), encoding="utf-8")
+
+            pi_env = {
+                "HOME": str(home),
+                "PI_CODING_AGENT_DIR": str(pi_agent),
+                "PI_OFFLINE": "1",
+                "PI_SKIP_VERSION_CHECK": "1",
+                "XDG_CONFIG_HOME": str(home / ".config"),
+                "TERM": "dumb",
+                "AIPANE_PI_LAUNCH_CMD": "pi",
+            }
+            # Run from `caller` cwd to prove relative `relstore` resolves against `project`, not `caller`
+            prev_cwd = os.getcwd()
+            os.chdir(caller)
+            try:
+                p_proj = self.run_restore(
+                    project,
+                    coord={"tool": "p", "sid": pi_sid},
+                    title="pi",
+                    saved_codex_ids=set(),
+                    full_command="pi",
+                    current_command="pi",
+                    plan_json=True,
+                    extra_env=pi_env,
+                )
+            finally:
+                os.chdir(prev_cwd)
+            self.assertEqual(p_proj.returncode, 0, p_proj.stderr)
+            plan_proj = json.loads(p_proj.stdout.strip().splitlines()[-1])
+            self.assertIn(str(project_file.resolve()), plan_proj["command"])
+
+            # Removing project settings falls back to global settings (beating STALE_DEFAULT)
+            (project / ".pi/settings.json").unlink()
+            work2 = root / "work2"
+            work2.mkdir()
+            def2 = pi_agent / "sessions" / self._pi_encoded_dir(work2)
+            def2.mkdir(parents=True, exist_ok=True)
+            g2 = root / "g2"
+            g2.mkdir()
+            (pi_agent / "settings.json").write_text(json.dumps({"sessionDir": str(g2)}), encoding="utf-8")
+            (def2 / fname).write_text(
+                json.dumps({"type": "session", "version": 3, "id": pi_sid, "cwd": str(work2), "timestamp": "2026-11-23T09:01:27.117Z"}) + "\n",
+                encoding="utf-8",
+            )
+            g2_file = g2 / fname
+            g2_file.write_text(
+                json.dumps({"type": "session", "version": 3, "id": pi_sid, "cwd": str(work2), "timestamp": "2026-11-23T09:01:27.117Z"}) + "\n",
+                encoding="utf-8",
+            )
+            res_g2 = self.run_restore(
+                work2,
+                coord={"tool": "p", "sid": pi_sid},
+                title="pi",
+                saved_codex_ids=set(),
+                full_command="pi",
+                current_command="pi",
+                plan_json=True,
+                extra_env=pi_env,
+            )
+            self.assertEqual(res_g2.returncode, 0, res_g2.stderr)
+            plan_g2 = json.loads(res_g2.stdout.strip().splitlines()[-1])
+            self.assertIn(str(g2_file.resolve()), plan_g2["command"])
+
+            pi_bin = Path("/opt/homebrew/bin/pi")
+            if pi_bin.is_file():
+                rpc_args = shlex.split(plan_proj["command"])[1:]
+                proc = subprocess.Popen(
+                    [str(pi_bin), "--mode", "rpc", "--offline", "--no-extensions", "--no-skills", *rpc_args],
+                    cwd=project,
+                    env={**pi_env, "PATH": os.environ["PATH"]},
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                try:
+                    assert proc.stdin is not None and proc.stdout is not None
+                    proc.stdin.write(b'{"type":"get_messages","id":"m"}\n')
+                    proc.stdin.flush()
+                    out = b""
+                    deadline = time.monotonic() + 8.0
+                    while time.monotonic() < deadline:
+                        ready, _, _ = select.select([proc.stdout], [], [], max(0.0, deadline - time.monotonic()))
+                        if not ready:
+                            break
+                        chunk = os.read(proc.stdout.fileno(), 65536)
+                        if not chunk:
+                            break
+                        out += chunk
+                        if b'"command":"get_messages"' in out:
+                            break
+                finally:
+                    proc.terminate()
+                    try:
+                        more, _ = proc.communicate(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        more, _ = proc.communicate()
+                self.assertIn(b"PROJECT_ACTIVE", out + more)
+                self.assertNotIn(b"GLOBAL_ACTIVE", out + more)
+                self.assertNotIn(b"STALE_DEFAULT", out + more)
+
 
 if __name__ == "__main__":
     unittest.main()

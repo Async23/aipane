@@ -632,6 +632,36 @@ class LiveSessionsUnitTests(unittest.TestCase):
         self.assertTrue(fresh_res["complete"])
         self.assertEqual([ev["text"] for s in fresh_res["sources"] for ev in s["events"]], ["RIGHT_SPACED_CUSTOM"])
 
+        # 5. Relative CODEX_HOME in live process env resolves against target process cwd, never reader cwd
+        workspace = self.home / "workspace"
+        target_profile = workspace / "profile"
+        reader_shadow = self.home / "profile"
+        target_profile.mkdir(parents=True, exist_ok=True)
+        reader_shadow.mkdir(parents=True, exist_ok=True)
+        rel_proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(15)"],
+            cwd=workspace,
+            env={**os.environ, "CODEX_HOME": "profile", "HOME": str(self.home)},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            prev_cwd = os.getcwd()
+            os.chdir(self.home)
+            try:
+                resolved_root = live_mod._process_codex_home(rel_proc.pid)
+            finally:
+                os.chdir(prev_cwd)
+            self.assertEqual(resolved_root, str(target_profile.resolve()))
+            self.assertNotEqual(resolved_root, str(reader_shadow.resolve()))
+        finally:
+            rel_proc.terminate()
+            try:
+                rel_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                rel_proc.kill()
+                rel_proc.wait()
+
     def test_kimi_2x_discovery_preview_timeline_and_ref_prefix(self) -> None:
         raw_uuid = "aa4313fb-986d-4f74-8f8b-c5e14883633d"
         full_sid = f"session_{raw_uuid}"

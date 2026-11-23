@@ -203,8 +203,13 @@ codex_session_exists() {
 }
 
 codex_session_known() {
-  command python3 "$SCRIPT_DIR/../lib/codex_sessions.py" \
-    --known "$1" "${coord_codex_home:-${CODEX_HOME:-$HOME/.codex}}"
+  if [[ -n "${2:-}" && "${2:-}" != "$1" ]]; then
+    command python3 "$SCRIPT_DIR/../lib/codex_sessions.py" \
+      --known --conflict-sid "$2" "$1" "${coord_codex_home:-${CODEX_HOME:-$HOME/.codex}}"
+  else
+    command python3 "$SCRIPT_DIR/../lib/codex_sessions.py" \
+      --known "$1" "${coord_codex_home:-${CODEX_HOME:-$HOME/.codex}}"
+  fi
 }
 
 # Claude accepts an aipane-assigned --session-id before the first real model
@@ -255,54 +260,87 @@ raise SystemExit(1)
 PY
 }
 
-# pi_session_resolve <uuid> <cwd> — resolve a durable Pi session whose header
-# identifies both the requested id and the pane's project cwd.
-# Prints "native\t<path>" ONLY when `pi --session-id <id>` is guaranteed to open
-# that exact verified file without environment drift or ambiguity (no
-# PI_CODING_AGENT_SESSION_DIR override, no conflicting settings.json sessionDir,
-# file lives in default encoded-cwd dir, and it is the unique file in that dir
-# declaring id == sid). Otherwise prints "path\t<path>" for `pi --session <path>`.
+# pi_session_resolve <uuid> <cwd> [full_cmd] — resolve a durable Pi session whose
+# header identifies both the requested id and the pane's project cwd, following
+# Pi 1.5.2's exact directory precedence (CLI --session-dir > PI_CODING_AGENT_SESSION_DIR
+# > project <cwd>/.pi/settings.json > global $PI_CODING_AGENT_DIR/settings.json
+# > default encoded-cwd dir > fallback sessions scan) with relative paths resolved
+# against the target project cwd.
 pi_session_resolve() {
-  local sid="$1" cwd="$2"
+  local sid="$1" cwd="$2" full_cmd="${3:-}"
   local agent_dir="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
   local default_sessions="$agent_dir/sessions"
   local explicit_dir="${PI_CODING_AGENT_SESSION_DIR:-}"
   command -v python3 &>/dev/null || return 1
-  python3 - "$sid" "$cwd" "$PI_SESSION_ROOT" "$default_sessions" "$explicit_dir" "$agent_dir" <<'PY'
+  python3 - "$sid" "$cwd" "$default_sessions" "$explicit_dir" "$agent_dir" "$full_cmd" <<'PY'
 import json
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 
-sid, cwd, primary_root, default_root, explicit_dir, agent_dir = sys.argv[1:7]
-expected_cwd = os.path.normcase(os.path.realpath(cwd))
+sid, cwd, default_root, explicit_dir, agent_dir, full_cmd = sys.argv[1:7]
 resolved_cwd = os.path.realpath(cwd)
+expected_cwd = os.path.normcase(resolved_cwd)
 safe_dir = "--" + re.sub(r"[/\\:]", "-", re.sub(r"^[/\\]", "", resolved_cwd)) + "--"
-default_native_dir = os.path.normcase(os.path.realpath(os.path.join(default_root, safe_dir)))
+default_native_dir_path = Path(default_root).expanduser() / safe_dir
+default_native_dir = os.path.normcase(os.path.realpath(str(default_native_dir_path)))
 
-settings_session_dir = ""
-settings_path = Path(agent_dir).expanduser() / "settings.json"
-if settings_path.is_file():
+def _resolve_dir_for_cwd(raw: str) -> Path | None:
+    s = raw.strip()
+    if not s:
+        return None
+    p = Path(s).expanduser()
+    if not p.is_absolute():
+        p = Path(resolved_cwd) / p
     try:
-        settings_obj = json.loads(settings_path.read_text(encoding="utf-8"))
-        if isinstance(settings_obj, dict) and isinstance(settings_obj.get("sessionDir"), str):
-            settings_session_dir = settings_obj["sessionDir"].strip()
+        return p.resolve()
+    except OSError:
+        return p
+
+def _read_settings_session_dir(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(obj, dict) and isinstance(obj.get("sessionDir"), str):
+            return obj["sessionDir"].strip()
     except (OSError, UnicodeError, json.JSONDecodeError):
         pass
+    return ""
 
+cli_session_dir = ""
+if full_cmd.strip():
+    try:
+        tokens = shlex.split(full_cmd)
+    except ValueError:
+        tokens = full_cmd.split()
+    for idx, tok in enumerate(tokens):
+        if tok == "--session-dir" and idx + 1 < len(tokens):
+            cli_session_dir = tokens[idx + 1]
+        elif tok.startswith("--session-dir="):
+            cli_session_dir = tok.split("=", 1)[1]
+
+project_session_dir = _read_settings_session_dir(Path(resolved_cwd) / ".pi" / "settings.json")
+global_session_dir = _read_settings_session_dir(Path(agent_dir).expanduser() / "settings.json")
+
+# Priority order matching real Pi 1.5.2 SessionManager resolution:
+# 1. CLI --session-dir, 2. PI_CODING_AGENT_SESSION_DIR, 3. project settings,
+# 4. global settings, 5. default encoded-cwd dir, 6. fallback sessions/ tree.
+raw_ordered = [
+    cli_session_dir,
+    explicit_dir,
+    project_session_dir,
+    global_session_dir,
+    str(default_native_dir_path),
+    default_root,
+]
 roots: list[Path] = []
-for raw_root in (primary_root, default_root, settings_session_dir):
-    if not raw_root:
-        continue
-    p = Path(raw_root).expanduser()
-    if p.is_dir():
-        try:
-            rp = p.resolve()
-        except OSError:
-            rp = p
-        if rp not in roots:
-            roots.append(rp)
+for raw_root in raw_ordered:
+    rp = _resolve_dir_for_cwd(raw_root)
+    if rp is not None and rp.is_dir() and rp not in roots:
+        roots.append(rp)
 
 def _read_pi_header(path: Path) -> dict | None:
     try:
@@ -330,13 +368,11 @@ def _check(path: Path) -> str | None:
     return None
 
 def _native_dir_is_unambiguous(matched_path: str) -> bool:
-    if explicit_dir or settings_session_dir:
+    if cli_session_dir or explicit_dir or project_session_dir or global_session_dir:
         return False
     parent = os.path.normcase(os.path.dirname(matched_path))
     if parent != default_native_dir:
         return False
-    # Ensure no second file in default_native_dir also declares header.id == sid
-    # (otherwise Pi's findById could pick the wrong-cwd sibling in readdir order).
     same_id_count = 0
     try:
         for entry in Path(os.path.dirname(matched_path)).iterdir():
@@ -351,9 +387,11 @@ def _native_dir_is_unambiguous(matched_path: str) -> bool:
         return False
     return same_id_count == 1
 
-seen: set[Path] = set()
-fast_matches: list[Path] = []
+# Search strictly root-by-root in Pi's priority order so a stale file in default
+# sessions never shadows an active file in project/global/env sessionDir.
 for root in roots:
+    seen: set[Path] = set()
+    fast_matches: list[Path] = []
     for pat in (f"*_{sid}.jsonl", f"*_{sid}_*.jsonl"):
         try:
             for cand in root.rglob(pat):
@@ -362,79 +400,91 @@ for root in roots:
                     fast_matches.append(cand)
         except OSError:
             continue
-
-fallback_match: str | None = None
-for cand in fast_matches:
-    matched = _check(cand)
-    if matched is not None:
-        if _native_dir_is_unambiguous(matched):
-            print(f"native\t{matched}")
+    fast_matches.sort(key=lambda p: (p.stat().st_mtime if p.is_file() else 0.0, p.name), reverse=True)
+    for cand in fast_matches:
+        matched = _check(cand)
+        if matched is not None:
+            mode = "native" if _native_dir_is_unambiguous(matched) else "path"
+            print(f"{mode}\t{matched}")
             raise SystemExit(0)
-        if fallback_match is None:
-            fallback_match = matched
+    try:
+        other_jsonl = [c for c in root.rglob("*.jsonl") if c not in seen and c.is_file()]
+    except OSError:
+        other_jsonl = []
+    other_jsonl.sort(key=lambda p: (p.stat().st_mtime if p.is_file() else 0.0, p.name), reverse=True)
+    for cand in other_jsonl:
+        matched = _check(cand)
+        if matched is not None:
+            mode = "native" if _native_dir_is_unambiguous(matched) else "path"
+            print(f"{mode}\t{matched}")
+            raise SystemExit(0)
 
-if fallback_match is None:
-    for root in roots:
-        try:
-            all_jsonl = root.rglob("*.jsonl")
-        except OSError:
-            continue
-        for cand in all_jsonl:
-            if cand in seen or not cand.is_file():
-                continue
-            seen.add(cand)
-            matched = _check(cand)
-            if matched is not None:
-                if _native_dir_is_unambiguous(matched):
-                    print(f"native\t{matched}")
-                    raise SystemExit(0)
-                if fallback_match is None:
-                    fallback_match = matched
-
-if fallback_match is not None:
-    print(f"path\t{fallback_match}")
-    raise SystemExit(0)
 raise SystemExit(1)
 PY
 }
 
-# pi_session_id_exists <uuid> — distinguish a truly empty, never-persisted Pi
+# pi_session_id_exists <uuid> [cwd] [full_cmd] — distinguish a truly empty, never-persisted Pi
 # session (safe to recreate as an empty TUI) from a durable/corrupt session that
 # belongs to another cwd or has a broken header (unsafe to recreate).
 pi_session_id_exists() {
-  local sid="$1"
+  local sid="$1" cwd="${2:-$PWD}" full_cmd="${3:-}"
   local agent_dir="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
   local default_sessions="$agent_dir/sessions"
+  local explicit_dir="${PI_CODING_AGENT_SESSION_DIR:-}"
   command -v python3 &>/dev/null || return 1
-  python3 - "$sid" "$PI_SESSION_ROOT" "$default_sessions" "$agent_dir" <<'PY'
+  python3 - "$sid" "$cwd" "$default_sessions" "$explicit_dir" "$agent_dir" "$full_cmd" <<'PY'
 import json
+import os
+import shlex
 import sys
 from pathlib import Path
 
-sid, primary_root, default_root, agent_dir = sys.argv[1:5]
+sid, cwd, default_root, explicit_dir, agent_dir, full_cmd = sys.argv[1:7]
+resolved_cwd = os.path.realpath(cwd) if cwd else os.getcwd()
 
-settings_session_dir = ""
-settings_path = Path(agent_dir).expanduser() / "settings.json"
-if settings_path.is_file():
+def _resolve_dir_for_cwd(raw: str) -> Path | None:
+    s = raw.strip()
+    if not s:
+        return None
+    p = Path(s).expanduser()
+    if not p.is_absolute():
+        p = Path(resolved_cwd) / p
     try:
-        settings_obj = json.loads(settings_path.read_text(encoding="utf-8"))
-        if isinstance(settings_obj, dict) and isinstance(settings_obj.get("sessionDir"), str):
-            settings_session_dir = settings_obj["sessionDir"].strip()
+        return p.resolve()
+    except OSError:
+        return p
+
+def _read_settings_session_dir(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(obj, dict) and isinstance(obj.get("sessionDir"), str):
+            return obj["sessionDir"].strip()
     except (OSError, UnicodeError, json.JSONDecodeError):
         pass
+    return ""
+
+cli_session_dir = ""
+if full_cmd.strip():
+    try:
+        tokens = shlex.split(full_cmd)
+    except ValueError:
+        tokens = full_cmd.split()
+    for idx, tok in enumerate(tokens):
+        if tok == "--session-dir" and idx + 1 < len(tokens):
+            cli_session_dir = tokens[idx + 1]
+        elif tok.startswith("--session-dir="):
+            cli_session_dir = tok.split("=", 1)[1]
+
+project_session_dir = _read_settings_session_dir(Path(resolved_cwd) / ".pi" / "settings.json")
+global_session_dir = _read_settings_session_dir(Path(agent_dir).expanduser() / "settings.json")
 
 roots: list[Path] = []
-for raw_root in (primary_root, default_root, settings_session_dir):
-    if not raw_root:
-        continue
-    p = Path(raw_root).expanduser()
-    if p.is_dir():
-        try:
-            rp = p.resolve()
-        except OSError:
-            rp = p
-        if rp not in roots:
-            roots.append(rp)
+for raw_root in (cli_session_dir, explicit_dir, project_session_dir, global_session_dir, default_root):
+    rp = _resolve_dir_for_cwd(raw_root)
+    if rp is not None and rp.is_dir() and rp not in roots:
+        roots.append(rp)
 
 seen: set[Path] = set()
 for root in roots:
@@ -451,7 +501,6 @@ for root in roots:
                 with cand.open(encoding="utf-8") as session:
                     header = json.loads(session.readline())
             except (OSError, UnicodeError, json.JSONDecodeError):
-                # Corrupt/unreadable file carrying this sid is unsafe to recreate.
                 raise SystemExit(0)
             if isinstance(header, dict) and header.get("type") == "session":
                 if "createdAt" in header and "timestamp" not in header:
@@ -461,7 +510,6 @@ for root in roots:
                     continue
             raise SystemExit(0)
 
-# Fallback: check opaque filenames (including session.jsonl) whose Pi header declares id == sid.
 for root in roots:
     try:
         all_jsonl = root.rglob("*.jsonl")
@@ -499,7 +547,7 @@ build_resume() {
   local tool="$1" full="$2" title="$3" coord_sid="$4" cwd="$5" id
   REPLY=""; REPLY_KIND=""; REPLY_SID=""
   extract_uuid "$full"; id="$REPLY"
-  if [[ "$tool" == codex && -n "$coord_sid" ]] && { codex_session_exists "$coord_sid" || codex_session_known "$coord_sid"; }; then
+  if [[ "$tool" == codex && -n "$coord_sid" ]] && { codex_session_exists "$coord_sid" || codex_session_known "$coord_sid" "$id"; }; then
     id="$coord_sid"
   elif [[ ( "$tool" == pi || "$tool" == grok || "$tool" == dsh ) && -n "$coord_sid" ]]; then
     # The current coordinate binding is authoritative even when that new session
@@ -556,7 +604,7 @@ build_resume() {
     pi)
       if [[ -n "$id" ]]; then
         local pi_resolved="" pi_mode="" pi_path=""
-        if pi_resolved="$(pi_session_resolve "$id" "$cwd")"; then
+        if pi_resolved="$(pi_session_resolve "$id" "$cwd" "$full")"; then
           pi_mode="${pi_resolved%%$'\t'*}"
           pi_path="${pi_resolved#*$'\t'}"
           if [[ "$pi_mode" == path && -n "$pi_path" ]]; then
@@ -565,7 +613,7 @@ build_resume() {
             REPLY="$PI_BASE --session-id $id"
           fi
           REPLY_KIND=resume
-        elif pi_session_id_exists "$id"; then
+        elif pi_session_id_exists "$id" "$cwd" "$full"; then
           REPLY="$PI_BASE --session-id $id"
           REPLY_KIND=invalid
         else
