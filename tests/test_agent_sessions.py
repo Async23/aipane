@@ -1838,7 +1838,7 @@ class AgentSessionsTest(unittest.TestCase):
         write_jsonl(prev_p, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-01T02:00:00Z", "payload": {"id": ids[0]}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ROOT"}]}}])
         for j in range(1, len(ids)):
             cur_p = fork_home / f".codex/sessions/2026/11/{j+1:02d}" / f"rollout-2026-11-{j+1:02d}T10-00-00-{ids[j]}.jsonl"
-            write_jsonl(cur_p, [{"ordinal": j * 2, "type": "session_meta", "timestamp": f"2026-11-{j+1:02d}T02:00:00Z", "payload": {"id": ids[j], "history_base": {"thread_id": ids[j - 1], "end_ordinal_exclusive": j * 2, "end_byte_offset": prev_p.stat().st_size}}}, {"ordinal": j * 2 + 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": f"HOP_{j}"}]}}])
+            write_jsonl(cur_p, [{"ordinal": j * 2, "type": "session_meta", "timestamp": f"2026-11-{j+1:02d}T02:00:00Z", "payload": {"id": ids[j], "forked_from_id": ids[j - 1], "history_base": {"thread_id": ids[j - 1], "end_ordinal_exclusive": j * 2, "end_byte_offset": prev_p.stat().st_size}}}, {"ordinal": j * 2 + 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": f"HOP_{j}"}]}}])
             prev_p = cur_p
         rglob_calls = Counter()
         real_rglob = Path.rglob
@@ -2592,6 +2592,209 @@ class AgentSessionsTest(unittest.TestCase):
                 lb = mod.list_sessions(["codex"], days=14, limit=lim, home=h_batch, now=self.now)
             self.assertEqual(lb["count"], lim)
             self.assertEqual(spy_c.call_count, 1, f"limit={lim} opened SQLite {spy_c.call_count} times")
+
+    def test_r6_whitelist_fork_revert_bounds_collisions_hops_archive_pi_and_linear_cost(self) -> None:
+        from contextlib import closing
+        import shutil
+        import sqlite3
+        import subprocess
+        from unittest import mock
+        import uuid as _uuid
+
+        sid_a = "11111111-aaaa-7bbb-8ccc-000000000001"
+        sid_b = "22222222-aaaa-7bbb-8ccc-000000000002"
+        sid_c = "33333333-aaaa-7bbb-8ccc-000000000003"
+        sid_d = "44444444-aaaa-7bbb-8ccc-000000000004"
+        rid1 = "55555555-aaaa-7bbb-8ccc-000000000005"
+        rid2 = "66666666-aaaa-7bbb-8ccc-000000000006"
+        rid3 = "77777777-aaaa-7bbb-8ccc-000000000007"
+        other_sid = "88888888-aaaa-7bbb-8ccc-000000000008"
+
+        # 1. Spec #1: multi-level fork survives parent revert, rejects unreachable sibling RID
+        #    and rejects bounds exceeding parent's inherited prefix.
+        h_fork = self.home / "r6-fork"
+        p_a1 = h_fork / f".codex/sessions/2026/11/01/rollout-2026-11-01T10-00-00-{sid_a}_{rid1}.jsonl"
+        p_a2 = h_fork / f".codex/sessions/2026/11/01/rollout-2026-11-01T10-00-00-{sid_a}_{rid2}.jsonl"
+        write_jsonl(p_a1, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-01T10:00:00Z", "payload": {"id": sid_a, "history_mode": "paginated"}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "A_T1"}]}}, {"ordinal": 2, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "A_T2"}]}}])
+        write_jsonl(p_a2, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-01T10:00:00Z", "payload": {"id": sid_a, "history_mode": "paginated"}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "EVIL"}]}}])
+        a1_lines = p_a1.read_bytes().splitlines(True)
+        eb_a1_2 = len(a1_lines[0] + a1_lines[1])
+        eb_a1_3 = len(a1_lines[0] + a1_lines[1] + a1_lines[2])
+        p_b1 = h_fork / f".codex/sessions/2026/11/02/rollout-2026-11-02T10-00-00-{sid_b}.jsonl"
+        p_b_rev = h_fork / f".codex/sessions/2026/11/03/rollout-2026-11-03T10-00-00-{sid_b}_{rid3}.jsonl"
+        write_jsonl(p_b1, [{"ordinal": 3, "type": "session_meta", "timestamp": "2026-11-02T10:00:00Z", "payload": {"id": sid_b, "forked_from_id": sid_a, "history_mode": "paginated", "history_base": {"thread_id": rid1, "end_ordinal_exclusive": 3, "end_byte_offset": eb_a1_3}}}])
+        write_jsonl(p_b_rev, [{"ordinal": 2, "type": "session_meta", "timestamp": "2026-11-03T10:00:00Z", "payload": {"id": sid_b, "forked_from_id": sid_a, "history_mode": "paginated", "history_base": {"thread_id": rid1, "end_ordinal_exclusive": 2, "end_byte_offset": eb_a1_2}}}])
+        p_c_ok = h_fork / f".codex/sessions/2026/11/02/rollout-2026-11-02T11-00-00-{sid_c}.jsonl"
+        write_jsonl(p_c_ok, [{"ordinal": 3, "type": "session_meta", "timestamp": "2026-11-02T11:00:00Z", "payload": {"id": sid_c, "forked_from_id": sid_b, "history_mode": "paginated", "history_base": {"thread_id": rid1, "end_ordinal_exclusive": 3, "end_byte_offset": eb_a1_3}}}, {"ordinal": 4, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "C_OWN"}]}}])
+        with closing(sqlite3.connect(h_fork / ".codex/state_5.sqlite")) as con, con:
+            con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            con.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid_b, str(p_b_rev), int(self.now)))
+            con.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid_c, str(p_c_ok), int(self.now)))
+        res_c = mod.read_session(f"codex:{sid_c}", view="timeline", full=True, include_children=False, home=h_fork)
+        self.assertTrue(res_c["complete"], res_c["warnings"])
+        self.assertEqual([ev["text"] for s in res_c["sources"] for ev in s["events"]], ["A_T1", "A_T2", "C_OWN"])
+        # Unreachable sibling RID2 is rejected
+        p_c_bad = h_fork / f".codex/sessions/2026/11/02/rollout-2026-11-02T12-00-00-{sid_d}.jsonl"
+        write_jsonl(p_c_bad, [{"ordinal": 2, "type": "session_meta", "timestamp": "2026-11-02T12:00:00Z", "payload": {"id": sid_d, "forked_from_id": sid_b, "history_mode": "paginated", "history_base": {"thread_id": rid2, "end_ordinal_exclusive": 2, "end_byte_offset": p_a2.stat().st_size}}}])
+        res_bad = mod.read_session(f"codex:{sid_d}", view="timeline", full=True, include_children=False, home=h_fork)
+        self.assertFalse(res_bad["complete"])
+        self.assertTrue(any("history_base_parent_sid_mismatch" in w for w in res_bad["warnings"]))
+
+        # 2. Spec #2: initial fork RID collision prefers parent over colliding same-SID rollout,
+        #    and normal non-fork rollback rejects sole foreign-SID RID candidate.
+        h_col = self.home / "r6-col"
+        pa = h_col / f".codex/sessions/2026/11/01/rollout-2026-11-01T10-00-00-{sid_a}_{rid1}.jsonl"
+        pw = h_col / f".codex/sessions/2026/11/03/rollout-2026-11-03T10-00-00-{sid_b}_{rid1}.jsonl"
+        pb = h_col / f".codex/sessions/2026/11/02/rollout-2026-11-02T10-00-00-{sid_b}.jsonl"
+        write_jsonl(pa, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-01T10:00:00Z", "payload": {"id": sid_a, "history_mode": "paginated"}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "TRUE_PARENT"}]}}])
+        write_jsonl(pw, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-03T10:00:00Z", "payload": {"id": sid_b, "history_mode": "paginated"}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "WRONG_CHILD"}]}}])
+        write_jsonl(pb, [{"ordinal": 2, "type": "session_meta", "timestamp": "2026-11-02T10:00:00Z", "payload": {"id": sid_b, "forked_from_id": sid_a, "history_mode": "paginated", "history_base": {"thread_id": rid1, "end_ordinal_exclusive": 2, "end_byte_offset": pa.stat().st_size}}}, {"ordinal": 3, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "B_OWN"}]}}])
+        with closing(sqlite3.connect(h_col / ".codex/state_5.sqlite")) as con, con:
+            con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            con.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid_b, str(pb), int(self.now)))
+        rb = mod.read_session(f"codex:{sid_b}", view="timeline", full=True, include_children=False, home=h_col)
+        self.assertTrue(rb["complete"])
+        self.assertEqual([ev["text"] for s in rb["sources"] for ev in s["events"]], ["TRUE_PARENT", "B_OWN"])
+
+        h_nf = self.home / "r6-nonfork"
+        pf = h_nf / f".codex/sessions/2026/11/01/rollout-2026-11-01T10-00-00-{other_sid}_{rid1}.jsonl"
+        pc = h_nf / f".codex/sessions/2026/11/02/rollout-2026-11-02T10-00-00-{sid_a}_{rid2}.jsonl"
+        write_jsonl(pf, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-01T10:00:00Z", "payload": {"id": other_sid, "history_mode": "paginated"}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "FOREIGN_DROP"}]}}])
+        write_jsonl(pc, [{"ordinal": 2, "type": "session_meta", "timestamp": "2026-11-02T10:00:00Z", "payload": {"id": sid_a, "history_mode": "paginated", "history_base": {"thread_id": rid1, "end_ordinal_exclusive": 2, "end_byte_offset": pf.stat().st_size}}}, {"ordinal": 3, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "OWN_KEEP"}]}}])
+        rnf = mod.read_session(f"codex:{sid_a}", view="timeline", full=True, include_children=False, home=h_nf)
+        self.assertFalse(rnf["complete"])
+        self.assertTrue(any("history_base_parent_sid_mismatch" in w for w in rnf["warnings"]))
+        self.assertEqual([ev["text"] for s in rnf["sources"] for ev in s["events"]], ["OWN_KEEP"])
+
+        # 3. Spec #3 + #4 + #5: 2-hop misnamed single-UUID predecessors under --all, interior ordinal
+        #    hole (0,1,3,4), standalone non-zero paginated root, and double-UUID legacy under --no-children.
+        h_hops = self.home / "r6-hops"
+        hc1 = h_hops / f".codex/sessions/2026/11/01/rollout-2026-11-01T10-00-00-{other_sid}.jsonl"
+        hc2 = h_hops / f".codex/sessions/2026/11/02/rollout-2026-11-02T10-00-00-{rid1}.jsonl"
+        hc3 = h_hops / f".codex/sessions/2026/11/03/rollout-2026-11-03T10-00-00-{sid_a}_{rid2}.jsonl"
+        write_jsonl(hc1, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-01T10:00:00Z", "payload": {"id": sid_a, "history_mode": "paginated"}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "HOP_DEEP"}]}}])
+        write_jsonl(hc2, [{"ordinal": 2, "type": "session_meta", "timestamp": "2026-11-02T10:00:00Z", "payload": {"id": sid_a, "history_mode": "paginated", "history_base": {"thread_id": other_sid, "end_ordinal_exclusive": 2, "end_byte_offset": hc1.stat().st_size}}}, {"ordinal": 3, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "HOP_MID"}]}}])
+        write_jsonl(hc3, [{"ordinal": 4, "type": "session_meta", "timestamp": "2026-11-03T10:00:00Z", "payload": {"id": sid_a, "history_mode": "paginated", "history_base": {"thread_id": rid1, "end_ordinal_exclusive": 4, "end_byte_offset": hc2.stat().st_size}}}, {"ordinal": 5, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "HOP_HEAD"}]}}])
+        l_hops = mod.list_sessions(["codex"], scan_all=True, home=h_hops)
+        self.assertEqual([(s["session_id"], s["segment_count"]) for s in l_hops["sessions"]], [(sid_a, 3)])
+
+        h_gap = self.home / "r6-gap"
+        pg1 = h_gap / f".codex/sessions/2026/11/01/rollout-2026-11-01T10-00-00-{sid_a}.jsonl"
+        pg2 = h_gap / f".codex/sessions/2026/11/02/rollout-2026-11-02T10-00-00-{sid_a}_{rid1}.jsonl"
+        write_jsonl(pg1, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-01T10:00:00Z", "payload": {"id": sid_a, "history_mode": "paginated"}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "O1"}]}}, {"ordinal": 3, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "O3"}]}}, {"ordinal": 4, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "O4"}]}}])
+        write_jsonl(pg2, [{"ordinal": 5, "type": "session_meta", "timestamp": "2026-11-02T10:00:00Z", "payload": {"id": sid_a, "history_mode": "paginated", "history_base": {"thread_id": sid_a, "end_ordinal_exclusive": 5, "end_byte_offset": pg1.stat().st_size}}}])
+        rgap = mod.read_session(f"codex:{sid_a}", view="timeline", full=True, include_children=False, home=h_gap)
+        self.assertFalse(rgap["complete"])
+        self.assertTrue(any("history_base_ordinal_truncated" in w for w in rgap["warnings"]))
+
+        h_nz = self.home / "r6-nz"
+        pnz = h_nz / f".codex/sessions/2026/11/02/rollout-2026-11-02T10-00-00-{sid_a}_{rid1}.jsonl"
+        write_jsonl(pnz, [{"ordinal": 17, "type": "session_meta", "timestamp": "2026-11-02T10:00:00Z", "payload": {"id": sid_a, "history_mode": "paginated"}}])
+        rnz = mod.read_session(f"codex:{sid_a}", view="timeline", full=True, include_children=False, home=h_nz)
+        self.assertFalse(rnz["complete"])
+        self.assertTrue(any("paginated_root_ordinal_nonzero" in w for w in rnz["warnings"]))
+
+        h_leg = self.home / "r6-leg"
+        pl1 = h_leg / f".codex/sessions/2026/11/01/rollout-2026-11-01T10-00-00-{other_sid}_{rid1}.jsonl"
+        pl2 = h_leg / f".codex/sessions/2026/11/02/rollout-2026-11-02T10-00-00-{sid_a}_{rid2}.jsonl"
+        write_jsonl(pl1, [{"type": "session_meta", "timestamp": "2026-11-01T10:00:00Z", "payload": {"id": sid_a}}, {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "LEGACY_VERIFIED"}]}}])
+        write_jsonl(pl2, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-02T10:00:00Z", "payload": {"id": sid_a, "history_mode": "paginated"}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "RESET"}]}}])
+        with closing(sqlite3.connect(h_leg / ".codex/state_5.sqlite")) as con, con:
+            con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            con.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid_a, str(pl2), int(self.now)))
+        rleg = mod.read_session(f"codex:{sid_a}", view="timeline", full=True, include_children=False, home=h_leg)
+        self.assertFalse(rleg["complete"])
+        self.assertEqual([ev["text"] for s in rleg["sources"] for ev in s["events"]], ["LEGACY_VERIFIED", "RESET"])
+
+        # 4. St-2b + St-7: single uncommitted visible segment uses lower-DB future_threads preview;
+        #    foreign same-dir .zst twin does not mask genuine archived_sessions committed copy.
+        h_p1 = self.home / "r6-single-preview"
+        p_out = h_p1 / ".codex/future_threads/opaque.jsonl"
+        p_un = h_p1 / f".codex/sessions/2026/11/23/rollout-2026-11-23T01-00-00-{sid_a}_{rid1}.jsonl"
+        p_for = h_p1 / ".codex/future_threads/foreign.jsonl"
+        write_jsonl(p_out, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T00:00:00Z", "payload": {"id": sid_a}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "CONTENT_COMMITTED"}]}}])
+        write_jsonl(p_un, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T01:00:00Z", "payload": {"id": sid_a, "history_base": {"thread_id": sid_a, "end_ordinal_exclusive": 0, "end_byte_offset": 0}}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "CONTENT_UNCOMMITTED"}]}}])
+        write_jsonl(p_for, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T00:00:00Z", "payload": {"id": other_sid}}])
+        with closing(sqlite3.connect(h_p1 / ".codex/state_8.sqlite")) as con, con:
+            con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            con.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid_a, str(p_out), int(self.now)))
+        with closing(sqlite3.connect(h_p1 / ".codex/state_9.sqlite")) as con, con:
+            con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            con.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid_a, str(p_for), int(self.now)))
+        l_p1 = mod.list_sessions(["codex"], scan_all=True, home=h_p1)
+        self.assertEqual([s["preview"] for s in l_p1["sessions"] if s["session_id"] == sid_a], ["CONTENT_COMMITTED"])
+
+        if shutil.which("zstd"):
+            h_arc = self.home / "r6-archive-mask"
+            stem = f"rollout-2026-11-23T02-02-02-{sid_a}"
+            orig_missing = h_arc / ".codex/sessions/2026/11/23" / f"{stem}.jsonl"
+            foreign_twin = h_arc / ".codex/sessions/2026/11/23" / f"{stem}.jsonl.zst"
+            good_arc = h_arc / ".codex/archived_sessions" / f"{stem}.jsonl.zst"
+            write_zstd_jsonl(good_arc, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T02:02:02Z", "payload": {"id": sid_a}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ARCHIVED_COMMITTED"}]}}])
+            write_zstd_jsonl(foreign_twin, [{"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T02:02:02Z", "payload": {"id": other_sid}}, {"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "FOREIGN_TWIN"}]}}])
+            with closing(sqlite3.connect(h_arc / ".codex/state_9.sqlite")) as con, con:
+                con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+                con.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid_a, str(orig_missing), int(self.now)))
+            r_arc = mod.read_session(f"codex:{sid_a}", view="timeline", full=True, include_children=False, home=h_arc)
+            self.assertTrue(r_arc["complete"], r_arc["warnings"])
+            self.assertEqual([ev["text"] for s in r_arc["sources"] for ev in s["events"]], ["ARCHIVED_COMMITTED"])
+
+        # 5. St-5: Pi project .pi/settings.json discovery beats dormant global settings.json
+        h_pi = self.home / "r6-pi-disc"
+        proj = h_pi / "proj"
+        rel_store = proj / "relstore"
+        glob_store = h_pi / "globstore"
+        pi_agent = h_pi / ".pi/agent"
+        for d in (proj / ".pi", rel_store, glob_store, pi_agent):
+            d.mkdir(parents=True, exist_ok=True)
+        pi_fname = f"2026-11-23T09-01-27-117Z_{sid_a}.jsonl"
+        write_jsonl(rel_store / pi_fname, [{"type": "session", "version": 3, "id": sid_a, "timestamp": "2026-11-23T09:01:27.117Z", "cwd": str(proj)}, {"type": "message", "id": "m1", "parentId": None, "message": {"role": "user", "content": [{"type": "text", "text": "PROJECT_IN_USE"}]}}])
+        write_jsonl(glob_store / pi_fname, [{"type": "session", "version": 3, "id": sid_a, "timestamp": "2026-11-23T09:01:27.117Z", "cwd": str(proj)}, {"type": "message", "id": "m1", "parentId": None, "message": {"role": "user", "content": [{"type": "text", "text": "GLOBAL_DORMANT"}]}}])
+        (proj / ".pi/settings.json").write_text(json.dumps({"sessionDir": "relstore"}), encoding="utf-8")
+        (pi_agent / "settings.json").write_text(json.dumps({"sessionDir": str(glob_store)}), encoding="utf-8")
+        prev_cwd = os.getcwd()
+        os.chdir(proj)
+        try:
+            r_pi = mod.read_session(f"pi:{sid_a}", view="timeline", full=True, home=h_pi, environment={"HOME": str(h_pi), "PI_CODING_AGENT_DIR": str(pi_agent)})
+            self.assertTrue(r_pi["complete"])
+            self.assertEqual([ev["text"] for s in r_pi["sources"] for ev in s["events"]], ["PROJECT_IN_USE"])
+        finally:
+            os.chdir(prev_cwd)
+
+        # 6. Extra P2: linear 48-segment chain stays O(N) for rollout_id metadata lookups
+        h_lin = self.home / "r6-linear"
+        last_rid = None
+        last_sz = 0
+        for idx in range(48):
+            rid_i = str(_uuid.uuid4()) if idx else sid_a
+            fp = h_lin / ".codex/sessions/2026/11/04" / (f"rollout-2026-11-04T00-{idx:02d}-00-{sid_a}" + (f"_{rid_i}" if idx else "") + ".jsonl")
+            meta_p: dict[str, object] = {"id": sid_a, "history_mode": "paginated", "timestamp": f"2026-11-04T00:{idx:02d}:00Z"}
+            if idx:
+                meta_p["history_base"] = {"thread_id": last_rid, "end_ordinal_exclusive": 2 * idx, "end_byte_offset": last_sz}
+            write_jsonl(fp, [{"ordinal": 2 * idx, "type": "session_meta", "timestamp": f"2026-11-04T00:{idx:02d}:00Z", "payload": meta_p}, {"ordinal": 2 * idx + 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": f"M_{idx}"}]}}])
+            last_rid = rid_i
+            last_sz = fp.stat().st_size
+        with closing(sqlite3.connect(h_lin / ".codex/state_5.sqlite")) as con, con:
+            con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            con.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid_a, str(fp), int(self.now)))
+        rid_gets = [0]
+        orig_meta = mod.codex_sessions.read_rollout_meta_detailed
+
+        class _MeteredDict(dict):
+            def get(self, k, *a):
+                if k == "rollout_id":
+                    rid_gets[0] += 1
+                return super().get(k, *a)
+
+        def _metered(*a, **kw):
+            m, e = orig_meta(*a, **kw)
+            return (_MeteredDict(m) if m else m), e
+
+        with mock.patch.object(mod.codex_sessions, "read_rollout_meta_detailed", _metered):
+            r_lin = mod.read_session(f"codex:{sid_a}", view="timeline", full=True, include_children=False, home=h_lin)
+        self.assertTrue(r_lin["complete"])
+        self.assertEqual(len(r_lin["sources"]), 48)
+        self.assertLess(rid_gets[0], 300)
 
 
 if __name__ == "__main__":

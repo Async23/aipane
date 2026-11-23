@@ -245,12 +245,30 @@ def _codex_home(
     return (h / ".codex").expanduser()
 
 
+def _pi_encoded_cwd_name(cwd: Path) -> str:
+    resolved = str(cwd.resolve())
+    return "--" + re.sub(r"[/\\:]", "-", re.sub(r"^[/\\]", "", resolved)) + "--"
+
+
+def _read_pi_settings_session_dir(settings_path: Path) -> str:
+    if not settings_path.is_file():
+        return ""
+    try:
+        obj = json.loads(settings_path.read_text(encoding="utf-8"))
+        if isinstance(obj, dict) and isinstance(obj.get("sessionDir"), str):
+            return obj["sessionDir"].strip()
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
 def agent_roots(
     agent: str,
     home: Path | None = None,
     *,
     codex_home: Path | None = None,
     environment: Mapping[str, str] | None = None,
+    project_cwd: Path | None = None,
 ) -> list[tuple[Path, dict[str, Any]]]:
     env = os.environ if environment is None else environment
     h = home or Path(env.get("HOME") or str(Path.home()))
@@ -279,27 +297,57 @@ def agent_roots(
     if agent == "pi":
         roots: list[tuple[Path, dict[str, Any]]] = []
         seen: set[Path] = set()
-        explicit_dir = env.get("PI_CODING_AGENT_SESSION_DIR")
-        if explicit_dir:
-            p = Path(explicit_dir).expanduser()
-            seen.add(p)
-            roots.append((p, {}))
-        base = Path(env.get("PI_CODING_AGENT_DIR") or (h / ".pi" / "agent"))
-        settings_path = base / "settings.json"
-        if settings_path.is_file():
+        try:
+            cwd_base = (project_cwd if project_cwd is not None else Path.cwd()).expanduser().resolve()
+        except OSError:
+            cwd_base = Path.cwd()
+
+        def _resolve_pi_dir(raw: str) -> Path | None:
+            s = raw.strip()
+            if not s:
+                return None
+            p = Path(s).expanduser()
+            if not p.is_absolute():
+                p = cwd_base / p
             try:
-                settings_obj = json.loads(settings_path.read_text(encoding="utf-8"))
-                sdir = settings_obj.get("sessionDir") if isinstance(settings_obj, dict) else None
-                if isinstance(sdir, str) and sdir.strip():
-                    sp = Path(sdir.strip()).expanduser()
-                    if sp not in seen:
-                        seen.add(sp)
-                        roots.append((sp, {}))
-            except (OSError, ValueError):
-                pass
+                return p.resolve()
+            except OSError:
+                return p
+
+        def _push_pi_root(raw: str, priority: int, *, configured: bool) -> None:
+            rp = _resolve_pi_dir(raw)
+            if rp is not None and rp not in seen:
+                seen.add(rp)
+                roots.append(
+                    (
+                        rp,
+                        {
+                            "pi_priority": priority,
+                            "pi_configured": configured,
+                            "pi_encoded_cwd": _pi_encoded_cwd_name(cwd_base),
+                        },
+                    )
+                )
+
+        # Match Pi 1.5.2 precedence: env > project .pi/settings.json > global settings.json > default sessions/.
+        explicit_dir = env.get("PI_CODING_AGENT_SESSION_DIR") or ""
+        if explicit_dir.strip():
+            _push_pi_root(explicit_dir, 0, configured=True)
+        project_sdir = _read_pi_settings_session_dir(cwd_base / ".pi" / "settings.json")
+        if project_sdir:
+            _push_pi_root(project_sdir, 1, configured=True)
+        base = Path(env.get("PI_CODING_AGENT_DIR") or (h / ".pi" / "agent")).expanduser()
+        global_sdir = _read_pi_settings_session_dir(base / "settings.json")
+        if global_sdir:
+            _push_pi_root(global_sdir, 2, configured=True)
         default_sessions = base / "sessions"
-        if default_sessions not in seen:
-            roots.append((default_sessions, {}))
+        try:
+            default_resolved = default_sessions.resolve()
+        except OSError:
+            default_resolved = default_sessions
+        if default_resolved not in seen:
+            seen.add(default_resolved)
+            roots.append((default_sessions, {"pi_priority": 3, "pi_configured": False}))
         return roots
     if agent == "kimi":
         roots: list[tuple[Path, dict[str, Any]]] = []
@@ -457,16 +505,49 @@ def discover_agent_files(
                 found.append(SessionFile("grok", sid, p, st.st_mtime, st.st_size))
 
     elif agent == "pi":
-        for root, _ in agent_roots("pi", home, environment=environment):
+        seen_pi_sid_priority: dict[str, int] = {}
+        seen_pi_paths: set[tuple[Path, int, int]] = set()
+        for root, meta_info in agent_roots("pi", home, environment=environment):
             if not root.is_dir():
                 continue
-            for p in root.rglob("*.jsonl"):
+            prio = int(meta_info.get("pi_priority", 3))
+            is_configured = bool(meta_info.get("pi_configured", False))
+            encoded_cwd = str(meta_info.get("pi_encoded_cwd") or "")
+            cand_paths: list[Path] = []
+            if is_configured:
+                # Native Pi 1.5.2 stores configured sessionDir files directly under
+                # the root (or under `<root>/<encoded-cwd>`), never arbitrary nested `backup/`.
+                try:
+                    for entry in root.iterdir():
+                        if entry.name.endswith(".jsonl") and entry.is_file():
+                            cand_paths.append(entry)
+                except OSError:
+                    pass
+                if encoded_cwd:
+                    enc_dir = root / encoded_cwd
+                    if enc_dir.is_dir():
+                        try:
+                            for entry in enc_dir.iterdir():
+                                if entry.name.endswith(".jsonl") and entry.is_file():
+                                    cand_paths.append(entry)
+                        except OSError:
+                            pass
+            else:
+                try:
+                    cand_paths = [p for p in root.rglob("*.jsonl") if p.is_file()]
+                except OSError:
+                    cand_paths = []
+            for p in cand_paths:
                 try:
                     if not p.is_file():
                         continue
                     st = p.stat()
                 except OSError:
                     continue
+                pkey = _meta_cache_key(p)
+                if pkey in seen_pi_paths:
+                    continue
+                seen_pi_paths.add(pkey)
                 is_dsh_name = bool(DSH_GEN_RE.match(p.name))
                 m = UUID_RE.findall(p.stem)
                 verified_hdr = False
@@ -498,6 +579,12 @@ def discover_agent_files(
                         verified_ino = (st.st_dev, st.st_ino)
                     else:
                         sid = m[0] if m else p.stem
+                prev_prio = seen_pi_sid_priority.get(sid)
+                if prev_prio is not None and prev_prio < prio:
+                    # Shadow dormant lower-priority duplicates (e.g. global/default) when
+                    # an active higher-priority root (e.g. project .pi/settings.json) owns `sid`.
+                    continue
+                seen_pi_sid_priority.setdefault(sid, prio)
                 found.append(
                     SessionFile(
                         "pi",
@@ -898,17 +985,14 @@ def _populate_rollout_index_from_files(
     for sf in files:
         if not codex_sessions.is_canonical_rollout_name(sf.path):
             continue
-        _, rid = codex_sessions.extract_filename_ids(sf.path)
+        fn_sid, rid = codex_sessions.extract_filename_ids(sf.path)
         if rid:
             codex_sessions._add_rollout_index_candidate(rollout_index, rid, sf.path)
-        stem_key = f"__stem__:{codex_sessions.rollout_plain_stem(sf.path)}"
-        prev_stem = rollout_index.get(stem_key)
-        if prev_stem is None or (
-            isinstance(prev_stem, Path)
-            and codex_sessions.rollout_dedup_priority(sf.path)
-            < codex_sessions.rollout_dedup_priority(prev_stem)
-        ):
-            rollout_index[stem_key] = sf.path
+        if fn_sid:
+            codex_sessions._add_rollout_sid_candidate(rollout_index, fn_sid, sf.path)
+        codex_sessions._add_rollout_stem_candidate(
+            rollout_index, codex_sessions.rollout_plain_stem(sf.path), sf.path
+        )
     rollout_index[sentinel] = codex_home
 
 
@@ -1083,7 +1167,7 @@ def resolve_session_sources(
                                 cur_p = base_p
                                 cur_m = base_m
                         elif cur_m.get("ordinal") == 0 and not any(
-                            not codex_sessions.is_canonical_rollout_name(sf.path)
+                            not codex_sessions.is_canonical_single_uuid_rollout(sf.path)
                             and _meta_cache_key(sf.path) != _meta_cache_key(sqlite_head_path)
                             for sf in raw_files
                         ):
@@ -1875,8 +1959,11 @@ class _RangeCheck:
     misaligned: bool = False
     bounds_mismatch: bool = False
     max_ord_before_eb: int | None = None
+    prev_ord_before_eb: int | None = None
     saw_ord_at_or_after_eb: bool = False
     max_ord_seen: int | None = None
+    prev_ord_seen: int | None = None
+    has_interior_gap: bool = False
 
 
 def _build_range_checks(
@@ -1910,6 +1997,9 @@ def _observe_range_checks(
         eo = chk.end_ord
         if eb is not None:
             if line_end <= eb:
+                if chk.prev_ord_before_eb is not None and ord_v != chk.prev_ord_before_eb + 1:
+                    chk.has_interior_gap = True
+                chk.prev_ord_before_eb = ord_v
                 if chk.max_ord_before_eb is None or ord_v > chk.max_ord_before_eb:
                     chk.max_ord_before_eb = ord_v
                 if ord_v >= eo:
@@ -1919,6 +2009,10 @@ def _observe_range_checks(
                 if ord_v < eo:
                     chk.bounds_mismatch = True
         else:
+            if ord_v < eo:
+                if chk.prev_ord_seen is not None and ord_v != chk.prev_ord_seen + 1:
+                    chk.has_interior_gap = True
+                chk.prev_ord_seen = ord_v
             if chk.max_ord_seen is None or ord_v > chk.max_ord_seen:
                 chk.max_ord_seen = ord_v
 
@@ -1955,6 +2049,11 @@ def _finalize_range_checks(
             warnings.append(
                 f"history_base_bounds_mismatch: end_ordinal_exclusive={eo} "
                 f"disagrees with end_byte_offset={eb} in {path}"
+            )
+        elif chk.has_interior_gap:
+            warnings.append(
+                f"history_base_ordinal_truncated: missing interior ordinal(s) "
+                f"before end_ordinal_exclusive={eo} in {path}"
             )
         elif eb is not None:
             if byte_count >= eb and not chk.misaligned and eo > 0:
@@ -3065,9 +3164,9 @@ def _verify_hot_logical_sessions(
         if vsf is not None:
             verified_files.append(vsf)
 
-    # Re-attribute any hot canonical single-UUID file whose physical RID is explicitly
-    # referenced by another hot Codex segment's `history_base` (e.g. under `--all`,
-    # where a misnamed canonical single-UUID predecessor is already in `hot_rough`).
+    # Re-attribute hot canonical single-UUID files transitively when referenced by
+    # another hot Codex segment's `history_base` (e.g. multi-hop chains under `--all`
+    # or all-hot windows).
     hot_codex_by_rid: dict[str, list[int]] = {}
     for idx_v, sf in enumerate(verified_files):
         if sf.agent == "codex" and codex_sessions.is_canonical_rollout_name(sf.path):
@@ -3075,10 +3174,18 @@ def _verify_hot_logical_sessions(
             if rid:
                 hot_codex_by_rid.setdefault(rid, []).append(idx_v)
     if hot_codex_by_rid:
-        for idx_v in range(len(verified_files)):
-            sf = verified_files[idx_v]
-            if sf.agent != "codex" or codex_sessions.is_canonical_single_uuid_rollout(sf.path):
+        worklist: deque[int] = deque(
+            idx_v
+            for idx_v, sf in enumerate(verified_files)
+            if sf.agent == "codex" and not codex_sessions.is_canonical_single_uuid_rollout(sf.path)
+        )
+        visited_work: set[int] = set()
+        while worklist:
+            idx_v = worklist.popleft()
+            if idx_v in visited_work:
                 continue
+            visited_work.add(idx_v)
+            sf = verified_files[idx_v]
             meta = _cached_codex_meta(sf.path, meta_cache)
             if not meta:
                 continue
@@ -3090,19 +3197,20 @@ def _verify_hot_logical_sessions(
                 continue
             for cand_idx in hot_codex_by_rid.get(base_rid, ()):
                 cand_sf = verified_files[cand_idx]
-                if cand_sf.session_id == meta["sid"]:
-                    continue
                 cmeta = _cached_codex_meta(cand_sf.path, meta_cache)
                 if cmeta and cmeta["sid"] == meta["sid"]:
-                    verified_files[cand_idx] = SessionFile(
-                        "codex",
-                        meta["sid"],
-                        cand_sf.path,
-                        cand_sf.mtime,
-                        cand_sf.size_bytes,
-                        cand_sf.is_subagent,
-                        cand_sf.parent_id,
-                    )
+                    if cand_sf.session_id != meta["sid"]:
+                        verified_files[cand_idx] = SessionFile(
+                            "codex",
+                            meta["sid"],
+                            cand_sf.path,
+                            cand_sf.mtime,
+                            cand_sf.size_bytes,
+                            cand_sf.is_subagent,
+                            cand_sf.parent_id,
+                        )
+                    if cand_idx not in visited_work:
+                        worklist.append(cand_idx)
 
     all_verified = group_logical_sessions(verified_files, sort_segments=False, meta_cache=meta_cache)
     all_verified.sort(key=lambda s: s.mtime, reverse=True)
@@ -3152,53 +3260,70 @@ def _extract_logical_preview(
     rollout_index: dict[str, Any] | None = None,
     sqlite_rows_by_sid: dict[str, list[Path]] | None = None,
 ) -> str:
-    if ls.agent == "codex" and len(ls.segments) > 1:
+    if ls.agent == "codex":
         chome = _codex_home(home)
-        if sqlite_rows_by_sid is not None:
-            sqlite_path = _pick_verified_sqlite_head_from_rows(
-                ls.session_id,
-                sqlite_rows_by_sid.get(ls.session_id, []),
-                chome,
-                meta_cache=meta_cache,
-                rollout_index=rollout_index,
-            )
-        else:
-            sqlite_path, _ = codex_sessions.resolve_committed_head_detailed(
-                ls.session_id,
-                chome,
-                verify_header=True,
-                rollout_index=rollout_index,
-                meta_cache=meta_cache,
-                sqlite_only=True,
-            )
-        effective, _, _ = codex_sessions.resolve_effective_lineage(
-            ls.session_id,
-            [s.path for s in ls.segments],
-            sqlite_path=sqlite_path,
-            codex_home=chome,
-            meta_cache=meta_cache,
-            rollout_index=rollout_index,
+        raw_sqlite_paths = (
+            sqlite_rows_by_sid.get(ls.session_id, [])
+            if sqlite_rows_by_sid is not None
+            else None
         )
-        by_key = {_meta_cache_key(s.path): s for s in ls.segments}
-        for seg in effective:
-            p = seg["path"]
-            sf = by_key.get(_meta_cache_key(p))
-            if sf is None:
-                try:
-                    st = p.stat()
-                    sf = SessionFile("codex", ls.session_id, p, st.st_mtime, st.st_size)
-                except OSError:
-                    continue
-            preview = extract_preview(
-                sf,
-                max_ordinal_exclusive=seg.get("end_ordinal_exclusive"),
-                max_byte_offset_exclusive=seg.get("end_byte_offset"),
+        need_lineage = len(ls.segments) > 1
+        if not need_lineage and len(ls.segments) == 1 and raw_sqlite_paths:
+            seg0_key = _meta_cache_key(ls.segments[0].path)
+            first_raw = raw_sqlite_paths[0]
+            if not (first_raw.is_file() and _meta_cache_key(first_raw) == seg0_key):
+                need_lineage = True
+        if need_lineage:
+            if sqlite_rows_by_sid is not None:
+                sqlite_path = _pick_verified_sqlite_head_from_rows(
+                    ls.session_id,
+                    raw_sqlite_paths or [],
+                    chome,
+                    meta_cache=meta_cache,
+                    rollout_index=rollout_index,
+                )
+            else:
+                sqlite_path, _ = codex_sessions.resolve_committed_head_detailed(
+                    ls.session_id,
+                    chome,
+                    verify_header=True,
+                    rollout_index=rollout_index,
+                    meta_cache=meta_cache,
+                    sqlite_only=True,
+                )
+            cand_paths = [s.path for s in ls.segments]
+            if sqlite_path is not None:
+                skey = _meta_cache_key(sqlite_path)
+                if all(_meta_cache_key(p) != skey for p in cand_paths):
+                    cand_paths.append(sqlite_path)
+            effective, _, _ = codex_sessions.resolve_effective_lineage(
+                ls.session_id,
+                cand_paths,
+                sqlite_path=sqlite_path,
+                codex_home=chome,
+                meta_cache=meta_cache,
+                rollout_index=rollout_index,
             )
-            if preview:
-                return preview
-        # Effective lineage is authoritative: if all opening prompts were rolled
-        # back, return "" instead of falling back to superseded segments.
-        return ""
+            by_key = {_meta_cache_key(s.path): s for s in ls.segments}
+            for seg in effective:
+                p = seg["path"]
+                sf = by_key.get(_meta_cache_key(p))
+                if sf is None:
+                    try:
+                        st = p.stat()
+                        sf = SessionFile("codex", ls.session_id, p, st.st_mtime, st.st_size)
+                    except OSError:
+                        continue
+                preview = extract_preview(
+                    sf,
+                    max_ordinal_exclusive=seg.get("end_ordinal_exclusive"),
+                    max_byte_offset_exclusive=seg.get("end_byte_offset"),
+                )
+                if preview:
+                    return preview
+            # Effective lineage is authoritative: if all opening prompts were rolled
+            # back, return "" instead of falling back to superseded segments.
+            return ""
     for seg in ls.segments:
         preview = extract_preview(seg)
         if preview:
@@ -3236,12 +3361,10 @@ def list_sessions(
             rindex,
         )
     # Query all hot Codex SIDs in a single batch SQLite pass (1 connection per DB),
-    # reused across both cold-predecessor attachment and multi-segment preview.
+    # reused across cold-predecessor attachment and committed-head previews.
     hot_codex_sids_rough = [ls.session_id for ls in hot_rough if ls.agent == "codex"]
     sqlite_rows_by_sid: dict[str, list[Path]] | None = None
-    if chome is not None and hot_codex_sids_rough and (
-        cold_rough or any(len(ls.segments) > 1 for ls in hot_rough if ls.agent == "codex")
-    ):
+    if chome is not None and hot_codex_sids_rough:
         sqlite_rows_by_sid = codex_sessions.query_sqlite_rollout_paths_batch_all(
             hot_codex_sids_rough, chome
         )
@@ -3260,19 +3383,18 @@ def list_sessions(
     )
     skipped = max(0, skipped + delta_skipped)
     selected = selected[:limit]
-    # If header verification introduced a newly split hot multi-segment SID not in
-    # the rough batch, query ONLY those missing multi-segment SIDs in one batch.
+    # If header verification introduced a newly split hot SID not in the rough
+    # batch, query ONLY those missing selected SIDs in one batch.
     if chome is not None:
-        missing_multi_sids = [
+        missing_selected_sids = [
             ls.session_id
             for ls in selected
             if ls.agent == "codex"
-            and len(ls.segments) > 1
             and (sqlite_rows_by_sid is None or ls.session_id not in sqlite_rows_by_sid)
         ]
-        if missing_multi_sids:
+        if missing_selected_sids:
             extra_rows = codex_sessions.query_sqlite_rollout_paths_batch_all(
-                missing_multi_sids, chome
+                missing_selected_sids, chome
             )
             if sqlite_rows_by_sid is None:
                 sqlite_rows_by_sid = extra_rows

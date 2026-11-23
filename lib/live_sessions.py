@@ -468,15 +468,15 @@ def _pick_preferred_rollout_rec(
     sid = curr.get("sid") or prev.get("sid") or ""
     if chome_str and sid:
         chome = Path(chome_str)
-        sqlite_raw = codex_sessions.query_sqlite_rollout_path(sid, chome)
-        if sqlite_raw is not None:
-            sqlite_res = codex_sessions.resolve_alternate_rollout_path(sqlite_raw, chome)
-            if sqlite_res is not None:
-                skey = codex_sessions.path_identity_key(sqlite_res)
-                if codex_sessions.path_identity_key(Path(prev["rollout"])) == skey:
-                    return prev
-                if codex_sessions.path_identity_key(Path(curr["rollout"])) == skey:
-                    return curr
+        sqlite_res, _ = codex_sessions.resolve_committed_head_detailed(
+            sid, chome, verify_header=True, sqlite_only=True
+        )
+        if sqlite_res is not None:
+            skey = codex_sessions.path_identity_key(sqlite_res)
+            if codex_sessions.path_identity_key(Path(prev["rollout"])) == skey:
+                return prev
+            if codex_sessions.path_identity_key(Path(curr["rollout"])) == skey:
+                return curr
     try:
         prev_p = Path(prev["rollout"])
         curr_p = Path(curr["rollout"])
@@ -873,43 +873,89 @@ def _resolve_single_raw_pane(
                 active_path = matched[0].get("rollout", "")
                 storage_root = matched[0].get("codex_home", "")
                 authority = "codex_lsof"
+        def _path_is_within(child_s: str, parent_s: str) -> bool:
+            if not child_s or not parent_s:
+                return True
+            try:
+                cp = Path(child_s).expanduser().resolve()
+                pp = Path(parent_s).expanduser().resolve()
+                return cp == pp or pp in cp.parents
+            except OSError:
+                return False
+
+        def _resolve_root_for_pane(raw_root: str, target_pid: int | None, active_file: str) -> str:
+            raw_s = raw_root.strip()
+            if not raw_s:
+                return ""
+            rp = Path(raw_s).expanduser()
+            if rp.is_absolute():
+                resolved_s = str(rp.resolve())
+            else:
+                base_cwd = ""
+                if target_pid is not None:
+                    base_cwd = codex_sessions.process_cwd(target_pid)
+                if not base_cwd and pane.cwd and Path(pane.cwd).is_absolute():
+                    base_cwd = pane.cwd
+                if not base_cwd:
+                    return ""
+                resolved_s = str((Path(base_cwd) / rp).resolve())
+            if active_file and Path(active_file).expanduser().is_absolute():
+                if not _path_is_within(active_file, resolved_s):
+                    return ""
+            return resolved_s
+
+        tty_pids = codex_tty_pids.get(pane.short_tty, [])
+        single_pid = tty_pids[0] if len(tty_pids) == 1 else None
+        proc_chome = _process_codex_home(single_pid, cwd=pane.cwd) if single_pid is not None else ""
+
         if (
             authority == "codex_lsof"
             and not storage_root
-            and act_rec
-            and isinstance(act_rec.get("root"), dict)
-            and act_rec["root"].get("codex_home")
         ):
-            root_info = act_rec["root"]
-            if root_info.get("session_id") == sid or (
-                active_path and str(root_info.get("transcript_path") or "") == active_path
+            if proc_chome and _path_is_within(active_path, proc_chome):
+                storage_root = proc_chome
+            if (
+                not storage_root
+                and act_rec
+                and isinstance(act_rec.get("root"), dict)
+                and act_rec["root"].get("codex_home")
             ):
-                storage_root = str(root_info.get("codex_home") or "")
+                root_info = act_rec["root"]
+                if root_info.get("session_id") == sid or (
+                    active_path and str(root_info.get("transcript_path") or "") == active_path
+                ):
+                    storage_root = _resolve_root_for_pane(
+                        str(root_info.get("codex_home") or ""), single_pid, active_path
+                    )
         if not sid and preferred:
             if act_rec and isinstance(act_rec.get("root"), dict) and act_rec["root"].get("session_id") == preferred:
                 sid = preferred
                 active_path = str(act_rec["root"].get("transcript_path") or "")
-                storage_root = str(act_rec["root"].get("codex_home") or "")
                 authority = "codex_activity"
+                if proc_chome and _path_is_within(active_path, proc_chome):
+                    storage_root = proc_chome
+                if not storage_root and active_path and Path(active_path).expanduser().is_absolute():
+                    storage_root = codex_sessions.infer_codex_home(Path(active_path).expanduser())
+                if not storage_root:
+                    storage_root = _resolve_root_for_pane(
+                        str(act_rec["root"].get("codex_home") or ""), single_pid, active_path
+                    )
+                if not storage_root and reg_rec.get("tool") in {"x", "codex"} and reg_rec.get("sid") == preferred:
+                    storage_root = _resolve_root_for_pane(
+                        str(reg_rec.get("codex_home") or ""), single_pid, active_path
+                    )
             elif reg_rec.get("tool") in {"x", "codex"} and reg_rec.get("sid") == preferred:
                 sid = preferred
                 authority = "registry"
-                tty_pids = codex_tty_pids.get(pane.short_tty, [])
-                proc_chome = _process_codex_home(tty_pids[0], cwd=pane.cwd) if len(tty_pids) == 1 else ""
                 if proc_chome:
                     storage_root = proc_chome
                 else:
-                    reg_chome = str(reg_rec.get("codex_home") or "")
-                    if reg_chome:
-                        reg_p = Path(reg_chome).expanduser()
-                        if reg_p.is_absolute():
-                            storage_root = str(reg_p.resolve())
-                        elif pane.cwd and Path(pane.cwd).is_absolute():
-                            storage_root = str((Path(pane.cwd) / reg_p).resolve())
+                    storage_root = _resolve_root_for_pane(
+                        str(reg_rec.get("codex_home") or ""), single_pid, active_path
+                    )
             if sid and not storage_root and not active_path:
-                tty_pids = codex_tty_pids.get(pane.short_tty, [])
-                if len(tty_pids) == 1:
-                    storage_root = _process_codex_home(tty_pids[0], cwd=pane.cwd)
+                if proc_chome:
+                    storage_root = proc_chome
 
     # 3. Claude Code
     elif _is_claude_cmd(cmd):

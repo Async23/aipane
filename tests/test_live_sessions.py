@@ -750,6 +750,102 @@ class LiveSessionsUnitTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             sessions_mod.parse_session_ref("codex:123", explicit_agent="claude")
 
+    def test_r6_multi_db_fd_selection_hook_relative_root_and_orphan_infer_codex_home(self) -> None:
+        from contextlib import closing
+        import sqlite3
+        from unittest import mock
+
+        sid = "91919191-aaaa-4919-8919-919191919191"
+        rid2 = "92929292-bbbb-4929-8929-929292929292"
+        chome = self.home / ".codex"
+        day = chome / "sessions/2026/11/23"
+        day.mkdir(parents=True, exist_ok=True)
+        p = day / f"rollout-2026-11-23T07-00-00-{sid}.jsonl"
+        q = day / f"rollout-2026-11-23T08-00-00-{sid}_{rid2}.jsonl"
+        p.write_text(json.dumps({"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T07:00:00Z", "payload": {"id": sid, "cwd": str(self.home)}}) + "\n", encoding="utf-8")
+        q.write_text(json.dumps({"ordinal": 1, "type": "session_meta", "timestamp": "2026-11-23T08:00:00Z", "payload": {"id": sid, "cwd": str(self.home), "history_base": {"thread_id": sid, "end_ordinal_exclusive": 1, "end_byte_offset": p.stat().st_size}}}) + "\n", encoding="utf-8")
+        with closing(sqlite3.connect(chome / "state_7.sqlite")) as db, db:
+            db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            db.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid, str(p), int(time.time())))
+        with closing(sqlite3.connect(chome / "state_9.sqlite")) as db, db:
+            db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            db.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid, str(day / "missing.jsonl"), int(time.time())))
+
+        # 1. St-2c: upper DB missing, lower DB valid -> live FD selection picks lower-DB committed head `p`.
+        rec_p = {"sid": sid, "rollout": str(p), "codex_home": str(chome)}
+        rec_q = {"sid": sid, "rollout": str(q), "codex_home": str(chome)}
+        self.assertEqual(live_mod._pick_preferred_rollout_rec(rec_p, rec_q)["rollout"], str(p))
+        self.assertEqual(live_mod._pick_preferred_rollout_rec(rec_q, rec_p)["rollout"], str(p))
+
+        # 2. St-3b: unrelated ancestor containing an empty `sessions/` directory must NOT claim an orphan file.
+        ancestor = self.home / "common_project"
+        (ancestor / "sessions").mkdir(parents=True, exist_ok=True)
+        orphan = ancestor / "tmp/orphan_dir" / f"rollout-2026-11-23T09-00-00-{sid}.jsonl"
+        orphan.parent.mkdir(parents=True, exist_ok=True)
+        orphan.write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
+        self.assertEqual(sessions_mod.codex_sessions.infer_codex_home(orphan), "")
+
+        # 3. St-3a: legacy relative `codex_home="profile"` and mismatched-cwd absolute `codex_home`
+        #    in activity hook records both resolve to target workspace profile, never reader cwd.
+        ws = self.home / "ws"
+        target_profile = ws / "profile"
+        foreign_profile = self.home / "profile"
+        target_log = target_profile / "sessions/2026/11/23" / f"rollout-2026-11-23T00-00-00-{sid}.jsonl"
+        target_log.parent.mkdir(parents=True, exist_ok=True)
+        target_log.write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
+        foreign_profile.mkdir(parents=True, exist_ok=True)
+
+        for stored_home in ("profile", str(foreign_profile)):
+            raw_pane = live_mod.RawPane(
+                pane_id="%50",
+                session_name="s",
+                window_id="@1",
+                window_index="0",
+                window_name="w",
+                pane_index="0",
+                pane_active=True,
+                window_active=True,
+                current_command="codex",
+                cwd=str(ws),
+                pane_tty="/dev/ttys050",
+                pane_title="codex",
+                socket_path=self.sock,
+                server_pid=self.srv,
+                pane_pid="5050",
+                activity_record=json.dumps(
+                    {
+                        "root": {
+                            "session_id": sid,
+                            "turn_id": "t1",
+                            "transcript_path": str(target_log),
+                            "codex_home": stored_home,
+                        }
+                    }
+                ),
+            )
+            prev_cwd = os.getcwd()
+            os.chdir(self.home)
+            try:
+                with mock.patch.object(live_mod, "_process_codex_home", return_value=str(target_profile.resolve())):
+                    resolved = live_mod._resolve_single_raw_pane(
+                        raw_pane,
+                        current_pane_id="%50",
+                        registry={},
+                        codex_tty_map={},
+                        codex_tty_pids={"ttys050": [5050]},
+                        claude_by_target={},
+                        claude_by_pane={},
+                        dsh_by_pane={},
+                        grok_tty_map={},
+                        pi_node_ttys=set(),
+                        environment={"HOME": str(self.home)},
+                        home=self.home,
+                        process_exists=lambda pid: pid == 5050,
+                    )
+            finally:
+                os.chdir(prev_cwd)
+            self.assertEqual(resolved.storage_root, str(target_profile.resolve()), stored_home)
+
 
 class PickerAndTmuxIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:

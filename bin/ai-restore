@@ -311,6 +311,7 @@ def _read_settings_session_dir(path: Path) -> str:
     return ""
 
 cli_session_dir = ""
+cli_session_file = ""
 if full_cmd.strip():
     try:
         tokens = shlex.split(full_cmd)
@@ -321,26 +322,34 @@ if full_cmd.strip():
             cli_session_dir = tokens[idx + 1]
         elif tok.startswith("--session-dir="):
             cli_session_dir = tok.split("=", 1)[1]
+        elif tok == "--session" and idx + 1 < len(tokens):
+            cli_session_file = tokens[idx + 1]
+        elif tok.startswith("--session="):
+            cli_session_file = tok.split("=", 1)[1]
 
 project_session_dir = _read_settings_session_dir(Path(resolved_cwd) / ".pi" / "settings.json")
 global_session_dir = _read_settings_session_dir(Path(agent_dir).expanduser() / "settings.json")
 
 # Priority order matching real Pi 1.5.2 SessionManager resolution:
+# 0. Explicit CLI --session <file> (if verified matching sid + cwd)
 # 1. CLI --session-dir, 2. PI_CODING_AGENT_SESSION_DIR, 3. project settings,
 # 4. global settings, 5. default encoded-cwd dir, 6. fallback sessions/ tree.
+default_root_resolved = _resolve_dir_for_cwd(default_root)
 raw_ordered = [
-    cli_session_dir,
-    explicit_dir,
-    project_session_dir,
-    global_session_dir,
-    str(default_native_dir_path),
-    default_root,
+    (cli_session_dir, False),
+    (explicit_dir, False),
+    (project_session_dir, False),
+    (global_session_dir, False),
+    (str(default_native_dir_path), False),
+    (default_root, True),
 ]
-roots: list[Path] = []
-for raw_root in raw_ordered:
+roots: list[tuple[Path, bool]] = []
+seen_roots: set[Path] = set()
+for raw_root, allow_deep in raw_ordered:
     rp = _resolve_dir_for_cwd(raw_root)
-    if rp is not None and rp.is_dir() and rp not in roots:
-        roots.append(rp)
+    if rp is not None and rp.is_dir() and rp not in seen_roots:
+        seen_roots.add(rp)
+        roots.append((rp, allow_deep))
 
 def _read_pi_header(path: Path) -> dict | None:
     try:
@@ -367,6 +376,15 @@ def _check(path: Path) -> str | None:
         return os.path.realpath(str(path))
     return None
 
+# Preserve an explicitly verified `--session <file>` from the pane's launch argv.
+if cli_session_file:
+    explicit_file = _resolve_dir_for_cwd(cli_session_file)
+    if explicit_file is not None and explicit_file.is_file():
+        matched_explicit = _check(explicit_file)
+        if matched_explicit is not None:
+            print(f"path\t{matched_explicit}")
+            raise SystemExit(0)
+
 def _native_dir_is_unambiguous(matched_path: str) -> bool:
     if cli_session_dir or explicit_dir or project_session_dir or global_session_dir:
         return False
@@ -387,37 +405,74 @@ def _native_dir_is_unambiguous(matched_path: str) -> bool:
         return False
     return same_id_count == 1
 
-# Search strictly root-by-root in Pi's priority order so a stale file in default
-# sessions never shadows an active file in project/global/env sessionDir.
-for root in roots:
-    seen: set[Path] = set()
-    fast_matches: list[Path] = []
-    for pat in (f"*_{sid}.jsonl", f"*_{sid}_*.jsonl"):
-        try:
-            for cand in root.rglob(pat):
-                if cand.is_file() and cand not in seen:
-                    seen.add(cand)
-                    fast_matches.append(cand)
-        except OSError:
-            continue
-    fast_matches.sort(key=lambda p: (p.stat().st_mtime if p.is_file() else 0.0, p.name), reverse=True)
-    for cand in fast_matches:
-        matched = _check(cand)
-        if matched is not None:
-            mode = "native" if _native_dir_is_unambiguous(matched) else "path"
-            print(f"{mode}\t{matched}")
-            raise SystemExit(0)
+def _search_flat_dir(directory: Path) -> str | None:
+    if not directory.is_dir():
+        return None
+    fast: list[Path] = []
+    other: list[Path] = []
     try:
-        other_jsonl = [c for c in root.rglob("*.jsonl") if c not in seen and c.is_file()]
+        for entry in directory.iterdir():
+            if not entry.name.endswith(".jsonl") or not entry.is_file():
+                continue
+            if f"_{sid}.jsonl" in entry.name or f"_{sid}_" in entry.name:
+                fast.append(entry)
+            else:
+                other.append(entry)
     except OSError:
-        other_jsonl = []
-    other_jsonl.sort(key=lambda p: (p.stat().st_mtime if p.is_file() else 0.0, p.name), reverse=True)
-    for cand in other_jsonl:
-        matched = _check(cand)
+        return None
+    for bucket in (fast, other):
+        bucket.sort(key=lambda p: (p.stat().st_mtime if p.is_file() else 0.0, p.name), reverse=True)
+        for cand in bucket:
+            matched = _check(cand)
+            if matched is not None:
+                return matched
+    return None
+
+# Search strictly root-by-root in Pi's priority order using native flat directory
+# layout (direct children first, then `<root>/<encoded-cwd>` direct children), so
+# nested `backup/` copies never shadow active files.
+for root, allow_deep in roots:
+    matched = _search_flat_dir(root)
+    if matched is not None:
+        mode = "native" if _native_dir_is_unambiguous(matched) else "path"
+        print(f"{mode}\t{matched}")
+        raise SystemExit(0)
+    encoded_sub = root / safe_dir
+    if encoded_sub != root and encoded_sub.is_dir():
+        matched = _search_flat_dir(encoded_sub)
         if matched is not None:
             mode = "native" if _native_dir_is_unambiguous(matched) else "path"
             print(f"{mode}\t{matched}")
             raise SystemExit(0)
+    if allow_deep:
+        seen: set[Path] = set()
+        fast_matches: list[Path] = []
+        for pat in (f"*_{sid}.jsonl", f"*_{sid}_*.jsonl"):
+            try:
+                for cand in root.rglob(pat):
+                    if cand.is_file() and cand not in seen:
+                        seen.add(cand)
+                        fast_matches.append(cand)
+            except OSError:
+                continue
+        fast_matches.sort(key=lambda p: (p.stat().st_mtime if p.is_file() else 0.0, p.name), reverse=True)
+        for cand in fast_matches:
+            matched = _check(cand)
+            if matched is not None:
+                mode = "native" if _native_dir_is_unambiguous(matched) else "path"
+                print(f"{mode}\t{matched}")
+                raise SystemExit(0)
+        try:
+            other_jsonl = [c for c in root.rglob("*.jsonl") if c not in seen and c.is_file()]
+        except OSError:
+            other_jsonl = []
+        other_jsonl.sort(key=lambda p: (p.stat().st_mtime if p.is_file() else 0.0, p.name), reverse=True)
+        for cand in other_jsonl:
+            matched = _check(cand)
+            if matched is not None:
+                mode = "native" if _native_dir_is_unambiguous(matched) else "path"
+                print(f"{mode}\t{matched}")
+                raise SystemExit(0)
 
 raise SystemExit(1)
 PY

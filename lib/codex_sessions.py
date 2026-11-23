@@ -260,8 +260,48 @@ def _extract_history_base(payload: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _sqlite_dbs_reference_rollout(ancestor: Path, path: Path, resolved: Path) -> bool:
+    """Return True if any `state_*.sqlite` directly under `ancestor` references `path`/`resolved`."""
+    dbs = find_state_dbs(ancestor)
+    if not dbs:
+        return False
+    target_key = path_identity_key(resolved)
+    fn_sid, _ = extract_filename_ids(resolved)
+    raw_strings = {str(resolved), str(path)}
+    for db_path in dbs:
+        try:
+            uri = f"{db_path.resolve().as_uri()}?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True, timeout=0.1)) as conn:
+                for raw_s in raw_strings:
+                    row = conn.execute(
+                        "SELECT 1 FROM threads WHERE rollout_path = ? LIMIT 1",
+                        (raw_s,),
+                    ).fetchone()
+                    if row is not None:
+                        return True
+                if fn_sid:
+                    row = conn.execute(
+                        "SELECT rollout_path FROM threads WHERE id = ? LIMIT 1",
+                        (fn_sid,),
+                    ).fetchone()
+                    if row and isinstance(row[0], str) and row[0].strip():
+                        if path_identity_key(Path(row[0].strip()).expanduser()) == target_key:
+                            return True
+        except (OSError, sqlite3.Error, ValueError):
+            continue
+    return False
+
+
 def infer_codex_home(path: Path) -> str:
-    """Infer the owning `CODEX_HOME` for a rollout path, including future layouts."""
+    """Infer the owning `CODEX_HOME` for a rollout path, including future layouts.
+
+    - Standard layouts under `<root>/sessions/...` or `<root>/archived_sessions/...`
+      immediately identify `<root>`.
+    - Non-standard layouts (e.g. `<root>/future_threads/...`) only identify an
+      ancestor if it is `.codex` itself OR contains a `state_*.sqlite` database
+      that explicitly references this rollout, so an unrelated sibling `sessions/`
+      directory in a parent project never falsely claims an orphan rollout.
+    """
     try:
         resolved = path.resolve()
     except OSError:
@@ -272,21 +312,13 @@ def infer_codex_home(path: Path) -> str:
     )
     if directory is not None:
         return str(directory.parent)
-    # Fallback for novel subdirectories (e.g. <custom_home>/future_threads/...):
-    # look up a few levels for state_*.sqlite (root or sqlite/), config.toml,
-    # sessions/, archived_sessions/, or a `.codex` root.
     for idx, ancestor in enumerate(resolved.parents):
         if idx > 5:
             break
         if ancestor.name == ".codex":
             return str(ancestor)
         try:
-            if (
-                (ancestor / "config.toml").is_file()
-                or (ancestor / "sessions").is_dir()
-                or (ancestor / "archived_sessions").is_dir()
-                or bool(find_state_dbs(ancestor))
-            ):
+            if _sqlite_dbs_reference_rollout(ancestor, path, resolved):
                 return str(ancestor)
         except OSError:
             continue
@@ -538,6 +570,7 @@ def read_rollout_meta_detailed(
         ts = payload.get("timestamp") or metadata.get("timestamp") or ""
         fn_sid, fn_rid = extract_filename_ids(path)
         rollout_id = fn_rid or sid
+        hb = _extract_history_base(payload)
         return (
             {
                 "sid": sid,
@@ -549,7 +582,8 @@ def read_rollout_meta_detailed(
                 "ordinal": ordinal,
                 "parent_id": extract_parent_session_id(payload),
                 "subagent_parent_id": extract_subagent_parent_id(payload),
-                "history_base": _extract_history_base(payload),
+                "history_base": hb,
+                "malformed_history_base": (payload.get("history_base") is not None and hb is None),
                 "history_mode": str(payload.get("history_mode") or ""),
                 "codex_home": infer_codex_home(path),
                 "rollout": str(path),
@@ -1056,10 +1090,32 @@ def resolve_committed_head_detailed(
     """
     if not sid:
         return None, False
-    rows, _ = query_sqlite_rollout_paths_detailed(sid, codex_home)
+    rows, db_errors = query_sqlite_rollout_paths_detailed(sid, codex_home)
+    dbs = find_state_dbs(codex_home)
+    db_rank = {str(p): i for i, p in enumerate(dbs)}
+    earliest_lock_rank: int | None = None
+    if db_errors:
+        for err_msg in db_errors:
+            low_err = err_msg.lower()
+            if "locked" not in low_err and "busy" not in low_err:
+                continue
+            matched_rank: int | None = None
+            for db_str, rank in db_rank.items():
+                if err_msg.startswith(db_str + ":") or err_msg == db_str:
+                    matched_rank = rank
+                    break
+            rank_val = matched_rank if matched_rank is not None else 0
+            if earliest_lock_rank is None or rank_val < earliest_lock_rank:
+                earliest_lock_rank = rank_val
+
     saw_sqlite_row = False
-    for _, sqlite_path in rows:
+    for row_db, sqlite_path in rows:
         saw_sqlite_row = True
+        row_rank = db_rank.get(str(row_db), 0)
+        if earliest_lock_rank is not None and row_rank > earliest_lock_rank:
+            # A higher-version DB was locked/busy; do not trust a lower-version DB
+            # row to override it.
+            return None, True
         resolved = resolve_alternate_rollout_path(
             sqlite_path, codex_home, rollout_index=rollout_index, expected_sid=sid
         )
@@ -1076,7 +1132,7 @@ def resolve_committed_head_detailed(
         # so a headerless or foreign-SID upper-DB row never masks a valid lower-DB head.
         if err is None and meta is not None and meta["sid"] == sid:
             return resolved, False
-    if saw_sqlite_row:
+    if saw_sqlite_row or db_errors:
         return None, True
     if sqlite_only:
         return None, False
@@ -1102,14 +1158,64 @@ def _add_rollout_index_candidate(rollout_index: dict[str, Any], rid: str, path: 
     if prev is None or (isinstance(prev, Path) and rollout_dedup_priority(path) < rollout_dedup_priority(prev)):
         rollout_index[rid] = path
     bucket_key = f"__rids__:{rid}"
+    keys_key = f"__rids_keys__:{rid}"
     bucket = rollout_index.get(bucket_key)
-    if not isinstance(bucket, list):
+    seen_keys = rollout_index.get(keys_key)
+    if not isinstance(bucket, list) or not isinstance(seen_keys, set):
         bucket = []
+        seen_keys = set()
         rollout_index[bucket_key] = bucket
+        rollout_index[keys_key] = seen_keys
     pkey = path_identity_key(path)
-    if not any(path_identity_key(existing) == pkey for existing in bucket):
+    if pkey not in seen_keys:
+        seen_keys.add(pkey)
         bucket.append(path)
-        bucket.sort(key=rollout_dedup_priority)
+        if len(bucket) > 1:
+            bucket.sort(key=rollout_dedup_priority)
+
+
+def _add_rollout_stem_candidate(rollout_index: dict[str, Any], stem: str, path: Path) -> None:
+    if not stem:
+        return
+    stem_key = f"__stem__:{stem}"
+    prev_stem = rollout_index.get(stem_key)
+    if prev_stem is None or (
+        isinstance(prev_stem, Path) and rollout_dedup_priority(path) < rollout_dedup_priority(prev_stem)
+    ):
+        rollout_index[stem_key] = path
+    bucket_key = f"__stems__:{stem}"
+    keys_key = f"__stems_keys__:{stem}"
+    bucket = rollout_index.get(bucket_key)
+    seen_keys = rollout_index.get(keys_key)
+    if not isinstance(bucket, list) or not isinstance(seen_keys, set):
+        bucket = []
+        seen_keys = set()
+        rollout_index[bucket_key] = bucket
+        rollout_index[keys_key] = seen_keys
+    pkey = path_identity_key(path)
+    if pkey not in seen_keys:
+        seen_keys.add(pkey)
+        bucket.append(path)
+        if len(bucket) > 1:
+            bucket.sort(key=rollout_dedup_priority)
+
+
+def _add_rollout_sid_candidate(rollout_index: dict[str, Any], sid: str, path: Path) -> None:
+    if not sid:
+        return
+    bucket_key = f"__sids__:{sid}"
+    keys_key = f"__sids_keys__:{sid}"
+    bucket = rollout_index.get(bucket_key)
+    seen_keys = rollout_index.get(keys_key)
+    if not isinstance(bucket, list) or not isinstance(seen_keys, set):
+        bucket = []
+        seen_keys = set()
+        rollout_index[bucket_key] = bucket
+        rollout_index[keys_key] = seen_keys
+    pkey = path_identity_key(path)
+    if pkey not in seen_keys:
+        seen_keys.add(pkey)
+        bucket.append(path)
 
 
 def _populate_rollout_index_once(
@@ -1121,15 +1227,12 @@ def _populate_rollout_index_once(
         return
     for path in iter_codex_rollout_files(codex_home):
         if is_canonical_rollout_name(path):
-            _, fn_rid = extract_filename_ids(path)
+            fn_sid, fn_rid = extract_filename_ids(path)
             if fn_rid:
                 _add_rollout_index_candidate(rollout_index, fn_rid, path)
-            stem_key = f"__stem__:{rollout_plain_stem(path)}"
-            prev_stem = rollout_index.get(stem_key)
-            if prev_stem is None or (
-                isinstance(prev_stem, Path) and rollout_dedup_priority(path) < rollout_dedup_priority(prev_stem)
-            ):
-                rollout_index[stem_key] = path
+            if fn_sid:
+                _add_rollout_sid_candidate(rollout_index, fn_sid, path)
+            _add_rollout_stem_candidate(rollout_index, rollout_plain_stem(path), path)
     rollout_index[sentinel] = codex_home
 
 
@@ -1222,10 +1325,14 @@ def resolve_alternate_rollout_path(
 
     # 1. If path is compressed (or points to compressed), check plain `.jsonl` counterparts FIRST.
     if path_is_comp:
-        target_sid = expected_sid
-        if not target_sid and path_exists:
-            orig_meta = read_rollout_meta(path, max_lines=1)
-            target_sid = orig_meta["sid"] if orig_meta else None
+        orig_meta = read_rollout_meta(path, max_lines=1) if path_exists else None
+        if path_exists and expected_sid:
+            # Never bypass an existing compressed SQLite target whose own header
+            # belongs to a different SID or fails verification: return the original
+            # path so the caller sees the conflict and falls back to lower DBs.
+            if orig_meta is None or orig_meta["sid"] != expected_sid:
+                return path
+        target_sid = expected_sid or (orig_meta["sid"] if orig_meta else None)
 
         def _plain_matches_existing(cand: Path) -> bool:
             if not cand.is_file() or is_compressed_rollout(cand):
@@ -1244,9 +1351,16 @@ def resolve_alternate_rollout_path(
             return plain_sibling
         if canonical and home is not None:
             if rollout_index is not None:
-                stem_cand = rollout_index.get(f"__stem__:{stem}")
-                if isinstance(stem_cand, Path) and _plain_matches_existing(stem_cand):
-                    return stem_cand
+                _populate_rollout_index_once(home, rollout_index)
+                stem_cands = rollout_index.get(f"__stems__:{stem}")
+                if isinstance(stem_cands, list):
+                    for sc in stem_cands:
+                        if _plain_matches_existing(sc):
+                            return sc
+                else:
+                    stem_cand = rollout_index.get(f"__stem__:{stem}")
+                    if isinstance(stem_cand, Path) and _plain_matches_existing(stem_cand):
+                        return stem_cand
                 if fn_rid:
                     for rid_cand in find_rollouts_by_rollout_id(fn_rid, home, rollout_index=rollout_index):
                         if _plain_matches_existing(rid_cand):
@@ -1259,33 +1373,59 @@ def resolve_alternate_rollout_path(
     if path_exists:
         return path
 
-    # 2. Path missing on disk: check compressed sibling in the EXACT same directory.
-    if not path_is_comp and path.name.lower().endswith(".jsonl"):
-        comp = path.with_name(path.name + ".zst")
-        if comp.is_file():
-            return comp
+    # 2. Path missing on disk: collect ordered candidates across same-dir compression
+    #    counterpart and (for canonical names) cross-dir mirrors, verifying `expected_sid`
+    #    on each so a foreign-SID same-dir twin never masks the genuine archived copy.
+    missing_cands: list[Path] = []
+    seen_cands: set[tuple[Path, int, int]] = set()
 
-    # 3. Cross-directory lookup ONLY for canonical filenames carrying a physical rollout_id.
+    def _push_cand(cand: Path | None) -> None:
+        if cand is None or not cand.is_file():
+            return
+        ck = path_identity_key(cand)
+        if ck not in seen_cands:
+            seen_cands.add(ck)
+            missing_cands.append(cand)
+
+    if not path_is_comp and path.name.lower().endswith(".jsonl"):
+        _push_cand(path.with_name(path.name + ".zst"))
+    elif path_is_comp:
+        _push_cand(path.with_name(stem + ".jsonl"))
+
     if canonical and home is not None:
         if rollout_index is not None:
             _populate_rollout_index_once(home, rollout_index)
-            stem_cand = rollout_index.get(f"__stem__:{stem}")
-            if stem_cand and stem_cand.is_file():
-                return stem_cand
+            stem_cands = rollout_index.get(f"__stems__:{stem}")
+            if isinstance(stem_cands, list):
+                for sc in stem_cands:
+                    _push_cand(sc)
+            else:
+                stem_cand = rollout_index.get(f"__stem__:{stem}")
+                if isinstance(stem_cand, Path):
+                    _push_cand(stem_cand)
             if fn_rid:
-                rid_cand = rollout_index.get(fn_rid)
-                if rid_cand and rid_cand.is_file():
-                    return rid_cand
+                for rc in find_rollouts_by_rollout_id(fn_rid, home, rollout_index=rollout_index):
+                    _push_cand(rc)
         else:
             if fn_rid:
-                found = find_rollout_by_rollout_id(fn_rid, home)
-                if found is not None and found.is_file():
-                    return found
+                for found in find_rollouts_by_rollout_id(fn_rid, home):
+                    _push_cand(found)
             for root in codex_session_roots(home, existing_only=True):
                 for suffix in CODEX_ROLLOUT_SUFFIXES:
-                    for cand in root.rglob(f"{stem}{suffix}"):
-                        if cand.is_file():
-                            return cand
+                    try:
+                        for cand in root.rglob(f"{stem}{suffix}"):
+                            _push_cand(cand)
+                    except OSError:
+                        continue
+
+    if not missing_cands:
+        return None
+    if not expected_sid:
+        return missing_cands[0]
+    for cand in missing_cands:
+        m_cand = read_rollout_meta(cand, max_lines=1)
+        if m_cand is not None and m_cand["sid"] == expected_sid:
+            return cand
     return None
 
 
@@ -1332,10 +1472,15 @@ def resolve_effective_lineage(
         return [], [], []
 
     local_rindex: dict[str, Any] = rollout_index if rollout_index is not None else {}
+    local_by_rid: dict[str, list[Path]] = {}
     for m, p in ordered_entries:
         rid = (m or {}).get("rollout_id") or extract_filename_ids(p)[1]
         if isinstance(rid, str) and rid:
             _add_rollout_index_candidate(local_rindex, rid, p)
+            local_by_rid.setdefault(rid, []).append(p)
+        msid = (m or {}).get("sid") or extract_filename_ids(p)[0]
+        if isinstance(msid, str) and msid:
+            _add_rollout_sid_candidate(local_rindex, msid, p)
 
     def _match_anchor(anchor: Path | None) -> tuple[dict[str, Any] | None, Path] | None:
         if anchor is None:
@@ -1376,104 +1521,192 @@ def resolve_effective_lineage(
 
     # Path A: Head participates in Codex's explicit `history_base` lineage chain
     if head_meta is not None and head_meta.get("history_base") is not None:
-        def _is_verified_ancestor_of(
-            target_sid: str,
-            target_rid: str,
-            target_eo: int | None,
-            target_eb: int | None,
-            logical_parent_sid: str,
-            visited_parents: set[str] | None = None,
-            depth: int = 0,
-        ) -> bool:
-            if not logical_parent_sid or depth > 16:
-                return False
-            seen_p = set(visited_parents or ())
-            if logical_parent_sid in seen_p:
-                return False
-            seen_p.add(logical_parent_sid)
+        def _min_bound(a: int | None, b: int | None) -> int | None:
+            if a is None:
+                return b
+            if b is None:
+                return a
+            return min(a, b)
 
-            p_head: Path | None = None
-            if codex_home is not None:
+        def _max_bound(a: int | None, b: int | None) -> int | None:
+            if a is None or b is None:
+                return None
+            return max(a, b)
+
+        parent_rollouts_cache: dict[str, list[tuple[Path, dict[str, Any]]]] = {}
+        sid_bounds_cache: dict[tuple[str, str, str], tuple[bool, int | None, int | None]] = {}
+        visiting_sid_bounds: set[tuple[str, str, str]] = set()
+        visiting_rollout_bounds: set[tuple[tuple[Path, int, int], str, str]] = set()
+
+        def _parent_rollouts(psid: str) -> list[tuple[Path, dict[str, Any]]]:
+            if psid in parent_rollouts_cache:
+                return parent_rollouts_cache[psid]
+            cands: list[Path] = []
+            seen_pk: set[tuple[Path, int, int]] = set()
+
+            def _add_p(cp: Path) -> None:
+                rp = resolve_alternate_rollout_path(cp, codex_home, rollout_index=local_rindex, expected_sid=psid) or cp
+                if not rp.is_file():
+                    return
+                pk = path_identity_key(rp)
+                if pk not in seen_pk:
+                    seen_pk.add(pk)
+                    cands.append(rp)
+
+            for bucket_key in (f"__sids__:{psid}", f"__rids__:{psid}"):
+                bucket = local_rindex.get(bucket_key)
+                if isinstance(bucket, list):
+                    for cp in bucket:
+                        _add_p(cp)
+            if codex_home is not None and f"__scanned__:{codex_home}" not in local_rindex:
+                _populate_rollout_index_once(codex_home, local_rindex)
+                for bucket_key in (f"__sids__:{psid}", f"__rids__:{psid}"):
+                    bucket = local_rindex.get(bucket_key)
+                    if isinstance(bucket, list):
+                        for cp in bucket:
+                            _add_p(cp)
+
+            verified: list[tuple[Path, dict[str, Any]]] = []
+            for cp in cands:
+                cm = _meta(cp)
+                if cm is not None and cm["sid"] == psid:
+                    verified.append((cp, cm))
+            if not verified and codex_home is not None:
                 p_head, _ = resolve_committed_head_detailed(
-                    logical_parent_sid,
+                    psid,
                     codex_home,
                     verify_header=True,
                     rollout_index=local_rindex,
                     meta_cache=cache,
                     sqlite_only=True,
                 )
-            if p_head is None:
-                for cand in find_rollouts_by_rollout_id(
-                    logical_parent_sid, codex_home, rollout_index=local_rindex
-                ):
-                    cm = _meta(cand)
-                    if cm is not None and cm["sid"] == logical_parent_sid:
-                        p_head = cand
-                        break
-            if p_head is None and codex_home is not None:
-                rlist = find_session_rollouts(logical_parent_sid, codex_home, verify_header=True)
-                if rlist:
-                    p_head = rlist[-1]
-            if p_head is None:
-                return False
+                if p_head is not None:
+                    cm = _meta(p_head)
+                    if cm is not None and cm["sid"] == psid:
+                        verified.append((p_head, cm))
+            parent_rollouts_cache[psid] = verified
+            return verified
 
-            p_meta = _meta(p_head)
-            if p_meta is None or p_meta["sid"] != logical_parent_sid:
-                return False
-
-            walk_seen: set[tuple[Path, int, int]] = set()
-            w_path: Path | None = p_head
-            w_meta: dict[str, Any] | None = p_meta
-            max_eo: int | None = None
-            max_eb: int | None = None
-            for _ in range(16):
-                if w_path is None or w_meta is None:
-                    break
-                wkey = path_identity_key(w_path)
-                if wkey in walk_seen:
-                    break
-                walk_seen.add(wkey)
-                w_hb = w_meta.get("history_base")
-                if not isinstance(w_hb, dict):
-                    break
-                w_rid = str(w_hb.get("rollout_id") or "")
-                hop_eo = w_hb.get("end_ordinal_exclusive")
-                hop_eb = w_hb.get("end_byte_offset")
-                eff_eo = hop_eo if max_eo is None else (min(max_eo, hop_eo) if hop_eo is not None else max_eo)
-                eff_eb = hop_eb if max_eb is None else (min(max_eb, hop_eb) if hop_eb is not None else max_eb)
-                w_cands = find_rollouts_by_rollout_id(w_rid, codex_home, rollout_index=local_rindex)
-                next_p: Path | None = None
-                next_m: dict[str, Any] | None = None
-                w_parent = w_meta.get("parent_id")
-                for wc in w_cands:
-                    wc_res = resolve_alternate_rollout_path(wc, codex_home, rollout_index=local_rindex) or wc
-                    wm = _meta(wc_res)
-                    if wm is None:
+        def _bounds_from_rollout(
+            p_path: Path,
+            p_meta: dict[str, Any],
+            target_sid: str,
+            target_rid: str,
+        ) -> tuple[bool, int | None, int | None]:
+            p_sid = str(p_meta.get("sid") or "")
+            p_rid = str(p_meta.get("rollout_id") or "")
+            if p_sid == target_sid and p_rid == target_rid:
+                return True, None, None
+            vkey = (path_identity_key(p_path), target_sid, target_rid)
+            if vkey in visiting_rollout_bounds:
+                return False, None, None
+            p_hb = p_meta.get("history_base")
+            if not isinstance(p_hb, dict):
+                return False, None, None
+            hb_rid = str(p_hb.get("rollout_id") or "")
+            if not hb_rid:
+                return False, None, None
+            hb_eo = p_hb.get("end_ordinal_exclusive")
+            hb_eb = p_hb.get("end_byte_offset")
+            visiting_rollout_bounds.add(vkey)
+            try:
+                best_ok = False
+                best_eo: int | None = None
+                best_eb: int | None = None
+                p_parent = p_meta.get("parent_id")
+                p_parent_str = p_parent if isinstance(p_parent, str) and p_parent and p_parent != p_sid else ""
+                hb_cands = find_rollouts_by_rollout_id(hb_rid, codex_home, rollout_index=local_rindex)
+                for hc in hb_cands:
+                    hc_res = resolve_alternate_rollout_path(hc, codex_home, rollout_index=local_rindex) or hc
+                    if not hc_res.is_file():
                         continue
-                    if wm["sid"] == target_sid and (w_rid == target_rid or wm.get("rollout_id") == target_rid):
-                        eo_ok = target_eo is None or eff_eo is None or target_eo <= eff_eo
-                        eb_ok = target_eb is None or eff_eb is None or target_eb <= eff_eb
-                        if eo_ok and eb_ok:
-                            return True
-                    if next_p is None and wm["sid"] in {w_meta["sid"], w_parent}:
-                        next_p, next_m = wc_res, wm
-                if next_p is None and len(w_cands) == 1:
-                    wc_res = resolve_alternate_rollout_path(w_cands[0], codex_home, rollout_index=local_rindex) or w_cands[0]
-                    next_p, next_m = wc_res, _meta(wc_res)
-                if next_m is not None and next_m["sid"] == target_sid:
-                    eo_ok = target_eo is None or eff_eo is None or target_eo <= eff_eo
-                    eb_ok = target_eb is None or eff_eb is None or target_eb <= eff_eb
-                    if eo_ok and eb_ok:
-                        return True
-                w_path, w_meta = next_p, next_m
-                max_eo, max_eb = eff_eo, eff_eb
+                    hm = _meta(hc_res)
+                    if hm is None:
+                        continue
+                    hm_sid = str(hm.get("sid") or "")
+                    hm_rid = str(hm.get("rollout_id") or "")
+                    if hm_sid == p_sid:
+                        if p_parent_str and p_rid == p_sid:
+                            continue
+                        sub_ok, sub_eo, sub_eb = _bounds_from_rollout(hc_res, hm, target_sid, target_rid)
+                        if not sub_ok:
+                            continue
+                        eff_eo = _min_bound(hb_eo, sub_eo)
+                        eff_eb = hb_eb if (hm_sid == target_sid and hm_rid == target_rid) else sub_eb
+                    else:
+                        if not p_parent_str:
+                            continue
+                        par_ok, par_eo, par_eb = _max_inherited_bounds(p_parent_str, hm_sid, hb_rid)
+                        if not par_ok:
+                            continue
+                        if hb_eo is not None and par_eo is not None and hb_eo > par_eo:
+                            continue
+                        if hb_eb is not None and par_eb is not None and hb_eb > par_eb:
+                            continue
+                        hop_eo = _min_bound(hb_eo, par_eo)
+                        hop_eb = _min_bound(hb_eb, par_eb)
+                        if hm_sid == target_sid and (hm_rid == target_rid or hb_rid == target_rid):
+                            eff_eo, eff_eb = hop_eo, hop_eb
+                        else:
+                            sub_ok, sub_eo, sub_eb = _bounds_from_rollout(hc_res, hm, target_sid, target_rid)
+                            if not sub_ok:
+                                continue
+                            eff_eo = _min_bound(hop_eo, sub_eo)
+                            eff_eb = sub_eb
+                    if not best_ok:
+                        best_ok, best_eo, best_eb = True, eff_eo, eff_eb
+                    else:
+                        best_eo = _max_bound(best_eo, eff_eo)
+                        best_eb = _max_bound(best_eb, eff_eb)
+                return best_ok, best_eo, best_eb
+            finally:
+                visiting_rollout_bounds.discard(vkey)
 
-            next_parent = p_meta.get("parent_id")
-            if isinstance(next_parent, str) and next_parent and next_parent != logical_parent_sid:
-                return _is_verified_ancestor_of(
-                    target_sid, target_rid, target_eo, target_eb, next_parent, seen_p, depth + 1
-                )
-            return False
+        def _max_inherited_bounds(
+            curr_sid: str,
+            target_sid: str,
+            target_rid: str,
+        ) -> tuple[bool, int | None, int | None]:
+            if not curr_sid or not target_sid or not target_rid:
+                return False, None, None
+            ckey = (curr_sid, target_sid, target_rid)
+            if ckey in sid_bounds_cache:
+                return sid_bounds_cache[ckey]
+            if ckey in visiting_sid_bounds:
+                return False, None, None
+            visiting_sid_bounds.add(ckey)
+            try:
+                best_ok = False
+                best_eo: int | None = None
+                best_eb: int | None = None
+                for p_path, p_meta in _parent_rollouts(curr_sid):
+                    ok, eo, eb = _bounds_from_rollout(p_path, p_meta, target_sid, target_rid)
+                    if not ok:
+                        continue
+                    if not best_ok:
+                        best_ok, best_eo, best_eb = True, eo, eb
+                    else:
+                        best_eo = _max_bound(best_eo, eo)
+                        best_eb = _max_bound(best_eb, eb)
+                result = (best_ok, best_eo, best_eb)
+                sid_bounds_cache[ckey] = result
+                return result
+            finally:
+                visiting_sid_bounds.discard(ckey)
+
+        def _is_verified_ancestor_of(
+            target_sid: str,
+            target_rid: str,
+            target_eo: int | None,
+            target_eb: int | None,
+            logical_parent_sid: str,
+        ) -> bool:
+            ok, max_eo, max_eb = _max_inherited_bounds(logical_parent_sid, target_sid, target_rid)
+            if not ok:
+                return False
+            eo_ok = target_eo is None or max_eo is None or target_eo <= max_eo
+            eb_ok = target_eb is None or max_eb is None or target_eb <= max_eb
+            return eo_ok and eb_ok
 
         chain: list[dict[str, Any]] = []
         seen_rids: set[str] = set()
@@ -1507,7 +1740,11 @@ def resolve_effective_lineage(
             )
             hb = cur_meta.get("history_base") if cur_meta else None
             if not hb:
-                if (
+                if cur_meta is not None and cur_meta.get("malformed_history_base"):
+                    warnings.append(
+                        f"invalid_history_base_bounds: segment {cur_path} declared malformed history_base"
+                    )
+                elif (
                     cur_meta is not None
                     and cur_meta.get("history_mode") == "paginated"
                     and isinstance(cur_meta.get("ordinal"), int)
@@ -1541,9 +1778,9 @@ def resolve_effective_lineage(
 
             base_rid = hb["rollout_id"]
             raw_cands = find_rollouts_by_rollout_id(base_rid, codex_home, rollout_index=local_rindex)
-            for em, ep in ordered_entries:
-                if (em or {}).get("rollout_id") == base_rid:
-                    raw_cands.append(ep)
+            local_extra = local_by_rid.get(base_rid)
+            if local_extra:
+                raw_cands = [*raw_cands, *local_extra]
             resolved_cands: list[tuple[Path, dict[str, Any] | None]] = []
             seen_cand_keys: set[tuple[Path, int, int]] = set()
             for cp in raw_cands:
@@ -1564,9 +1801,19 @@ def resolve_effective_lineage(
 
             declared_parent = cur_meta.get("parent_id") if cur_meta else None
             declared_parent_str = (
-                declared_parent if (isinstance(declared_parent, str) and declared_parent) else ""
+                declared_parent
+                if (isinstance(declared_parent, str) and declared_parent and declared_parent != seg_sid)
+                else ""
             )
-            same_sid_cands = [(p, m) for p, m in resolved_cands if m is not None and m["sid"] == seg_sid]
+            # An initial fork segment (`cur_rid == seg_sid` with a declared parent)
+            # always links to its parent/ancestor thread, NEVER to a same-SID rollback
+            # segment created later with a colliding RID.
+            is_initial_fork_seg = bool(declared_parent_str and cur_rid == seg_sid)
+            same_sid_cands = (
+                []
+                if is_initial_fork_seg
+                else [(p, m) for p, m in resolved_cands if m is not None and m["sid"] == seg_sid]
+            )
             direct_parent_cands = (
                 [(p, m) for p, m in resolved_cands if m is not None and m["sid"] == declared_parent_str]
                 if declared_parent_str
@@ -1575,7 +1822,7 @@ def resolve_effective_lineage(
             ancestor_cands: list[tuple[Path, dict[str, Any] | None]] = []
             if declared_parent_str and not same_sid_cands and not direct_parent_cands:
                 for p, m in resolved_cands:
-                    if m is not None and _is_verified_ancestor_of(
+                    if m is not None and m["sid"] != seg_sid and _is_verified_ancestor_of(
                         m["sid"],
                         base_rid,
                         hb_end_ord,
@@ -1616,6 +1863,16 @@ def resolve_effective_lineage(
                     break
                 chosen = resolved_cands[0]
             else:
+                foreign_hit = next(
+                    (item for item in resolved_cands if item[1] is not None and item[1]["sid"] != seg_sid),
+                    None,
+                )
+                if foreign_hit is not None:
+                    warnings.append(
+                        f"history_base_parent_sid_mismatch: segment {cur_path} (session {seg_sid}) "
+                        f"references base rollout {foreign_hit[0]} belonging to foreign session {foreign_hit[1]['sid']}"  # type: ignore[index]
+                    )
+                    break
                 if len(resolved_cands) == 1:
                     chosen = resolved_cands[0]
                 else:
@@ -1655,6 +1912,25 @@ def resolve_effective_lineage(
     else:
         active_entries = ordered_entries
         unlinked_paths = []
+
+    if active_entries:
+        for em, ep in active_entries:
+            if em is not None and em.get("malformed_history_base"):
+                warnings.append(
+                    f"invalid_history_base_bounds: segment {ep} declared malformed history_base"
+                )
+        root_m, root_p = active_entries[0]
+        if (
+            root_m is not None
+            and not root_m.get("malformed_history_base")
+            and root_m.get("history_mode") == "paginated"
+            and isinstance(root_m.get("ordinal"), int)
+            and root_m["ordinal"] > 0
+        ):
+            warnings.append(
+                f"paginated_root_ordinal_nonzero: paginated root segment {root_p} "
+                f"starts at ordinal {root_m['ordinal']} without history_base"
+            )
 
     first_ords = [
         m.get("ordinal") if (m and isinstance(m.get("ordinal"), int)) else None
@@ -1867,20 +2143,42 @@ def query_recent_sqlite_rollouts(
 
 
 def session_exists(sid: str, codex_home: Path) -> bool:
-    """Find a durable rollout via standard roots or verified `state_*.sqlite` across all DB versions."""
+    """Return True if current Codex can natively `codex resume <sid>`.
+
+    Native Codex 0.167+ queries only its highest-version `state_*.sqlite` database
+    (not older lower-version DBs) and standard `sessions/`/`archived_sessions/`
+    canonical rollouts. If the highest-version DB records a row for `sid`, that
+    row's target must resolve cleanly with matching `session_meta.payload.id`;
+    a valid pointer surviving only in a lower-version DB makes the session known
+    (`session_is_known`) but NOT natively resumable via `codex resume <sid>`.
+    """
     if not sid:
         return False
+    latest_db = _latest_state_db(codex_home)
+    if latest_db is not None:
+        try:
+            uri = f"{latest_db.resolve().as_uri()}?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True, timeout=0.15)) as conn:
+                row = conn.execute(
+                    "SELECT rollout_path FROM threads WHERE id = ? LIMIT 1",
+                    (sid,),
+                ).fetchone()
+            if row is not None:
+                raw_path = row[0]
+                if not isinstance(raw_path, str) or not raw_path.strip():
+                    return False
+                resolved = resolve_alternate_rollout_path(
+                    Path(raw_path.strip()).expanduser(), codex_home, expected_sid=sid
+                )
+                return bool(resolved is not None and rollout_matches_session(resolved, sid))
+        except (OSError, sqlite3.Error, ValueError):
+            pass
     for root in codex_session_roots(codex_home, existing_only=True):
         for suffix in CODEX_ROLLOUT_SUFFIXES:
             for pattern in (f"*-{sid}{suffix}", f"*-{sid}_*{suffix}"):
                 for path in root.rglob(pattern):
                     if rollout_matches_session(path, sid):
                         return True
-    rows, _ = query_sqlite_rollout_paths_detailed(sid, codex_home)
-    for _, sqlite_path in rows:
-        resolved = resolve_alternate_rollout_path(sqlite_path, codex_home, expected_sid=sid)
-        if resolved is not None and rollout_matches_session(resolved, sid):
-            return True
     return False
 
 

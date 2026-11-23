@@ -2082,6 +2082,111 @@ class AgentActivityTests(unittest.TestCase):
             self.assertEqual(st, "idle")
             self.assertEqual(reason, "codex_rollout_turn_completed")
 
+    def test_r6_p1_locked_sqlite_foreign_zst_plain_twin_and_relative_hook_root(self) -> None:
+        from contextlib import closing
+        import shutil
+        import sqlite3
+        import subprocess
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp).resolve()
+            home = root / "home"
+            codex_home = home / ".codex"
+            day = codex_home / "sessions/2026/11/23"
+            day.mkdir(parents=True, exist_ok=True)
+            sid = "71717171-7171-4717-8717-717171717171"
+            foreign_sid = "82828282-8282-4828-8828-828282828282"
+            rid2 = "93939393-9393-4939-8939-939393939393"
+
+            done_p = day / f"rollout-2026-11-23T00-00-01-{sid}.jsonl"
+            done_p.write_text(
+                json.dumps({"ordinal": 0, "type": "session_meta", "payload": {"id": sid, "cwd": str(home), "source": "cli"}}) + "\n"
+                + json.dumps({"ordinal": 1, "type": "event_msg", "payload": {"type": "task_started", "turn_id": "t-done"}}) + "\n"
+                + json.dumps({"ordinal": 2, "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t-done", "completed_at": 1_795_400_200_000}}) + "\n",
+                encoding="utf-8",
+            )
+            busy_q = day / f"rollout-2026-11-23T00-00-02-{sid}_{rid2}.jsonl"
+            busy_q.write_text(
+                json.dumps({"ordinal": 0, "type": "session_meta", "payload": {"id": sid, "cwd": str(home), "source": "cli"}}) + "\n"
+                + json.dumps({"ordinal": 1, "type": "event_msg", "payload": {"type": "task_started", "turn_id": "t-busy"}}) + "\n",
+                encoding="utf-8",
+            )
+            db8 = codex_home / "state_8.sqlite"
+            with closing(sqlite3.connect(db8)) as conn, conn:
+                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+                conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid, str(busy_q), 1_795_400_100))
+
+            mod_activity, _ = self.activity_for(
+                PaneActivity(pane_id="%9", current_command="codex", pane_tty="/dev/ttys099", socket_path="/private/tmp/tmux-test", server_pid="999", pane_pid="9999"),
+                environment={"HOME": str(home), "CODEX_HOME": str(codex_home)},
+            )
+
+            # 1. Exclusive SQLite lock must fail closed (`unknown`), never silently allow `idle`.
+            locker = sqlite3.connect(db8)
+            try:
+                locker.execute("BEGIN EXCLUSIVE")
+                st_lock, reason_lock, _ = mod_activity._resolve_codex(
+                    {"session_id": sid, "turn_id": "t-done", "transcript_path": str(done_p), "codex_home": str(codex_home)},
+                    1_795_400_000_000,
+                )
+                self.assertEqual(st_lock, "unknown")
+                self.assertEqual(reason_lock, "codex_sqlite_conflict")
+            finally:
+                locker.rollback()
+                locker.close()
+
+            # 2. Higher DB pointing to foreign-SID .jsonl.zst with completed same-SID plain twin
+            #    must NOT bypass compressed target verification; falls back to lower busy DB.
+            if shutil.which("zstd"):
+                foreign_zst = done_p.with_name(done_p.name + ".zst")
+                foreign_bytes = done_p.read_bytes().replace(sid.encode(), foreign_sid.encode())
+                foreign_zst.write_bytes(subprocess.check_output(["zstd", "-cq"], input=foreign_bytes))
+                db10 = codex_home / "state_10.sqlite"
+                with closing(sqlite3.connect(db10)) as conn, conn:
+                    conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+                    conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid, str(foreign_zst), 1_795_400_200))
+                st_twin, reason_twin, _ = mod_activity._resolve_codex(
+                    {"session_id": sid, "turn_id": "t-done", "transcript_path": str(done_p), "codex_home": str(codex_home)},
+                    1_795_400_000_000,
+                )
+                self.assertEqual(st_twin, "busy")
+                self.assertEqual(reason_twin, "codex_rollout_turn_in_progress")
+
+            # 3. Relative CODEX_HOME reported by a hook running in another cwd resolves via target process cwd / transcript.
+            ws = root / "workspace"
+            target_profile = ws / "profile"
+            target_log = target_profile / "sessions/2026/11/23" / f"rollout-2026-11-23T00-00-00-{sid}.jsonl"
+            target_log.parent.mkdir(parents=True, exist_ok=True)
+            target_log.write_text(done_p.read_text(encoding="utf-8"), encoding="utf-8")
+            pane_rel = PaneActivity(
+                pane_id="%12",
+                current_command="codex",
+                pane_tty="/dev/ttys012",
+                socket_path="/private/tmp/tmux-test",
+                server_pid="999",
+                pane_pid="42424",
+            )
+            act_rel, adapter_rel = self.activity_for(
+                pane_rel,
+                environment={"HOME": str(home), "CODEX_HOME": "profile"},
+            )
+            prev_cwd = os.getcwd()
+            os.chdir(root)
+            try:
+                with mock.patch("codex_sessions.process_cwd", return_value=str(ws)):
+                    rep = act_rel.report(
+                        pane_rel.pane_id,
+                        "busy",
+                        owner="codex",
+                        payload={"session_id": sid, "turn_id": "t-1", "transcript_path": str(target_log)},
+                    )
+            finally:
+                os.chdir(prev_cwd)
+            self.assertTrue(rep.accepted)
+            saved_rec = json.loads(adapter_rel.read(pane_rel.pane_id).record)
+            self.assertEqual(saved_rec["root"]["codex_home"], str(target_profile.resolve()))
+
 
 if __name__ == "__main__":
     unittest.main()

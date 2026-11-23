@@ -1996,16 +1996,45 @@ class AgentActivity:
         }
         if _is_codex_command(pane.current_command):
             transcript_path = payload.get("transcript_path")
-            codex_home = self.environment.get("CODEX_HOME") or str(
+            raw_codex_home = self.environment.get("CODEX_HOME") or str(
                 Path(self.environment.get("HOME", str(Path.home()))) / ".codex"
             )
+            resolved_codex_home = ""
+            raw_ch_path = Path(raw_codex_home).expanduser()
+            t_path = (
+                Path(transcript_path).expanduser()
+                if isinstance(transcript_path, str) and transcript_path.strip()
+                else None
+            )
+            if raw_ch_path.is_absolute():
+                resolved_codex_home = str(raw_ch_path)
+            else:
+                lib_dir = str(Path(__file__).resolve().parent)
+                if lib_dir not in sys.path:
+                    sys.path.insert(0, lib_dir)
+                import codex_sessions
+
+                if pane.pane_pid.isdigit():
+                    proc_cwd = codex_sessions.process_cwd(int(pane.pane_pid))
+                    if proc_cwd:
+                        cand = (Path(proc_cwd) / raw_ch_path).resolve()
+                        if t_path is None or not t_path.is_absolute() or _path_within(t_path, cand):
+                            resolved_codex_home = str(cand)
+                if not resolved_codex_home and t_path is not None and t_path.is_absolute():
+                    inferred = codex_sessions.infer_codex_home(t_path)
+                    if inferred:
+                        resolved_codex_home = inferred
+                if not resolved_codex_home:
+                    fallback_abs = raw_ch_path.absolute()
+                    if t_path is None or not t_path.is_absolute() or _path_within(t_path, fallback_abs):
+                        resolved_codex_home = str(fallback_abs)
             record["root"] = {
                 "session_id": session_id if isinstance(session_id, str) else "",
                 "turn_id": turn_id if isinstance(turn_id, str) else "",
                 "transcript_path": (
                     transcript_path if isinstance(transcript_path, str) else ""
                 ),
-                "codex_home": str(Path(codex_home).expanduser().absolute()),
+                "codex_home": resolved_codex_home,
             }
         elif is_kimi_command(pane.current_command):
             kimi_home = self.environment.get("KIMI_CODE_HOME") or str(

@@ -1443,7 +1443,9 @@ class SessionRestoreTests(unittest.TestCase):
             sid_a = "11111111-1111-7111-8111-111111111111"
             sid_b = "22222222-2222-7222-8222-222222222222"
 
-            # 1. Codex: lower DB valid opaque B + higher DB missing -> still resumes B
+            # 1. Codex: lower DB valid opaque B + higher DB missing -> native `codex resume`
+            #    only reads the highest DB and fails, so ai-restore keeps bound B as `invalid`
+            #    instead of claiming restorable=True or falling back to stale argv A.
             cwd1 = root / "codex-db"
             cwd1.mkdir()
             body_b = (
@@ -1472,7 +1474,8 @@ class SessionRestoreTests(unittest.TestCase):
             )
             self.assertEqual(res_db.returncode, 0, res_db.stderr)
             plan_db = json.loads(res_db.stdout.strip().splitlines()[-1])
-            self.assertEqual(plan_db["kind"], "resume")
+            self.assertEqual(plan_db["kind"], "invalid")
+            self.assertFalse(plan_db["restorable"])
             self.assertEqual(plan_db["sid"], sid_b)
 
             # 2. Codex: distinct-timestamp filename A with header B, AND impossible date 2026-13-42T99-99-99 -> invalid B
@@ -1625,6 +1628,63 @@ class SessionRestoreTests(unittest.TestCase):
                 self.assertIn(b"PROJECT_ACTIVE", out + more)
                 self.assertNotIn(b"GLOBAL_ACTIVE", out + more)
                 self.assertNotIn(b"STALE_DEFAULT", out + more)
+
+            # 4. Pi: nested newer backup/ inside active sessionDir must NOT shadow direct active file,
+            #    and an explicit verified `--session <file>` in launch argv is preserved verbatim.
+            proj_flat = root / "project-flat"
+            (proj_flat / ".pi").mkdir(parents=True, exist_ok=True)
+            (proj_flat / "relstore/backup").mkdir(parents=True, exist_ok=True)
+            (proj_flat / ".pi/settings.json").write_text(json.dumps({"sessionDir": "relstore"}), encoding="utf-8")
+
+            def seed_pi_for(folder: Path, target_cwd: Path, marker: str) -> Path:
+                p = folder / fname
+                p.write_text(
+                    json.dumps({"type": "session", "version": 3, "id": pi_sid, "cwd": str(target_cwd), "timestamp": "2026-11-23T09:01:27.117Z"}) + "\n"
+                    + json.dumps({"type": "message", "id": "aabbccdd", "parentId": None, "timestamp": "2026-11-23T09:02:27.117Z", "message": {"role": "user", "content": [{"type": "text", "text": marker}], "timestamp": 1795400000000}}) + "\n",
+                    encoding="utf-8",
+                )
+                return p
+
+            direct_flat = seed_pi_for(proj_flat / "relstore", proj_flat, "DIRECT_FLAT")
+            backup_file = seed_pi_for(proj_flat / "relstore/backup", proj_flat, "NESTED_BACKUP")
+            future_t = time.time() + 60.0
+            os.utime(backup_file, (future_t, future_t))
+            p_flat = self.run_restore(
+                proj_flat,
+                coord={"tool": "p", "sid": pi_sid},
+                title="pi",
+                saved_codex_ids=set(),
+                full_command="pi",
+                current_command="pi",
+                plan_json=True,
+                extra_env=pi_env,
+            )
+            self.assertEqual(p_flat.returncode, 0, p_flat.stderr)
+            plan_flat = json.loads(p_flat.stdout.strip().splitlines()[-1])
+            self.assertIn(str(direct_flat.resolve()), plan_flat["command"])
+            self.assertNotIn("backup", plan_flat["command"])
+
+            proj_exp = root / "project-exp"
+            (proj_exp / ".pi").mkdir(parents=True, exist_ok=True)
+            (proj_exp / "relstore").mkdir(parents=True, exist_ok=True)
+            (proj_exp / ".pi/settings.json").write_text(json.dumps({"sessionDir": "relstore"}), encoding="utf-8")
+            seed_pi_for(proj_exp / "relstore", proj_exp, "OTHER_PROJECT_FILE")
+            external_dir = root / "external-pi"
+            external_dir.mkdir(parents=True, exist_ok=True)
+            external_file = seed_pi_for(external_dir, proj_exp, "EXPLICIT_FILE")
+            p_exp = self.run_restore(
+                proj_exp,
+                coord={"tool": "p", "sid": pi_sid},
+                title="pi",
+                saved_codex_ids=set(),
+                full_command=f"pi --session {external_file}",
+                current_command="pi",
+                plan_json=True,
+                extra_env=pi_env,
+            )
+            self.assertEqual(p_exp.returncode, 0, p_exp.stderr)
+            plan_exp = json.loads(p_exp.stdout.strip().splitlines()[-1])
+            self.assertIn(str(external_file.resolve()), plan_exp["command"])
 
 
 if __name__ == "__main__":
