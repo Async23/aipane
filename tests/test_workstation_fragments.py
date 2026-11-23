@@ -5,6 +5,7 @@ Drives the shipped conf files under conf/ (not re-implemented copies).
 
 from __future__ import annotations
 
+import json
 import os
 import pty
 import re
@@ -985,6 +986,30 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                     r".*tmux-rename-window-popup"
                 ),
             )
+            root_keys = subprocess.run(
+                ["tmux", "-L", socket, "list-keys", "-T", "root"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            for key_name, cmd_pattern in (
+                (r"M-<", r"swap-window -d -t :-1"),
+                (r"M->", r"swap-window -d -t :\+1"),
+                (r"M-S-<", r"swap-window -d -t :-1"),
+                (r"M-S->", r"swap-window -d -t :\+1"),
+                (r"M-H", r"resize-pane -L 2"),
+                (r"M-J", r"resize-pane -D 2"),
+                (r"M-K", r"resize-pane -U 2"),
+                (r"M-L", r"resize-pane -R 2"),
+                (r"M-S-H", r"resize-pane -L 2"),
+                (r"M-S-J", r"resize-pane -D 2"),
+                (r"M-S-K", r"resize-pane -U 2"),
+                (r"M-S-L", r"resize-pane -R 2"),
+            ):
+                self.assertRegex(
+                    root_keys,
+                    re.compile(rf"root\s+{key_name}\s+{cmd_pattern}"),
+                )
             fmt0 = subprocess.run(
                 [
                     "tmux",
@@ -1279,14 +1304,32 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                     break
                 time.sleep(0.02)
 
-            # 2 panes: toggle cleanly between even-horizontal ({...}) and tiled ([...]).
+            def layout_kind(layout: str) -> str:
+                if layout.startswith("{"):
+                    root = json.loads(layout)["L"]
+                    if root["t"] == "v":
+                        return "tiled"
+                    if root["t"] == "h":
+                        children = root.get("c", [])
+                        if any(child.get("t") == "v" for child in children):
+                            return "main-vertical"
+                        return "even-horizontal"
+                    return f"unknown:{layout}"
+                if re.match(r"^[0-9a-f]+,\d+x\d+,0,0\[", layout):
+                    return "tiled"
+                if re.match(r"^[0-9a-f]+,\d+x\d+,0,0\{.*\[", layout):
+                    return "main-vertical"
+                if re.match(r"^[0-9a-f]+,\d+x\d+,0,0\{", layout):
+                    return "even-horizontal"
+                return f"unknown:{layout}"
+
+            # 2 panes: toggle cleanly between even-horizontal and tiled.
             tmux("split-window", "-t", "layout:0", "sleep 60")
             tmux("select-layout", "-t", "layout:0", "even-horizontal")
             start_2 = tmux("display-message", "-p", "-t", "layout:0", "#{window_layout}")
-            self.assertIn("{", start_2)
+            self.assertEqual(layout_kind(start_2), "even-horizontal")
             step1_2 = press_prefix_space(start_2)
-            self.assertIn("[", step1_2)
-            self.assertNotIn("{", step1_2)
+            self.assertEqual(layout_kind(step1_2), "tiled")
             step2_2 = press_prefix_space(step1_2)
             self.assertEqual(step2_2, start_2)
 
@@ -1296,12 +1339,103 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                     tmux("split-window", "-t", "layout:0", "sleep 60")
                 tmux("select-layout", "-t", "layout:0", "even-horizontal")
                 even_h = tmux("display-message", "-p", "-t", "layout:0", "#{window_layout}")
+                self.assertEqual(layout_kind(even_h), "even-horizontal")
                 main_v = press_prefix_space(even_h)
-                self.assertRegex(main_v, r"^[0-9a-f]+,\d+x\d+,0,0\{.*\[")
+                self.assertEqual(layout_kind(main_v), "main-vertical")
                 tiled = press_prefix_space(main_v)
-                self.assertRegex(tiled, r"^[0-9a-f]+,\d+x\d+,0,0\[")
+                self.assertEqual(layout_kind(tiled), "tiled")
                 back_even_h = press_prefix_space(tiled)
                 self.assertEqual(back_even_h, even_h)
+        finally:
+            if master_fd is not None:
+                os.close(master_fd)
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGHUP)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(child_pid, 0)
+            tmux("kill-server", check=False)
+
+    def test_root_meta_shift_bindings_handle_extended_keys(self):
+        socket = f"ws-extkeys-{os.getpid()}-{id(self)}"
+        child_pid = None
+        master_fd = None
+        environment = os.environ.copy()
+        environment.pop("TMUX", None)
+        environment.pop("TMUX_PANE", None)
+        environment["TERM"] = "xterm-256color"
+
+        def tmux(*args: str, check: bool = True):
+            return subprocess.run(
+                ["tmux", "-L", socket, *args],
+                check=check,
+                capture_output=True,
+                text=True,
+                env=environment,
+            ).stdout.strip()
+
+        def drain() -> None:
+            while True:
+                try:
+                    if not os.read(master_fd, 65536):
+                        break
+                except BlockingIOError:
+                    break
+
+        def wait_for(reader, expected) -> object:
+            last = None
+            for _ in range(50):
+                drain()
+                last = reader()
+                if last == expected:
+                    return last
+                time.sleep(0.02)
+            return last
+
+        try:
+            tmux(
+                "-f", "/dev/null", "new-session", "-d", "-s", "ext",
+                "-n", "alpha", "-x", "120", "-y", "30", "sleep 60",
+            )
+            tmux("source-file", str(TMUX_WS))
+            tmux("new-window", "-t", "ext:", "-n", "beta", "sleep 60")
+            tmux("split-window", "-h", "-t", "ext:beta", "sleep 60")
+
+            child_pid, master_fd = pty.fork()
+            if child_pid == 0:
+                termios.tcsetwinsize(0, (30, 120))
+                os.execvpe(
+                    "tmux",
+                    ["tmux", "-L", socket, "attach-session", "-t", "ext"],
+                    environment,
+                )
+            os.set_blocking(master_fd, False)
+            for _ in range(50):
+                if tmux("list-clients"):
+                    break
+                time.sleep(0.02)
+
+            def window_order() -> list[str]:
+                return tmux("list-windows", "-t", "ext", "-F", "#{window_index}:#{window_name}").splitlines()
+
+            self.assertEqual(window_order(), ["0:alpha", "1:beta"])
+
+            # Ghostty under tmux 3.8 extkeys sends Alt+Shift+,/. as CSI 27;4;60~ / 62~.
+            os.write(master_fd, b"\x1b[27;4;60~")
+            self.assertEqual(wait_for(window_order, ["0:beta", "1:alpha"]), ["0:beta", "1:alpha"])
+            os.write(master_fd, b"\x1b[27;4;62~")
+            self.assertEqual(wait_for(window_order, ["0:alpha", "1:beta"]), ["0:alpha", "1:beta"])
+
+            # Ghostty under tmux 3.8 extkeys sends Alt+Shift+H/L as CSI 27;4;72~ / 76~.
+            def active_width() -> int:
+                return int(tmux("display-message", "-p", "-t", "ext:beta", "#{pane_width}"))
+
+            initial_width = active_width()
+            os.write(master_fd, b"\x1b[27;4;72~")
+            self.assertEqual(wait_for(active_width, initial_width + 2), initial_width + 2)
+            os.write(master_fd, b"\x1b[27;4;76~")
+            self.assertEqual(wait_for(active_width, initial_width), initial_width)
         finally:
             if master_fd is not None:
                 os.close(master_fd)

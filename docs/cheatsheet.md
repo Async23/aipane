@@ -49,7 +49,7 @@ also send complete prefix+key chords.
 | `prefix 0` / `Cmd+0` | select 0 if present, otherwise 10; repeat within 700ms to add 10 |
 | `prefix p` / `n` | prev / next window |
 | `prefix ,` / `Cmd+I` | centered popup rename current window |
-| `Option+,` / `Option+.` (`M-</>`) | reorder window left / right |
+| `Option+Shift+,` / `Option+Shift+.` (`M-</>`) | reorder window left / right |
 | `prefix w` | window list (tmux default) |
 
 Window numbering starts at 1. The `Cmd` bindings use the main number row.
