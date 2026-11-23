@@ -1311,10 +1311,22 @@ class AgentActivity:
                 # The record is safety truth; compatibility/display fields are
                 # projected only after this write succeeds.
                 changes.append((ACTIVITY_RECORD_OPTION, decision.record))
+            preserve_updated_at = (
+                decision.state == "busy"
+                and decision.record == pane.record
+                and pane.marker == desired_marker
+                and bool(pane.marker_updated_at)
+            )
             changes.append(
                 (
                     ACTIVITY_UPDATED_AT_OPTION,
-                    str(timestamp) if decision.state == "busy" else None,
+                    (
+                        pane.marker_updated_at
+                        if preserve_updated_at
+                        else str(timestamp)
+                    )
+                    if decision.state == "busy"
+                    else None,
                 )
             )
             changes.append((ACTIVITY_REPORTER_OPTION, pane.current_command))
@@ -1735,6 +1747,30 @@ class AgentActivity:
             and _is_codex_command(owner)
         )
 
+    def _record_matches_pane(
+        self,
+        record: Mapping[str, object],
+        pane: PaneActivity,
+        state: str,
+    ) -> bool:
+        revision = record.get("revision")
+        pane_identity = record.get("pane")
+        process = record.get("process")
+        return (
+            record.get("version") == 1
+            and isinstance(revision, str)
+            and bool(revision)
+            and record.get("owner") == pane.current_command
+            and record.get("reported") == state
+            and isinstance(pane_identity, dict)
+            and pane_identity.get("id") == pane.pane_id
+            and pane_identity.get("tty", "") == pane.pane_tty
+            and pane_identity.get("socket", "") == pane.socket_path
+            and str(pane_identity.get("server_pid", "")) == pane.server_pid
+            and isinstance(process, dict)
+            and self._same_process(process, pane)
+        )
+
     def _prepare_report(
         self,
         pane: PaneActivity,
@@ -1919,6 +1955,27 @@ class AgentActivity:
                 record=json.dumps(completed, separators=(",", ":")),
                 accepted=True,
                 wake=True,
+            )
+
+        if (
+            existing is not None
+            and (
+                event_name == "StatusLine"
+                or (
+                    pane.current_command == "agy"
+                    and event_name == "PreToolUse"
+                )
+            )
+            and self._record_matches_pane(existing, pane, state)
+        ):
+            # In tmux, writing any @user-option forces a full client redraw and
+            # aborts active Mode 2026 synchronized updates. Keep unchanged
+            # StatusLine polls and agy PreToolUse callbacks completely read-only.
+            return ActivityReport(
+                state=state,
+                record=pane.record,
+                accepted=True,
+                wake=False,
             )
 
         record: dict[str, object] = {

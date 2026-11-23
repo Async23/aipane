@@ -1597,6 +1597,198 @@ class AgentActivityTests(unittest.TestCase):
         self.assertEqual(after["root"], before["root"])
         self.assertEqual(after["generation"], before["generation"])
 
+    def test_repeated_agy_status_line_and_pre_tool_use_skip_tmux_option_writes(self):
+        process = {"pid": 7711, "started_at": "Mon Nov 23 09:53:36 2026"}
+        runtime_state = "busy"
+        pane = PaneActivity(
+            pane_id="%6",
+            current_command="agy",
+            pane_tty="/dev/ttys016",
+            socket_path="/private/tmp/tmux/default",
+            server_pid="37160",
+        )
+        process_alive = True
+        activity, adapter = self.activity_for(
+            pane,
+            process_identity=lambda _pane: process,
+            process_matches=lambda recorded, _pane: process_alive and recorded == process,
+        )
+
+        with mock.patch(
+            "agy_sessions.current_session",
+            side_effect=lambda **_kw: {"state": runtime_state},
+        ):
+            first_busy = activity.report(
+                pane.pane_id,
+                "busy",
+                {"session_id": "sid-1"},
+                owner="agy",
+                hook_event_name="StatusLine",
+                now_ms=10_000,
+            )
+            self.assertTrue(first_busy.accepted)
+            self.assertTrue(first_busy.changed)
+            self.assertEqual(adapter.wake_count, 1)
+            busy_snapshot = adapter.read(pane.pane_id)
+            self.assertEqual(busy_snapshot.marker, "agy")
+            self.assertEqual(busy_snapshot.marker_updated_at, "10000")
+
+            adapter.writes.clear()
+            repeated_busy = activity.report(
+                pane.pane_id,
+                "busy",
+                {"session_id": "sid-1"},
+                owner="agy",
+                hook_event_name="StatusLine",
+                now_ms=10_500,
+            )
+            self.assertTrue(repeated_busy.accepted)
+            self.assertFalse(repeated_busy.changed)
+            self.assertEqual(adapter.writes, [])
+            self.assertEqual(adapter.wake_count, 1)
+            self.assertEqual(adapter.read(pane.pane_id), busy_snapshot)
+
+            pre_tool = activity.report(
+                pane.pane_id,
+                "busy",
+                {"session_id": "sid-1"},
+                owner="agy",
+                hook_event_name="PreToolUse",
+                now_ms=10_700,
+            )
+            self.assertTrue(pre_tool.accepted)
+            self.assertFalse(pre_tool.changed)
+            self.assertEqual(adapter.writes, [])
+            self.assertEqual(adapter.wake_count, 1)
+
+            # PreInvocation must still refresh and wake on an already-busy pane.
+            pre_inv = activity.report(
+                pane.pane_id,
+                "busy",
+                {"session_id": "sid-1"},
+                owner="agy",
+                hook_event_name="PreInvocation",
+                now_ms=10_900,
+            )
+            self.assertTrue(pre_inv.accepted)
+            self.assertTrue(pre_inv.changed)
+            self.assertTrue(adapter.writes)
+            self.assertEqual(adapter.wake_count, 2)
+
+            # Transition busy -> idle via StatusLine must still write and wake.
+            runtime_state = "idle"
+            adapter.writes.clear()
+            to_idle = activity.report(
+                pane.pane_id,
+                "idle",
+                {"session_id": "sid-1"},
+                owner="agy",
+                hook_event_name="StatusLine",
+                now_ms=11_000,
+            )
+            self.assertTrue(to_idle.accepted)
+            self.assertTrue(to_idle.changed)
+            self.assertEqual(adapter.wake_count, 3)
+            idle_snapshot = adapter.read(pane.pane_id)
+            self.assertEqual(idle_snapshot.marker, "")
+            self.assertEqual(idle_snapshot.marker_updated_at, "")
+
+            # Repeated idle StatusLine polls must perform zero option writes.
+            adapter.writes.clear()
+            repeated_idle = activity.report(
+                pane.pane_id,
+                "idle",
+                {"session_id": "sid-1"},
+                owner="agy",
+                hook_event_name="StatusLine",
+                now_ms=11_500,
+            )
+            self.assertTrue(repeated_idle.accepted)
+            self.assertFalse(repeated_idle.changed)
+            self.assertEqual(adapter.writes, [])
+            self.assertEqual(adapter.wake_count, 3)
+            self.assertEqual(adapter.read(pane.pane_id), idle_snapshot)
+
+            # If the agy process restarted in the same pane, StatusLine must refresh.
+            process = {"pid": 8822, "started_at": "Mon Nov 23 10:00:00 2026"}
+            adapter.writes.clear()
+            restarted = activity.report(
+                pane.pane_id,
+                "idle",
+                {"session_id": "sid-1"},
+                owner="agy",
+                hook_event_name="StatusLine",
+                now_ms=12_000,
+            )
+            self.assertTrue(restarted.accepted)
+            self.assertTrue(restarted.changed)
+            self.assertTrue(adapter.writes)
+            self.assertEqual(
+                json.loads(adapter.read(pane.pane_id).record)["process"],
+                process,
+            )
+
+    def test_codex_same_turn_and_subagent_pre_tool_use_skip_option_writes(self):
+        process = {"pid": 6322, "started_at": "process-1"}
+        pane = PaneActivity(
+            pane_id="%12",
+            current_command="codex",
+            pane_tty="/dev/ttys031",
+            socket_path="/private/tmp/tmux/default",
+            server_pid="30402",
+        )
+        activity, adapter = self.activity_for(
+            pane,
+            environment={"CODEX_HOME": "/tmp/codex"},
+            process_identity=lambda _pane: process,
+        )
+        activity.report(
+            pane.pane_id,
+            "busy",
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "thread-root",
+                "turn_id": "turn-root",
+                "transcript_path": "/tmp/codex/sessions/root.jsonl",
+            },
+            now_ms=2_000,
+        )
+        snapshot = adapter.read(pane.pane_id)
+        wake_count = adapter.wake_count
+        adapter.writes.clear()
+
+        same_turn = activity.report(
+            pane.pane_id,
+            "busy",
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "thread-root",
+                "turn_id": "turn-root",
+                "transcript_path": "/tmp/codex/sessions/root.jsonl",
+            },
+            now_ms=2_100,
+        )
+        subagent = activity.report(
+            pane.pane_id,
+            "busy",
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "thread-child",
+                "turn_id": "turn-child",
+                "transcript_path": "/tmp/codex/sessions/child.jsonl",
+                "agent_id": "researcher",
+            },
+            now_ms=2_200,
+        )
+
+        self.assertTrue(same_turn.accepted)
+        self.assertFalse(same_turn.changed)
+        self.assertTrue(subagent.accepted)
+        self.assertFalse(subagent.changed)
+        self.assertEqual(adapter.writes, [])
+        self.assertEqual(adapter.wake_count, wake_count)
+        self.assertEqual(adapter.read(pane.pane_id), snapshot)
+
 
 if __name__ == "__main__":
     unittest.main()
