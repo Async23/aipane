@@ -2343,15 +2343,21 @@ def _codex_rollout_candidates(
     rollout_path: str = "",
 ) -> list[Path]:
     candidates: list[Path] = []
-    if rollout_path:
-        candidates.append(Path(rollout_path))
-    if thread_id:
-        codex_home = _codex_home(environment)
-        lib_dir = str(Path(__file__).resolve().parent)
-        if lib_dir not in sys.path:
-            sys.path.insert(0, lib_dir)
-        import codex_sessions
+    codex_home = _codex_home(environment)
+    lib_dir = str(Path(__file__).resolve().parent)
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    import codex_sessions
 
+    if rollout_path:
+        raw_p = Path(rollout_path).expanduser()
+        resolved = codex_sessions.resolve_alternate_rollout_path(raw_p, codex_home)
+        if resolved is not None:
+            meta = codex_sessions.read_rollout_meta(resolved, max_lines=1)
+            # Reject a SQLite rollout_path that explicitly declares a different SID.
+            if not thread_id or meta is None or meta.get("sid") == thread_id:
+                candidates.append(resolved)
+    if thread_id:
         # Prefer newest rollout segments first so recent turns are found immediately.
         candidates.extend(
             reversed(
@@ -2398,31 +2404,12 @@ def _codex_query_goal(
 
 
 def _iter_jsonl_reverse(path: Path, chunk_size: int = 64 * 1024):
-    try:
-        with path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            position = handle.tell()
-            pending = b""
-            while position > 0:
-                size = min(chunk_size, position)
-                position -= size
-                handle.seek(position)
-                lines = (handle.read(size) + pending).split(b"\n")
-                pending = lines[0]
-                for raw_line in reversed(lines[1:]):
-                    if not raw_line.strip():
-                        continue
-                    try:
-                        yield json.loads(raw_line.decode("utf-8"))
-                    except (UnicodeDecodeError, json.JSONDecodeError):
-                        continue
-            if pending.strip():
-                try:
-                    yield json.loads(pending.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    pass
-    except OSError:
-        return
+    lib_dir = str(Path(__file__).resolve().parent)
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    import codex_sessions
+
+    yield from codex_sessions.iter_rollout_records_reverse(path, chunk_size=chunk_size)
 
 
 def _codex_response_item_text(payload: Mapping[str, object]) -> str:
@@ -2488,6 +2475,11 @@ def _codex_rollout_thread_metadata(
     environment: Mapping[str, str],
     rollout_path: str = "",
 ) -> dict[str, object]:
+    lib_dir = str(Path(__file__).resolve().parent)
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    import codex_sessions
+
     seen: set[Path] = set()
     for candidate in _codex_rollout_candidates(
         thread_id,
@@ -2502,21 +2494,23 @@ def _codex_rollout_thread_metadata(
             continue
         seen.add(resolved)
         try:
-            with resolved.open("r", encoding="utf-8") as handle:
-                for _ in range(12):
-                    line = handle.readline()
-                    if not line:
-                        break
-                    record = json.loads(line)
-                    if record.get("type") != "session_meta":
-                        continue
-                    payload = record.get("payload") or {}
-                    if not isinstance(payload, dict):
-                        break
-                    metadata = dict(payload)
-                    metadata["rollout_path"] = str(resolved)
-                    return _codex_normalize_thread_metadata(metadata)
-        except (OSError, json.JSONDecodeError):
+            for idx, line in enumerate(codex_sessions.iter_rollout_lines(resolved)):
+                if idx >= 12:
+                    break
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if not isinstance(record, dict) or record.get("type") != "session_meta":
+                    continue
+                payload = record.get("payload") or {}
+                if not isinstance(payload, dict):
+                    break
+                if thread_id and payload.get("id") and payload.get("id") != thread_id:
+                    break
+                metadata = dict(payload)
+                metadata["rollout_path"] = str(resolved)
+                return _codex_normalize_thread_metadata(metadata)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
     return {}
 

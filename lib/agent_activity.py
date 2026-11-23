@@ -1105,6 +1105,12 @@ def codex_thread_identity(
     while current and current not in seen:
         seen.add(current)
         matches = codex_sessions.find_session_rollouts(current, root, verify_header=True)
+        if not matches:
+            sqlite_path = codex_sessions.query_sqlite_rollout_path(current, root)
+            if sqlite_path is not None:
+                resolved = codex_sessions.resolve_alternate_rollout_path(sqlite_path, root)
+                if resolved is not None:
+                    matches = [resolved]
         meta = None
         for path in reversed(matches):
             candidate = codex_sessions.read_rollout_meta(path, max_lines=1)
@@ -2305,10 +2311,21 @@ class AgentActivity:
             or Path(self.environment.get("HOME", str(Path.home()))) / ".codex"
         ).expanduser()
         session_id = str(binding["sid"])
-        transcripts = list(
-            codex_home.glob(f"sessions/*/*/*/*-{session_id}.jsonl")
+        lib_dir = str(Path(__file__).resolve().parent)
+        if lib_dir not in sys.path:
+            sys.path.insert(0, lib_dir)
+        import codex_sessions
+
+        transcripts = codex_sessions.find_session_rollouts(
+            session_id, codex_home, verify_header=False
         )
-        if len(transcripts) != 1:
+        if not transcripts:
+            sqlite_path = codex_sessions.query_sqlite_rollout_path(session_id, codex_home)
+            if sqlite_path is not None:
+                resolved = codex_sessions.resolve_alternate_rollout_path(sqlite_path, codex_home)
+                if resolved is not None and codex_sessions.rollout_matches_session(resolved, session_id):
+                    transcripts = [resolved]
+        if not transcripts:
             return ActivityView(
                 state="unknown",
                 reported=True,
@@ -2317,7 +2334,7 @@ class AgentActivity:
         root = {
             "session_id": session_id,
             "turn_id": "",
-            "transcript_path": str(transcripts[0]),
+            "transcript_path": str(transcripts[-1]),
             "codex_home": str(codex_home),
         }
         state, reason, evidence_turn_id = self._resolve_codex(root, marker_at)

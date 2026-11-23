@@ -1850,6 +1850,17 @@ class AgentActivityTests(unittest.TestCase):
                 )
                 self.assertEqual(codex_thread_identity(codex_home, zst_sid), CodexThreadIdentity(root_sid, "subagent"))
 
+            # SQLite-only rollout in future_threads/ is also resolved by codex_thread_identity
+            from contextlib import closing
+            sqlite_sid = "66666666-6666-7666-8666-666666666666"
+            future_p = codex_home / "future_threads" / f"rollout-2026-11-23T10-07-00-{sqlite_sid}.jsonl"
+            future_p.parent.mkdir(parents=True, exist_ok=True)
+            future_p.write_text(json.dumps({"type": "session_meta", "payload": {"id": sqlite_sid, "source": "cli"}}) + "\n", encoding="utf-8")
+            with closing(sqlite3.connect(codex_home / "state_5.sqlite")) as conn, conn:
+                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+                conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sqlite_sid, str(future_p), 1_795_400_000))
+            self.assertEqual(codex_thread_identity(codex_home, sqlite_sid), CodexThreadIdentity(sqlite_sid, "main"))
+
 
 if __name__ == "__main__":
     unittest.main()

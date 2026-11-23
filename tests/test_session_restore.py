@@ -798,35 +798,38 @@ class SessionRestoreTests(unittest.TestCase):
                              [(VALID_CODEX_SID, "%42")])
 
     def test_restore_resumes_double_uuid_pi_session_with_cwd_verification(self):
+        import shlex
+        import select
+        import time
+
         with tempfile.TemporaryDirectory() as raw_tmp:
-            tmp = Path(raw_tmp)
-            tmp_ok = tmp / "ok"
+            tmp = Path(raw_tmp).resolve()
+            tmp_native = tmp / "native"
+            tmp_renamed = tmp / "renamed"
             tmp_bad = tmp / "bad"
-            tmp_ok.mkdir()
-            tmp_bad.mkdir()
+            tmp_corrupt = tmp / "corrupt"
+            for d in (tmp_native, tmp_renamed, tmp_bad, tmp_corrupt):
+                d.mkdir()
             pi_dir = tmp / "pi-agent"
             pi_sid = "87878787-8787-7787-8787-878787878787"
             extra_uuid = "98989898-9898-7898-8898-989898989898"
-            project = pi_dir / "sessions" / "--fixture-project--"
-            project.mkdir(parents=True, exist_ok=True)
-            session_file = project / f"2026-11-23T09-01-27-117Z_{pi_sid}_{extra_uuid}.jsonl"
-            session_file.write_text(
-                json.dumps(
-                    {
-                        "type": "session",
-                        "version": 3,
-                        "id": pi_sid,
-                        "timestamp": "2026-11-23T09:01:27.117Z",
-                        "cwd": str(tmp_ok),
-                    }
+
+            # 1. Native encoded cwd dir -> `pi --session-id <sid>`
+            native_dir = pi_dir / "sessions" / self._pi_encoded_dir(tmp_native)
+            native_dir.mkdir(parents=True, exist_ok=True)
+            native_file = native_dir / f"2026-11-23T09-01-27-117Z_{pi_sid}_{extra_uuid}.jsonl"
+            native_file.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "session", "version": 3, "id": pi_sid, "timestamp": "2026-11-23T09:01:27.117Z", "cwd": str(tmp_native)}),
+                        json.dumps({"type": "message", "id": "aabbccdd", "parentId": None, "timestamp": "2026-11-23T09:02:27.117Z", "message": {"role": "user", "content": [{"type": "text", "text": "PI_NATIVE_MARKER"}], "timestamp": 1795400000000}}),
+                    ]
                 )
                 + "\n",
                 encoding="utf-8",
             )
-
-            # Matching cwd -> resume (must NOT classify as recreated)
             ok = self.run_restore(
-                tmp_ok,
+                tmp_native,
                 coord={"sid": pi_sid, "tool": "p"},
                 title="pi",
                 saved_codex_ids=set(),
@@ -838,9 +841,84 @@ class SessionRestoreTests(unittest.TestCase):
             self.assertEqual(ok.returncode, 0, ok.stderr)
             plan = json.loads(ok.stdout.strip().splitlines()[-1])
             self.assertEqual(plan["kind"], "resume")
-            self.assertEqual(plan["sid"], pi_sid)
+            self.assertEqual(plan["command"], f"pi --session-id {pi_sid}")
 
-            # Wrong cwd -> invalid (must NOT silently recreate over a durable session)
+            # 2. Non-default/renamed project dir with matching header id & cwd -> `pi --session <path>`
+            pi_sid2 = "88888888-8888-7888-8888-888888888888"
+            renamed_dir = pi_dir / "sessions" / "--fixture-project--"
+            renamed_dir.mkdir(parents=True, exist_ok=True)
+            renamed_file = renamed_dir / f"2026-11-23T09-01-27-117Z_{pi_sid2}_{extra_uuid}.jsonl"
+            renamed_file.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "session", "version": 3, "id": pi_sid2, "timestamp": "2026-11-23T09:01:27.117Z", "cwd": str(tmp_renamed)}),
+                        json.dumps({"type": "message", "id": "ddeeff00", "parentId": None, "timestamp": "2026-11-23T09:02:27.117Z", "message": {"role": "user", "content": [{"type": "text", "text": "PI_RENAMED_MARKER"}], "timestamp": 1795400000000}}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            ok2 = self.run_restore(
+                tmp_renamed,
+                coord={"sid": pi_sid2, "tool": "p"},
+                title="pi",
+                saved_codex_ids=set(),
+                plan_json=True,
+                current_command="pi",
+                full_command="pi",
+                extra_env={"PI_CODING_AGENT_DIR": str(pi_dir)},
+            )
+            self.assertEqual(ok2.returncode, 0, ok2.stderr)
+            plan2 = json.loads(ok2.stdout.strip().splitlines()[-1])
+            self.assertEqual(plan2["kind"], "resume")
+            self.assertIn("--session ", plan2["command"])
+            self.assertIn(str(renamed_file.resolve()), plan2["command"])
+
+            # End-to-end verification with real Pi RPC when installed: both planned resume commands load original messages
+            pi_bin = Path("/opt/homebrew/bin/pi")
+            if pi_bin.is_file():
+                for work_cwd, planned_cmd, marker in (
+                    (tmp_native, plan["command"], b"PI_NATIVE_MARKER"),
+                    (tmp_renamed, plan2["command"], b"PI_RENAMED_MARKER"),
+                ):
+                    cmd_parts = shlex.split(planned_cmd)
+                    rpc_cmd = [str(pi_bin), "--mode", "rpc", "--offline", "--no-extensions", "--no-skills", *cmd_parts[1:]]
+                    rpc_env = {
+                        "HOME": str(tmp),
+                        "PATH": os.environ["PATH"],
+                        "PI_CODING_AGENT_DIR": str(pi_dir),
+                        "PI_OFFLINE": "1",
+                        "PI_SKIP_VERSION_CHECK": "1",
+                        "XDG_CONFIG_HOME": str(tmp / ".config"),
+                        "TERM": "dumb",
+                    }
+                    proc = subprocess.Popen(rpc_cmd, cwd=work_cwd, env=rpc_env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    try:
+                        assert proc.stdin is not None and proc.stdout is not None
+                        proc.stdin.write(b'{"type":"get_messages","id":"m"}\n')
+                        proc.stdin.flush()
+                        out = b""
+                        deadline = time.monotonic() + 10
+                        while time.monotonic() < deadline:
+                            rlist, _, _ = select.select([proc.stdout], [], [], max(0.0, deadline - time.monotonic()))
+                            if not rlist:
+                                break
+                            chunk = os.read(proc.stdout.fileno(), 65536)
+                            if not chunk:
+                                break
+                            out += chunk
+                            if b'"command":"get_messages"' in out:
+                                break
+                    finally:
+                        proc.terminate()
+                        try:
+                            more, err = proc.communicate(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            more, err = proc.communicate()
+                    self.assertIn(marker, out + more, f"planned command {planned_cmd!r} failed to load history; stderr={err.decode(errors='replace')}")
+
+            # 3. Wrong cwd -> invalid (must NOT silently recreate over a durable session)
             bad_cwd = self.run_restore(
                 tmp_bad,
                 coord={"sid": pi_sid, "tool": "p"},
@@ -854,6 +932,80 @@ class SessionRestoreTests(unittest.TestCase):
             self.assertEqual(bad_cwd.returncode, 0, bad_cwd.stderr)
             bad_plan = json.loads(bad_cwd.stdout.strip().splitlines()[-1])
             self.assertEqual(bad_plan["kind"], "invalid")
+
+            # 4. Corrupt Pi file missing "id" -> invalid (must NOT classify as recreated)
+            corrupt_sid = "89898989-8989-7989-8989-898989898989"
+            corrupt_dir = pi_dir / "sessions" / self._pi_encoded_dir(tmp_corrupt)
+            corrupt_dir.mkdir(parents=True, exist_ok=True)
+            (corrupt_dir / f"2026-11-23T09-01-27-117Z_{corrupt_sid}.jsonl").write_text(
+                json.dumps({"type": "session", "version": 3, "cwd": str(tmp_corrupt)}) + "\n",
+                encoding="utf-8",
+            )
+            corrupt_res = self.run_restore(
+                tmp_corrupt,
+                coord={"sid": corrupt_sid, "tool": "p"},
+                title="pi",
+                saved_codex_ids=set(),
+                plan_json=True,
+                current_command="pi",
+                full_command="pi",
+                extra_env={"PI_CODING_AGENT_DIR": str(pi_dir)},
+            )
+            self.assertEqual(corrupt_res.returncode, 0, corrupt_res.stderr)
+            corrupt_plan = json.loads(corrupt_res.stdout.strip().splitlines()[-1])
+            self.assertEqual(corrupt_plan["kind"], "invalid")
+
+    def test_r2_p1_8_codex_sqlite_only_binding_resumes_and_broken_binding_blocks_stale_argv(self):
+        from contextlib import closing
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp).resolve()
+            # Case A: bound B lives in future_threads/ reachable only via state_5.sqlite; stale argv has durable A
+            case_a = tmp / "case_a"
+            case_a.mkdir()
+            chome_a = case_a / "codex"
+            future_b = chome_a / "future_threads" / f"rollout-2026-11-23T10-00-00-{FOREIGN_SID}.jsonl"
+            future_b.parent.mkdir(parents=True, exist_ok=True)
+            future_b.write_text(json.dumps({"type": "session_meta", "payload": {"id": FOREIGN_SID}}) + "\n", encoding="utf-8")
+            with closing(sqlite3.connect(chome_a / "state_5.sqlite")) as conn, conn:
+                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+                conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (FOREIGN_SID, str(future_b), 1_795_400_000))
+
+            res_a = self.run_restore(
+                case_a,
+                coord={"sid": FOREIGN_SID, "tool": "x"},
+                title="codex",
+                saved_codex_ids={VALID_CODEX_SID},
+                plan_json=True,
+                full_command=f"codex --yolo resume {VALID_CODEX_SID}",
+            )
+            self.assertEqual(res_a.returncode, 0, res_a.stderr)
+            plan_a = json.loads(res_a.stdout.strip().splitlines()[-1])
+            self.assertEqual(plan_a["kind"], "resume")
+            self.assertEqual(plan_a["sid"], FOREIGN_SID)
+
+            # Case B: bound B is recorded in SQLite with a missing rollout -> must mark B invalid, NEVER fall back to A
+            case_b = tmp / "case_b"
+            case_b.mkdir()
+            chome_b = case_b / "codex"
+            chome_b.mkdir(parents=True, exist_ok=True)
+            with closing(sqlite3.connect(chome_b / "state_5.sqlite")) as conn, conn:
+                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+                conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (FOREIGN_SID, str(chome_b / "future_threads/missing.jsonl"), 1_795_400_000))
+
+            res_b = self.run_restore(
+                case_b,
+                coord={"sid": FOREIGN_SID, "tool": "x"},
+                title="codex",
+                saved_codex_ids={VALID_CODEX_SID},
+                plan_json=True,
+                full_command=f"codex --yolo resume {VALID_CODEX_SID}",
+            )
+            self.assertEqual(res_b.returncode, 0, res_b.stderr)
+            plan_b = json.loads(res_b.stdout.strip().splitlines()[-1])
+            self.assertEqual(plan_b["kind"], "invalid")
+            self.assertEqual(plan_b["sid"], FOREIGN_SID)
 
     def test_restore_accepts_codex_header_larger_than_512kb(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -972,8 +1124,13 @@ class SessionRestoreTests(unittest.TestCase):
             (project / f"{FOREIGN_SID}.jsonl").touch()
         return config
 
+    @staticmethod
+    def _pi_encoded_dir(cwd: Path) -> str:
+        resolved = os.path.realpath(str(cwd))
+        return "--" + resolved.lstrip("/\\").replace("/", "-").replace("\\", "-").replace(":", "-") + "--"
+
     def write_pi_session(self, agent_dir: Path, sid: str, cwd: Path) -> Path:
-        project = agent_dir / "sessions" / "--fixture-project--"
+        project = agent_dir / "sessions" / self._pi_encoded_dir(cwd)
         project.mkdir(parents=True, exist_ok=True)
         session = project / f"2026-08-16T09-01-27-117Z_{sid}.jsonl"
         session.write_text(

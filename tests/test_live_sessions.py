@@ -407,6 +407,122 @@ class LiveSessionsUnitTests(unittest.TestCase):
             self.assertEqual(len(uncovered), 1)
             self.assertIn(str(future_file), uncovered[0]["message"])
 
+    def test_r2_p1_1_and_p1_2_uncommitted_pane_rollback_and_custom_archived_sqlite_root(self) -> None:
+        from contextlib import closing
+        import sqlite3
+        from unittest import mock
+
+        # Part A (P1-1): pane vs SID consistency when uncommitted rollback segment exists
+        sid = "77777777-aaaa-4777-8777-777777777777"
+        rid = "88888888-aaaa-4888-8888-888888888888"
+        chome = self.home / ".codex"
+        logs = chome / "sessions/2026/11/23"
+        logs.mkdir(parents=True, exist_ok=True)
+        p = logs / f"rollout-2026-11-23T07-00-00-{sid}.jsonl"
+        q = logs / f"rollout-2026-11-23T08-00-00-{sid}_{rid}.jsonl"
+        hdr_p = json.dumps({"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T07:00:00Z", "payload": {"id": sid, "cwd": str(self.home)}}) + "\n"
+        p.write_text(
+            hdr_p
+            + json.dumps({"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "COMMITTED_OPENING"}]}}) + "\n"
+            + json.dumps({"ordinal": 2, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "COMMITTED_TAIL"}]}}) + "\n",
+            encoding="utf-8",
+        )
+        q.write_text(
+            json.dumps({"ordinal": 1, "type": "session_meta", "timestamp": "2026-11-23T08:00:00Z", "payload": {"id": sid, "cwd": str(self.home), "history_base": {"thread_id": sid, "end_ordinal_exclusive": 1, "end_byte_offset": len(hdr_p.encode())}}}) + "\n",
+            encoding="utf-8",
+        )
+        with closing(sqlite3.connect(chome / "state_7.sqlite")) as db, db:
+            db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            db.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid, str(p), int(time.time())))
+
+        env = {"HOME": str(self.home), "AIPANE_STATE_DIR": str(self.state_dir), "TMUX_PANE": "%20"}
+        sid_res = sessions_mod.read_session(f"codex:{sid}", view="timeline", full=True, include_children=False, home=self.home, environment=env)
+        sid_texts = [ev["text"] for s in sid_res["sources"] for ev in s["events"]]
+        self.assertEqual(sid_texts, ["COMMITTED_OPENING", "COMMITTED_TAIL"])
+
+        for mode, open_files, expect_complete in (("both", [p, q], True), ("replacement_only", [q], False)):
+            tmux_out = _make_raw_line("%20", pane_index="1", cmd="codex", tty="/dev/ttys020", title="Codex", sock=self.sock, srv=self.srv) + "\n"
+            real_list = live_mod.list_live_panes
+
+            def fake_lsof(args: list[str], files=open_files) -> str:
+                out = ["p4020", "f0", "au", "n/dev/ttys020"]
+                for idx, fp in enumerate(files, start=9):
+                    out.extend([f"f{idx}", "aw", f"n{fp}"])
+                return "\n".join(out) + "\n"
+
+            def patched_list(**kwargs):
+                kwargs.setdefault("tmux_runner", lambda a: subprocess.CompletedProcess(a, 0, stdout=tmux_out, stderr=""))
+                kwargs.setdefault("pgrep_runner", lambda a: [4020] if a[-1] == "codex" else [])
+                kwargs.setdefault("lsof_runner", fake_lsof)
+                kwargs.setdefault("process_exists", lambda pid: pid == 4020)
+                return real_list(**kwargs)
+
+            with mock.patch.object(live_mod, "list_live_panes", side_effect=patched_list):
+                pane_res = sessions_mod.read_session(pane="%20", view="timeline", full=True, include_children=False, home=self.home, environment=env)
+            pane_texts = [ev["text"] for s in pane_res["sources"] for ev in s["events"]]
+            self.assertEqual(pane_texts, sid_texts, f"pane diverged from SID in mode={mode}")
+            self.assertEqual(pane_res["complete"], expect_complete)
+            if not expect_complete:
+                self.assertTrue(any("uncommitted_active_rollout" in w for w in pane_res["warnings"]))
+
+        # Part B (P1-2): custom CODEX_HOME with only archived_sessions/, sqlite/state_12.sqlite, and future_threads/
+        custom_root = self.home / "custom-nested-home"
+        (custom_root / "archived_sessions").mkdir(parents=True, exist_ok=True)
+        (custom_root / "sqlite").mkdir(parents=True, exist_ok=True)
+        custom_future = custom_root / "future_threads" / f"rollout-2026-11-23T09-00-00-{sid}.jsonl"
+        custom_future.parent.mkdir(parents=True, exist_ok=True)
+        custom_future.write_text(
+            json.dumps({"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T09:00:00Z", "payload": {"id": sid}}) + "\n"
+            + json.dumps({"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "CUSTOM_ONLY_TURN"}]}}) + "\n",
+            encoding="utf-8",
+        )
+        with closing(sqlite3.connect(custom_root / "sqlite/state_12.sqlite")) as db, db:
+            db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
+            db.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid, str(custom_future), int(time.time())))
+
+        tmux_custom = _make_raw_line("%21", pane_index="2", cmd="codex", tty="/dev/ttys021", title="Codex", sock=self.sock, srv=self.srv) + "\n"
+        real_list = live_mod.list_live_panes
+
+        def patched_custom(**kwargs):
+            kwargs.setdefault("tmux_runner", lambda a: subprocess.CompletedProcess(a, 0, stdout=tmux_custom, stderr=""))
+            kwargs.setdefault("pgrep_runner", lambda a: [4021] if a[-1] == "codex" else [])
+            kwargs.setdefault("lsof_runner", lambda a: f"p4021\nf0\nau\nn/dev/ttys021\nf9\naw\nn{custom_future}\n")
+            kwargs.setdefault("process_exists", lambda pid: pid == 4021)
+            return real_list(**kwargs)
+
+        with mock.patch.object(live_mod, "list_live_panes", side_effect=patched_custom):
+            custom_res = sessions_mod.read_session(pane="%21", view="timeline", full=True, include_children=False, home=self.home, environment=env)
+        custom_texts = [ev["text"] for s in custom_res["sources"] for ev in s["events"]]
+        self.assertEqual(custom_texts, ["CUSTOM_ONLY_TURN"])
+        self.assertNotIn("COMMITTED_OPENING", custom_texts)
+
+        # Bare unknown root (no markers, no CODEX_HOME env) must NOT mix default ~/.codex
+        orphan_file = self.home / "orphan_dir" / f"rollout-2026-11-23T09-30-00-{sid}.jsonl"
+        orphan_file.parent.mkdir(parents=True, exist_ok=True)
+        orphan_file.write_text(
+            json.dumps({"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-23T09:30:00Z", "payload": {"id": sid}}) + "\n"
+            + json.dumps({"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ORPHAN_ONLY_TURN"}]}}) + "\n",
+            encoding="utf-8",
+        )
+
+        def patched_orphan(**kwargs):
+            kwargs.setdefault("tmux_runner", lambda a: subprocess.CompletedProcess(a, 0, stdout=tmux_custom, stderr=""))
+            kwargs.setdefault("pgrep_runner", lambda a: [4022] if a[-1] == "codex" else [])
+            kwargs.setdefault("lsof_runner", lambda a: f"p4022\nf0\nau\nn/dev/ttys021\nf9\naw\nn{orphan_file}\n")
+            kwargs.setdefault("process_exists", lambda pid: pid == 4022)
+            return real_list(**kwargs)
+
+        with (
+            mock.patch.object(live_mod, "list_live_panes", side_effect=patched_orphan),
+            mock.patch.object(live_mod, "_process_env_var", return_value=""),
+        ):
+            orphan_res = sessions_mod.read_session(pane="%21", view="timeline", full=True, include_children=False, home=self.home, environment=env)
+        self.assertFalse(orphan_res["complete"])
+        self.assertTrue(any("unknown_pane_storage_root" in w for w in orphan_res["warnings"]))
+        orphan_texts = [ev["text"] for s in orphan_res["sources"] for ev in s["events"]]
+        self.assertEqual(orphan_texts, ["ORPHAN_ONLY_TURN"])
+        self.assertNotIn("COMMITTED_OPENING", orphan_texts)
+
     def test_kimi_2x_discovery_preview_timeline_and_ref_prefix(self) -> None:
         raw_uuid = "aa4313fb-986d-4f74-8f8b-c5e14883633d"
         full_sid = f"session_{raw_uuid}"

@@ -440,8 +440,54 @@ def _codex_rollout_meta(path_str: str) -> dict[str, str] | None:
     }
 
 
-def _pick_newer_rollout_rec(prev: dict[str, str], curr: dict[str, str]) -> dict[str, str]:
-    """When one PID holds two writable FDs for the same (codex_home, sid), pick the newer segment."""
+def _process_env_var(pid: int, var_name: str) -> str:
+    """Best-effort read of an environment variable from a live process via `ps eww`."""
+    if pid <= 0 or not var_name:
+        return ""
+    try:
+        res = subprocess.run(
+            ["ps", "eww", "-o", "command=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=1,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if res.returncode != 0 or not res.stdout:
+        return ""
+    prefix = f"{var_name}="
+    for token in res.stdout.split():
+        if token.startswith(prefix):
+            val = token[len(prefix) :].strip()
+            if val:
+                return val
+    return ""
+
+
+def _pick_preferred_rollout_rec(
+    prev: dict[str, str],
+    curr: dict[str, str],
+) -> dict[str, str]:
+    """Pick the authoritative open rollout when one PID holds multiple writable FDs.
+
+    If state_*.sqlite commits one of the open files, prefer that committed file so
+    an uncommitted replacement/rollback FD opened before SQLite switches never
+    overrides committed history.
+    """
+    chome_str = curr.get("codex_home") or prev.get("codex_home") or ""
+    sid = curr.get("sid") or prev.get("sid") or ""
+    if chome_str and sid:
+        chome = Path(chome_str)
+        sqlite_raw = codex_sessions.query_sqlite_rollout_path(sid, chome)
+        if sqlite_raw is not None:
+            sqlite_res = codex_sessions.resolve_alternate_rollout_path(sqlite_raw, chome)
+            if sqlite_res is not None:
+                skey = codex_sessions.path_identity_key(sqlite_res)
+                if codex_sessions.path_identity_key(Path(prev["rollout"])) == skey:
+                    return prev
+                if codex_sessions.path_identity_key(Path(curr["rollout"])) == skey:
+                    return curr
     try:
         prev_p = Path(prev["rollout"])
         curr_p = Path(curr["rollout"])
@@ -470,13 +516,19 @@ def _build_codex_tty_map(
     for pid, entry in lsof_data.items():
         if not entry["ttys"] or not entry["writable_jsonl"]:
             continue
+        pid_codex_home: str | None = None
         records: dict[tuple[str, str], dict[str, str]] = {}
         for jpath in entry["writable_jsonl"]:
             meta = _codex_rollout_meta(jpath)
             if meta is not None:
+                if not meta["codex_home"]:
+                    if pid_codex_home is None:
+                        pid_codex_home = _process_env_var(pid, "CODEX_HOME")
+                    if pid_codex_home:
+                        meta["codex_home"] = str(Path(pid_codex_home).expanduser().resolve())
                 key = (meta["codex_home"], meta["sid"])
                 prev = records.get(key)
-                records[key] = meta if prev is None else _pick_newer_rollout_rec(prev, meta)
+                records[key] = meta if prev is None else _pick_preferred_rollout_rec(prev, meta)
         if not records:
             continue
         for tty in entry["ttys"]:
@@ -812,6 +864,18 @@ def _resolve_single_raw_pane(
                 active_path = matched[0].get("rollout", "")
                 storage_root = matched[0].get("codex_home", "")
                 authority = "codex_lsof"
+        if (
+            authority == "codex_lsof"
+            and not storage_root
+            and act_rec
+            and isinstance(act_rec.get("root"), dict)
+            and act_rec["root"].get("codex_home")
+        ):
+            root_info = act_rec["root"]
+            if root_info.get("session_id") == sid or (
+                active_path and str(root_info.get("transcript_path") or "") == active_path
+            ):
+                storage_root = str(root_info.get("codex_home") or "")
         if not sid and preferred:
             if act_rec and isinstance(act_rec.get("root"), dict) and act_rec["root"].get("session_id") == preferred:
                 sid = preferred

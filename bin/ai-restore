@@ -202,6 +202,11 @@ codex_session_exists() {
     "$1" "${coord_codex_home:-${CODEX_HOME:-$HOME/.codex}}"
 }
 
+codex_session_known() {
+  command python3 "$SCRIPT_DIR/../lib/codex_sessions.py" \
+    --known "$1" "${coord_codex_home:-${CODEX_HOME:-$HOME/.codex}}"
+}
+
 # Claude accepts an aipane-assigned --session-id before the first real model
 # turn exists. Local slash commands such as /skills can therefore leave a live
 # Claude process whose id is not resumable. A real local conversation owns a
@@ -250,23 +255,30 @@ raise SystemExit(1)
 PY
 }
 
-# pi_session_exists <uuid> <cwd> — `pi --session-id` creates a new session when
-# the id is absent. Treating any UUID as resumable therefore turns stale bindings
-# into convincing empty sessions. Require a durable JSONL whose header identifies
-# both the requested id and the pane's project cwd.
-pi_session_exists() {
+# pi_session_resolve <uuid> <cwd> — resolve a durable Pi session whose header
+# identifies both the requested id and the pane's project cwd.
+# Prints "native\t<path>" when the file lives in Pi's default encoded-cwd dir
+# (so `pi --session-id <id>` opens it directly), or "path\t<path>" when the
+# verified file lives in a different subdir (requiring `pi --session <path>`).
+pi_session_resolve() {
   local sid="$1" cwd="$2"
   local -a matches
   matches=("$PI_SESSION_ROOT"/**/*_"$sid".jsonl(N) "$PI_SESSION_ROOT"/**/*_"$sid"_*.jsonl(N))
   (( ${#matches[@]} > 0 )) || return 1
   command -v python3 &>/dev/null || return 1
-  python3 - "$sid" "$cwd" "${matches[@]}" <<'PY'
+  python3 - "$sid" "$cwd" "$PI_SESSION_ROOT" "${matches[@]}" <<'PY'
 import json
 import os
+import re
 import sys
 
-sid, cwd, *paths = sys.argv[1:]
+sid, cwd, sessions_root, *paths = sys.argv[1:]
 expected_cwd = os.path.normcase(os.path.realpath(cwd))
+resolved_cwd = os.path.realpath(cwd)
+safe_dir = "--" + re.sub(r"[/\\:]", "-", re.sub(r"^[/\\]", "", resolved_cwd)) + "--"
+native_dir = os.path.normcase(os.path.realpath(os.path.join(sessions_root, safe_dir)))
+
+fallback_match = None
 for path in paths:
     try:
         with open(path, encoding="utf-8") as session:
@@ -276,19 +288,28 @@ for path in paths:
     if (
         isinstance(header, dict)
         and header.get("type") == "session"
-        and "createdAt" not in header
+        and not ("createdAt" in header and "timestamp" not in header)
         and header.get("id") == sid
         and isinstance(header.get("cwd"), str)
         and os.path.normcase(os.path.realpath(header["cwd"])) == expected_cwd
     ):
-        raise SystemExit(0)
+        parent = os.path.normcase(os.path.realpath(os.path.dirname(path)))
+        if parent == native_dir:
+            print(f"native\t{os.path.realpath(path)}")
+            raise SystemExit(0)
+        if fallback_match is None:
+            fallback_match = os.path.realpath(path)
+
+if fallback_match is not None:
+    print(f"path\t{fallback_match}")
+    raise SystemExit(0)
 raise SystemExit(1)
 PY
 }
 
 # pi_session_id_exists <uuid> — distinguish a truly empty, never-persisted Pi
 # session (safe to recreate as an empty TUI) from a durable/corrupt session that
-# belongs to another cwd (unsafe to reinterpret as a new session here).
+# belongs to another cwd or has a broken header (unsafe to recreate).
 pi_session_id_exists() {
   local sid="$1"
   local -a matches
@@ -307,12 +328,12 @@ for path in paths:
     except (OSError, UnicodeError, json.JSONDecodeError):
         # Corrupt/unreadable file with this sid is still unsafe to recreate.
         raise SystemExit(0)
-    if (
-        isinstance(header, dict)
-        and header.get("type") == "session"
-        and ("createdAt" in header or header.get("id") != sid)
-    ):
-        continue
+    if isinstance(header, dict) and header.get("type") == "session":
+        if "createdAt" in header and "timestamp" not in header:
+            continue
+        hdr_id = header.get("id")
+        if isinstance(hdr_id, str) and hdr_id and hdr_id != sid:
+            continue
     raise SystemExit(0)
 raise SystemExit(1)
 PY
@@ -329,7 +350,7 @@ build_resume() {
   local tool="$1" full="$2" title="$3" coord_sid="$4" cwd="$5" id
   REPLY=""; REPLY_KIND=""; REPLY_SID=""
   extract_uuid "$full"; id="$REPLY"
-  if [[ "$tool" == codex && -n "$coord_sid" ]] && codex_session_exists "$coord_sid"; then
+  if [[ "$tool" == codex && -n "$coord_sid" ]] && { codex_session_exists "$coord_sid" || codex_session_known "$coord_sid"; }; then
     id="$coord_sid"
   elif [[ ( "$tool" == pi || "$tool" == grok || "$tool" == dsh ) && -n "$coord_sid" ]]; then
     # The current coordinate binding is authoritative even when that new session
@@ -385,10 +406,23 @@ build_resume() {
       else REPLY="$DSH_BASE"; REPLY_KIND=fresh; fi ;;
     pi)
       if [[ -n "$id" ]]; then
-        REPLY="$PI_BASE --session-id $id"
-        if pi_session_exists "$id" "$cwd"; then REPLY_KIND=resume
-        elif pi_session_id_exists "$id"; then REPLY_KIND=invalid
-        else REPLY_KIND=recreated; fi
+        local pi_resolved="" pi_mode="" pi_path=""
+        if pi_resolved="$(pi_session_resolve "$id" "$cwd")"; then
+          pi_mode="${pi_resolved%%$'\t'*}"
+          pi_path="${pi_resolved#*$'\t'}"
+          if [[ "$pi_mode" == path && -n "$pi_path" ]]; then
+            REPLY="$PI_BASE --session ${(q)pi_path}"
+          else
+            REPLY="$PI_BASE --session-id $id"
+          fi
+          REPLY_KIND=resume
+        elif pi_session_id_exists "$id"; then
+          REPLY="$PI_BASE --session-id $id"
+          REPLY_KIND=invalid
+        else
+          REPLY="$PI_BASE --session-id $id"
+          REPLY_KIND=recreated
+        fi
       else REPLY="$PI_BASE"; REPLY_KIND=fresh; fi ;;
     grok)
       if [[ -n "$id" ]]; then

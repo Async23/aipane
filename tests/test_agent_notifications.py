@@ -1210,6 +1210,42 @@ class AgentNotificationsTests(unittest.TestCase):
         self.assertEqual(_codex_root_thread_title(sid_sub, {"CODEX_HOME": str(home_sub)}), "Sub Title")
         self.assertEqual(codex_sessions.query_sqlite_rollout_path(sid_sub, home_sub), Path("/tmp/sub.jsonl"))
 
+    def test_r2_p2_1_codex_notifications_read_compressed_zst_and_reject_foreign_sqlite_rollout(self) -> None:
+        import shutil
+        from agent_notifications import _codex_rollout_thread_metadata, _codex_turn_has_goal_context
+        import codex_sessions
+
+        if not shutil.which("zstd"):
+            self.skipTest("zstd is required")
+
+        codex_home = self.home / ".codex"
+        root_sid = "71717171-1111-7171-8171-717171717171"
+        sub_sid = "72727272-2222-7272-8272-727272727272"
+        arch = codex_home / "archived_sessions"
+        arch.mkdir(parents=True, exist_ok=True)
+
+        # 1. Archived compressed .jsonl.zst subagent rollout + goal_context
+        sub_zst = arch / f"rollout-2026-11-23T10-00-00-{sub_sid}.jsonl.zst"
+        raw_sub = "".join(
+            json.dumps(r) + "\n"
+            for r in (
+                {"type": "session_meta", "payload": {"id": sub_sid, "source": {"subagent": {"thread_spawn": {"parent_thread_id": root_sid}}}}},
+                {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-goal-1"}},
+                {"type": "response_item", "payload": {"type": "message", "role": "user", "internal_chat_message_metadata_passthrough": {"turn_id": "turn-goal-1"}, "content": [{"type": "input_text", "text": "<goal_context>Active Goal</goal_context>"}]}},
+            )
+        ).encode("utf-8")
+        subprocess.run([codex_sessions.zstd_binary(), "-q", "-o", str(sub_zst)], input=raw_sub, check=True)
+
+        env = {"CODEX_HOME": str(codex_home)}
+        meta = _codex_rollout_thread_metadata(sub_sid, env)
+        self.assertTrue(meta.get("is_subagent"))
+        self.assertTrue(_codex_turn_has_goal_context(sub_sid, "turn-goal-1", env))
+
+        # 2. Foreign SQLite rollout_path pointing main thread root_sid to sub_zst must be rejected
+        root_meta = _codex_rollout_thread_metadata(root_sid, env, rollout_path=str(sub_zst))
+        self.assertFalse(root_meta.get("is_subagent"))
+        self.assertFalse(_codex_turn_has_goal_context(root_sid, "turn-goal-1", env, rollout_path=str(sub_zst)))
+
 
 if __name__ == "__main__":
     unittest.main()
