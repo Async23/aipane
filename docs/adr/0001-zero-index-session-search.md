@@ -18,3 +18,13 @@ Implement `bin/aipane-sessions` (`lib/agent_sessions.py`) as a self-contained, z
 
 - **Gains**: zero space amplification, zero maintenance overhead, 100% freshness on live sessions, and no external indexer binary dependency.
 - **Costs**: unscoped `--all` content searches across multi-gigabyte cold histories take seconds rather than sub-second inverted-index lookups. If sub-second cold-corpus search ever becomes a frequent requirement, a pluggable index backend can sit behind `find` without changing the CLI or skill contract.
+
+## Addendum (2026-11-23): Logical Sessions, Physical Segments, and Completeness Verification
+
+Real-world Codex usage exposed that upstream CLIs do not preserve a 1:1 mapping between a logical conversation and a single on-disk file: on turn rollback/rewind, Codex opens a new suffixed rollout segment (`rollout-<ts>-<session_id>_<rollout_id>.jsonl`) whose `ordinal` restarts from the rolled-back boundary, and may move older logs to `archived_sessions/`.
+
+To uphold zero-index freshness without silent truncation:
+
+1. **Filenames are pre-filters, never final identity**: single-UUID Codex/Pi filenames keep a fast path, while multi-UUID or non-standard filenames resolve authoritative identity from the file header (`session_meta.payload.id` via `lib/codex_sessions.py`, shared across recovery, live pane resolution, history lookup, and notifications).
+2. **Separate `LogicalSession` from physical segments**: `list` and `find` aggregate and time-prune by logical session; `read --view timeline` orders Codex segments by creation timestamp and prunes superseded rollback tails by suffix-minimum `ordinal` (opt-in `--include-superseded`), while `--view export` stays byte-lossless and records ordinal bounds in `manifest.json`.
+3. **Verify completeness instead of hardcoding `complete: true`**: `read --pane` propagates the live `active_path` resolved via `lsof`, and Codex reads cross-check existing `state_*.sqlite` `rollout_path` entries read-only. Any uncovered file sets `complete: false` with explicit `warnings` and is recovered into the output; `aipane-doctor` audits recent files for layout drift.

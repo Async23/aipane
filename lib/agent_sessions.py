@@ -2133,6 +2133,184 @@ def render_preview(
     return "\n".join([*header_parts, *body_lines])
 
 
+def audit_session_storage_drift(
+    *,
+    home: Path | None = None,
+    days: int = 14,
+    environment: dict[str, str] | None = None,
+    check_live_panes: bool = False,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Read-only storage-layout drift check for aipane-doctor.
+
+    Verifies that recent local session files and Codex state_*.sqlite records
+    still match static discovery assumptions (no filename-vs-header ID drift,
+    no newly introduced Codex directory/layout missed by discovery, and
+    optionally no live tmux pane active_path missed by discovery).
+    """
+    env = dict(os.environ if environment is None else environment)
+    resolved_home = (home or Path(env.get("HOME", str(Path.home())))).expanduser()
+    issues: list[dict[str, str]] = []
+
+    old_codex_home = os.environ.get("CODEX_HOME")
+    old_pi_dir = os.environ.get("PI_CODING_AGENT_DIR")
+    if "CODEX_HOME" in env:
+        os.environ["CODEX_HOME"] = env["CODEX_HOME"]
+    elif home is not None:
+        os.environ.pop("CODEX_HOME", None)
+    if "PI_CODING_AGENT_DIR" in env:
+        os.environ["PI_CODING_AGENT_DIR"] = env["PI_CODING_AGENT_DIR"]
+    elif home is not None:
+        os.environ.pop("PI_CODING_AGENT_DIR", None)
+
+    try:
+        codex_files = discover_agent_files("codex", home=resolved_home)
+        hot_codex, _ = prune_by_time(list(codex_files), days, False, now=now)
+        codex_by_resolved: dict[Path, SessionFile] = {}
+        for sf in codex_files:
+            try:
+                codex_by_resolved[sf.path.resolve()] = sf
+            except OSError:
+                codex_by_resolved[sf.path] = sf
+
+        for sf in hot_codex:
+            meta = codex_sessions.read_rollout_meta(sf.path, max_lines=1)
+            if meta is not None and meta["sid"] != sf.session_id:
+                issues.append(
+                    {
+                        "severity": "error",
+                        "code": "codex_sid_drift",
+                        "message": (
+                            f"{sf.path}: discovered session_id={sf.session_id} "
+                            f"differs from session_meta.payload.id={meta['sid']}"
+                        ),
+                    }
+                )
+
+        codex_home = _codex_home(resolved_home)
+        recent_sqlite = codex_sessions.query_recent_sqlite_rollouts(
+            codex_home, days=days, now=now
+        )
+        checked_sqlite = 0
+        for tid, rpath in recent_sqlite:
+            if not rpath.is_file():
+                continue
+            checked_sqlite += 1
+            try:
+                r_resolved = rpath.resolve()
+            except OSError:
+                r_resolved = rpath
+            matched = codex_by_resolved.get(r_resolved)
+            if matched is None:
+                issues.append(
+                    {
+                        "severity": "error",
+                        "code": "codex_sqlite_rollout_uncovered",
+                        "message": (
+                            f"Codex state sqlite thread {tid} points to existing file {rpath} "
+                            "not discovered by aipane-sessions"
+                        ),
+                    }
+                )
+            elif matched.session_id != tid:
+                issues.append(
+                    {
+                        "severity": "error",
+                        "code": "codex_sqlite_sid_mismatch",
+                        "message": (
+                            f"Codex state sqlite thread {tid} rollout {rpath} "
+                            f"was discovered under session_id={matched.session_id}"
+                        ),
+                    }
+                )
+
+        pi_files = discover_agent_files("pi", home=resolved_home)
+        hot_pi, _ = prune_by_time(list(pi_files), days, False, now=now)
+        for sf in hot_pi:
+            hdr = read_first_json(sf.path)
+            if hdr and hdr.get("type") == "session":
+                hdr_id = hdr.get("id")
+                if isinstance(hdr_id, str) and hdr_id and hdr_id != sf.session_id:
+                    issues.append(
+                        {
+                            "severity": "error",
+                            "code": "pi_sid_drift",
+                            "message": (
+                                f"{sf.path}: discovered session_id={sf.session_id} "
+                                f"differs from session header id={hdr_id}"
+                            ),
+                        }
+                    )
+
+        checked_live = 0
+        if check_live_panes:
+            import live_sessions
+
+            panes = live_sessions.list_live_panes(
+                only_agents=True, environment=env, home=resolved_home
+            )
+            by_agent_resolved: dict[str, dict[Path, SessionFile]] = {"codex": codex_by_resolved}
+            for pane in panes:
+                if not pane.active_path:
+                    continue
+                ap = Path(pane.active_path).expanduser()
+                if not ap.is_file():
+                    continue
+                checked_live += 1
+                if pane.agent not in by_agent_resolved:
+                    agent_map: dict[Path, SessionFile] = {}
+                    for sf in discover_agent_files(pane.agent, home=resolved_home):
+                        try:
+                            agent_map[sf.path.resolve()] = sf
+                        except OSError:
+                            agent_map[sf.path] = sf
+                    by_agent_resolved[pane.agent] = agent_map
+                try:
+                    ap_res = ap.resolve()
+                except OSError:
+                    ap_res = ap
+                matched = by_agent_resolved[pane.agent].get(ap_res)
+                if matched is None:
+                    issues.append(
+                        {
+                            "severity": "error",
+                            "code": "live_pane_active_path_uncovered",
+                            "message": (
+                                f"Live pane {pane.coord} ({pane.agent}:{pane.session_id}) writes {ap} "
+                                "which is not covered by static discovery"
+                            ),
+                        }
+                    )
+                elif pane.session_id and matched.session_id != pane.session_id:
+                    issues.append(
+                        {
+                            "severity": "error",
+                            "code": "live_pane_sid_mismatch",
+                            "message": (
+                                f"Live pane {pane.coord} active file {ap} resolved to {pane.session_id} "
+                                f"via runtime but {matched.session_id} via static discovery"
+                            ),
+                        }
+                    )
+
+        return {
+            "checked_codex_files": len(hot_codex),
+            "checked_sqlite_rollouts": checked_sqlite,
+            "checked_pi_files": len(hot_pi),
+            "checked_live_panes": checked_live,
+            "issues": issues,
+        }
+    finally:
+        if old_codex_home is not None:
+            os.environ["CODEX_HOME"] = old_codex_home
+        else:
+            os.environ.pop("CODEX_HOME", None)
+        if old_pi_dir is not None:
+            os.environ["PI_CODING_AGENT_DIR"] = old_pi_dir
+        else:
+            os.environ.pop("PI_CODING_AGENT_DIR", None)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="aipane-sessions",

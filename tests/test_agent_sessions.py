@@ -817,8 +817,10 @@ class AgentSessionsTest(unittest.TestCase):
         )
 
         # 1. state_5.sqlite pointing to untracked rollout triggers complete=False + warning + recovery read
+        from contextlib import closing
+
         db_path = self.home / ".codex/state_5.sqlite"
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn, conn:
             conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER)")
             conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (sid, str(untracked), int(self.now)))
 
@@ -869,6 +871,72 @@ class AgentSessionsTest(unittest.TestCase):
         self.assertFalse(pane_res["complete"])
         self.assertTrue(any("active_file_missed_by_discovery" in w for w in pane_res["warnings"]))
         self.assertEqual(pane_res["sources"][-1]["events"][-1]["text"], "Latest from untracked dir")
+
+    def test_audit_session_storage_drift_detects_codex_pi_and_live_mismatches(self) -> None:
+        from unittest import mock
+
+        tests_dir = str(Path(__file__).resolve().parent)
+        if tests_dir not in sys.path:
+            sys.path.insert(0, tests_dir)
+        from session_fixtures import seed_codex_multi_segment
+        import live_sessions
+
+        sid = "a1a1a1a1-a1a1-71a1-81a1-a1a1a1a1a1a1"
+        other = "b2b2b2b2-b2b2-72b2-82b2-b2b2b2b2b2b2"
+        seed_codex_multi_segment(self.home, sid, now=self.now, include_sqlite=True)
+
+        # Clean state passes with zero issues
+        clean = mod.audit_session_storage_drift(home=self.home, days=14, now=self.now)
+        self.assertEqual(clean["issues"], [])
+        self.assertEqual(clean["checked_codex_files"], 2)
+        self.assertEqual(clean["checked_sqlite_rollouts"], 1)
+
+        # Drift 1: single-UUID Codex file whose header disagrees with filename
+        bad_codex = self.home / ".codex/sessions/2026/11/23" / f"rollout-2026-11-23T10-00-00-{sid}.jsonl"
+        write_jsonl(bad_codex, [{"type": "session_meta", "payload": {"id": other}}])
+        os.utime(bad_codex, (self.now, self.now))
+
+        # Drift 2: single-UUID Pi file whose header disagrees with filename
+        bad_pi = self.home / ".pi/agent/sessions" / f"2026-11-23_{sid}.jsonl"
+        write_jsonl(bad_pi, [{"type": "session", "id": other}])
+        os.utime(bad_pi, (self.now, self.now))
+
+        # Drift 3: live pane writing to an uncovered file
+        uncovered = self.home / ".codex/other_dir/live.jsonl"
+        write_jsonl(uncovered, [{"type": "session_meta", "payload": {"id": sid}}])
+        fake_pane = live_sessions.LivePaneSession(
+            pane_id="%1",
+            coord="0:1.1",
+            session_name="0",
+            window_id="@1",
+            window_index="1",
+            window_name="w",
+            pane_index="1",
+            pane_active=True,
+            window_active=True,
+            current_command="codex",
+            cwd=str(self.home),
+            pane_tty="/dev/ttys001",
+            pane_title="Codex",
+            agent="codex",
+            agent_alias="codex",
+            session_id=sid,
+            title="Codex",
+            authority="codex_lsof",
+            active_path=str(uncovered),
+        )
+        with mock.patch.object(live_sessions, "list_live_panes", return_value=[fake_pane]):
+            dirty = mod.audit_session_storage_drift(
+                home=self.home,
+                days=14,
+                environment={"HOME": str(self.home)},
+                check_live_panes=True,
+                now=self.now,
+            )
+        codes = {issue["code"] for issue in dirty["issues"]}
+        self.assertIn("codex_sid_drift", codes)
+        self.assertIn("pi_sid_drift", codes)
+        self.assertIn("live_pane_active_path_uncovered", codes)
 
 
 if __name__ == "__main__":

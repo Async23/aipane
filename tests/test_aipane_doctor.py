@@ -11,6 +11,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
 DOCTOR = ROOT / "bin" / "aipane-doctor"
 
 
@@ -41,8 +44,18 @@ class AipaneDoctorTests(unittest.TestCase):
             self.link(name)
 
     def run_doctor(self, **overrides) -> subprocess.CompletedProcess[str]:
-        environment = {key: value for key, value in os.environ.items()
-                       if key not in {"DSH_HOME", "AIPANE_DSH_BIN", "AIPANE_DSH_NOTIFIER_APP"}}
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key
+            not in {
+                "DSH_HOME",
+                "AIPANE_DSH_BIN",
+                "AIPANE_DSH_NOTIFIER_APP",
+                "CODEX_HOME",
+                "PI_CODING_AGENT_DIR",
+            }
+        }
         return subprocess.run(
             [
                 sys.executable,
@@ -347,6 +360,40 @@ class AipaneDoctorTests(unittest.TestCase):
         self.assertIn("notification icon is missing", result.stdout)
         (app / "Resources/DshBlackWhale.icns").write_bytes(b"fixture")
         self.assertEqual(self.run_doctor(**environment).returncode, 0)
+
+    def test_session_storage_drift_passes_for_suffixed_codex_segments(self) -> None:
+        from session_fixtures import seed_codex_multi_segment
+
+        self.configure_core()
+        sid = "12341234-1234-7234-8234-123412341234"
+        seed_codex_multi_segment(
+            self.home,
+            sid,
+            rollout_ids=("23452345-2345-7345-8345-234523452345",),
+            include_sqlite=True,
+        )
+        result = self.run_doctor(CODEX_HOME=str(self.home / ".codex"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OK   session storage drift: 2 codex, 1 sqlite", result.stdout)
+
+    def test_session_storage_drift_fails_when_sqlite_points_to_uncovered_rollout(self) -> None:
+        from session_fixtures import seed_codex_multi_segment, write_jsonl
+
+        self.configure_core()
+        sid = "56785678-5678-7678-8678-567856785678"
+        uncovered = self.home / ".codex/new_layout" / f"rollout-2026-11-23T10-00-00-{sid}.jsonl"
+        write_jsonl(
+            uncovered,
+            [{"ordinal": 50, "type": "session_meta", "timestamp": "2026-11-23T02:00:00Z", "payload": {"id": sid}}],
+        )
+        seed_codex_multi_segment(
+            self.home,
+            sid,
+            untracked_sqlite_rollout=uncovered,
+        )
+        result = self.run_doctor(CODEX_HOME=str(self.home / ".codex"))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("codex_sqlite_rollout_uncovered", result.stdout)
 
 
 if __name__ == "__main__":

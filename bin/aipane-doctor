@@ -11,6 +11,7 @@ import plistlib
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -332,6 +333,56 @@ def inspect_agy_registrations(audit: Audit, root: Path, home: Path) -> set[str]:
     return helpers
 
 
+def inspect_session_storage_drift(
+    audit: Audit,
+    home: Path,
+    *,
+    days: int = 14,
+    check_live_panes: bool = False,
+) -> None:
+    """Read-only drift audit comparing recent local session logs against discovery."""
+    codex_home = Path(os.environ.get("CODEX_HOME") or (home / ".codex")).expanduser()
+    pi_dir = Path(os.environ.get("PI_CODING_AGENT_DIR") or (home / ".pi/agent")).expanduser()
+    has_session_data = (
+        (codex_home / "sessions").is_dir()
+        or (codex_home / "archived_sessions").is_dir()
+        or any(codex_home.glob("state_*.sqlite"))
+        or (pi_dir / "sessions").is_dir()
+    )
+    if not has_session_data and not check_live_panes:
+        return
+
+    lib_dir = Path(__file__).resolve().parents[1] / "lib"
+    if not (lib_dir / "agent_sessions.py").is_file():
+        return
+    if str(lib_dir) not in sys.path:
+        sys.path.insert(0, str(lib_dir))
+    import agent_sessions
+
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    report = agent_sessions.audit_session_storage_drift(
+        home=home,
+        days=days,
+        environment=env,
+        check_live_panes=check_live_panes,
+    )
+    for issue in report["issues"]:
+        msg = f"session storage drift ({issue['code']}): {issue['message']}"
+        if issue.get("severity") == "warn":
+            audit.warn(msg)
+        else:
+            audit.fail(msg)
+    if not report["issues"]:
+        audit.ok(
+            "session storage drift: "
+            f"{report['checked_codex_files']} codex, "
+            f"{report['checked_sqlite_rollouts']} sqlite, "
+            f"{report['checked_pi_files']} pi"
+            + (f", {report['checked_live_panes']} live" if check_live_panes else "")
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="aipane-doctor",
@@ -349,6 +400,17 @@ def main() -> int:
         default=Path.home(),
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--check-sessions",
+        action="store_true",
+        help="Also cross-check live tmux AI panes against static session discovery",
+    )
+    parser.add_argument(
+        "--session-days",
+        type=int,
+        default=14,
+        help="Hot lookback window in days for session storage drift checks (default: 14)",
+    )
     arguments = parser.parse_args()
     root = arguments.root.expanduser().resolve()
     home = arguments.home.expanduser().resolve()
@@ -365,6 +427,12 @@ def main() -> int:
     checked.update(inspect_agy_registrations(audit, root, home))
     for name in sorted(checked):
         check_entrypoint(audit, root, home, name)
+    inspect_session_storage_drift(
+        audit,
+        home,
+        days=arguments.session_days,
+        check_live_panes=arguments.check_sessions,
+    )
 
     summary = (
         f"{len(checked)} entrypoints, "
