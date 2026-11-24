@@ -18,7 +18,11 @@ LIB_DIR = Path(__file__).resolve().parents[1] / "lib"
 if str(LIB_DIR) not in sys.path:
     sys.path.insert(0, str(LIB_DIR))
 
-from agent_activity_contract import ACTIVITY_MARKER_OPTION, ActivityError
+from agent_activity_contract import (
+    ACTIVITY_MARKER_OPTION,
+    PANE_AGENT_OPTION,
+    ActivityError,
+)
 from tmux_animation_log import AnimationLog, DEFAULT_LOG
 
 
@@ -34,7 +38,6 @@ MARKED_BUSY_PANE_FORMAT = (
     + ",#{pane_current_command}}}"
 )
 BUSY_PANES_FORMAT = "#{P:" + MARKED_BUSY_PANE_FORMAT + "}"
-PANE_AGENT_OPTION = "@tmux-window-wrap-agent"
 AGENT_PANES_FORMAT = (
     "#{P:#{&&:#{!:#{pane_dead}},#{==:#{" + PANE_AGENT_OPTION
     + "},#{pane_pid}:#{pane_current_command}}}}"
@@ -47,7 +50,9 @@ ACTIVITY_LEVEL_SEQUENCE = (
 )
 DEFAULT_ACTIVITY_FPS = 10
 ACTIVITY_PROBE_INTERVAL = 1.0
+AGENT_PRESENCE_PROBE_INTERVAL = 5.0
 _ACTIVITY_CONTROLLERS = {}
+_LAST_PROBE_CONTEXT = {}
 ANIMATION_TICK_ENVIRONMENT = "TMUX_WINDOW_WRAP_ANIMATION_TICK"
 REFRESH_CLIENTS_COMMAND = "#{L:refresh-client -S -t #{q:client_name};}"
 ANIMATION_CLIENT_FILTER = (
@@ -824,40 +829,58 @@ def _pane_process_commands(pane_pid):
     return commands
 
 
-def refresh_agent_presence(socket_name):
-    """Project live agent panes from one process snapshot, including idle tools."""
-    try:
-        completed = run_tmux(
-            socket_name, "list-panes", "-a", "-F",
-            WINDOW_SEPARATOR.join((
-                "#{pane_id}", "#{pane_pid}", "#{pane_current_command}",
-                "#{" + PANE_AGENT_OPTION + "}",
-            )),
-        )
-    except subprocess.CalledProcessError:
-        # tmux may load this fragment before its first session exists.
-        return False
+def _presence_panes_from_listed(listed_panes):
     panes = {}
-    # tmux records end at ASCII newlines; Unicode separators are field data.
-    for line in completed.stdout.split("\n"):
-        fields = line.split(WINDOW_SEPARATOR, 3)
-        if len(fields) != 4:
-            # One incomplete record must not terminate the animation driver.
-            continue
-        pane_id, pid, command, marker = fields
+    for item in listed_panes:
+        pane = item.pane
         try:
-            pane_pid = int(pid)
-        except ValueError:
+            pane_pid = int(pane.pane_pid)
+        except (TypeError, ValueError):
             continue
-        if pane_pid <= 0:
+        if pane_pid <= 0 or item.agent_marker is None:
             continue
-        panes[pane_pid] = (pane_id, command, marker)
+        panes[pane_pid] = (pane.pane_id, pane.current_command, item.agent_marker)
+    return panes
+
+
+def refresh_agent_presence(socket_name, *, listed_panes=None, processes=None):
+    """Project live agent panes from one process snapshot, including idle tools."""
+    if listed_panes is None:
+        try:
+            completed = run_tmux(
+                socket_name, "list-panes", "-a", "-F",
+                WINDOW_SEPARATOR.join((
+                    "#{pane_id}", "#{pane_pid}", "#{pane_current_command}",
+                    "#{" + PANE_AGENT_OPTION + "}",
+                )),
+            )
+        except subprocess.CalledProcessError:
+            # tmux may load this fragment before its first session exists.
+            return False
+        panes = {}
+        # tmux records end at ASCII newlines; Unicode separators are field data.
+        for line in completed.stdout.split("\n"):
+            fields = line.split(WINDOW_SEPARATOR, 3)
+            if len(fields) != 4:
+                # One incomplete record must not terminate the animation driver.
+                continue
+            pane_id, pid, command, marker = fields
+            try:
+                pane_pid = int(pid)
+            except ValueError:
+                continue
+            if pane_pid <= 0:
+                continue
+            panes[pane_pid] = (pane_id, command, marker)
+    else:
+        panes = _presence_panes_from_listed(listed_panes)
     if not panes:
         return False
-    try:
-        processes = _process_table()
-    except (OSError, subprocess.SubprocessError):
-        return False
+    if processes is None:
+        try:
+            processes = _process_table()
+        except (OSError, subprocess.SubprocessError):
+            return False
     if processes is None:
         return False
 
@@ -891,6 +914,9 @@ def refresh_agent_presence(socket_name):
     # probe retries any surviving pane whose projection did not update.
     run_tmux(socket_name, "source-file", "-", input="\n".join(updates) + "\n")
     return True
+
+
+_DEFAULT_REFRESH_AGENT_PRESENCE = refresh_agent_presence
 
 
 def pane_agent_status(socket_name, pane_id):
@@ -973,6 +999,13 @@ def activity_controller(socket_name, environment=None):
     return controller
 
 
+def _store_probe_context(socket_name, result):
+    panes = getattr(result, "panes", None)
+    if isinstance(panes, tuple):
+        snapshot = getattr(result, "process_snapshot", None)
+        _LAST_PROBE_CONTEXT[socket_name] = (panes, snapshot)
+
+
 def animation_probe(socket_name, controller=None, log=None):
     controller = controller or activity_controller(socket_name)
     result = controller.reconcile()
@@ -989,6 +1022,7 @@ def animation_probe(socket_name, controller=None, log=None):
                     if log is not None:
                         log.probe_errors(retry.errors)
                     if retry.owner is not None:
+                        _store_probe_context(socket_name, retry)
                         return retry.owner, retry.busy
                     raise ActivityError(result.errors[0])
             except subprocess.CalledProcessError:
@@ -1000,6 +1034,7 @@ def animation_probe(socket_name, controller=None, log=None):
             ),
             False,
         )
+    _store_probe_context(socket_name, result)
     return result.owner, result.busy
 
 
@@ -1072,6 +1107,8 @@ def animate_status(socket_name, fps, log=None):
     last_tick = None
     color_scheme = None
     next_probe = 0.0
+    next_presence_probe = 0.0
+    last_presence_key = None
     next_scheme_probe = 0.0
     next_tick_at = 0.0
     next_heartbeat = time.monotonic() + 60.0
@@ -1081,6 +1118,7 @@ def animate_status(socket_name, fps, log=None):
         now = time.monotonic()
         if now >= next_probe:
             stage("activity_probe")
+            _LAST_PROBE_CONTEXT.pop(socket_name, None)
             if log is None:
                 current_owner, busy = animation_probe(socket_name)
             else:
@@ -1103,9 +1141,58 @@ def animate_status(socket_name, fps, log=None):
                         log.emit("source_reload_failed", level="error", error=str(error))
                     source_version = version
             stage("agent_probe")
-            if refresh_agent_presence(socket_name):
-                stage("cache_invalidation")
-                invalidate_cache(socket_name)
+            probe_context = _LAST_PROBE_CONTEXT.pop(socket_name, None)
+            listed_panes, process_snapshot = (
+                probe_context if probe_context is not None else (None, None)
+            )
+            reusable_panes = (
+                listed_panes
+                if isinstance(listed_panes, tuple)
+                and all(
+                    getattr(item, "agent_marker", None) is not None
+                    for item in listed_panes
+                )
+                else None
+            )
+            presence_key = (
+                tuple(
+                    (
+                        item.pane.pane_id,
+                        item.pane.pane_pid,
+                        item.pane.current_command,
+                    )
+                    for item in reusable_panes
+                )
+                if reusable_panes is not None
+                else None
+            )
+            if (
+                presence_key is None
+                or presence_key != last_presence_key
+                or now >= next_presence_probe
+            ):
+                if (
+                    refresh_agent_presence is _DEFAULT_REFRESH_AGENT_PRESENCE
+                    and reusable_panes is not None
+                ):
+                    reused_processes = (
+                        process_snapshot.presence_table()
+                        if process_snapshot is not None
+                        and hasattr(process_snapshot, "presence_table")
+                        else None
+                    )
+                    presence_changed = refresh_agent_presence(
+                        socket_name,
+                        listed_panes=reusable_panes,
+                        processes=reused_processes,
+                    )
+                else:
+                    presence_changed = refresh_agent_presence(socket_name)
+                if presence_changed:
+                    stage("cache_invalidation")
+                    invalidate_cache(socket_name)
+                last_presence_key = presence_key
+                next_presence_probe = time.monotonic() + AGENT_PRESENCE_PROBE_INTERVAL
             if log is not None and busy != previous_busy:
                 log.emit("activity_changed", busy=busy)
             previous_busy = busy

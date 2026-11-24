@@ -2187,6 +2187,236 @@ class AgentActivityTests(unittest.TestCase):
             saved_rec = json.loads(adapter_rel.read(pane_rel.pane_id).record)
             self.assertEqual(saved_rec["root"]["codex_home"], str(target_profile.resolve()))
 
+    def test_process_snapshot_parses_numeric_tdev_and_single_digit_day_lstart(self):
+        import stat as stat_mod
+        from agent_activity import parse_process_snapshot
+
+        output = "\n".join(
+            (
+                "  100     1 Fri Aug  4 19:00:41 2026    16/75 S+   /usr/local/bin/agy --mode auto",
+                "  200     1 Tue Nov 24 01:03:36 2026    16/76 S    codex --yolo",
+                "  300     1 Tue Nov 24 01:03:36 2026       ?? Ss   /sbin/launchd",
+                "  400   200 Tue Nov 24 01:04:00 2026    16/76 Z    (defunct)",
+            )
+        )
+        fake_stats = {
+            "/dev/ttys075": mock.Mock(
+                st_mode=stat_mod.S_IFCHR | 0o620,
+                st_rdev=os.makedev(16, 75),
+            ),
+            "/dev/ttys076": mock.Mock(
+                st_mode=stat_mod.S_IFCHR | 0o620,
+                st_rdev=os.makedev(16, 76),
+            ),
+            "/dev/notatty": mock.Mock(
+                st_mode=stat_mod.S_IFREG | 0o644,
+                st_rdev=os.makedev(16, 75),
+            ),
+        }
+
+        def fake_stat(path):
+            if path not in fake_stats:
+                raise FileNotFoundError(path)
+            return fake_stats[path]
+
+        snap = parse_process_snapshot(output, stat_fn=fake_stat)
+        pane_75 = PaneActivity(pane_id="%1", current_command="agy", pane_tty="/dev/ttys075")
+        pane_76 = PaneActivity(pane_id="%2", current_command="codex", pane_tty="/dev/ttys076")
+        pane_bad = PaneActivity(pane_id="%3", current_command="agy", pane_tty="/dev/notatty")
+
+        # Double-space single-digit day preserved verbatim for exact 24-char match.
+        self.assertTrue(
+            snap.matches_process(
+                {"pid": 100, "started_at": "Fri Aug  4 19:00:41 2026"},
+                pane_75,
+            )
+        )
+        self.assertFalse(
+            snap.matches_process(
+                {"pid": 100, "started_at": "Fri Aug 4 19:00:41 2026"},
+                pane_75,
+            )
+        )
+        self.assertFalse(
+            snap.matches_process(
+                {"pid": 100, "started_at": "Fri Aug  4 19:00:41 2026"},
+                pane_76,
+            )
+        )
+        self.assertFalse(
+            snap.matches_process(
+                {"pid": 100, "started_at": "Fri Aug  4 19:00:41 2026"},
+                pane_bad,
+            )
+        )
+
+        agy_info = snap.agy_process_info(100, "/dev/ttys075")
+        self.assertIsNotNone(agy_info)
+        self.assertEqual(agy_info["executable"], "agy")
+        self.assertEqual(agy_info["tty"], "ttys075")
+        self.assertTrue(agy_info["foreground"])
+
+        # Mismatched tty must not match pane_tty.
+        agy_wrong_tty = snap.agy_process_info(100, "/dev/ttys076")
+        self.assertIsNotNone(agy_wrong_tty)
+        self.assertNotEqual(agy_wrong_tty["tty"], "ttys076")
+
+        # No-tty process maps to empty tty_for_pid; zombies excluded from presence_table.
+        self.assertEqual(snap.tty_for_pid(300, "/dev/ttys075"), "")
+        self.assertEqual(snap.tty_for_pid(200, "/dev/ttys076"), "ttys076")
+        presence = snap.presence_table()
+        self.assertIn(100, presence)
+        self.assertIn(200, presence)
+        self.assertNotIn(400, presence)
+
+    def test_reconcile_shares_single_snapshot_and_revalidates_live_before_repair(self):
+        import stat as stat_mod
+        from datetime import datetime
+        from agent_activity import parse_process_snapshot
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            codex_home = root / ".codex"
+            agy_state = root / "aipane-state"
+            sid = "019d0000-0000-7000-8000-000000000001"
+            rollout = make_codex_history(
+                codex_home,
+                session_id=sid,
+                lifecycles=[("turn-1", "completed", 1_795_400_000, 1_795_400_005)],
+            )
+
+            started_at = "Tue Nov 24 01:03:36 2026"
+            started_ts = datetime.strptime(started_at, "%a %b %d %H:%M:%S %Y").timestamp()
+            codex_record = json.dumps(
+                {
+                    "version": 1,
+                    "revision": "rev-1",
+                    "owner": "codex",
+                    "reported": "busy",
+                    "updated_at": 1_795_400_000_000,
+                    "pane": {
+                        "id": "%1",
+                        "tty": "/dev/ttys075",
+                        "socket": "/tmp/tmux-test",
+                        "server_pid": "999",
+                    },
+                    "process": {"pid": 100, "started_at": started_at},
+                    "root": {
+                        "session_id": sid,
+                        "turn_id": "turn-1",
+                        "transcript_path": str(rollout),
+                        "codex_home": str(codex_home),
+                    },
+                }
+            )
+            pane_codex = PaneActivity(
+                pane_id="%1",
+                current_command="codex",
+                pane_tty="/dev/ttys075",
+                socket_path="/tmp/tmux-test",
+                server_pid="999",
+                pane_pid="100",
+                marker="codex",
+                reporter="codex",
+                marker_updated_at="1795400000000",
+                record=codex_record,
+            )
+            pane_agy = PaneActivity(
+                pane_id="%2",
+                current_command="agy",
+                pane_tty="/dev/ttys076",
+                socket_path="/tmp/tmux-test",
+                server_pid="999",
+                pane_pid="200",
+                reporter="agy",
+                record="{}",
+            )
+            env = {
+                "CODEX_HOME": str(codex_home),
+                "AIPANE_STATE_DIR": str(agy_state),
+                "HOME": str(root),
+            }
+            import agy_sessions
+            rt_path = agy_sessions.runtime_path("%2", "/tmp/tmux-test", "999", env)
+            rt_path.parent.mkdir(parents=True, exist_ok=True)
+            rt_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "pid": 200,
+                        "started_at": started_ts,
+                        "tty": "ttys076",
+                        "pane": "%2",
+                        "socket": "/tmp/tmux-test",
+                        "server": "999",
+                        "state": "idle",
+                        "cwd": str(root),
+                        "session_id": sid,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(rt_path, 0o600)
+
+            ps_output = "\n".join(
+                (
+                    f"  100     1 {started_at}    16/75 S+   codex --yolo",
+                    f"  200     1 {started_at}    16/76 S+   agy --mode auto",
+                )
+            )
+            fake_stats = {
+                "/dev/ttys075": mock.Mock(
+                    st_mode=stat_mod.S_IFCHR | 0o620,
+                    st_rdev=os.makedev(16, 75),
+                ),
+                "/dev/ttys076": mock.Mock(
+                    st_mode=stat_mod.S_IFCHR | 0o620,
+                    st_rdev=os.makedev(16, 76),
+                ),
+            }
+            snapshot = parse_process_snapshot(ps_output, stat_fn=fake_stats.__getitem__)
+            adapter = InMemoryActivityAdapter([pane_codex, pane_agy], environment=env)
+            activity = AgentActivity(adapter=adapter, environment=env)
+
+            live_checks = []
+            live_matches_result = [False]
+
+            def fake_live_ps(arguments, **_kwargs):
+                live_checks.append(arguments)
+                lstart = started_at if live_matches_result[0] else "Tue Nov 24 02:00:00 2026"
+                return subprocess.CompletedProcess(
+                    arguments, 0, f"{lstart} ttys075\n", "",
+                )
+
+            with (
+                mock.patch("agent_activity.capture_process_snapshot", return_value=snapshot) as cap_mock,
+                mock.patch("agent_activity.os.kill"),
+                mock.patch("agent_activity.subprocess.run", side_effect=fake_live_ps),
+                mock.patch("agy_sessions.process_info", side_effect=AssertionError("must use shared snapshot for agy scan")),
+            ):
+                # Round 1: read-only scan uses shared snapshot once; zero live ps calls.
+                first = activity.reconcile()
+                self.assertEqual(cap_mock.call_count, 1)
+                self.assertEqual(live_checks, [])
+                self.assertTrue(first.busy)
+                self.assertFalse(first.changed)
+
+                # Round 2: triggers _repair(), which MUST run live identity check under lock.
+                # Because live_matches_result is False (PID reused), repair aborts safely.
+                second = activity.reconcile()
+                self.assertEqual(cap_mock.call_count, 2)
+                self.assertEqual(len(live_checks), 1)
+                self.assertFalse(second.changed)
+                self.assertEqual(adapter.read("%1").marker, "codex")
+
+                # Round 3: live process now matches -> _repair() succeeds and clears marker.
+                live_matches_result[0] = True
+                third = activity.reconcile()
+                self.assertEqual(len(live_checks), 2)
+                self.assertTrue(third.changed)
+                self.assertFalse(third.busy)
+                self.assertEqual(adapter.read("%1").marker, "")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -809,6 +809,89 @@ class WindowWrapCliTests(unittest.TestCase):
         self.assertEqual(len(probes), 3, f"idle activity scans at {probes}")
         self.assertTrue(all(b - a >= 1 for a, b in zip(probes, probes[1:])))
 
+    def test_animator_reuses_reconcile_panes_and_throttles_presence_with_early_trigger(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        script_globals = namespace["animate_status"].__globals__
+        from agent_activity import (
+            ActivityReconcileResult,
+            ListedPaneActivity,
+            PaneActivity,
+            parse_process_snapshot,
+        )
+
+        owner = {}
+        tmux_calls = []
+        presence_calls = []
+
+        class FakeTime:
+            now = 0.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+            @classmethod
+            def sleep(cls, seconds):
+                cls.now += max(seconds, 0.01)
+
+        def fake_run_tmux(_socket, *arguments, input=None):
+            tmux_calls.append((arguments, input))
+            if arguments[:3] == ("set-environment", "-g", "TMUX_WINDOW_WRAP_ANIMATOR_OWNER"):
+                owner["value"] = arguments[-1]
+            return subprocess.CompletedProcess(["tmux", *arguments], 0, stdout="", stderr="")
+
+        snapshot = parse_process_snapshot(
+            "  100     1 Tue Nov 24 01:03:36 2026    16/75 S+   zsh\n"
+            "  101   100 Tue Nov 24 01:03:37 2026    16/75 S+   codex --yolo\n"
+        )
+        # Reconcile ticks at t=0,1,2,3,4,5,6,7; command changes at t=2; superseded at t=8.
+        tick_index = {"n": 0}
+
+        class FakeController:
+            def reconcile(self):
+                t = FakeTime.now
+                idx = tick_index["n"]
+                tick_index["n"] += 1
+                cmd = "zsh" if t < 2.0 else "codex"
+                pane = PaneActivity(
+                    pane_id="%1",
+                    current_command=cmd,
+                    pane_pid="100",
+                    pane_tty="/dev/ttys075",
+                )
+                return ActivityReconcileResult(
+                    owner=owner["value"] if t < 7.5 else "successor",
+                    busy=False,
+                    changed=False,
+                    panes=(ListedPaneActivity(attached=True, pane=pane, agent_marker=""),),
+                    process_snapshot=snapshot,
+                )
+
+        real_refresh = script_globals["refresh_agent_presence"]
+
+        def spy_refresh(socket_name, *, listed_panes=None, processes=None):
+            presence_calls.append((round(FakeTime.now, 2), listed_panes is not None, processes is not None))
+            return real_refresh(socket_name, listed_panes=listed_panes, processes=processes)
+
+        script_globals["time"] = FakeTime
+        script_globals["run_tmux"] = fake_run_tmux
+        script_globals["activity_controller"] = lambda _socket: FakeController()
+        script_globals["refresh_agent_presence"] = spy_refresh
+        script_globals["_DEFAULT_REFRESH_AGENT_PRESENCE"] = spy_refresh
+        script_globals["_process_table"] = mock.Mock(
+            side_effect=AssertionError("must reuse process_snapshot instead of calling _process_table"),
+        )
+        script_globals["detect_color_scheme"] = lambda: "light"
+        script_globals["invalidate_cache"] = mock.Mock()
+
+        self.assertEqual(namespace["animate_status"]("test", 10), "superseded")
+        # Presence should run at t=0 (initial), t=2 (command changed zsh->codex), and t=7 (5s fallback after t=2).
+        times = [entry[0] for entry in presence_calls]
+        self.assertEqual(times, [0.0, 2.0, 7.0], f"unexpected presence schedule: {presence_calls}")
+        self.assertTrue(all(has_panes and has_procs for _, has_panes, has_procs in presence_calls))
+        # No list-panes call should be issued by refresh_agent_presence.
+        self.assertFalse(any(args and args[0] == "list-panes" for args, _ in tmux_calls))
+
     def test_animation_probe_still_raises_when_snapshot_retry_fails(self):
         namespace = runpy.run_path(str(SCRIPT))
         probe = namespace["animation_probe"]

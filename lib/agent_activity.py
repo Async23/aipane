@@ -7,11 +7,13 @@ callers may materialize a newer projection.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
 import shlex
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -34,6 +36,7 @@ from agent_activity_contract import (
     ACTIVITY_RECORD_OPTION,
     ACTIVITY_REPORTER_OPTION,
     ACTIVITY_UPDATED_AT_OPTION,
+    PANE_AGENT_OPTION,
     ActivityError,
 )
 from dsh_activity import read_runtime as read_dsh_activity_runtime
@@ -49,7 +52,10 @@ __all__ = (
     "ActivityWriteError",
     "AgentActivity",
     "InMemoryActivityAdapter",
+    "ProcessEntry",
+    "ProcessSnapshot",
     "TmuxActivityAdapter",
+    "capture_process_snapshot",
     "codex_goal_state",
     "codex_thread_identity",
 )
@@ -223,12 +229,15 @@ class ActivityReconcileResult:
     changed: bool
     available: bool = True
     errors: tuple[str, ...] = ()
+    panes: tuple[ListedPaneActivity, ...] = ()
+    process_snapshot: ProcessSnapshot | None = None
 
 
 @dataclass(frozen=True)
 class ListedPaneActivity:
     attached: bool
     pane: PaneActivity
+    agent_marker: str | None = None
 
 
 class ActivityProjectionAdapter(Protocol):
@@ -365,21 +374,24 @@ class TmuxActivityAdapter:
                 "#{TMUX_WINDOW_WRAP_ANIMATOR_OWNER}",
                 "#{session_attached}",
                 self.pane_format(),
+                f"#{{{PANE_AGENT_OPTION}}}",
             )
         )
         completed = self._run("list-panes", "-a", "-F", pane_format)
         owner = None
         panes: list[ListedPaneActivity] = []
         invalid_projection = False
-        for line in completed.stdout.splitlines():
-            fields = line.split(ACTIVITY_FIELD_SEPARATOR, 12)
-            if len(fields) != 13:
+        raw_stdout = completed.stdout
+        lines = raw_stdout.removesuffix("\n").split("\n") if raw_stdout else []
+        for line in lines:
+            fields = line.split(ACTIVITY_FIELD_SEPARATOR, 13)
+            if len(fields) not in {13, 14}:
                 invalid_projection = True
                 continue
             if owner is None:
                 owner = fields[0]
             try:
-                pane = self._pane(fields[2:])
+                pane = self._pane(fields[2:13])
             except ActivityReadError:
                 invalid_projection = True
                 continue
@@ -387,7 +399,11 @@ class TmuxActivityAdapter:
                 invalid_projection = True
                 continue
             panes.append(
-                ListedPaneActivity(attached=fields[1] != "0", pane=pane)
+                ListedPaneActivity(
+                    attached=fields[1] != "0",
+                    pane=pane,
+                    agent_marker=fields[13] if len(fields) == 14 else None,
+                )
             )
         if invalid_projection:
             raise ActivityReadError(
@@ -515,6 +531,239 @@ class InMemoryActivityAdapter:
 
     def wake(self) -> None:
         self.wake_count += 1
+
+
+_PS_SNAPSHOT_LINE = re.compile(
+    r"^\s*(\d+)\s+(\d+)\s+"
+    r"([A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+"
+    r"(\S+)\s+(\S+)(?:\s+(.*))?$"
+)
+
+
+def _parse_tdev_pair(value: str) -> tuple[int, int] | None:
+    if "/" in value:
+        major_raw, _, minor_raw = value.partition("/")
+        try:
+            return (int(major_raw), int(minor_raw))
+        except ValueError:
+            return None
+    return None
+
+
+@dataclass(frozen=True)
+class ProcessEntry:
+    pid: int
+    ppid: int
+    lstart: str
+    tdev: str
+    tdev_pair: tuple[int, int] | None
+    stat: str
+    command: str
+
+
+class ProcessSnapshot:
+    """Single-cycle process table captured with numeric tdev to avoid devname() lookups."""
+
+    def __init__(
+        self,
+        entries: Mapping[int, ProcessEntry],
+        *,
+        stat_fn: Callable[[str], os.stat_result] = os.stat,
+    ) -> None:
+        self.entries: dict[int, ProcessEntry] = dict(entries)
+        self._stat_fn = stat_fn
+        self._tty_devices: dict[str, tuple[int, int] | None] = {}
+        self._presence_table: dict[int, tuple[int, str]] | None = None
+
+    def tty_device(self, pane_tty: str) -> tuple[int, int] | None:
+        if not pane_tty:
+            return None
+        if pane_tty in self._tty_devices:
+            return self._tty_devices[pane_tty]
+        dev_path = pane_tty if pane_tty.startswith("/") else f"/dev/{pane_tty}"
+        try:
+            info = self._stat_fn(dev_path)
+            device = (
+                (os.major(info.st_rdev), os.minor(info.st_rdev))
+                if stat.S_ISCHR(info.st_mode)
+                else None
+            )
+        except OSError:
+            device = None
+        self._tty_devices[pane_tty] = device
+        return device
+
+    def matches_process(
+        self,
+        process: Mapping[str, object],
+        pane: PaneActivity,
+    ) -> bool:
+        pid = process.get("pid")
+        started_at = process.get("started_at")
+        if (
+            not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 0
+            or not isinstance(started_at, str)
+            or not started_at
+        ):
+            return False
+        entry = self.entries.get(pid)
+        if entry is None or entry.lstart != started_at:
+            return False
+        pane_tty = pane.pane_tty.removeprefix("/dev/")
+        if not pane_tty:
+            return True
+        pane_dev = self.tty_device(pane.pane_tty)
+        if pane_dev is not None and entry.tdev_pair is not None:
+            return entry.tdev_pair == pane_dev
+        return entry.tdev.removeprefix("/dev/") == pane_tty
+
+    def agy_process_info(self, pid: int, pane_tty: str = "") -> dict[str, object] | None:
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return None
+        entry = self.entries.get(pid)
+        if entry is None or not entry.command:
+            return None
+        try:
+            args = shlex.split(entry.command)
+            started_at = datetime.strptime(
+                entry.lstart,
+                "%a %b %d %H:%M:%S %Y",
+            ).timestamp()
+        except ValueError:
+            return None
+        pane_name = pane_tty.removeprefix("/dev/")
+        if (
+            pane_name
+            and entry.tdev_pair is not None
+            and entry.tdev_pair == self.tty_device(pane_tty)
+        ):
+            tty = pane_name
+        else:
+            tty = entry.tdev.removeprefix("/dev/")
+        return {
+            "pid": entry.pid,
+            "ppid": entry.ppid,
+            "started_at": started_at,
+            "tty": tty,
+            "foreground": "+" in entry.stat,
+            "executable": Path(args[0]).name if args else "",
+        }
+
+    def tty_for_pid(self, pid: int, pane_tty: str = "") -> str:
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return ""
+        entry = self.entries.get(pid)
+        if entry is None or entry.tdev in {"", "?", "??", "-"}:
+            return ""
+        pane_name = pane_tty.removeprefix("/dev/")
+        if (
+            pane_name
+            and entry.tdev_pair is not None
+            and entry.tdev_pair == self.tty_device(pane_tty)
+        ):
+            return pane_name
+        return entry.tdev.removeprefix("/dev/")
+
+    def process_started_at(self, pane: PaneActivity) -> int | None:
+        tty = pane.pane_tty.removeprefix("/dev/")
+        if not tty or not pane.current_command:
+            return None
+        pane_dev = self.tty_device(pane.pane_tty)
+        exact: list[int] = []
+        compatible: list[int] = []
+        for entry in self.entries.values():
+            if not entry.command:
+                continue
+            if pane_dev is not None and entry.tdev_pair is not None:
+                if entry.tdev_pair != pane_dev:
+                    continue
+            elif entry.tdev.removeprefix("/dev/") != tty:
+                continue
+            try:
+                args = shlex.split(entry.command)
+            except ValueError:
+                args = entry.command.split()
+            if not args:
+                continue
+            command = Path(args[0]).name
+            try:
+                started_at = int(
+                    datetime.strptime(
+                        entry.lstart,
+                        "%a %b %d %H:%M:%S %Y",
+                    ).timestamp()
+                    * 1000
+                )
+            except ValueError:
+                continue
+            if command == pane.current_command:
+                exact.append(started_at)
+            elif _agent_commands_compatible(command, pane.current_command):
+                compatible.append(started_at)
+        candidates = exact or compatible
+        return min(candidates) if candidates else None
+
+    def presence_table(self) -> dict[int, tuple[int, str]]:
+        if self._presence_table is None:
+            self._presence_table = {
+                pid: (entry.ppid, entry.command)
+                for pid, entry in self.entries.items()
+                if entry.command and not entry.stat.startswith("Z")
+            }
+        return self._presence_table
+
+
+def parse_process_snapshot(
+    output: str,
+    *,
+    stat_fn: Callable[[str], os.stat_result] = os.stat,
+) -> ProcessSnapshot:
+    entries: dict[int, ProcessEntry] = {}
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        match = _PS_SNAPSHOT_LINE.match(line)
+        if not match:
+            continue
+        pid = int(match.group(1))
+        ppid = int(match.group(2))
+        lstart = match.group(3)
+        tdev = match.group(4)
+        proc_stat = match.group(5)
+        command = (match.group(6) or "").strip()
+        entries[pid] = ProcessEntry(
+            pid=pid,
+            ppid=ppid,
+            lstart=lstart,
+            tdev=tdev,
+            tdev_pair=_parse_tdev_pair(tdev),
+            stat=proc_stat,
+            command=command,
+        )
+    return ProcessSnapshot(entries, stat_fn=stat_fn)
+
+
+def capture_process_snapshot(
+    environment: Mapping[str, str] | None = None,
+) -> ProcessSnapshot | None:
+    env = dict(os.environ if environment is None else environment)
+    env["LC_ALL"] = "C"
+    try:
+        completed = subprocess.run(
+            ["ps", "-ax", "-o", "pid=,ppid=,lstart=,tdev=,stat=,command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return parse_process_snapshot(completed.stdout)
 
 
 def _default_process_matches(
@@ -1368,7 +1617,11 @@ class AgentActivity:
             )
         return self._inspection(pane)
 
-    def reconcile(self) -> ActivityReconcileResult:
+    def reconcile(
+        self,
+        *,
+        process_snapshot: ProcessSnapshot | None = None,
+    ) -> ActivityReconcileResult:
         """Probe all panes and repair only stable, revalidated evidence."""
 
         adapter = self.adapter
@@ -1388,6 +1641,23 @@ class AgentActivity:
             if pane_id not in live_ids:
                 self._repair_candidates.pop(pane_id, None)
 
+        candidate_panes = [
+            listed
+            for listed in listed_panes
+            if listed.attached
+            and (
+                listed.pane.marker
+                or listed.pane.reporter
+                or listed.pane.record
+            )
+        ]
+        if process_snapshot is None and len(candidate_panes) >= 2 and (
+            self.process_matches is _default_process_matches
+            or self.process_started_at is _default_process_started_at
+            or any(listed.pane.current_command == "agy" for listed in candidate_panes)
+        ):
+            process_snapshot = capture_process_snapshot(self.environment)
+
         busy = False
         changed = False
         errors: list[str] = []
@@ -1401,7 +1671,7 @@ class AgentActivity:
                 self._repair_candidates.pop(pane.pane_id, None)
                 continue
 
-            view = self._resolve(pane)
+            view = self._resolve(pane, process_snapshot=process_snapshot)
             stable_repair = (
                 bool((_record_object(pane.record) or {}).get("dsh_runtime"))
                 or
@@ -1476,6 +1746,8 @@ class AgentActivity:
             busy=busy,
             changed=changed,
             errors=tuple(errors),
+            panes=tuple(listed_panes),
+            process_snapshot=process_snapshot,
         )
 
     def clear(self, target: str) -> bool:
@@ -2064,12 +2336,27 @@ class AgentActivity:
             wake=True,
         )
 
-    def _resolve(self, pane: PaneActivity) -> ActivityView:
+    def _resolve(
+        self,
+        pane: PaneActivity,
+        *,
+        process_snapshot: ProcessSnapshot | None = None,
+    ) -> ActivityView:
         if pane.current_command == "agy":
             from agy_sessions import current_session
-            session = current_session(pane_id=pane.pane_id, socket_path=pane.socket_path,
-                                      server_pid=pane.server_pid, pane_tty=pane.pane_tty,
-                                      environment=self.environment)
+            kwargs: dict[str, object] = {
+                "pane_id": pane.pane_id,
+                "socket_path": pane.socket_path,
+                "server_pid": pane.server_pid,
+                "pane_tty": pane.pane_tty,
+                "environment": self.environment,
+            }
+            if process_snapshot is not None and inspect.isfunction(current_session):
+                kwargs["reader"] = lambda pid: process_snapshot.agy_process_info(
+                    pid,
+                    pane.pane_tty,
+                )
+            session = current_session(**kwargs)
             return ActivityView(state=session["state"] if session else "unknown",
                                 reported=session is not None,
                                 reason="agy_runtime" if session else "agy_runtime_unavailable")
@@ -2078,9 +2365,15 @@ class AgentActivity:
             busy = bool(pane.marker) and pane.marker == pane.current_command
             reported = busy or pane.reporter == pane.current_command
             if _is_codex_command(pane.current_command) and reported:
-                return self._resolve_legacy_codex(pane)
+                return self._resolve_legacy_codex(
+                    pane,
+                    process_snapshot=process_snapshot,
+                )
             if busy:
-                external = self._external_idle_view(pane)
+                external = self._external_idle_view(
+                    pane,
+                    process_snapshot=process_snapshot,
+                )
                 if external is not None:
                     return external
             return ActivityView(
@@ -2114,7 +2407,11 @@ class AgentActivity:
                 and str(pane_identity.get("server_pid")) != pane.server_pid
             )
             or not isinstance(process, dict)
-            or not self._same_process(process, pane)
+            or not self._same_process(
+                process,
+                pane,
+                process_snapshot=process_snapshot,
+            )
         ):
             return ActivityView(
                 state="unknown",
@@ -2132,6 +2429,7 @@ class AgentActivity:
                     pane,
                     revision=revision,
                     record=record,
+                    process_snapshot=process_snapshot,
                 )
                 if external is not None:
                     return external
@@ -2219,9 +2517,16 @@ class AgentActivity:
         *,
         revision: str = "",
         record: Mapping[str, object] | None = None,
+        process_snapshot: ProcessSnapshot | None = None,
     ) -> ActivityView | None:
         reason = ""
         evidence = ""
+        tty_lookup = (
+            (lambda pid: process_snapshot.tty_for_pid(pid, pane.pane_tty))
+            if process_snapshot is not None
+            and self.process_tty is globals()["process_tty"]
+            else self.process_tty
+        )
         if is_kimi_command(pane.current_command) and record is not None:
             session = record.get("session")
             reported_at = _milliseconds(record.get("updated_at"))
@@ -2249,7 +2554,7 @@ class AgentActivity:
                 {tty},
                 self.environment,
                 self.process_exists,
-                self.process_tty,
+                tty_lookup,
             )
             state = states.get(tty)
             if grok_idle_supersedes_marker(
@@ -2265,7 +2570,7 @@ class AgentActivity:
                 {pane.target},
                 self.environment,
                 self.process_exists,
-                self.process_tty,
+                tty_lookup,
             )
             state = states.get(pane.target)
             if claude_idle_supersedes_marker(
@@ -2303,18 +2608,36 @@ class AgentActivity:
         self,
         process: Mapping[str, object],
         pane: PaneActivity,
+        *,
+        process_snapshot: ProcessSnapshot | None = None,
     ) -> bool:
         if "pid" in process:
+            if (
+                process_snapshot is not None
+                and self.process_matches is _default_process_matches
+            ):
+                return process_snapshot.matches_process(process, pane)
             return self.process_matches(process, pane)
         recorded_start = _milliseconds(process.get("started_at_ms"))
-        current_start = self.process_started_at(pane)
+        if (
+            process_snapshot is not None
+            and self.process_started_at is _default_process_started_at
+        ):
+            current_start = process_snapshot.process_started_at(pane)
+        else:
+            current_start = self.process_started_at(pane)
         return (
             recorded_start is not None
             and current_start is not None
             and recorded_start == current_start
         )
 
-    def _resolve_legacy_codex(self, pane: PaneActivity) -> ActivityView:
+    def _resolve_legacy_codex(
+        self,
+        pane: PaneActivity,
+        *,
+        process_snapshot: ProcessSnapshot | None = None,
+    ) -> ActivityView:
         try:
             marker_at = int(pane.marker_updated_at)
         except (TypeError, ValueError):
@@ -2323,7 +2646,13 @@ class AgentActivity:
                 reported=True,
                 reason="legacy_codex_marker_time_missing",
             )
-        process_started_at = self.process_started_at(pane)
+        if (
+            process_snapshot is not None
+            and self.process_started_at is _default_process_started_at
+        ):
+            process_started_at = process_snapshot.process_started_at(pane)
+        else:
+            process_started_at = self.process_started_at(pane)
         if process_started_at is None or process_started_at > marker_at:
             return ActivityView(
                 state="unknown",

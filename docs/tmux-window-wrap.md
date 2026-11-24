@@ -80,9 +80,11 @@ processes do not inflate the count. Supported command identities are shared
 with `pane-agent-status`, including Codex, Claude Code, dsh-TUI, Kimi, Pi, Grok,
 Gemini, and Antigravity CLI (`agy`). Browser helpers are excluded here.
 
-The animator checks presence once per second using one process snapshot for
-all panes. It projects the owning pane PID and current command into
-`@tmux-window-wrap-agent` and invalidates cached rows when presence changes.
+The animator reuses the activity probe's `list-panes` snapshot and shared
+numeric-`tdev` process table to refresh presence whenever the pane set, pane
+PID, or foreground command changes, with a five-second fallback poll. It
+projects the owning pane PID and current command into `@tmux-window-wrap-agent`
+and invalidates cached rows when presence changes.
 The renderer only reads this projection; zooming does not hide other panes,
 and an old projection is ignored after the owning PID or command changes.
 

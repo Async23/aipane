@@ -4,6 +4,7 @@ ACTIVITY_MARKER_OPTION = "@tmux-window-wrap-activity"
 ACTIVITY_REPORTER_OPTION = "@tmux-window-wrap-activity-reporter"
 ACTIVITY_UPDATED_AT_OPTION = "@tmux-window-wrap-activity-updated-at"
 ACTIVITY_RECORD_OPTION = "@tmux-window-wrap-activity-record"
+PANE_AGENT_OPTION = "@tmux-window-wrap-agent"
 ACTIVITY_OPTIONS = (
     ACTIVITY_MARKER_OPTION,
     ACTIVITY_REPORTER_OPTION,
