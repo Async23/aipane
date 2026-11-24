@@ -149,13 +149,15 @@ def _meta_cache_key(path: Path) -> tuple[Path, int, int]:
 def _cached_codex_meta(
     path: Path,
     meta_cache: dict[Any, dict[str, Any] | None] | None,
+    *,
+    key: tuple[Path, int, int] | None = None,
 ) -> dict[str, Any] | None:
     if meta_cache is None:
         return codex_sessions.read_rollout_meta(path, max_lines=1)
-    key = _meta_cache_key(path)
-    if key not in meta_cache:
-        meta_cache[key] = codex_sessions.read_rollout_meta(path, max_lines=1)
-    return meta_cache[key]
+    resolved_key = key if key is not None else _meta_cache_key(path)
+    if resolved_key not in meta_cache:
+        meta_cache[resolved_key] = codex_sessions.read_rollout_meta(path, max_lines=1)
+    return meta_cache[resolved_key]
 
 
 def _dedup_session_files(files: list[SessionFile]) -> list[SessionFile]:
@@ -691,7 +693,7 @@ def is_noise_user_text(text: str) -> bool:
 
 
 def zstd_binary() -> str:
-    return shutil.which("zstd") or "/opt/homebrew/bin/zstd"
+    return codex_sessions.zstd_binary()
 
 
 def _is_zstd_path(path: Path) -> bool:
@@ -709,6 +711,24 @@ def iter_head_lines(
     """
     if _is_zstd_path(path):
         cap = min(max_bytes, 4 * 1024 * 1024)
+        if codex_sessions._stdlib_zstd is not None:
+            read_bytes = 0
+            try:
+                with codex_sessions._stdlib_zstd.open(path, "rb") as fh:
+                    for _ in range(max_lines):
+                        remaining = cap - read_bytes
+                        if remaining <= 0:
+                            break
+                        raw = fh.readline(remaining + 1)
+                        if not raw:
+                            break
+                        read_bytes += len(raw)
+                        if len(raw) > remaining:
+                            break
+                        yield raw.decode("utf-8", errors="replace")
+            except Exception:
+                return
+            return
         try:
             with path.open("rb") as fh:
                 proc = subprocess.Popen(
@@ -736,16 +756,7 @@ def iter_head_lines(
         except Exception:
             return
         finally:
-            try:
-                proc.stdout.close()
-            except OSError:
-                pass
-            proc.terminate()
-            try:
-                proc.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+            codex_sessions._reap_zstd_proc(proc, terminate=True)
         return
     try:
         read_bytes = 0
@@ -773,6 +784,14 @@ def read_head_lines(path: Path, max_lines: int = 80, max_bytes: int = 262144) ->
 def iter_raw_bytes_lines(path: Path) -> Iterator[bytes]:
     """Yield raw line bytes (preserving exact CRLF/LF line endings) for plain or zstd files."""
     if _is_zstd_path(path):
+        if codex_sessions._stdlib_zstd is not None:
+            try:
+                with codex_sessions._stdlib_zstd.open(path, "rb") as fh:
+                    for raw in fh:
+                        yield raw
+            except codex_sessions._ZSTD_DECODE_ERRORS as exc:
+                raise RuntimeError(f"zstd decode failed for {path}: {exc}") from exc
+            return
         with path.open("rb") as fh:
             proc = subprocess.Popen(
                 [zstd_binary(), "-dcq"],
@@ -787,24 +806,15 @@ def iter_raw_bytes_lines(path: Path) -> Iterator[bytes]:
                 yield raw
             completed = True
         finally:
-            try:
-                proc.stdout.close()
-            except OSError:
-                pass
             if not completed:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+                codex_sessions._reap_zstd_proc(proc, terminate=True)
                 if proc.stderr:
                     try:
                         proc.stderr.close()
                     except OSError:
                         pass
             else:
-                rc = proc.wait()
+                rc = codex_sessions._reap_zstd_proc(proc, terminate=False)
                 stderr_bytes = proc.stderr.read() if proc.stderr else b""
                 if proc.stderr:
                     proc.stderr.close()
@@ -1011,7 +1021,7 @@ def _collect_codex_children_by_sid(
         skey = _meta_cache_key(sf.path)
         if skey in seen_keys:
             continue
-        meta = _cached_codex_meta(sf.path, meta_cache)
+        meta = _cached_codex_meta(sf.path, meta_cache, key=skey)
         if not meta:
             continue
         actual_sid = meta["sid"]

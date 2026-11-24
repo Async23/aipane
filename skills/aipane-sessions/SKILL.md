@@ -10,9 +10,9 @@ Use `aipane-sessions` (run `aipane-sessions --help` for full flags). All subcomm
 ## Four Default Paths
 
 1. **Live tmux pane / sibling handoff (zero-copy topology lookup)**:
-   When the user refers to another pane in this tmux window or server (for example "check pane 1 and 2", "summarize the other agents in this window", or "read `0:4.1`"), resolve live panes directly instead of asking the user to copy UUIDs:
+   When the user refers to another pane in this tmux window or server (for example "check pane 1 and 2", "summarize the other agents in this window", or "read `0:4.1`"), resolve live panes directly instead of asking the user to copy UUIDs. Use `panes --siblings` whenever you need the live `pane_id` → `session_id`/`ref` mapping for `current_pane` (anchored on `$TMUX_PANE`) and same-window sibling panes:
    ```bash
-   # List other AI panes in the current window (uses $TMUX_PANE automatically)
+   # Return current_pane and same-window sibling AI panes with live session IDs (uses $TMUX_PANE)
    aipane-sessions panes --siblings
    # List all live AI panes across the tmux server
    aipane-sessions panes --all

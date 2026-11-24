@@ -20,6 +20,17 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+try:
+    from compression import zstd as _stdlib_zstd  # Python 3.14+
+except ImportError:  # pragma: no cover
+    _stdlib_zstd = None
+
+_ZSTD_DECODE_ERRORS: tuple[type[BaseException], ...] = (
+    (OSError, EOFError, _stdlib_zstd.ZstdError)
+    if _stdlib_zstd is not None
+    else (OSError, EOFError)
+)
+
 CODEX_SESSION_ROOT_NAMES = ("sessions", "archived_sessions")
 CODEX_ROLLOUT_SUFFIXES = (".jsonl", ".jsonl.zst")
 ROLLOUT_META_MAX_BYTES = 4 * 1024 * 1024
@@ -42,8 +53,28 @@ _CANONICAL_ROLLOUT_STEM_RE = re.compile(
 )
 
 
+@functools.lru_cache(maxsize=8)
+def _resolve_zstd_binary(path_env: str) -> str:
+    return shutil.which("zstd", path=path_env or None) or "/opt/homebrew/bin/zstd"
+
+
 def zstd_binary() -> str:
-    return shutil.which("zstd") or "/opt/homebrew/bin/zstd"
+    return _resolve_zstd_binary(os.environ.get("PATH", ""))
+
+
+def _reap_zstd_proc(proc: subprocess.Popen[bytes], *, terminate: bool) -> int:
+    """Close stdout pipe and reap a read-only `zstd -dcq` child without timeout polling sleep."""
+    if proc.stdout is not None:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+    if terminate:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    return proc.wait()
 
 
 def path_identity_key(path: Path) -> tuple[Path, int, int]:
@@ -333,6 +364,22 @@ def _read_first_lines_raw(
 ) -> tuple[list[bytes], str | None]:
     """Read up to `max_lines` raw lines from plain or zstd-compressed rollout."""
     if is_compressed_rollout(path):
+        if _stdlib_zstd is not None:
+            lines: list[bytes] = []
+            err: str | None = None
+            try:
+                with _stdlib_zstd.open(path, "rb") as fh:
+                    for _ in range(max(1, max_lines)):
+                        raw = fh.readline(max_bytes + 1)
+                        if not raw:
+                            break
+                        if len(raw) > max_bytes:
+                            err = "header_too_large"
+                            break
+                        lines.append(raw)
+            except _ZSTD_DECODE_ERRORS:
+                err = "io_error"
+            return lines, err
         try:
             with path.open("rb") as fh:
                 proc = subprocess.Popen(
@@ -344,8 +391,8 @@ def _read_first_lines_raw(
         except OSError:
             return [], "io_error"
         assert proc.stdout is not None
-        lines: list[bytes] = []
-        err: str | None = None
+        lines = []
+        err = None
         try:
             for _ in range(max(1, max_lines)):
                 raw = proc.stdout.readline(max_bytes + 1)
@@ -358,16 +405,7 @@ def _read_first_lines_raw(
         except OSError:
             err = "io_error"
         finally:
-            try:
-                proc.stdout.close()
-            except OSError:
-                pass
-            proc.terminate()
-            try:
-                proc.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+            _reap_zstd_proc(proc, terminate=True)
         return lines, err
 
     try:
@@ -388,6 +426,15 @@ def _read_first_lines_raw(
 def iter_rollout_bytes_lines(path: Path, *, strict: bool = False) -> Iterator[bytes]:
     """Stream raw byte lines (preserving exact line lengths) from a plain or zstd rollout."""
     if is_compressed_rollout(path):
+        if _stdlib_zstd is not None:
+            try:
+                with _stdlib_zstd.open(path, "rb") as fh:
+                    for raw in fh:
+                        yield raw
+            except _ZSTD_DECODE_ERRORS as exc:
+                if strict:
+                    raise OSError(f"zstd decode failed for {path}: {exc}") from exc
+            return
         with path.open("rb") as fh:
             proc = subprocess.Popen(
                 [zstd_binary(), "-dcq"],
@@ -402,17 +449,7 @@ def iter_rollout_bytes_lines(path: Path, *, strict: bool = False) -> Iterator[by
                 yield raw
             completed = True
         finally:
-            try:
-                proc.stdout.close()
-            except OSError:
-                pass
-            if not completed:
-                proc.terminate()
-            try:
-                rc = proc.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                rc = proc.wait()
+            rc = _reap_zstd_proc(proc, terminate=not completed)
         if strict and completed and rc != 0:
             raise OSError(f"zstd decode failed with exit code {rc} for {path}")
         return
@@ -446,48 +483,60 @@ def iter_rollout_records_reverse(
     yielded.
     """
     if is_compressed_rollout(path):
-        try:
-            with path.open("rb") as fh:
-                proc = subprocess.Popen(
-                    [zstd_binary(), "-dcq"],
-                    stdin=fh,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                )
-        except OSError:
-            return
-        assert proc.stdout is not None
         tail: deque[bytes] = deque()
         buffered = 0
         byte_pos = 0
-        try:
-            for raw_b in proc.stdout:
-                line_start = byte_pos
-                byte_pos += len(raw_b)
-                if max_bytes is not None and (
-                    line_start >= max_bytes or (line_start < max_bytes < byte_pos)
-                ):
-                    break
-                if not raw_b.strip():
-                    continue
-                tail.append(raw_b)
-                buffered += len(raw_b)
-                while len(tail) > 1 and buffered > max_compressed_tail_bytes:
-                    buffered -= len(tail.popleft())
-        except OSError:
-            return
-        finally:
+        if _stdlib_zstd is not None:
             try:
-                proc.stdout.close()
+                with _stdlib_zstd.open(path, "rb") as fh:
+                    for raw_b in fh:
+                        line_start = byte_pos
+                        byte_pos += len(raw_b)
+                        if max_bytes is not None and (
+                            line_start >= max_bytes or (line_start < max_bytes < byte_pos)
+                        ):
+                            break
+                        if not raw_b.strip():
+                            continue
+                        tail.append(raw_b)
+                        buffered += len(raw_b)
+                        while len(tail) > 1 and buffered > max_compressed_tail_bytes:
+                            buffered -= len(tail.popleft())
+            except _ZSTD_DECODE_ERRORS:
+                return
+        else:
+            try:
+                with path.open("rb") as fh:
+                    proc = subprocess.Popen(
+                        [zstd_binary(), "-dcq"],
+                        stdin=fh,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                    )
             except OSError:
-                pass
-            if max_bytes is not None:
-                proc.terminate()
+                return
+            assert proc.stdout is not None
+            completed = False
             try:
-                proc.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+                for raw_b in proc.stdout:
+                    line_start = byte_pos
+                    byte_pos += len(raw_b)
+                    if max_bytes is not None and (
+                        line_start >= max_bytes or (line_start < max_bytes < byte_pos)
+                    ):
+                        break
+                    if not raw_b.strip():
+                        continue
+                    tail.append(raw_b)
+                    buffered += len(raw_b)
+                    while len(tail) > 1 and buffered > max_compressed_tail_bytes:
+                        buffered -= len(tail.popleft())
+                else:
+                    completed = True
+            except OSError:
+                return
+            finally:
+                _reap_zstd_proc(proc, terminate=not completed)
         for raw_b in reversed(tail):
             try:
                 obj = json.loads(raw_b.decode("utf-8"))

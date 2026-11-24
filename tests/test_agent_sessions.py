@@ -2796,6 +2796,88 @@ class AgentSessionsTest(unittest.TestCase):
         self.assertEqual(len(r_lin["sources"]), 48)
         self.assertLess(rid_gets[0], 300)
 
+    def test_inproc_zstd_parity_and_subprocess_fallback(self) -> None:
+        from unittest import mock
+        import codex_sessions
+
+        if codex_sessions._stdlib_zstd is None:
+            self.skipTest("Python 3.14+ stdlib compression.zstd required")
+        cz = codex_sessions._stdlib_zstd
+
+        h = self.home / "zstd-parity"
+        sid_p = "88880001-aaaa-7888-8888-888800000001"
+        sid_c = "88880002-aaaa-7888-8888-888800000002"
+        p_parent = h / ".codex/sessions/2026/11/20" / f"rollout-2026-11-20T10-00-00-{sid_p}.jsonl.zst"
+        p_child = h / ".codex/sessions/2026/11/20" / f"rollout-2026-11-20T10-05-00-{sid_c}.jsonl.zst"
+        p_parent.parent.mkdir(parents=True, exist_ok=True)
+
+        # Concatenated two-frame zstd parent + single-frame child
+        row_p0 = json.dumps({"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-20T02:00:00Z", "payload": {"id": sid_p}}).encode() + b"\n"
+        row_p1 = json.dumps({"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "PARENT_MULTI"}]}}).encode() + b"\n"
+        p_parent.write_bytes(cz.compress(row_p0) + cz.compress(row_p1))
+        row_c0 = json.dumps({"ordinal": 0, "type": "session_meta", "timestamp": "2026-11-20T02:05:00Z", "payload": {"id": sid_c, "forked_from_id": sid_p}}).encode() + b"\n"
+        row_c1 = json.dumps({"ordinal": 1, "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "CHILD_FORK"}]}}).encode() + b"\n"
+        p_child.write_bytes(cz.compress(row_c0 + row_c1))
+
+        # 1. Default include_children=True read spawns 0 zstd subprocesses on Python 3.14+
+        with mock.patch.object(subprocess, "Popen", wraps=subprocess.Popen) as spy_p:
+            res = mod.read_session(f"codex:{sid_p}", view="timeline", full=True, include_children=True, home=h)
+        self.assertTrue(res["complete"], res["warnings"])
+        self.assertEqual([e["text"] for s in res["sources"] for e in s["events"]], ["PARENT_MULTI", "CHILD_FORK"])
+        self.assertEqual([c for c in spy_p.call_args_list if c.args and Path(c.args[0][0]).name == "zstd"], [])
+
+        # 2. Edge-case files: valid empty frame, 0-byte file, corrupt body, trailing junk, oversized header
+        p_valid_empty = h / "valid_empty.jsonl.zst"
+        p_valid_empty.write_bytes(cz.compress(b""))
+        p_zero = h / "zero.jsonl.zst"
+        p_zero.write_bytes(b"")
+        p_bad = h / "bad.jsonl.zst"
+        p_bad.write_bytes(b"not-valid-zstd-stream")
+        p_trail = h / "trail.jsonl.zst"
+        p_trail.write_bytes(cz.compress(row_p0 + row_p1) + b"junkinvalid")
+        p_huge = h / "huge.jsonl.zst"
+        p_huge.write_bytes(cz.compress(b'{"type":"session_meta","payload":{"id":"x","pad":"' + b"A" * 200 + b'"}}\n'))
+
+        modes = [("inproc", codex_sessions._stdlib_zstd)]
+        if shutil.which("zstd"):
+            modes.append(("fallback", None))
+
+        for label, zmod in modes:
+            with mock.patch.object(codex_sessions, "_stdlib_zstd", zmod):
+                m_p, err_p = codex_sessions.read_rollout_meta_detailed(p_parent)
+                self.assertIsNone(err_p, label)
+                self.assertEqual(m_p["sid"], sid_p, label)
+                self.assertEqual(list(codex_sessions.iter_rollout_bytes_lines(p_parent, strict=True)), [row_p0, row_p1], label)
+                self.assertEqual(list(mod.iter_raw_bytes_lines(p_parent)), [row_p0, row_p1], label)
+                self.assertEqual(len(list(mod.iter_head_lines(p_parent, max_lines=1))), 1, label)
+                rev_all = list(codex_sessions.iter_rollout_records_reverse(p_parent))
+                self.assertEqual([r["ordinal"] for r in rev_all], [1, 0], label)
+                rev_cut = list(codex_sessions.iter_rollout_records_reverse(p_parent, max_bytes=len(row_p0)))
+                self.assertEqual([r["ordinal"] for r in rev_cut], [0], label)
+
+                # Valid empty zstd frame -> missing_meta
+                self.assertEqual(codex_sessions.read_rollout_meta_detailed(p_valid_empty), (None, "missing_meta"), label)
+                # Oversized header -> header_too_large
+                self.assertEqual(codex_sessions.read_rollout_meta_detailed(p_huge, max_bytes=64), (None, "header_too_large"), label)
+                # Corrupt / 0-byte / trailing-junk strict reads fail cleanly
+                for bad_p in (p_zero, p_bad, p_trail):
+                    with self.assertRaises(OSError, msg=f"{label}:{bad_p.name}"):
+                        list(codex_sessions.iter_rollout_bytes_lines(bad_p, strict=True))
+                    with self.assertRaises(RuntimeError, msg=f"{label}:{bad_p.name}"):
+                        list(mod.iter_raw_bytes_lines(bad_p))
+                if zmod is not None:
+                    self.assertEqual(codex_sessions.read_rollout_meta_detailed(p_bad), (None, "io_error"))
+                    self.assertEqual(codex_sessions.read_rollout_meta_detailed(p_zero), (None, "io_error"))
+
+        # 3. zstd_binary cache honors PATH changes
+        fake_bin_dir = h / "fake-bin"
+        fake_bin_dir.mkdir(parents=True, exist_ok=True)
+        fake_zstd = fake_bin_dir / "zstd"
+        fake_zstd.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_zstd.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(fake_bin_dir)}):
+            self.assertEqual(Path(codex_sessions.zstd_binary()).resolve(), fake_zstd.resolve())
+
 
 if __name__ == "__main__":
     unittest.main()
