@@ -49,7 +49,7 @@ git -C ~/.aipane pull --ff-only
 |------|------|
 | Ghostty Cmd 桥 | `Cmd+S` prefix；单次 `Cmd+T/W/D/[]/…`；`Cmd+I` 中央弹窗重命名；`Cmd+Opt+P` 打开交互式会话与窗格拾取器；`Cmd+Opt+Y` 复制当前窗格 AI 会话引用（`<agent>:<id>`） |
 | Shift+Enter | tmux 里给 Codex 等稳定换行（→ Ctrl+J） |
-| tmux workstation | 数字连按跳窗、zoom 保持导航、广播/单格豁免、pane 顶栏、256 色表、vi 复制 |
+| tmux workstation | 数字连按跳窗、zoom 保持导航、pane 级子集广播与无弹窗数字直选、pane 顶栏、256 色表、vi 复制 |
 | window-wrap | 状态栏窗口标签最多 3 行 |
 | copy-mode `Y` | 可选长截图，依赖 [tmux-shot](https://github.com/Async23/tmux-shot) |
 
@@ -70,6 +70,7 @@ ln -sf "$AIPANE_ROOT/bin/tmux-session-picker" ~/.local/bin/tmux-session-picker
 ln -sf "$AIPANE_ROOT/bin/tmux-close-window-popup" ~/.local/bin/tmux-close-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
 ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
+ln -sf "$AIPANE_ROOT/bin/tmux-pane-sync" ~/.local/bin/tmux-pane-sync
 ln -sf "$AIPANE_ROOT/bin/aipane-activity" ~/.local/bin/aipane-activity
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
 ln -sf "$AIPANE_ROOT/bin/ai-restart" ~/.local/bin/ai-restart
@@ -102,6 +103,7 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `bin/tmux-session-picker` | 交互式 AI 会话与窗格拾取器弹窗（`Cmd+Opt+P` / `prefix+Q`） |
 | `bin/tmux-colour-palette` | 终端索引色表（`0–255`） |
 | `bin/tmux-window-jump` | 同数字连按、精确 index 的窗口选择器 |
+| `bin/tmux-pane-sync` | pane 级 `synchronize-panes` 子集广播与无弹窗数字直选控制器 |
 | `bin/tmux-window-wrap` | 渲染 CLI |
 | `bin/aipane-activity` | Agent Activity CLI |
 | `bin/aipane-sessions` | 零索引跨 Agent 本地会话检索与导出 CLI（`list` / `find` / `read`） |

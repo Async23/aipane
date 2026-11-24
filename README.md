@@ -49,7 +49,7 @@ Terminal shell tuned for many AI CLI panes. **Not** loaded by `init.zsh`. Person
 |-------|----------------|
 | Ghostty Cmd bridge | `Cmd+S` prefix; one-shot `Cmd+T/W/D/[]/…`; `Cmd+I` renames in a centered popup; `Cmd+Opt+P` opens session & pane picker; `Cmd+Opt+Y` copies current pane's AI session ref (`<agent>:<id>`) |
 | Shift+Enter | Newline for Codex/other CLIs under tmux (`→` Ctrl+J) |
-| tmux workstation | repeated-digit window jump, zoom-aware nav, broadcast + per-pane mute, pane top bar, 256-colour palette, vi copy-mode |
+| tmux workstation | repeated-digit window jump, zoom-aware nav, per-pane broadcast + numeric sync-pick, pane top bar, 256-colour palette, vi copy-mode |
 | window-wrap | status window labels wrap up to 3 lines |
 | `Y` in copy-mode | optional long screenshot via [tmux-shot](https://github.com/Async23/tmux-shot) |
 
@@ -70,6 +70,7 @@ ln -sf "$AIPANE_ROOT/bin/tmux-session-picker" ~/.local/bin/tmux-session-picker
 ln -sf "$AIPANE_ROOT/bin/tmux-close-window-popup" ~/.local/bin/tmux-close-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
 ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
+ln -sf "$AIPANE_ROOT/bin/tmux-pane-sync" ~/.local/bin/tmux-pane-sync
 ln -sf "$AIPANE_ROOT/bin/aipane-activity" ~/.local/bin/aipane-activity
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
 ln -sf "$AIPANE_ROOT/bin/ai-restart" ~/.local/bin/ai-restart
@@ -103,6 +104,7 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `bin/tmux-close-window-popup` | centered stable-target window close confirmation |
 | `bin/tmux-colour-palette` | indexed terminal colour palette (`0–255`) |
 | `bin/tmux-window-jump` | repeated-digit exact-index window selector |
+| `bin/tmux-pane-sync` | per-pane `synchronize-panes` broadcast & numeric `sync-pick` controller |
 | `bin/tmux-window-wrap` | renderer CLI |
 | `bin/aipane-activity` | Agent Activity CLI |
 | `bin/aipane-sessions` | Zero-index local session lookup, search, and export CLI (`list` / `find` / `read`) |

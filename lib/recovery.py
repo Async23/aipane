@@ -310,6 +310,23 @@ class Tmux:
         configured = completed.stdout.strip() if completed.returncode == 0 else ""
         return configured or self.environment.get("SHELL", "/bin/zsh")
 
+    def _window_pane_sync_states(self, window_id: str) -> list[tuple[str, str]]:
+        completed = self.run(
+            "list-panes",
+            "-t",
+            window_id,
+            "-F",
+            f"#{{pane_id}}{FIELD_SEPARATOR}#{{pane_synchronized}}",
+        )
+        if completed.returncode != 0 or not completed.stdout.strip():
+            return []
+        states: list[tuple[str, str]] = []
+        for line in completed.stdout.splitlines():
+            fields = line.split(FIELD_SEPARATOR, 1)
+            if len(fields) == 2 and fields[0]:
+                states.append((fields[0], fields[1]))
+        return states
+
     def synchronized_windows(
         self, items: list[dict[str, Any]]
     ) -> dict[str, str]:
@@ -328,7 +345,11 @@ class Tmux:
                 raise RestoreExecutionError(
                     f"could not resolve the window containing {target}"
                 )
-            result[fields[0]] = fields[1]
+            window_id, state = fields
+            pane_states = self._window_pane_sync_states(window_id)
+            if pane_states and any(s in {"1", "on"} for _, s in pane_states):
+                state = "1"
+            result[window_id] = state
         return result
 
     def disable_synchronized_windows(self, items: list[dict[str, Any]]) -> list[str]:
@@ -351,6 +372,29 @@ class Tmux:
                 raise RestoreExecutionError(
                     f"could not disable synchronized input for {window_id}: {reason}"
                 )
+            pane_states = self._window_pane_sync_states(window_id)
+            for pane_id, _ in pane_states:
+                cleared = self.run(
+                    "set-option",
+                    "-p",
+                    "-u",
+                    "-t",
+                    pane_id,
+                    "synchronize-panes",
+                )
+                if cleared.returncode != 0:
+                    reason = cleared.stderr.strip() or "tmux rejected pane option clear"
+                    raise RestoreExecutionError(
+                        f"could not clear pane synchronized input for {pane_id}: {reason}"
+                    )
+            if pane_states:
+                self.run(
+                    "set-option",
+                    "-wu",
+                    "-t",
+                    window_id,
+                    "@aipane-sync-managed",
+                )
             verification = self.run(
                 "display-message",
                 "-p",
@@ -365,6 +409,12 @@ class Tmux:
                 raise RestoreExecutionError(
                     f"synchronized input is still enabled for {window_id}"
                 )
+            if pane_states:
+                remaining = self._window_pane_sync_states(window_id)
+                if any(s not in {"0", "off"} for _, s in remaining):
+                    raise RestoreExecutionError(
+                        f"pane-level synchronized input is still enabled in {window_id}"
+                    )
         return disabled
 
     def respawn(self, target: str, cwd: str, shell: str) -> str:

@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+"""Manage per-pane tmux synchronize-panes broadcast groups with draft pick mode.
+
+State schema:
+  - Live broadcast state:
+      * Window option `synchronize-panes` stays `off` (new splits never inherit sync).
+      * Pane option `synchronize-panes` is `on` for members of an active group (>= 2)
+        and unset (`-p -u`) for non-members.
+      * Window option `@aipane-sync-managed` is `"1"` while a managed group is active.
+      * Window option `@aipane-sync-last` stores space-separated stable pane IDs (`%N`)
+        from the most recently committed valid group (>= 2).
+  - Draft pick state (strictly separate from live state until Enter commits):
+      * Window option `@aipane-sync-draft` stores `" %1 %3 "` (or `" "` when empty).
+      * Window option `@aipane-sync-draft-count` stores `"0"`, `"1"`, `"2"`, ...
+      * Hidden global env `AIPANE_SYNC_PICK_<client_pid>` stores
+        `"<window_id>|<was_zoomed_0_or_1>|<origin_pane_id>"`.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
+
+WINDOW_ID_RE = re.compile(r"^@[0-9]+$")
+PANE_ID_RE = re.compile(r"^%[0-9]+$")
+CLIENT_PID_RE = re.compile(r"^[0-9]+$")
+SEP = "\x1f"
+
+
+@contextmanager
+def state_lock():
+    if fcntl is None:
+        yield
+        return
+    tmux_env = os.environ.get("TMUX", "")
+    key_src = tmux_env.split(",", 2)[0] if tmux_env else f"uid-{os.getuid()}"
+    digest = hashlib.sha256(key_src.encode("utf-8")).hexdigest()[:12]
+    lock_path = Path(tempfile.gettempdir()) / f"aipane-pane-sync-{digest}.lock"
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def tmux_bin() -> str:
+    return os.environ.get("AIPANE_TMUX_BIN", "tmux")
+
+
+def run_tmux(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [tmux_bin(), *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def run_tmux_batch(commands: list[list[str]]) -> subprocess.CompletedProcess[str] | None:
+    if not commands:
+        return None
+    argv: list[str] = []
+    for idx, cmd in enumerate(commands):
+        if idx > 0:
+            argv.append(";")
+        argv.extend(cmd)
+    return run_tmux(*argv)
+
+
+def invalidate_window_wrap() -> None:
+    candidate = os.environ.get("AIPANE_WINDOW_WRAP_BIN")
+    if candidate:
+        path = Path(candidate)
+    else:
+        path = Path.home() / ".local" / "bin" / "tmux-window-wrap"
+    if path.is_file() and os.access(path, os.X_OK):
+        subprocess.run(
+            [str(path), "invalidate"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def display_msg(client_name: str, text: str) -> None:
+    if client_name:
+        run_tmux("display-message", "-c", client_name, text)
+    else:
+        run_tmux("display-message", text)
+
+
+def refresh_client(client_name: str) -> None:
+    if client_name:
+        run_tmux("refresh-client", "-t", client_name, ";", "refresh-client", "-S", "-t", client_name)
+    else:
+        run_tmux("refresh-client", "-S")
+
+
+def list_window_panes(window_id: str) -> list[dict[str, str]]:
+    fmt = SEP.join(
+        (
+            "#{pane_id}",
+            "#{pane_index}",
+            "#{pane_synchronized}",
+            "#{pane_active}",
+            "#{window_zoomed_flag}",
+        )
+    )
+    completed = run_tmux("list-panes", "-t", window_id, "-F", fmt)
+    if completed.returncode != 0:
+        return []
+    panes: list[dict[str, str]] = []
+    for line in completed.stdout.splitlines():
+        parts = line.split(SEP)
+        if len(parts) != 5:
+            continue
+        panes.append(
+            {
+                "id": parts[0],
+                "index": parts[1],
+                "synchronized": parts[2],
+                "active": parts[3],
+                "zoomed": parts[4],
+            }
+        )
+    return panes
+
+
+def get_window_option(window_id: str, name: str) -> str:
+    completed = run_tmux("show-options", "-wqv", "-t", window_id, name)
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout.rstrip("\n")
+
+
+def env_name(client_pid: str) -> str:
+    return f"AIPANE_SYNC_PICK_{client_pid}"
+
+
+def get_pick_state(client_pid: str) -> tuple[str, int, str] | None:
+    if not CLIENT_PID_RE.fullmatch(client_pid):
+        return None
+    name = env_name(client_pid)
+    completed = run_tmux("show-environment", "-gh", name)
+    if completed.returncode != 0:
+        return None
+    line = completed.stdout.strip()
+    prefix = f"{name}="
+    if not line.startswith(prefix):
+        return None
+    raw = line[len(prefix) :]
+    parts = raw.split("|")
+    if len(parts) != 3:
+        return None
+    wid, was_zoomed_str, origin_pane = parts
+    if not WINDOW_ID_RE.fullmatch(wid):
+        return None
+    if was_zoomed_str not in {"0", "1"}:
+        return None
+    if origin_pane and not PANE_ID_RE.fullmatch(origin_pane):
+        return None
+    return wid, int(was_zoomed_str), origin_pane
+
+
+def parse_pane_id_list(raw: str, alive_ids: set[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for token in raw.split():
+        if token in alive_ids and token not in seen:
+            seen.add(token)
+            result.append(token)
+    return result
+
+
+def ordered_subset(panes: list[dict[str, str]], selected: set[str]) -> list[str]:
+    return [pane["id"] for pane in panes if pane["id"] in selected]
+
+
+def format_draft_value(pane_ids: list[str]) -> str:
+    if not pane_ids:
+        return " "
+    return " " + " ".join(pane_ids) + " "
+
+
+def write_draft(window_id: str, pane_ids: list[str]) -> None:
+    run_tmux_batch(
+        [
+            ["set-option", "-w", "-t", window_id, "@aipane-sync-draft", format_draft_value(pane_ids)],
+            ["set-option", "-w", "-t", window_id, "@aipane-sync-draft-count", str(len(pane_ids))],
+        ]
+    )
+
+
+def clear_live_sync(window_id: str, panes: list[dict[str, str]]) -> None:
+    cmds: list[list[str]] = [
+        ["set-option", "-w", "-t", window_id, "synchronize-panes", "off"],
+        ["set-option", "-wu", "-t", window_id, "@aipane-sync-managed"],
+    ]
+    for pane in panes:
+        cmds.append(["set-option", "-p", "-u", "-t", pane["id"], "synchronize-panes"])
+    run_tmux_batch(cmds)
+
+
+def apply_live_sync(
+    window_id: str,
+    panes: list[dict[str, str]],
+    selected: list[str],
+    *,
+    focus_if_outside: bool = True,
+) -> None:
+    selected_set = set(selected)
+    cmds: list[list[str]] = [
+        ["set-option", "-w", "-t", window_id, "synchronize-panes", "off"],
+    ]
+    active_pane_id = ""
+    for pane in panes:
+        if pane["active"] == "1":
+            active_pane_id = pane["id"]
+        if pane["id"] in selected_set:
+            cmds.append(["set-option", "-p", "-t", pane["id"], "synchronize-panes", "on"])
+        else:
+            cmds.append(["set-option", "-p", "-u", "-t", pane["id"], "synchronize-panes"])
+    cmds.append(["set-option", "-w", "-t", window_id, "@aipane-sync-managed", "1"])
+    cmds.append(["set-option", "-w", "-t", window_id, "@aipane-sync-last", " ".join(selected)])
+    if focus_if_outside and active_pane_id not in selected_set and selected:
+        cmds.append(["select-pane", "-t", selected[0]])
+    run_tmux_batch(cmds)
+
+
+def restore_zoom_if_needed(window_id: str, was_zoomed: int, origin_pane: str) -> None:
+    if was_zoomed != 1:
+        return
+    panes = list_window_panes(window_id)
+    if len(panes) < 2:
+        return
+    if panes[0]["zoomed"] == "1":
+        return
+    alive_ids = {p["id"] for p in panes}
+    cmds: list[list[str]] = []
+    if origin_pane and origin_pane in alive_ids:
+        cmds.append(["select-pane", "-t", origin_pane])
+    cmds.append(["resize-pane", "-Z", "-t", window_id])
+    run_tmux_batch(cmds)
+
+
+def enter_pick(
+    window_id: str,
+    client_pid: str,
+    client_name: str,
+    panes: list[dict[str, str]],
+    initial_selected: list[str],
+) -> int:
+    # If this client had an older stale pick session on another window, clean it first.
+    existing = get_pick_state(client_pid)
+    if existing and existing[0] != window_id:
+        old_wid, old_zoomed, old_origin = existing
+        run_tmux_batch(
+            [
+                ["set-option", "-wu", "-t", old_wid, "@aipane-sync-draft"],
+                ["set-option", "-wu", "-t", old_wid, "@aipane-sync-draft-count"],
+            ]
+        )
+        restore_zoom_if_needed(old_wid, old_zoomed, old_origin)
+
+    was_zoomed = 1 if panes and panes[0]["zoomed"] == "1" else 0
+    origin_pane = next((p["id"] for p in panes if p["active"] == "1"), panes[0]["id"])
+
+    cmds: list[list[str]] = []
+    if was_zoomed:
+        cmds.append(["resize-pane", "-Z", "-t", window_id])
+    cmds.append(["set-option", "-w", "-t", window_id, "@aipane-sync-draft", format_draft_value(initial_selected)])
+    cmds.append(["set-option", "-w", "-t", window_id, "@aipane-sync-draft-count", str(len(initial_selected))])
+    cmds.append(["set-environment", "-gh", env_name(client_pid), f"{window_id}|{was_zoomed}|{origin_pane}"])
+    if client_name:
+        cmds.append(["switch-client", "-c", client_name, "-T", "sync-pick"])
+    else:
+        cmds.append(["switch-client", "-T", "sync-pick"])
+    run_tmux_batch(cmds)
+    refresh_client(client_name)
+    return 0
+
+
+def cmd_toggle(window_id: str, client_pid: str, client_name: str) -> int:
+    if not WINDOW_ID_RE.fullmatch(window_id):
+        return 2
+    # Re-pressing Cmd+Opt+I (\x00B) while in sync-pick cancels cleanly and
+    # restores zoom (tmux intercepts prefix C-Space before custom key-tables).
+    pick_state = get_pick_state(client_pid)
+    if pick_state is not None and pick_state[0] == window_id and get_window_option(window_id, "@aipane-sync-draft"):
+        return cmd_cancel(client_pid, client_name, quiet=False)
+    panes = list_window_panes(window_id)
+    if not panes:
+        return 0
+    live_synced = [p["id"] for p in panes if p["synchronized"] == "1"]
+
+    # Clean up any ghost singleton before routing so the user never wastes a press
+    # or overwrites @aipane-sync-last with a single-pane entry.
+    if len(live_synced) == 1:
+        clear_live_sync(window_id, panes)
+        invalidate_window_wrap()
+        live_synced = []
+
+    if len(live_synced) >= 2:
+        # Preserve history if @aipane-sync-last was empty (e.g. manually synced).
+        if not get_window_option(window_id, "@aipane-sync-last").strip():
+            run_tmux("set-option", "-w", "-t", window_id, "@aipane-sync-last", " ".join(live_synced))
+        clear_live_sync(window_id, panes)
+        invalidate_window_wrap()
+        refresh_client(client_name)
+        display_msg(client_name, "Broadcast OFF")
+        return 0
+
+    if len(panes) < 2:
+        display_msg(client_name, "Broadcast needs at least 2 panes")
+        return 0
+
+    if len(panes) == 2:
+        # Fast path for 2 panes: auto-unzoom first so both targets are visible.
+        if panes[0]["zoomed"] == "1":
+            run_tmux("resize-pane", "-Z", "-t", window_id)
+        both = [p["id"] for p in panes]
+        apply_live_sync(window_id, panes, both, focus_if_outside=False)
+        invalidate_window_wrap()
+        refresh_client(client_name)
+        display_msg(client_name, "Broadcast ON (2/2 panes)")
+        return 0
+
+    # 3+ panes: enter draft pick mode starting from empty selection (no preselect).
+    return enter_pick(window_id, client_pid, client_name, panes, [])
+
+
+def cmd_edit(window_id: str, client_pid: str, client_name: str) -> int:
+    if not WINDOW_ID_RE.fullmatch(window_id):
+        return 2
+    panes = list_window_panes(window_id)
+    if len(panes) < 2:
+        display_msg(client_name, "Broadcast needs at least 2 panes")
+        return 0
+    live_synced = [p["id"] for p in panes if p["synchronized"] == "1"]
+    if len(live_synced) == 1:
+        clear_live_sync(window_id, panes)
+        invalidate_window_wrap()
+        live_synced = []
+    # Uniform initialization: load current valid group (empty on cold start;
+    # existing >=2 members when editing mid-broadcast).
+    return enter_pick(window_id, client_pid, client_name, panes, live_synced)
+
+
+def load_active_pick(
+    window_id: str,
+    client_pid: str,
+    client_name: str,
+) -> tuple[str, list[dict[str, str]], list[str]] | None:
+    state = get_pick_state(client_pid)
+    if state is None:
+        cmd_cancel(client_pid, client_name, quiet=True)
+        return None
+    pick_wid, _, _ = state
+    if pick_wid != window_id:
+        cmd_cancel(client_pid, client_name, quiet=True)
+        return None
+    panes = list_window_panes(pick_wid)
+    if not panes:
+        cmd_cancel(client_pid, client_name, quiet=True)
+        return None
+    alive_ids = {p["id"] for p in panes}
+    draft = parse_pane_id_list(get_window_option(pick_wid, "@aipane-sync-draft"), alive_ids)
+    return pick_wid, panes, draft
+
+
+def cmd_pick_action(
+    action: str,
+    window_id: str,
+    client_pid: str,
+    client_name: str,
+    target_arg: str = "",
+) -> int:
+    loaded = load_active_pick(window_id, client_pid, client_name)
+    if loaded is None:
+        return 0
+    pick_wid, panes, draft = loaded
+    selected = set(draft)
+    notice = ""
+
+    if action == "pick-index":
+        match = next((p["id"] for p in panes if p["index"] == target_arg), None)
+        if match is None:
+            notice = f"No pane {target_arg}"
+        elif match in selected:
+            selected.remove(match)
+        else:
+            selected.add(match)
+    elif action == "pick-pane":
+        if any(p["id"] == target_arg for p in panes):
+            if target_arg in selected:
+                selected.remove(target_arg)
+            else:
+                selected.add(target_arg)
+    elif action == "pick-current":
+        current = next((p["id"] for p in panes if p["active"] == "1"), None)
+        if current:
+            if current in selected:
+                selected.remove(current)
+            else:
+                selected.add(current)
+    elif action == "pick-all":
+        selected = {p["id"] for p in panes}
+    elif action == "pick-invert":
+        selected = {p["id"] for p in panes if p["id"] not in selected}
+    elif action == "pick-clear":
+        selected.clear()
+    elif action == "pick-last":
+        alive_ids = {p["id"] for p in panes}
+        last_ids = parse_pane_id_list(get_window_option(pick_wid, "@aipane-sync-last"), alive_ids)
+        if not last_ids:
+            notice = "No previous sync group in this window"
+        else:
+            selected = set(last_ids)
+
+    ordered = ordered_subset(panes, selected)
+    write_draft(pick_wid, ordered)
+    if client_name:
+        run_tmux("switch-client", "-c", client_name, "-T", "sync-pick")
+    else:
+        run_tmux("switch-client", "-T", "sync-pick")
+    refresh_client(client_name)
+    if notice:
+        display_msg(client_name, notice)
+    return 0
+
+
+def cmd_commit(window_id: str, client_pid: str, client_name: str) -> int:
+    state = get_pick_state(client_pid)
+    if state is None:
+        if client_name:
+            run_tmux("switch-client", "-c", client_name, "-T", "root")
+        return 0
+    pick_wid, was_zoomed, origin_pane = state
+    panes = list_window_panes(pick_wid)
+    alive_ids = {p["id"] for p in panes}
+    draft = parse_pane_id_list(get_window_option(pick_wid, "@aipane-sync-draft"), alive_ids)
+    selected = ordered_subset(panes, set(draft))
+
+    cleanup_cmds: list[list[str]] = [
+        ["set-option", "-wu", "-t", pick_wid, "@aipane-sync-draft"],
+        ["set-option", "-wu", "-t", pick_wid, "@aipane-sync-draft-count"],
+        ["set-environment", "-gu", env_name(client_pid)],
+    ]
+    if client_name:
+        cleanup_cmds.append(["switch-client", "-c", client_name, "-T", "root"])
+    else:
+        cleanup_cmds.append(["switch-client", "-T", "root"])
+    run_tmux_batch(cleanup_cmds)
+
+    if not panes:
+        return 0
+
+    if len(selected) < 2:
+        clear_live_sync(pick_wid, panes)
+        restore_zoom_if_needed(pick_wid, was_zoomed, origin_pane)
+        invalidate_window_wrap()
+        refresh_client(client_name)
+        display_msg(client_name, "Broadcast OFF (needs at least 2 panes)" if len(selected) == 1 else "Broadcast OFF")
+        return 0
+
+    # Keep unzoomed when broadcast becomes active so all targets stay visible.
+    apply_live_sync(pick_wid, panes, selected, focus_if_outside=True)
+    invalidate_window_wrap()
+    refresh_client(client_name)
+    display_msg(client_name, f"Broadcast ON ({len(selected)}/{len(panes)} panes)")
+    return 0
+
+
+def cmd_cancel(client_pid: str, client_name: str, *, quiet: bool = False) -> int:
+    state = get_pick_state(client_pid)
+    cmds: list[list[str]] = []
+    if state is not None:
+        pick_wid, was_zoomed, origin_pane = state
+        cmds.extend(
+            [
+                ["set-option", "-wu", "-t", pick_wid, "@aipane-sync-draft"],
+                ["set-option", "-wu", "-t", pick_wid, "@aipane-sync-draft-count"],
+                ["set-environment", "-gu", env_name(client_pid)],
+            ]
+        )
+    else:
+        was_zoomed = 0
+        pick_wid = ""
+        origin_pane = ""
+        if CLIENT_PID_RE.fullmatch(client_pid):
+            cmds.append(["set-environment", "-gu", env_name(client_pid)])
+
+    if client_name:
+        cmds.append(["switch-client", "-c", client_name, "-T", "root"])
+    run_tmux_batch(cmds)
+
+    if pick_wid and was_zoomed:
+        restore_zoom_if_needed(pick_wid, was_zoomed, origin_pane)
+
+    if client_name:
+        refresh_client(client_name)
+    if not quiet and state is not None:
+        display_msg(client_name, "Sync pick cancelled")
+    return 0
+
+
+def cmd_prune(window_id: str) -> int:
+    if not WINDOW_ID_RE.fullmatch(window_id):
+        return 2
+    if get_window_option(window_id, "@aipane-sync-managed") != "1":
+        return 0
+    panes = list_window_panes(window_id)
+    if not panes:
+        return 0
+    live_synced = [p["id"] for p in panes if p["synchronized"] == "1"]
+    if len(live_synced) >= 2:
+        return 0
+    clear_live_sync(window_id, panes)
+    invalidate_window_wrap()
+    run_tmux("refresh-client", "-S")
+    return 0
+
+
+def cmd_prune_clients() -> int:
+    live_res = run_tmux("list-clients", "-F", "#{client_pid}")
+    live_pids = set(live_res.stdout.split()) if live_res.returncode == 0 else set()
+    env_res = run_tmux("show-environment", "-gh")
+    if env_res.returncode != 0:
+        return 0
+    for line in env_res.stdout.splitlines():
+        if not line.startswith("AIPANE_SYNC_PICK_") or "=" not in line:
+            continue
+        name = line.split("=", 1)[0]
+        pid = name.removeprefix("AIPANE_SYNC_PICK_")
+        if pid not in live_pids:
+            cmd_cancel(pid, "", quiet=True)
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        return 2
+    action = argv[0]
+    args = argv[1:]
+    with state_lock():
+        if action == "toggle" and len(args) == 3:
+            return cmd_toggle(args[0], args[1], args[2])
+        if action == "edit" and len(args) == 3:
+            return cmd_edit(args[0], args[1], args[2])
+        if action in {"pick-index", "pick-pane"} and len(args) == 4:
+            return cmd_pick_action(action, args[1], args[2], args[3], target_arg=args[0])
+        if action in {"pick-current", "pick-all", "pick-invert", "pick-clear", "pick-last"} and len(args) == 3:
+            return cmd_pick_action(action, args[0], args[1], args[2])
+        if action == "commit" and len(args) == 3:
+            return cmd_commit(args[0], args[1], args[2])
+        if action == "cancel":
+            quiet = False
+            rest = list(args)
+            if rest and rest[0] == "--quiet":
+                quiet = True
+                rest = rest[1:]
+            if len(rest) == 1:
+                return cmd_cancel(rest[0], "", quiet=quiet)
+            if len(rest) == 2:
+                return cmd_cancel(rest[0], rest[1], quiet=quiet)
+            return 2
+        if action == "prune" and len(args) == 1:
+            return cmd_prune(args[0])
+        if action == "prune-clients" and not args:
+            return cmd_prune_clients()
+    print(f"tmux-pane-sync: invalid arguments: {argv!r}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

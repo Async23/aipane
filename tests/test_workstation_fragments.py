@@ -26,6 +26,7 @@ TMUX_WRAP = ROOT / "conf" / "tmux-window-wrap.conf"
 WRAP_BIN = ROOT / "bin" / "tmux-window-wrap"
 DOCTOR_BIN = ROOT / "bin" / "aipane-doctor"
 WINDOW_JUMP_BIN = ROOT / "bin" / "tmux-window-jump"
+PANE_SYNC_BIN = ROOT / "bin" / "tmux-pane-sync"
 RENAME_BIN = ROOT / "bin" / "tmux-rename-window-popup"
 PICKER_BIN = ROOT / "bin" / "tmux-session-picker"
 COLOUR_PALETTE_BIN = ROOT / "bin" / "tmux-colour-palette"
@@ -43,6 +44,8 @@ class GhosttyFragmentTests(unittest.TestCase):
         self.assertIn("keybind = cmd+t=text:\\x00c", text)
         self.assertIn("keybind = cmd+d=text:\\x00|", text)
         self.assertIn("keybind = cmd+b=text:\\x00T", text)
+        self.assertIn("keybind = super+alt+i=text:\\x00B", text)
+        self.assertNotIn("super+alt+shift+i", text)
         self.assertIn("keybind = shift+enter=text:\\x0a", text)
         self.assertIn("macos-option-as-alt = true", text)
         for digit in range(10):
@@ -862,6 +865,8 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
         self.assertNotIn("#{session_id}", text)
         self.assertTrue(WINDOW_JUMP_BIN.is_file())
         self.assertTrue(os.access(WINDOW_JUMP_BIN, os.X_OK))
+        self.assertTrue(PANE_SYNC_BIN.is_file())
+        self.assertTrue(os.access(PANE_SYNC_BIN, os.X_OK))
         self.assertTrue(RENAME_BIN.is_file())
         self.assertTrue(os.access(RENAME_BIN, os.X_OK))
         self.assertTrue(PICKER_BIN.is_file())
@@ -955,7 +960,18 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             ).stdout
-            self.assertRegex(keys, re.compile(r"prefix\s+B\s+.*synchronize-panes"))
+            self.assertRegex(keys, re.compile(r"prefix\s+B\s+.*tmux-pane-sync.*synchronize-panes"))
+            self.assertRegex(keys, re.compile(r"prefix\s+e\s+.*tmux-pane-sync.*edit"))
+            sync_pick_keys = subprocess.run(
+                ["tmux", "-L", socket, "list-keys", "-T", "sync-pick"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertRegex(sync_pick_keys, re.compile(r"sync-pick\s+Enter\s+.*commit"))
+            self.assertRegex(sync_pick_keys, re.compile(r"sync-pick\s+q\s+.*cancel"))
+            self.assertRegex(sync_pick_keys, re.compile(r"sync-pick\s+Escape\s+.*cancel"))
+            self.assertRegex(sync_pick_keys, re.compile(r"sync-pick\s+Any\s+.*switch-client -T sync-pick"))
             self.assertRegex(
                 keys,
                 re.compile(r"prefix\s+T\s+.*status.*run-shell -b -c /.*set-option status off"),

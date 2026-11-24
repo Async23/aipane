@@ -4738,7 +4738,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         cache_keys = (
             "TMUX_WINDOW_WRAP_GENERATION=#{TMUX_WINDOW_WRAP_GENERATION}",
             "TMUX_WINDOW_WRAP_WINDOWS=#{W:",
-            "#{q:window_name}_#{pane_synchronized}",
+            "#{q:window_name}_#{||:#{e|>=:#{n:#{s/0//:#{P:#{pane_synchronized}}}},2},#{&&:#{==:#{window_panes},1},#{pane_synchronized}}}",
             "#{P:#{&&:#{m/r:^.+$,#{@tmux-window-wrap-activity}},"
             "#{==:#{@tmux-window-wrap-activity},#{pane_current_command}}}}",
             "TMUX_WINDOW_WRAP_CLIENTS=#{L:",

@@ -183,17 +183,21 @@ DEFAULT_ACTIVITY_PALETTES = {
         ),
     },
 }
+WINDOW_SYNC_FORMAT = (
+    "#{||:#{e|>=:#{n:#{s/0//:#{P:#{pane_synchronized}}}},2},"
+    "#{&&:#{==:#{window_panes},1},#{pane_synchronized}}}"
+)
 WINDOW_FORMAT = WINDOW_SEPARATOR.join(
     (
         "#{window_id}",
         "#{window_index}",
         "#{window_name}",
         "#{window_active}",
-        "#{pane_synchronized}",
+        WINDOW_SYNC_FORMAT,
         BUSY_PANES_FORMAT,
         AGENT_PANES_FORMAT,
         "#{variation-selector-always-wide}",
-        "#{w: #{window_index}:#{window_name}#{?pane_synchronized, ▶,} }",
+        f"#{{w: #{{window_index}}:#{{window_name}}#{{?{WINDOW_SYNC_FORMAT}, ▶,}} }}",
     )
 )
 STATUS_WIDTH_FORMAT = WINDOW_SEPARATOR.join(

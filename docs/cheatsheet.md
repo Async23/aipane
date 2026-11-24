@@ -23,8 +23,7 @@ also send complete prefix+key chords.
 | `Cmd+B` | toggle tmux statusline |
 | `Cmd+1…9` | select exact index; repeat within 700ms to add 10 |
 | `Cmd+0` | select 0 if present, otherwise 10; repeat within 700ms to add 10 |
-| `Cmd+Opt+I` | broadcast on/off (window) |
-| `Cmd+Opt+Shift+I` | this pane join/leave broadcast |
+| `Cmd+Opt+I` | clear active broadcast / 2-pane toggle / 3+ pane numeric sync-pick |
 | `Shift+Enter` | newline for AI CLIs (→ Ctrl+J) |
 
 ## Pane navigation (zoom-aware)
@@ -110,14 +109,24 @@ Requires Ghostty `macos-option-as-alt = true` (in `ghostty-tmux.conf`).
 
 ## Broadcast
 
+Uses per-pane `synchronize-panes` (window-level stays `off`, so new splits never join broadcast and non-synced panes remain freely typeable). Requires tmux with per-pane `synchronize-panes` support (verified on tmux 3.8a).
+
 | Key | Action |
 |-----|--------|
-| `prefix B` / `Cmd+Opt+I` | sync input to all panes in window |
-| `prefix e` / `Cmd+Opt+Shift+I` | mute / unmute this pane only |
+| `Cmd+Opt+I` / `prefix B` | clear active sync group (`>= 2` panes) / toggle both panes (2 panes, auto-unzoom) / enter no-popup numeric `sync-pick` (3+ panes) |
+| `prefix e` | enter `sync-pick` anytime (keeps existing members when editing mid-broadcast) |
 
-Status: yellow `SYNC`; pane bar / window label show `▶` when synced. A pane
-with input disabled shows a red-background `OFF` badge in its pane bar even
-when `SYNC` is off.
+Inside `sync-pick` (draft-only until `Enter`; live sync is untouched while picking):
+
+| Key | Action |
+|-----|--------|
+| `1`–`9` / left-click pane | toggle that pane in the draft |
+| `Space` | toggle current active pane |
+| `a` / `i` / `c` / `r` | select all / invert / clear / restore last committed group (`pane_id`) |
+| `Enter` | commit draft (`< 2` clears to off; focuses first synced pane if current is outside) |
+| `Esc` / `q` / `Ctrl-C` / `Cmd+Opt+I` | cancel draft and restore pre-entry zoom |
+
+Status & borders: in `sync-pick`, pane borders turn yellow, drafted panes show a wide yellow `★ [#P ✓] SELECTED` top banner, and `status-right` displays a yellow `PICK k/n` pill (without recolouring the window-list background). When live broadcast is active (`>= 2` panes), synced panes show red `▶ ▶ ▶` in their top bar and `status-right` shows yellow `SYNC k/n` (or `SYNC(other) k/n` when focused on a solo pane while siblings remain synced); window labels show `▶`. A pane manually locked via `tmux select-pane -d` still displays a red-background `OFF` badge in its pane bar.
 
 ## Copy mode
 
