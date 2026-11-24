@@ -1,8 +1,8 @@
 # aipane
 
-用于日常 AI CLI 工作流的 zsh 工具集：通过 tmux 窗格编排多个 AI 工具、清理相关进程，以及可选的 **Ghostty + tmux 工作台**（Cmd 键位桥、广播输入、窗口标签多行换行）。
+面向日常 AI CLI 工作流的 zsh 工具集与 Agent Skills 套件：通过 tmux 窗格编排多个 AI 工具、清理相关进程、可选的 **Ghostty + tmux 工作台**（Cmd 键位桥、广播输入、窗口标签多行换行），以及一套中文 `aipane-*` Agent Skills。
 
-[English README](README.md)
+[English README](README.md) | [Agent Skills 目录](skills/README.md)
 
 ## 功能
 
@@ -12,6 +12,7 @@
 | `killmcp [options]` | 清理过期、已分离或孤立的 MCP 辅助进程 |
 | `killrod [options]` | 强制清理匹配的 Rod/Leakless 浏览器进程和 Playwright `chrome-headless-shell` 进程 |
 | 可选 Ghostty + tmux 工作台 | Cmd↔tmux 键位桥、广播、窗口标签多行（**不会**被 `init.zsh` 加载） |
+| `skills/`（`aipane-*`） | 8 个中文 Agent Skills：含 1 个工作台会话检索技能（`aipane-sessions`）与 7 个可独立复用的通用工作流技能（代码残留审计、零前情冷审、README 治理、公开长文改写、Obsidian CLI 等） |
 
 > [!WARNING]
 > 部分 `ai` 启动器（含 `ai c` 启动 Claude Code）会关闭对应工具的审批检查；清理命令会终止进程。请先确认命令定义，不确定时先用 `--dry-run` 检查清理范围。
@@ -245,6 +246,20 @@ killrod --dry-run
 - `AIPANE_MCP_SESSION_MAX_AGE`（未设置时禁用）
 - `AIPANE_TMUX_BIN`（可选的 tmux 显式路径）
 
+## Agent Skills
+
+`skills/` 提供 8 个统一以 `aipane-*` 命名的中文 Agent Skills。除 `aipane-sessions` 依赖本机 `aipane-sessions` CLI 外，其余 7 个通用工作流技能均不依赖终端工作台，可按需独立安装：
+
+```bash
+# 通过 skills CLI 安装全部技能
+npx skills add Async23/aipane
+
+# 或按需安装单个独立技能
+npx skills add Async23/aipane --skill aipane-cold-critique
+```
+
+完整技能目录、逐项运行依赖、手动复制/软链方式与测试命令见 [skills/README.md](skills/README.md)。
+
 ## 项目结构
 
 ```text
@@ -280,6 +295,7 @@ killrod --dry-run
 │   ├── grok/
 │   ├── kimi/
 │   └── pi/
+├── skills/                  # aipane-* Agent Skills（完整索引见 skills/README.md）
 ├── docs/
 │   ├── agent-notifications.md
 │   ├── cheatsheet.md
@@ -339,6 +355,7 @@ node --experimental-strip-types --test tests/pi-session-binding.test.mjs
 python3 tests/test_tmux_window_jump.py
 python3 tests/test_workstation_fragments.py
 python3 tests/test_tmux_window_wrap.py
+python3 tests/test_skills_cold_critique.py
 ```
 
 ## 许可证

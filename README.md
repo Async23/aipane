@@ -1,8 +1,8 @@
 # aipane
 
-A zsh toolkit for daily AI CLI workflows: tmux pane orchestration for multiple AI tools, process cleanup, plus an optional **Ghostty + tmux workstation** (Cmd key bridge, broadcast, multi-line window list).
+A zsh toolkit and Agent Skills suite for daily AI CLI workflows: tmux pane orchestration for multiple AI tools, process cleanup, an optional **Ghostty + tmux workstation** (Cmd key bridge, broadcast, multi-line window list), and a collection of Chinese `aipane-*` Agent Skills.
 
-[中文文档 / Chinese README](README_CN.md)
+[中文文档 / Chinese README](README_CN.md) | [Agent Skills Index](skills/README.md)
 
 ## Features
 
@@ -12,6 +12,7 @@ A zsh toolkit for daily AI CLI workflows: tmux pane orchestration for multiple A
 | `killmcp [options]` | Clean up stale detached/orphaned MCP helper processes |
 | `killrod [options]` | Force-clean matching Rod/Leakless browser processes and Playwright `chrome-headless-shell` processes |
 | Optional Ghostty + tmux workstation | Cmd↔tmux key bridge, broadcast, multi-line window list (not loaded by `init.zsh`) |
+| `skills/` (`aipane-*`) | 8 Chinese Agent Skills covering session lookup (`aipane-sessions`) and 7 standalone workflow skills (residue audit, cold critique, README governance, writing, Obsidian CLI, etc.) |
 
 > [!WARNING]
 > Several `ai` launchers (including `ai c` for Claude Code) disable their tools' approval checks. The cleanup commands terminate processes. Review the command definitions and use `--dry-run` before cleanup when in doubt.
@@ -250,6 +251,20 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 - `AIPANE_MCP_SESSION_MAX_AGE` (disabled when unset)
 - `AIPANE_TMUX_BIN` (optional explicit tmux path)
 
+## Agent Skills
+
+`skills/` ships 8 Chinese Agent Skills under the unified `aipane-*` namespace. Except for `aipane-sessions` (which wraps the local `aipane-sessions` CLI), the other 7 workflow skills have no dependency on the zsh/tmux/Ghostty workstation and can be installed standalone:
+
+```bash
+# Install all skills via the skills CLI
+npx skills add Async23/aipane
+
+# Or install a single standalone skill
+npx skills add Async23/aipane --skill aipane-cold-critique
+```
+
+See [skills/README.md](skills/README.md) for the complete catalog, per-skill dependency matrix, manual copy/symlink instructions, and standalone test commands.
+
 ## Project Structure
 
 ```text
@@ -286,6 +301,7 @@ Cleanup actions are logged to `~/logs/aipane-cleanup.log`. Age defaults can be o
 │   ├── grok/
 │   ├── kimi/
 │   └── pi/
+├── skills/                  # aipane-* Agent Skills (see skills/README.md)
 ├── docs/
 │   ├── agent-notifications.md
 │   ├── cheatsheet.md
@@ -349,6 +365,7 @@ node --experimental-strip-types --test tests/pi-session-binding.test.mjs
 python3 tests/test_tmux_window_jump.py
 python3 tests/test_workstation_fragments.py
 python3 tests/test_tmux_window_wrap.py
+python3 tests/test_skills_cold_critique.py
 ```
 
 ## License
