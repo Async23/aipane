@@ -50,6 +50,7 @@ also send complete prefix+key chords.
 | `prefix p` / `n` | prev / next window |
 | `prefix ,` / `Cmd+I` | centered popup rename current window |
 | `Option+Shift+,` / `Option+Shift+.` (`M-</>`) | reorder window left / right |
+| left-drag status window label onto another label | browser-style reorder (left: insert before target; right: insert after target) |
 | `prefix w` | window list (tmux default) |
 
 Window numbering starts at 1. The `Cmd` bindings use the main number row.

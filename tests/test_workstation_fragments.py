@@ -1572,6 +1572,717 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                     os.waitpid(child_pid, 0)
                 tmux("kill-server", check=False)
 
+    def test_status_tab_drag_reorders_windows_like_browser_tabs(self):
+        socket = f"ws-status-drag-{os.getpid()}-{id(self)}"
+        child_pid = None
+        master_fd = None
+        environment = os.environ.copy()
+        environment.pop("TMUX", None)
+        environment.pop("TMUX_PANE", None)
+        environment["TERM"] = "xterm-256color"
+
+        def tmux(*args: str, check: bool = True):
+            return subprocess.run(
+                ["tmux", "-L", socket, *args],
+                check=check,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+        def drain() -> None:
+            if master_fd is not None:
+                while True:
+                    try:
+                        chunk = os.read(master_fd, 65536)
+                        if not chunk:
+                            break
+                    except BlockingIOError:
+                        break
+
+        def wait_until(predicate, timeout: float = 3.0) -> bool:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                drain()
+                if predicate():
+                    return True
+                time.sleep(0.02)
+            return predicate()
+
+        def window_order(session: str = "drag") -> list[tuple[int, str]]:
+            lines = tmux(
+                "list-windows", "-t", session,
+                "-F", "#{window_index}\t#{window_name}",
+            ).stdout.splitlines()
+            return [(int(idx), name) for idx, name in (line.split("\t", 1) for line in lines)]
+
+        def active_name(session: str = "drag") -> str:
+            return tmux(
+                "display-message", "-p", "-t", session, "#{window_name}"
+            ).stdout.strip()
+
+        def global_env(name: str) -> str | None:
+            out = tmux("show-environment", "-gh").stdout.splitlines()
+            prefix = f"{name}="
+            for line in out:
+                if line.startswith(prefix):
+                    return line[len(prefix):]
+            return None
+
+        def send_press(x: int, y: int, button: int = 0) -> None:
+            os.write(master_fd, f"\x1b[<{button};{x};{y}M".encode())
+
+        def send_move(x: int, y: int, button: int = 32) -> None:
+            os.write(master_fd, f"\x1b[<{button};{x};{y}M".encode())
+
+        def send_release(x: int, y: int, button: int = 0) -> None:
+            os.write(master_fd, f"\x1b[<{button};{x};{y}m".encode())
+
+        def send_drag(
+            x1: int, y1: int, x2: int, y2: int,
+            *, mid=None, pause: float = 0.35, release_button: int = 0,
+        ) -> None:
+            if pause > 0:
+                time.sleep(pause)
+            send_press(x1, y1)
+            if mid is not None:
+                send_move(mid[0], mid[1])
+            send_move(x2, y2)
+            send_release(x2, y2, button=release_button)
+
+        try:
+            tmux(
+                "-f", "/dev/null", "new-session", "-d", "-s", "drag",
+                "-n", "AAA", "-x", "100", "-y", "30", "sleep 120",
+            )
+            tmux("source-file", str(TMUX_WS))
+            tmux("move-window", "-r", "-t", "drag")
+            for name in ("BBB", "CCC", "DDD"):
+                tmux("new-window", "-d", "-t", "drag", "-n", name, "sleep 120")
+            tmux("select-window", "-t", "drag:1")
+            tmux("set-option", "-g", "status-position", "bottom")
+            tmux(
+                "set-option", "-g", "status-format[0]",
+                "#{W:#[range=window|#{window_index}]#{window_index}:#{window_name}#[norange] }",
+            )
+
+            child_pid, master_fd = pty.fork()
+            if child_pid == 0:
+                termios.tcsetwinsize(0, (30, 100))
+                os.execvpe(
+                    "tmux", ["tmux", "-L", socket, "attach-session", "-t", "drag"],
+                    environment,
+                )
+            os.set_blocking(master_fd, False)
+            self.assertTrue(
+                wait_until(
+                    lambda: bool(tmux("list-clients", "-t", "drag").stdout.strip()),
+                    timeout=3.0,
+                ),
+                "client did not attach",
+            )
+            client_pid = tmux(
+                "list-clients", "-t", "drag", "-F", "#{client_pid}",
+            ).stdout.strip().splitlines()[0]
+            drag_var = f"AIPANE_STATUS_DRAG_{client_pid}"
+            dbl_var = f"AIPANE_STATUS_DBLCLICK_{client_pid}"
+            time.sleep(0.15)
+            drain()
+
+            # Columns for "1:AAA 2:BBB 3:CCC 4:DDD ":
+            # slot1=1..5(x=3), slot2=7..11(x=9), slot3=13..17(x=15), slot4=19..23(x=21), blank=x=40
+            # 1. Drag right: 1:AAA → 3:CCC ⇒ [1:BBB, 2:CCC, 3:AAA, 4:DDD], AAA active.
+            send_drag(3, 30, 15, 30, mid=(9, 30))
+            self.assertTrue(
+                wait_until(
+                    lambda: window_order() == [(1, "BBB"), (2, "CCC"), (3, "AAA"), (4, "DDD")],
+                    timeout=2.0,
+                ),
+                f"drag right failed, got {window_order()}",
+            )
+            self.assertEqual(active_name(), "AAA")
+            self.assertTrue(wait_until(lambda: global_env(drag_var) is None, timeout=1.0))
+
+            # 2. Drag left: 3:AAA → 1:BBB ⇒ [1:AAA, 2:BBB, 3:CCC, 4:DDD], AAA active.
+            send_drag(15, 30, 3, 30, mid=(9, 30))
+            self.assertTrue(
+                wait_until(
+                    lambda: window_order() == [(1, "AAA"), (2, "BBB"), (3, "CCC"), (4, "DDD")],
+                    timeout=2.0,
+                ),
+                f"drag left failed, got {window_order()}",
+            )
+            self.assertEqual(active_name(), "AAA")
+            self.assertTrue(wait_until(lambda: global_env(drag_var) is None, timeout=1.0))
+
+            # 3. Split press / release checks so cancel assertions cannot pass on dropped input.
+            for label, drop_x, drop_y, rel_btn, with_motion in (
+                ("self", 4, 30, 0, True),
+                ("blank", 40, 30, 0, True),
+                ("pane", 10, 10, 0, True),
+                ("ctrl-release-on-tab", 15, 30, 16, True),
+                ("coalesced-blank-up", 40, 30, 0, False),
+            ):
+                time.sleep(0.35)
+                send_press(3, 30)
+                self.assertTrue(
+                    wait_until(lambda: global_env(drag_var) is not None, timeout=1.5),
+                    f"{label}: press did not record {drag_var}",
+                )
+                if with_motion:
+                    send_move(drop_x, drop_y)
+                send_release(drop_x, drop_y, button=rel_btn)
+                self.assertTrue(
+                    wait_until(lambda: global_env(drag_var) is None, timeout=1.5),
+                    f"{label}: release did not clear {drag_var}",
+                )
+                self.assertEqual(
+                    window_order(),
+                    [(1, "AAA"), (2, "BBB"), (3, "CCC"), (4, "DDD")],
+                    f"{label}: unexpectedly changed window order",
+                )
+                # Follow-up drag starting on blank status space onto tab 3 must never reorder.
+                send_drag(40, 30, 15, 30)
+                time.sleep(0.1)
+                drain()
+                self.assertEqual(
+                    window_order(),
+                    [(1, "AAA"), (2, "BBB"), (3, "CCC"), (4, "DDD")],
+                    f"{label}: follow-up blank→tab drag reordered windows",
+                )
+
+            # 4. Drag starting inside a pane and released on a status tab does NOT reorder.
+            send_drag(10, 10, 15, 30, mid=(10, 20))
+            time.sleep(0.15)
+            drain()
+            self.assertEqual(window_order(), [(1, "AAA"), (2, "BBB"), (3, "CCC"), (4, "DDD")])
+            self.assertIsNone(global_env(drag_var))
+
+            # 5. Dragging from a status tab into a copy-mode-vi pane with an active selection
+            # must NOT copy the selection, must keep copy-mode open, and must clear drag state.
+            tmux("select-window", "-t", "drag:1")
+            pane1 = tmux("display-message", "-p", "-t", "drag:1", "#{pane_id}").stdout.strip()
+            tmux("delete-buffer", check=False)
+            tmux("copy-mode", "-t", pane1)
+            tmux("send-keys", "-t", pane1, "-X", "begin-selection")
+            tmux("send-keys", "-t", pane1, "-X", "cursor-right")
+            time.sleep(0.35)
+            send_press(3, 30)
+            self.assertTrue(wait_until(lambda: global_env(drag_var) is not None, timeout=1.5))
+            send_move(10, 10)
+            send_release(10, 10)
+            self.assertTrue(wait_until(lambda: global_env(drag_var) is None, timeout=1.5))
+            self.assertEqual(
+                tmux("display-message", "-p", "-t", pane1, "#{pane_in_mode}").stdout.strip(),
+                "1",
+                "dragging status tab into copy-mode exited copy-mode",
+            )
+            self.assertEqual(
+                tmux("list-buffers", check=False).stdout.strip(),
+                "",
+                "dragging status tab into copy-mode copied selection into paste buffer",
+            )
+            # Follow-up blank→tab drag still does nothing.
+            send_drag(40, 30, 15, 30)
+            time.sleep(0.1)
+            drain()
+            self.assertEqual(window_order(), [(1, "AAA"), (2, "BBB"), (3, "CCC"), (4, "DDD")])
+            tmux("send-keys", "-t", pane1, "-X", "cancel")
+
+            # 6. Click A then 40ms later drag B→D must NOT zoom C via delayed DoubleClick1Status,
+            # while a real same-tab double-click still zooms.
+            for idx in (1, 2, 3, 4):
+                tmux("split-window", "-d", "-t", f"drag:{idx}", "sleep 120")
+            time.sleep(0.35)
+            send_press(3, 30)
+            send_release(3, 30)
+            time.sleep(0.04)
+            send_press(9, 30)
+            send_move(21, 30)
+            send_release(21, 30)
+            self.assertTrue(
+                wait_until(
+                    lambda: window_order() == [(1, "AAA"), (2, "CCC"), (3, "DDD"), (4, "BBB")],
+                    timeout=2.0,
+                ),
+                f"quick click-then-drag failed, got {window_order()}",
+            )
+            # Wait past tmux's 300ms click timeout; NO window should be zoomed.
+            time.sleep(0.45)
+            drain()
+            zoomed = [
+                line for line in tmux(
+                    "list-windows", "-t", "drag", "-F", "#{window_name}:#{window_zoomed_flag}"
+                ).stdout.splitlines()
+                if line.endswith(":1")
+            ]
+            self.assertEqual(zoomed, [], f"click-then-drag triggered stray zoom: {zoomed}")
+            self.assertIsNone(global_env(dbl_var))
+
+            # Restore order AAA BBB CCC DDD, then test real same-tab double-click zoom.
+            send_drag(21, 30, 9, 30)
+            self.assertTrue(
+                wait_until(
+                    lambda: window_order() == [(1, "AAA"), (2, "BBB"), (3, "CCC"), (4, "DDD")],
+                    timeout=2.0,
+                ),
+            )
+            time.sleep(0.35)
+            send_press(3, 30)
+            send_release(3, 30)
+            send_press(3, 30)
+            send_release(3, 30)
+            self.assertTrue(
+                wait_until(
+                    lambda: tmux(
+                        "display-message", "-p", "-t", "drag:1", "#{window_zoomed_flag}"
+                    ).stdout.strip() == "1",
+                    timeout=2.0,
+                ),
+                "double-click on same status tab did not zoom pane",
+            )
+            tmux("resize-pane", "-Z", "-t", "drag:1")
+
+            # 7. Rapid 3 consecutive drags at ~45ms intervals (hits SecondClick + TripleClick).
+            time.sleep(0.35)
+            for expected in (
+                [(1, "BBB"), (2, "CCC"), (3, "DDD"), (4, "AAA")],
+                [(1, "CCC"), (2, "DDD"), (3, "AAA"), (4, "BBB")],
+                [(1, "DDD"), (2, "AAA"), (3, "BBB"), (4, "CCC")],
+            ):
+                send_drag(3, 30, 21, 30, pause=0.045)
+                self.assertTrue(
+                    wait_until(lambda exp=expected: window_order() == exp, timeout=2.0),
+                    f"rapid consecutive drag failed: expected {expected}, got {window_order()}",
+                )
+            # Restore AAA BBB CCC DDD
+            send_drag(3, 30, 21, 30)
+            self.assertTrue(
+                wait_until(
+                    lambda: window_order() == [(1, "AAA"), (2, "BBB"), (3, "CCC"), (4, "DDD")],
+                    timeout=2.0,
+                ),
+            )
+
+            # 8. Same window linked twice in the same session (slots 2 and 5):
+            # dragging slot 2 → slot 3 must move slot 2 without miscomputing direction.
+            tmux("set-option", "-g", "renumber-windows", "off")
+            tmux("link-window", "-s", "drag:=2", "-t", "drag:=5")
+            time.sleep(0.1)
+            drain()
+            # Columns now: 1:AAA(3) 2:BBB(9) 3:CCC(15) 4:DDD(21) 5:BBB(27)
+            send_drag(9, 30, 15, 30)
+            self.assertTrue(
+                wait_until(
+                    lambda: window_order() == [(1, "AAA"), (2, "CCC"), (3, "BBB"), (4, "DDD"), (5, "BBB")],
+                    timeout=2.0,
+                ),
+                f"duplicate linked window drag failed, got {window_order()}",
+            )
+            tmux("unlink-window", "-t", "drag:=5")
+            # Restore AAA BBB CCC DDD
+            send_drag(15, 30, 9, 30)
+            self.assertTrue(
+                wait_until(
+                    lambda: window_order() == [(1, "AAA"), (2, "BBB"), (3, "CCC"), (4, "DDD")],
+                    timeout=2.0,
+                ),
+            )
+
+            # 9. Non-contiguous indexes with renumber-windows off + grouped session sync.
+            tmux("move-window", "-s", "drag:=4", "-t", "drag:=12")
+            tmux("move-window", "-s", "drag:=3", "-t", "drag:=8")
+            tmux("move-window", "-s", "drag:=2", "-t", "drag:=5")
+            tmux("new-session", "-d", "-t", "drag", "-s", "grouped")
+            time.sleep(0.1)
+            drain()
+            # Columns for "1:AAA 5:BBB 8:CCC 12:DDD ":
+            # 1:AAA=1..5(3), 5:BBB=7..11(9), 8:CCC=13..17(15), 12:DDD=19..24(21)
+            send_drag(3, 30, 15, 30)
+            expected_gapped = [(1, "BBB"), (5, "CCC"), (8, "AAA"), (12, "DDD")]
+            self.assertTrue(
+                wait_until(lambda: window_order("drag") == expected_gapped, timeout=2.0),
+                f"gapped drag right failed, got {window_order('drag')}",
+            )
+            self.assertEqual(
+                window_order("grouped"), expected_gapped,
+                "grouped session drifted out of sync after drag",
+            )
+            send_drag(15, 30, 3, 30)
+            expected_restored = [(1, "AAA"), (5, "BBB"), (8, "CCC"), (12, "DDD")]
+            self.assertTrue(
+                wait_until(lambda: window_order("drag") == expected_restored, timeout=2.0),
+                f"gapped drag left failed, got {window_order('drag')}",
+            )
+            self.assertEqual(window_order("grouped"), expected_restored)
+        finally:
+            if master_fd is not None:
+                os.close(master_fd)
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGHUP)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(child_pid, 0)
+            tmux("kill-server", check=False)
+
+    def test_status_tab_drag_isolates_sessions_clients_and_stale_wrap_rows(self):
+        socket = f"ws-status-drag-iso-{os.getpid()}-{id(self)}"
+        procs: list[tuple[int, int]] = []
+        environment = os.environ.copy()
+        environment.pop("TMUX", None)
+        environment.pop("TMUX_PANE", None)
+        environment["TERM"] = "xterm-256color"
+        environment["PATH"] = f"{ROOT / 'bin'}{os.pathsep}{environment['PATH']}"
+
+        def tmux(*args: str, check: bool = True):
+            return subprocess.run(
+                ["tmux", "-L", socket, *args],
+                check=check,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+        def drain_all() -> None:
+            for _, fd in procs:
+                while True:
+                    try:
+                        chunk = os.read(fd, 65536)
+                        if not chunk:
+                            break
+                    except BlockingIOError:
+                        break
+
+        def wait_until(predicate, timeout: float = 3.0) -> bool:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                drain_all()
+                if predicate():
+                    return True
+                time.sleep(0.02)
+            return predicate()
+
+        def attach(session: str, cols: int = 100, rows: int = 30) -> tuple[int, int]:
+            pid, fd = pty.fork()
+            if pid == 0:
+                termios.tcsetwinsize(0, (rows, cols))
+                os.execvpe(
+                    "tmux", ["tmux", "-L", socket, "attach-session", "-t", session],
+                    environment,
+                )
+            os.set_blocking(fd, False)
+            procs.append((pid, fd))
+            return pid, fd
+
+        def window_order(session: str) -> list[tuple[int, str]]:
+            lines = tmux(
+                "list-windows", "-t", session,
+                "-F", "#{window_index}\t#{window_name}",
+            ).stdout.splitlines()
+            return [(int(idx), name) for idx, name in (line.split("\t", 1) for line in lines)]
+
+        def global_env(name: str) -> str | None:
+            prefix = f"{name}="
+            for line in tmux("show-environment", "-gh").stdout.splitlines():
+                if line.startswith(prefix):
+                    return line[len(prefix):]
+            return None
+
+        try:
+            # --- Part A: Cross-session linked window isolation + dual-client isolation ---
+            tmux(
+                "-f", "/dev/null", "new-session", "-d", "-s", "drag",
+                "-n", "AAA", "-x", "100", "-y", "30", "sleep 120",
+            )
+            tmux("source-file", str(TMUX_WS))
+            tmux("move-window", "-r", "-t", "drag")
+            for name in ("BBB", "CCC", "DDD"):
+                tmux("new-window", "-d", "-t", "drag", "-n", name, "sleep 120")
+            tmux("select-window", "-t", "drag:1")
+            tmux("set-option", "-g", "status-position", "bottom")
+            tmux(
+                "set-option", "-g", "status-format[0]",
+                "#{W:#[range=window|#{window_index}]#{window_index}:#{window_name}#[norange] }",
+            )
+            # Second session `other` shares window CCC via link-window.
+            tmux("new-session", "-d", "-s", "other", "-n", "OOO", "sleep 120")
+            tmux("link-window", "-s", "drag:=3", "-t", "other:")
+
+            _, fd_a = attach("drag")
+            _, fd_b = attach("drag")
+            _, fd_other = attach("other")
+            self.assertTrue(
+                wait_until(lambda: len(tmux("list-clients").stdout.splitlines()) == 3, timeout=3.0),
+                "all three clients did not attach",
+            )
+            drag_pids = tmux("list-clients", "-t", "drag", "-F", "#{client_pid}").stdout.splitlines()
+            self.assertEqual(len(drag_pids), 2)
+            time.sleep(0.15)
+            drain_all()
+
+            # Client A presses tab 1 (AAA); Client B clicks a pane in the SAME session;
+            # meanwhile the client in `other` sends keystrokes right before Client A drops on CCC.
+            os.write(fd_a, b"\x1b[<0;3;30M\x1b[<32;9;30M")
+            self.assertTrue(
+                wait_until(
+                    lambda: any(global_env(f"AIPANE_STATUS_DRAG_{p}") is not None for p in drag_pids),
+                    timeout=1.5,
+                ),
+                "Client A press did not record drag state",
+            )
+            pid_a = next(p for p in drag_pids if global_env(f"AIPANE_STATUS_DRAG_{p}") is not None)
+            os.write(fd_b, b"\x1b[<0;10;10M\x1b[<0;10;10m")
+            os.write(fd_other, b"q")
+            time.sleep(0.1)
+            drain_all()
+            self.assertIsNotNone(
+                global_env(f"AIPANE_STATUS_DRAG_{pid_a}"),
+                "Client B clicking a pane cleared Client A's active drag",
+            )
+            os.write(fd_a, b"\x1b[<32;15;30M\x1b[<0;15;30m")
+            self.assertTrue(
+                wait_until(
+                    lambda: window_order("drag") == [(1, "BBB"), (2, "CCC"), (3, "AAA"), (4, "DDD")],
+                    timeout=2.0,
+                ),
+                f"concurrent client/session drag failed: drag={window_order('drag')} other={window_order('other')}",
+            )
+            self.assertEqual(
+                window_order("other"), [(1, "OOO"), (2, "CCC")],
+                "window leaked across sessions into `other`",
+            )
+            self.assertTrue(
+                wait_until(lambda: global_env(f"AIPANE_STATUS_DRAG_{pid_a}") is None, timeout=1.0),
+            )
+
+            # Switching sessions mid-drag cleans up that client's env vars, and detaching does too.
+            pid_b = next(p for p in drag_pids if p != pid_a)
+            client_b_name = tmux(
+                "list-clients", "-t", "drag",
+                "-F", "#{?#{==:#{client_pid}," + pid_b + "},#{client_name},}",
+            ).stdout.strip()
+            os.write(fd_b, b"\x1b[<0;3;30M")
+            self.assertTrue(
+                wait_until(lambda: global_env(f"AIPANE_STATUS_DRAG_{pid_b}") is not None, timeout=1.5),
+            )
+            tmux("switch-client", "-c", client_b_name, "-t", "other")
+            self.assertTrue(
+                wait_until(lambda: global_env(f"AIPANE_STATUS_DRAG_{pid_b}") is None, timeout=2.0),
+                "switching client session did not clean up its drag env var",
+            )
+            tmux("switch-client", "-c", client_b_name, "-t", "drag")
+            time.sleep(0.15)
+            drain_all()
+            os.write(fd_b, b"\x1b[<0;3;30M")
+            self.assertTrue(
+                wait_until(lambda: global_env(f"AIPANE_STATUS_DRAG_{pid_b}") is not None, timeout=1.5),
+            )
+            tmux("detach-client", "-t", client_b_name)
+            self.assertTrue(
+                wait_until(lambda: global_env(f"AIPANE_STATUS_DRAG_{pid_b}") is None, timeout=2.0),
+                "detaching client did not clean up its drag env var",
+            )
+
+            # --- Part B: Real 3-row tmux-window-wrap stale-screen guard + live cross-row drag ---
+            with tempfile.TemporaryDirectory() as fake_home:
+                bin_dir = Path(fake_home) / ".local" / "bin"
+                bin_dir.mkdir(parents=True)
+                os.symlink(WRAP_BIN, bin_dir / "tmux-window-wrap")
+                wrap_env = environment.copy()
+                wrap_env["HOME"] = fake_home
+                wrap_env["PATH"] = f"{bin_dir}{os.pathsep}{wrap_env['PATH']}"
+
+                def wt(*args: str, check: bool = True):
+                    return subprocess.run(
+                        ["tmux", "-L", f"{socket}-wrap", *args],
+                        check=check,
+                        capture_output=True,
+                        text=True,
+                        env=wrap_env,
+                    )
+
+                w_pid = None
+                w_fd = None
+                try:
+                    wt(
+                        "-f", "/dev/null", "new-session", "-d", "-s", "w",
+                        "-n", "alpha", "-x", "28", "-y", "20", "sleep 120",
+                    )
+                    wt("source-file", str(TMUX_WS))
+                    wt("source-file", str(TMUX_WRAP))
+                    wt("set-option", "-g", "status-right", "")
+                    wt("move-window", "-r", "-t", "w")
+                    for name in ("bravo", "charlie", "delta", "echo", "foxtrot"):
+                        wt("new-window", "-d", "-t", "w", "-n", name, "sleep 120")
+                    wt("select-window", "-t", "w:1")
+
+                    w_pid, w_fd = pty.fork()
+                    if w_pid == 0:
+                        termios.tcsetwinsize(0, (20, 28))
+                        os.execvpe(
+                            "tmux", ["tmux", "-L", f"{socket}-wrap", "attach-session", "-t", "w"],
+                            wrap_env,
+                        )
+                    os.set_blocking(w_fd, False)
+
+                    def drain_w():
+                        while True:
+                            try:
+                                if not os.read(w_fd, 65536):
+                                    break
+                            except BlockingIOError:
+                                break
+
+                    def wait_w(pred, timeout=4.0):
+                        deadline = time.monotonic() + timeout
+                        while time.monotonic() < deadline:
+                            drain_w()
+                            if pred():
+                                return True
+                            time.sleep(0.03)
+                        return pred()
+
+                    def w_order():
+                        lines = wt("list-windows", "-t", "w", "-F", "#{window_index}\t#{window_name}").stdout.splitlines()
+                        return [(int(i), n) for i, n in (ln.split("\t", 1) for ln in lines)]
+
+                    def w_row(n: int) -> str:
+                        return wt("show-option", "-t", "w", "-qv", f"@tmux-window-wrap-row-{n}").stdout.strip()
+
+                    def label_coords(rows_text: list[str], prefix_width: int = 3) -> dict[int, tuple[int, int]]:
+                        coords: dict[int, tuple[int, int]] = {}
+                        for r_idx in range(3):
+                            expanded = wt(
+                                "display-message", "-p", "-t", "w",
+                                f"#{{E:@tmux-window-wrap-row-{r_idx}}}",
+                            ).stdout.rstrip("\n")
+                            col = (prefix_width + 1) if r_idx == 0 else 1
+                            pos = 0
+                            cur_slot = None
+                            while pos < len(expanded):
+                                if expanded.startswith("#[", pos):
+                                    end = expanded.find("]", pos)
+                                    if end == -1:
+                                        break
+                                    tag = expanded[pos + 2:end]
+                                    if tag.startswith("range=window|"):
+                                        cur_slot = int(tag.split("|", 1)[1])
+                                    elif tag == "norange":
+                                        cur_slot = None
+                                    pos = end + 1
+                                    continue
+                                if cur_slot is not None and cur_slot not in coords and expanded[pos] != " ":
+                                    coords[cur_slot] = (col, 18 + r_idx)
+                                col += 1
+                                pos += 1
+                        return coords
+
+                    self.assertTrue(
+                        wait_w(
+                            lambda: wt("show-option", "-t", "w", "-qv", "status").stdout.strip() == "3"
+                            and all(f"range=window|{i}]" in (w_row(0) + w_row(1) + w_row(2)) for i in range(1, 7)),
+                            timeout=5.0,
+                        ),
+                        f"tmux-window-wrap did not render all 6 slots across 3 rows: status={wt('show-option', '-t', 'w', '-qv', 'status').stdout!r} rows={[w_row(i) for i in range(3)]!r}",
+                    )
+                    # Snapshot the pre-swap rendered rows so we can deterministically exercise
+                    # the stale-screen window where tmux order changed before wrap repaints.
+                    stale_rows = [w_row(0), w_row(1), w_row(2)]
+                    stale_coords = label_coords(stale_rows)
+                    self.assertIn(2, stale_coords)
+                    self.assertIn(4, stale_coords)
+                    self.assertIn(6, stale_coords)
+
+                    # Reorder alpha → echo in tmux, then pin the stale rows briefly (and point
+                    # render key to layout key so the background renderer stays paused for this check).
+                    wt("swap-window", "-d", "-s", "w:=1", "-t", "w:=2", ";",
+                       "swap-window", "-d", "-s", "w:=2", "-t", "w:=3", ";",
+                       "swap-window", "-d", "-s", "w:=3", "-t", "w:=4", ";",
+                       "swap-window", "-d", "-s", "w:=4", "-t", "w:=5")
+                    for r_idx, text in enumerate(stale_rows):
+                        wt("set-option", "-t", "w", f"@tmux-window-wrap-row-{r_idx}", text)
+                    cur_key = wt("display-message", "-p", "-t", "w", "#{E:@tmux-window-wrap-layout-key}").stdout.strip()
+                    wt("set-environment", "-h", "-t", "w", "TMUX_WINDOW_WRAP_RENDER_KEY", cur_key)
+                    wt("refresh-client", "-S")
+                    time.sleep(0.1)
+                    drain_w()
+                    order_before_stale = w_order()
+                    active_before_stale = wt("display-message", "-p", "-t", "w", "#{window_name}").stdout.strip()
+                    self.assertEqual(active_before_stale, "alpha")
+                    # Slot 2 now holds `charlie`, while the stale row still displays `2:bravo`.
+                    # Attempting to drag slot 2 → slot 4 must be ignored (neither move nor switch).
+                    x2, y2 = stale_coords[2]
+                    x4, y4 = stale_coords[4]
+                    os.write(
+                        w_fd,
+                        f"\x1b[<0;{x2};{y2}M\x1b[<32;{x4};{y4}M\x1b[<0;{x4};{y4}m".encode(),
+                    )
+                    time.sleep(0.2)
+                    drain_w()
+                    self.assertEqual(w_order(), order_before_stale, "stale wrap screen allowed wrong-window drag")
+                    self.assertEqual(
+                        wt("display-message", "-p", "-t", "w", "#{window_name}").stdout.strip(),
+                        "alpha",
+                        "stale wrap screen switched active window to wrong slot",
+                    )
+
+                    # Now allow wrap to refresh to the real layout and verify live cross-row drag works!
+                    wt("set-environment", "-h", "-t", "w", "TMUX_WINDOW_WRAP_RENDER_KEY", "stale-trigger")
+                    wt("refresh-client", "-S")
+                    self.assertTrue(
+                        wait_w(
+                            lambda: "#{==:#{window_id}," + wt("display-message", "-p", "-t", "w:=6", "#{window_id}").stdout.strip() + "},#[range=window|6]" in (w_row(0) + w_row(1) + w_row(2))
+                            and "#{==:#{window_id}," + wt("display-message", "-p", "-t", "w:=1", "#{window_id}").stdout.strip() + "},#[range=window|1]" in (w_row(0) + w_row(1) + w_row(2)),
+                            timeout=4.0,
+                        ),
+                        "tmux-window-wrap did not refresh after reorder",
+                    )
+                    fresh_coords = label_coords([w_row(0), w_row(1), w_row(2)])
+                    x1, y1 = fresh_coords[1]
+                    x6, y6 = fresh_coords[6]
+                    self.assertNotEqual(y1, y6, f"expected slot 1 and slot 6 on different rows: {fresh_coords}")
+                    time.sleep(0.35)
+                    os.write(
+                        w_fd,
+                        f"\x1b[<0;{x6};{y6}M\x1b[<32;{x1};{y1}M\x1b[<0;{x1};{y1}m".encode(),
+                    )
+                    self.assertTrue(
+                        wait_w(
+                            lambda: w_order() == [
+                                (1, "foxtrot"), (2, "bravo"), (3, "charlie"),
+                                (4, "delta"), (5, "echo"), (6, "alpha"),
+                            ],
+                            timeout=3.0,
+                        ),
+                        f"real 3-row wrap cross-row drag failed, got {w_order()}",
+                    )
+                finally:
+                    if w_fd is not None:
+                        os.close(w_fd)
+                    if w_pid is not None:
+                        try:
+                            os.kill(w_pid, signal.SIGHUP)
+                        except ProcessLookupError:
+                            pass
+                        os.waitpid(w_pid, 0)
+                    wt("kill-server", check=False)
+        finally:
+            for pid, fd in procs:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    os.kill(pid, signal.SIGHUP)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+            tmux("kill-server", check=False)
+
 
 class RenameWindowPopupTests(unittest.TestCase):
     def setUp(self):
