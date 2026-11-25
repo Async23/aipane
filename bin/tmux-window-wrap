@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import ctypes
+import inspect
 import json
 import os
 import re
@@ -31,9 +33,9 @@ MAX_STATUS_LINES = 3
 PANE_ACTIVITY_OPTION = ACTIVITY_MARKER_OPTION
 PANE_ACTIVITY_REFERENCE = "#{" + PANE_ACTIVITY_OPTION + "}"
 MARKED_BUSY_PANE_FORMAT = (
-    "#{&&:#{m/r:^.+$,"
+    "#{&&:#{!=:"
     + PANE_ACTIVITY_REFERENCE
-    + "},#{==:"
+    + ",},#{==:"
     + PANE_ACTIVITY_REFERENCE
     + ",#{pane_current_command}}}"
 )
@@ -48,16 +50,24 @@ ACTIVITY_LEVEL_SEQUENCE = (
     *range(ACTIVITY_LEVEL_COUNT),
     *range(ACTIVITY_LEVEL_COUNT - 2, 0, -1),
 )
+ACTIVITY_LEVEL_STRIDES = (1, 2, 3, 4, 6, 12)
 DEFAULT_ACTIVITY_FPS = 10
 ACTIVITY_PROBE_INTERVAL = 1.0
+IDLE_PROBE_BACKOFF_DELAY = 10.0
+IDLE_ACTIVITY_PROBE_INTERVAL = 5.0
 AGENT_PRESENCE_PROBE_INTERVAL = 5.0
+POWER_PROBE_INTERVAL = 15.0
+SCREEN_LOCK_PROBE_INTERVAL = 2.0
+THEME_PROBE_INTERVAL = 5.0
+THEME_SKIP_PROBE_INTERVAL = 30.0
 _ACTIVITY_CONTROLLERS = {}
 _LAST_PROBE_CONTEXT = {}
 ANIMATION_TICK_ENVIRONMENT = "TMUX_WINDOW_WRAP_ANIMATION_TICK"
 REFRESH_CLIENTS_COMMAND = "#{L:refresh-client -S -t #{q:client_name};}"
 ANIMATION_CLIENT_FILTER = (
+    "#{&&:#{!=:#{status},off},"
     "#{&&:#{m:*focused*,#{client_flags}},"
-    "#{!:#{||:#{client_control_mode},#{m:*suspended*,#{client_flags}}}}}"
+    "#{!:#{||:#{client_control_mode},#{m:*suspended*,#{client_flags}}}}}}"
 )
 REFRESH_ANIMATED_CLIENTS_COMMAND = (
     "#{L:#{?" + ANIMATION_CLIENT_FILTER
@@ -66,6 +76,7 @@ REFRESH_ANIMATED_CLIENTS_COMMAND = (
 RENDER_REQUEST_OPTION = "@tmux-window-wrap-render-request"
 RENDERED_REQUEST_OPTION = "@tmux-window-wrap-rendered-request"
 RENDER_KEY_ENVIRONMENT = "TMUX_WINDOW_WRAP_RENDER_KEY"
+ACTIVE_DEPENDENT_ENVIRONMENT = "TMUX_WINDOW_WRAP_ACTIVE_DEPENDENT"
 COLOR_SCHEME_OPTION = "@tmux-window-wrap-color-scheme"
 DEFAULT_PANE_COUNT_STYLE = "subscript"
 PANE_COUNT_STYLES = ("subscript", "plain", "off")
@@ -527,6 +538,40 @@ def plan(payload):
     ]
     lines = [first_line, *continuation_lines]
     return {"line_count": len(lines), "lines": lines}
+
+
+def layout_depends_on_active(payload):
+    """Return True iff changing payload['active'] could alter line breaks or indent."""
+    windows = payload["windows"]
+    pane_count_style = payload.get(
+        "pane_count_style",
+        DEFAULT_PANE_COUNT_STYLE,
+    )
+    first_line_capacity = max(
+        0,
+        payload["width"] - payload["left_width"] - payload["right_width"],
+    )
+    used = 0
+    split_at = 0
+    for window in windows:
+        label_width = window_width(window, pane_count_style)
+        if used + label_width > first_line_capacity:
+            break
+        used += label_width
+        split_at += 1
+
+    overflow = windows[split_at:]
+    if not overflow:
+        return False
+    requested_indent = max(0, min(payload["left_width"], payload["width"]))
+    if any(
+        requested_indent + window_width(window, pane_count_style) > payload["width"]
+        for window in overflow
+    ):
+        return True
+    continuation_capacity = max(0, payload["width"] - requested_indent)
+    all_lines = wrap_windows(overflow, continuation_capacity, pane_count_style)
+    return len(all_lines) > MAX_STATUS_LINES - 1
 
 
 def render_window(
@@ -1007,7 +1052,14 @@ def _store_probe_context(socket_name, result):
     panes = getattr(result, "panes", None)
     if isinstance(panes, tuple):
         snapshot = getattr(result, "process_snapshot", None)
-        _LAST_PROBE_CONTEXT[socket_name] = (panes, snapshot)
+        client_animation_ready = getattr(result, "client_animation_ready", None)
+        clients_need_os_theme = getattr(result, "clients_need_os_theme", None)
+        _LAST_PROBE_CONTEXT[socket_name] = (
+            panes,
+            snapshot,
+            client_animation_ready,
+            clients_need_os_theme,
+        )
 
 
 def animation_probe(socket_name, controller=None, log=None):
@@ -1042,8 +1094,273 @@ def animation_probe(socket_name, controller=None, log=None):
     return result.owner, result.busy
 
 
+_DARWIN_SYSTEM_PROBES = None
+_DARWIN_SYSTEM_PROBES_FAILED = False
+
+
+class _DarwinSystemProbes:
+    """Zero-fork macOS probes for theme, screen lock, battery, and Low Power Mode."""
+
+    _UTF8 = 0x08000100
+    _CF_NUMBER_INT_TYPE = 9
+
+    def __init__(self):
+        self.cf = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+        self.cf.CFStringCreateWithCString.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32,
+        ]
+        self.cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        self.cf.CFPreferencesCopyAppValue.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p,
+        ]
+        self.cf.CFPreferencesCopyAppValue.restype = ctypes.c_void_p
+        self.cf.CFStringGetCString.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32,
+        ]
+        self.cf.CFStringGetCString.restype = ctypes.c_bool
+        self.cf.CFStringGetCStringPtr.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32,
+        ]
+        self.cf.CFStringGetCStringPtr.restype = ctypes.c_char_p
+        self.cf.CFDictionaryGetValue.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p,
+        ]
+        self.cf.CFDictionaryGetValue.restype = ctypes.c_void_p
+        self.cf.CFGetTypeID.argtypes = [ctypes.c_void_p]
+        self.cf.CFGetTypeID.restype = ctypes.c_ulong
+        self.cf.CFBooleanGetTypeID.restype = ctypes.c_ulong
+        self.cf.CFBooleanGetValue.argtypes = [ctypes.c_void_p]
+        self.cf.CFBooleanGetValue.restype = ctypes.c_bool
+        self.cf.CFNumberGetTypeID.restype = ctypes.c_ulong
+        self.cf.CFNumberGetValue.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+        ]
+        self.cf.CFNumberGetValue.restype = ctypes.c_bool
+        self.cf.CFRelease.argtypes = [ctypes.c_void_p]
+        self.cf.CFRelease.restype = None
+
+        self._bool_type_id = self.cf.CFBooleanGetTypeID()
+        self._num_type_id = self.cf.CFNumberGetTypeID()
+        self._any_app = ctypes.c_void_p.in_dll(
+            self.cf, "kCFPreferencesAnyApplication"
+        )
+        self._key_interface_style = self.cf.CFStringCreateWithCString(
+            None, b"AppleInterfaceStyle", self._UTF8
+        )
+        self._key_screen_locked = self.cf.CFStringCreateWithCString(
+            None, b"CGSSessionScreenIsLocked", self._UTF8
+        )
+        self._key_on_console = self.cf.CFStringCreateWithCString(
+            None, b"kCGSSessionOnConsoleKey", self._UTF8
+        )
+
+        self.cg = None
+        try:
+            cg = ctypes.CDLL(
+                "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+            )
+            cg.CGSessionCopyCurrentDictionary.restype = ctypes.c_void_p
+            self.cg = cg
+        except OSError:
+            pass
+
+        self.iokit = None
+        try:
+            iokit = ctypes.CDLL(
+                "/System/Library/Frameworks/IOKit.framework/IOKit"
+            )
+            iokit.IOPSCopyPowerSourcesInfo.restype = ctypes.c_void_p
+            iokit.IOPSGetProvidingPowerSourceType.argtypes = [ctypes.c_void_p]
+            iokit.IOPSGetProvidingPowerSourceType.restype = ctypes.c_void_p
+            self.iokit = iokit
+        except OSError:
+            pass
+
+        self._objc_msg_id = None
+        self._objc_msg_bool = None
+        self._ns_process_info = None
+        self._sel_process_info = None
+        self._sel_low_power = None
+        try:
+            ctypes.CDLL(
+                "/System/Library/Frameworks/Foundation.framework/Foundation"
+            )
+            objc = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
+            objc.objc_getClass.argtypes = [ctypes.c_char_p]
+            objc.objc_getClass.restype = ctypes.c_void_p
+            objc.sel_registerName.argtypes = [ctypes.c_char_p]
+            objc.sel_registerName.restype = ctypes.c_void_p
+            self._objc_msg_id = ctypes.CFUNCTYPE(
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
+            )(("objc_msgSend", objc))
+            self._objc_msg_bool = ctypes.CFUNCTYPE(
+                ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p
+            )(("objc_msgSend", objc))
+            self._ns_process_info = objc.objc_getClass(b"NSProcessInfo")
+            self._sel_process_info = objc.sel_registerName(b"processInfo")
+            self._sel_low_power = objc.sel_registerName(
+                b"isLowPowerModeEnabled"
+            )
+        except OSError:
+            pass
+
+    def _cf_bool_value(self, value):
+        if not value:
+            return None
+        type_id = self.cf.CFGetTypeID(value)
+        if type_id == self._bool_type_id:
+            return bool(self.cf.CFBooleanGetValue(value))
+        if type_id == self._num_type_id:
+            num = ctypes.c_int(0)
+            if self.cf.CFNumberGetValue(
+                value, self._CF_NUMBER_INT_TYPE, ctypes.byref(num)
+            ):
+                return bool(num.value)
+        return None
+
+    def color_scheme(self):
+        value = self.cf.CFPreferencesCopyAppValue(
+            self._key_interface_style, self._any_app
+        )
+        if not value:
+            return "light"
+        try:
+            buf = ctypes.create_string_buffer(64)
+            if self.cf.CFStringGetCString(value, buf, 64, self._UTF8):
+                text = buf.value.decode("utf-8", "replace").strip().lower()
+                return "dark" if text == "dark" else "light"
+        finally:
+            self.cf.CFRelease(value)
+        return "light"
+
+    def screen_is_locked(self):
+        if self.cg is None:
+            return False
+        session = self.cg.CGSessionCopyCurrentDictionary()
+        if not session:
+            return False
+        try:
+            locked = self._cf_bool_value(
+                self.cf.CFDictionaryGetValue(session, self._key_screen_locked)
+            )
+            if locked:
+                return True
+            on_console = self._cf_bool_value(
+                self.cf.CFDictionaryGetValue(session, self._key_on_console)
+            )
+            if on_console is False:
+                return True
+            return False
+        finally:
+            self.cf.CFRelease(session)
+
+    def power_mode(self):
+        if self._ns_process_info and self._objc_msg_id and self._objc_msg_bool:
+            instance = self._objc_msg_id(
+                self._ns_process_info, self._sel_process_info
+            )
+            if instance and self._objc_msg_bool(instance, self._sel_low_power):
+                return "low_power"
+        if self.iokit is not None:
+            info = self.iokit.IOPSCopyPowerSourcesInfo()
+            if info:
+                try:
+                    source_type = self.iokit.IOPSGetProvidingPowerSourceType(info)
+                    if source_type:
+                        raw = self.cf.CFStringGetCStringPtr(
+                            source_type, self._UTF8
+                        )
+                        if not raw:
+                            buf = ctypes.create_string_buffer(64)
+                            if self.cf.CFStringGetCString(
+                                source_type, buf, 64, self._UTF8
+                            ):
+                                raw = buf.value
+                        if raw == b"Battery Power":
+                            return "battery"
+                finally:
+                    self.cf.CFRelease(info)
+        return "ac"
+
+
+def _darwin_system_probes():
+    global _DARWIN_SYSTEM_PROBES, _DARWIN_SYSTEM_PROBES_FAILED
+    if sys.platform != "darwin" or _DARWIN_SYSTEM_PROBES_FAILED:
+        return None
+    if _DARWIN_SYSTEM_PROBES is None:
+        try:
+            _DARWIN_SYSTEM_PROBES = _DarwinSystemProbes()
+        except OSError:
+            _DARWIN_SYSTEM_PROBES_FAILED = True
+            return None
+    return _DARWIN_SYSTEM_PROBES
+
+
+def screen_is_locked():
+    if sys.platform != "darwin":
+        return False
+    if os.environ.get("TMUX_WINDOW_WRAP_IGNORE_SCREEN_LOCK") == "1":
+        return False
+    probes = _darwin_system_probes()
+    if probes is None:
+        return False
+    try:
+        return probes.screen_is_locked()
+    except OSError:
+        return False
+
+
+_DEFAULT_SCREEN_IS_LOCKED = screen_is_locked
+
+
+def detect_power_mode():
+    override = os.environ.get("TMUX_WINDOW_WRAP_POWER_MODE", "").strip().lower()
+    if override in {"ac", "battery", "low_power"}:
+        return override
+    if sys.platform != "darwin":
+        return "ac"
+    probes = _darwin_system_probes()
+    if probes is None:
+        return "ac"
+    try:
+        return probes.power_mode()
+    except OSError:
+        return "ac"
+
+
+def effective_animation_schedule(
+    base_fps,
+    power_mode,
+    battery_fps=None,
+    low_power_fps=None,
+):
+    target_fps = float(base_fps)
+    if power_mode in {"battery", "low_power"} and battery_fps is not None:
+        target_fps = min(target_fps, float(battery_fps))
+    if power_mode == "low_power" and low_power_fps is not None:
+        target_fps = min(target_fps, float(low_power_fps))
+    if target_fps <= 0:
+        return 0.0, 1
+    if target_fps >= base_fps:
+        return target_fps, 1
+    ratio = base_fps / target_fps
+    stride = min(
+        ACTIVITY_LEVEL_STRIDES,
+        key=lambda candidate: (abs(candidate - ratio), candidate),
+    )
+    return target_fps, stride
+
+
 def detect_color_scheme():
     if sys.platform == "darwin":
+        probes = _darwin_system_probes()
+        if probes is not None:
+            try:
+                return probes.color_scheme()
+            except OSError:
+                pass
         try:
             completed = subprocess.run(
                 ["defaults", "read", "-g", "AppleInterfaceStyle"],
@@ -1063,19 +1380,23 @@ def detect_color_scheme():
     return "dark" if background <= 8 else "light"
 
 
-def next_animation_tick(last_tick):
+def next_animation_tick(last_tick, step=1):
     if last_tick is None:
         return 0
-    return (last_tick + 1) % len(ACTIVITY_LEVEL_SEQUENCE)
+    return (last_tick + step) % len(ACTIVITY_LEVEL_SEQUENCE)
 
 
 def animation_has_focused_client(socket_name):
     # tmux initializes clients as focused, so terminals without focus reports
-    # retain animation. Control-mode and suspended clients need no frames.
+    # retain animation. Hidden-status, control-mode and suspended clients need
+    # no frames.
     completed = run_tmux(
         socket_name, "list-clients", "-F", ANIMATION_CLIENT_FILTER,
     )
     return "1" in completed.stdout.splitlines()
+
+
+_DEFAULT_ANIMATION_HAS_FOCUSED_CLIENT = animation_has_focused_client
 
 
 def animator_source_version(path):
@@ -1086,7 +1407,34 @@ def animator_source_version(path):
     return stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size
 
 
-def animate_status(socket_name, fps, log=None):
+def _snapshot_presence_table(process_snapshot, listed_panes):
+    if process_snapshot is None or not hasattr(process_snapshot, "presence_table"):
+        return None
+    pane_pids = []
+    for item in listed_panes:
+        try:
+            pid = int(item.pane.pane_pid)
+        except (TypeError, ValueError):
+            continue
+        if pid > 0:
+            pane_pids.append(pid)
+    try:
+        params = inspect.signature(process_snapshot.presence_table).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "root_pids" in params:
+        return process_snapshot.presence_table(root_pids=pane_pids)
+    return process_snapshot.presence_table()
+
+
+def animate_status(
+    socket_name,
+    fps,
+    log=None,
+    *,
+    battery_fps=None,
+    low_power_fps=None,
+):
     owner = log.context["owner"] if log is not None else uuid.uuid4().hex
     source_path = Path(__file__)
     source_version = animator_source_version(source_path)
@@ -1110,10 +1458,19 @@ def animate_status(socket_name, fps, log=None):
     animate_frames = False
     last_tick = None
     color_scheme = None
+    clients_need_os_theme = None
     next_probe = 0.0
     next_presence_probe = 0.0
     last_presence_key = None
     next_scheme_probe = 0.0
+    next_power_probe = 0.0
+    next_lock_probe = 0.0
+    cached_locked = False
+    power_mode = "ac"
+    effective_fps = float(fps)
+    tick_stride = 1
+    previous_schedule = (power_mode, effective_fps, tick_stride)
+    idle_since = None
     next_tick_at = 0.0
     next_heartbeat = time.monotonic() + 60.0
     previous_busy = None
@@ -1146,9 +1503,22 @@ def animate_status(socket_name, fps, log=None):
                     source_version = version
             stage("agent_probe")
             probe_context = _LAST_PROBE_CONTEXT.pop(socket_name, None)
-            listed_panes, process_snapshot = (
-                probe_context if probe_context is not None else (None, None)
-            )
+            if probe_context is not None and len(probe_context) == 4:
+                (
+                    listed_panes,
+                    process_snapshot,
+                    client_animation_ready,
+                    clients_need_os_theme,
+                ) = probe_context
+            elif probe_context is not None:
+                listed_panes, process_snapshot = probe_context[:2]
+                client_animation_ready = None
+                clients_need_os_theme = None
+            else:
+                listed_panes = None
+                process_snapshot = None
+                client_animation_ready = None
+                clients_need_os_theme = None
             reusable_panes = (
                 listed_panes
                 if isinstance(listed_panes, tuple)
@@ -1170,6 +1540,12 @@ def animate_status(socket_name, fps, log=None):
                 if reusable_panes is not None
                 else None
             )
+            presence_changed = False
+            panes_changed = (
+                last_presence_key is not None
+                and presence_key is not None
+                and presence_key != last_presence_key
+            )
             if (
                 presence_key is None
                 or presence_key != last_presence_key
@@ -1179,11 +1555,9 @@ def animate_status(socket_name, fps, log=None):
                     refresh_agent_presence is _DEFAULT_REFRESH_AGENT_PRESENCE
                     and reusable_panes is not None
                 ):
-                    reused_processes = (
-                        process_snapshot.presence_table()
-                        if process_snapshot is not None
-                        and hasattr(process_snapshot, "presence_table")
-                        else None
+                    reused_processes = _snapshot_presence_table(
+                        process_snapshot,
+                        reusable_panes,
                     )
                     presence_changed = refresh_agent_presence(
                         socket_name,
@@ -1201,40 +1575,103 @@ def animate_status(socket_name, fps, log=None):
                 log.emit("activity_changed", busy=busy)
             previous_busy = busy
             stage("client_probe")
-            animate_frames = busy and animation_has_focused_client(socket_name)
+            if busy:
+                idle_since = None
+                check_lock = (
+                    animation_has_focused_client
+                    is _DEFAULT_ANIMATION_HAS_FOCUSED_CLIENT
+                    or screen_is_locked is not _DEFAULT_SCREEN_IS_LOCKED
+                )
+                if check_lock and now >= next_lock_probe:
+                    cached_locked = screen_is_locked()
+                    next_lock_probe = now + SCREEN_LOCK_PROBE_INTERVAL
+                if cached_locked:
+                    has_client = False
+                elif (
+                    animation_has_focused_client
+                    is _DEFAULT_ANIMATION_HAS_FOCUSED_CLIENT
+                    and client_animation_ready is not None
+                ):
+                    has_client = client_animation_ready
+                else:
+                    has_client = animation_has_focused_client(socket_name)
+                if (
+                    (battery_fps is not None or low_power_fps is not None)
+                    and now >= next_power_probe
+                ):
+                    power_mode = detect_power_mode()
+                    effective_fps, tick_stride = effective_animation_schedule(
+                        fps,
+                        power_mode,
+                        battery_fps=battery_fps,
+                        low_power_fps=low_power_fps,
+                    )
+                    next_power_probe = now + POWER_PROBE_INTERVAL
+                    schedule = (power_mode, effective_fps, tick_stride)
+                    if log is not None and schedule != previous_schedule:
+                        log.emit(
+                            "power_mode_changed",
+                            power_mode=power_mode,
+                            effective_fps=effective_fps,
+                            stride=tick_stride,
+                        )
+                    previous_schedule = schedule
+                animate_frames = has_client and effective_fps > 0
+            else:
+                animate_frames = False
+                next_lock_probe = 0.0
+                cached_locked = False
+                if presence_changed or panes_changed:
+                    idle_since = None
+                elif idle_since is None:
+                    idle_since = now
             if log is not None and animate_frames != previous_animation:
                 log.emit("animation_changed", active=animate_frames)
             previous_animation = animate_frames
             # Lifecycle reports already update and redraw the status directly.
             # This scan repairs missed reports and starts/stops decoration.
-            next_probe = time.monotonic() + ACTIVITY_PROBE_INTERVAL
+            probe_interval = (
+                IDLE_ACTIVITY_PROBE_INTERVAL
+                if idle_since is not None
+                and (now - idle_since) >= IDLE_PROBE_BACKOFF_DELAY
+                else ACTIVITY_PROBE_INTERVAL
+            )
+            next_probe = time.monotonic() + probe_interval
             if not busy:
                 last_tick = None
                 next_tick_at = 0.0
 
         if now >= next_scheme_probe:
-            stage("theme_probe")
-            detected_scheme = detect_color_scheme()
-            if detected_scheme != color_scheme:
-                stage("theme_update")
-                run_tmux(
-                    socket_name,
-                    "set-option",
-                    "-g",
-                    COLOR_SCHEME_OPTION,
-                    detected_scheme,
+            if color_scheme is not None and clients_need_os_theme is False:
+                next_scheme_probe = now + THEME_SKIP_PROBE_INTERVAL
+            else:
+                stage("theme_probe")
+                detected_scheme = detect_color_scheme()
+                if detected_scheme != color_scheme:
+                    stage("theme_update")
+                    run_tmux(
+                        socket_name,
+                        "set-option",
+                        "-g",
+                        COLOR_SCHEME_OPTION,
+                        detected_scheme,
+                    )
+                    color_scheme = detected_scheme
+                    stage("cache_invalidation")
+                    invalidate_cache(socket_name)
+                    if log is not None:
+                        log.emit("theme_changed", color_scheme=color_scheme)
+                next_scheme_probe = now + (
+                    THEME_SKIP_PROBE_INTERVAL
+                    if idle_since is not None
+                    and (now - idle_since) >= IDLE_PROBE_BACKOFF_DELAY
+                    else THEME_PROBE_INTERVAL
                 )
-                color_scheme = detected_scheme
-                stage("cache_invalidation")
-                invalidate_cache(socket_name)
-                if log is not None:
-                    log.emit("theme_changed", color_scheme=color_scheme)
-            next_scheme_probe = now + 5.0
 
         if animate_frames:
             frame_now = time.monotonic()
             if last_tick is None or frame_now >= next_tick_at:
-                tick = next_animation_tick(last_tick)
+                tick = next_animation_tick(last_tick, tick_stride)
                 stage("frame_update")
                 # User option updates request a full client redraw in tmux.
                 # Keep the frame in hidden state and redraw only status rows.
@@ -1253,7 +1690,7 @@ def animate_status(socket_name, fps, log=None):
                 # Schedule from the frame actually rendered. If another
                 # probe stalls briefly, stretch that frame instead of
                 # jumping over intermediate breathing levels to catch up.
-                next_tick_at = time.monotonic() + (1 / fps)
+                next_tick_at = time.monotonic() + (1 / effective_fps)
             wake_at = min(next_probe, next_tick_at, next_scheme_probe)
         else:
             wake_at = min(next_probe, next_scheme_probe)
@@ -1274,6 +1711,9 @@ def run_animation_with_error_log(
     fps,
     error_log,
     animator=None,
+    *,
+    battery_fps=None,
+    low_power_fps=None,
 ):
     if animator is None:
         animator = animate_status
@@ -1295,7 +1735,16 @@ def run_animation_with_error_log(
         for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             previous_handlers[signum] = signal.signal(signum, receive_signal)
         log.emit("started")
-        reason = animator(socket_name, fps, log=log) or "returned"
+        if animator is animate_status:
+            reason = animator(
+                socket_name,
+                fps,
+                log=log,
+                battery_fps=battery_fps,
+                low_power_fps=low_power_fps,
+            ) or "returned"
+        else:
+            reason = animator(socket_name, fps, log=log) or "returned"
     except AnimationSignal as error:
         reason = "signal"
         log.emit("signal_received", signal=signal.Signals(error.signum).name)
@@ -1612,6 +2061,18 @@ def main():
         default=DEFAULT_ACTIVITY_FPS,
     )
     animate_parser.add_argument(
+        "--battery-fps",
+        type=float,
+        default=None,
+        help="cap FPS while running on battery (0 pauses frames)",
+    )
+    animate_parser.add_argument(
+        "--low-power-fps",
+        type=float,
+        default=None,
+        help="cap FPS while macOS Low Power Mode is active (0 pauses frames)",
+    )
+    animate_parser.add_argument(
         "--error-log", "--log-file", default=DEFAULT_LOG,
         help="rotating lifecycle/error log (default: %(default)s)",
     )
@@ -1697,6 +2158,18 @@ def main():
         parser.error("--animation-fps must be greater than zero")
     if arguments.command == "animate" and arguments.fps <= 0:
         parser.error("--fps must be greater than zero")
+    if (
+        arguments.command == "animate"
+        and arguments.battery_fps is not None
+        and arguments.battery_fps < 0
+    ):
+        parser.error("--battery-fps must be non-negative")
+    if (
+        arguments.command == "animate"
+        and arguments.low_power_fps is not None
+        and arguments.low_power_fps < 0
+    ):
+        parser.error("--low-power-fps must be non-negative")
     if arguments.command == "render":
         if arguments.store_rows:
             if arguments.line is not None:
@@ -1746,6 +2219,8 @@ def main():
             arguments.socket_name,
             arguments.fps,
             arguments.error_log,
+            battery_fps=arguments.battery_fps,
+            low_power_fps=arguments.low_power_fps,
         )
         return
 
@@ -1826,6 +2301,11 @@ def main():
             [
                 "set-option", "-t", arguments.session_id,
                 RENDERED_REQUEST_OPTION, str(arguments.request_id),
+            ],
+            [
+                "set-environment", "-h", "-t", arguments.session_id,
+                ACTIVE_DEPENDENT_ENVIRONMENT,
+                "1" if layout_depends_on_active(payload) else "0",
             ],
         ))
         if arguments.render_key is not None:

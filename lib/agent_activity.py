@@ -7,6 +7,7 @@ callers may materialize a newer projection.
 
 from __future__ import annotations
 
+import ctypes
 import inspect
 import json
 import os
@@ -14,6 +15,7 @@ import re
 import shlex
 import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -231,6 +233,17 @@ class ActivityReconcileResult:
     errors: tuple[str, ...] = ()
     panes: tuple[ListedPaneActivity, ...] = ()
     process_snapshot: ProcessSnapshot | None = None
+    client_animation_ready: bool | None = None
+    clients_need_os_theme: bool | None = None
+
+
+_CLIENT_META_PREFIX = "\x1eCLIENT_META\x1f"
+_CLIENT_ANIMATION_FILTER = (
+    "#{&&:#{!=:#{status},off},"
+    "#{&&:#{m:*focused*,#{client_flags}},"
+    "#{!:#{||:#{client_control_mode},#{m:*suspended*,#{client_flags}}}}}}"
+)
+IDLE_RESOLVE_RECHECK_INTERVAL = 15.0
 
 
 @dataclass(frozen=True)
@@ -286,6 +299,8 @@ class TmuxActivityAdapter:
         )
         self.runner = runner
         self.wake_callback = wake
+        self.last_client_animation_ready: bool | None = None
+        self.last_clients_need_os_theme: bool | None = None
 
     @staticmethod
     def pane_format() -> str:
@@ -377,13 +392,31 @@ class TmuxActivityAdapter:
                 f"#{{{PANE_AGENT_OPTION}}}",
             )
         )
-        completed = self._run("list-panes", "-a", "-F", pane_format)
+        client_format = (
+            _CLIENT_META_PREFIX
+            + _CLIENT_ANIMATION_FILTER
+            + ACTIVITY_FIELD_SEPARATOR
+            + "#{?client_theme,1,0}"
+        )
+        completed = self._run(
+            "list-panes", "-a", "-F", pane_format,
+            ";",
+            "list-clients", "-F", client_format,
+        )
         owner = None
         panes: list[ListedPaneActivity] = []
+        client_rows: list[tuple[bool, bool]] = []
         invalid_projection = False
         raw_stdout = completed.stdout
         lines = raw_stdout.removesuffix("\n").split("\n") if raw_stdout else []
         for line in lines:
+            if line.startswith(_CLIENT_META_PREFIX):
+                meta = line[len(_CLIENT_META_PREFIX):].split(
+                    ACTIVITY_FIELD_SEPARATOR, 1
+                )
+                if len(meta) == 2:
+                    client_rows.append((meta[0] == "1", meta[1] == "1"))
+                continue
             fields = line.split(ACTIVITY_FIELD_SEPARATOR, 13)
             if len(fields) not in {13, 14}:
                 invalid_projection = True
@@ -409,6 +442,19 @@ class TmuxActivityAdapter:
             raise ActivityReadError(
                 "tmux returned an invalid activity projection list"
             )
+        if client_rows:
+            self.last_client_animation_ready = any(
+                animatable for animatable, _has_theme in client_rows
+            )
+            self.last_clients_need_os_theme = any(
+                not has_theme for _animatable, has_theme in client_rows
+            )
+        elif panes and not any(item.attached for item in panes):
+            self.last_client_animation_ready = False
+            self.last_clients_need_os_theme = False
+        else:
+            self.last_client_animation_ready = None
+            self.last_clients_need_os_theme = None
         return owner, panes
 
     def set_option(self, target: str, option: str, value: str) -> None:
@@ -569,11 +615,24 @@ class ProcessSnapshot:
         entries: Mapping[int, ProcessEntry],
         *,
         stat_fn: Callable[[str], os.stat_result] = os.stat,
+        command_resolver: Callable[[int], str | None] | None = None,
     ) -> None:
         self.entries: dict[int, ProcessEntry] = dict(entries)
         self._stat_fn = stat_fn
+        self._command_resolver = command_resolver
+        self._resolved_commands: dict[int, str] = {}
         self._tty_devices: dict[str, tuple[int, int] | None] = {}
         self._presence_table: dict[int, tuple[int, str]] | None = None
+
+    def _full_command(self, pid: int, fallback: str) -> str:
+        if self._command_resolver is None:
+            return fallback
+        if pid in self._resolved_commands:
+            return self._resolved_commands[pid]
+        resolved = self._command_resolver(pid)
+        command = resolved if resolved else fallback
+        self._resolved_commands[pid] = command
+        return command
 
     def tty_device(self, pane_tty: str) -> tuple[int, int] | None:
         if not pane_tty:
@@ -681,10 +740,11 @@ class ProcessSnapshot:
                     continue
             elif entry.tdev.removeprefix("/dev/") != tty:
                 continue
+            raw_command = self._full_command(entry.pid, entry.command)
             try:
-                args = shlex.split(entry.command)
+                args = shlex.split(raw_command)
             except ValueError:
-                args = entry.command.split()
+                args = raw_command.split()
             if not args:
                 continue
             command = Path(args[0]).name
@@ -705,14 +765,234 @@ class ProcessSnapshot:
         candidates = exact or compatible
         return min(candidates) if candidates else None
 
-    def presence_table(self) -> dict[int, tuple[int, str]]:
+    def presence_table(
+        self,
+        *,
+        root_pids: Iterable[int] | None = None,
+    ) -> dict[int, tuple[int, str]]:
+        if self._command_resolver is None:
+            if self._presence_table is None:
+                self._presence_table = {
+                    pid: (entry.ppid, entry.command)
+                    for pid, entry in self.entries.items()
+                    if entry.command and not entry.stat.startswith("Z")
+                }
+            return self._presence_table
+
+        if root_pids is not None:
+            roots = set(root_pids)
+            if not roots:
+                return {}
+            selected: set[int] = set()
+            for pid, entry in self.entries.items():
+                if entry.stat.startswith("Z"):
+                    continue
+                chain: list[int] = []
+                cur = pid
+                seen: set[int] = set()
+                while cur in self.entries and cur not in seen:
+                    if cur in roots or cur in selected:
+                        selected.update(chain)
+                        selected.add(cur)
+                        break
+                    seen.add(cur)
+                    chain.append(cur)
+                    cur = self.entries[cur].ppid
+            table: dict[int, tuple[int, str]] = {}
+            for pid in selected:
+                entry = self.entries.get(pid)
+                if entry is None or entry.stat.startswith("Z"):
+                    continue
+                cmd = self._full_command(pid, entry.command)
+                if cmd:
+                    table[pid] = (entry.ppid, cmd)
+            return table
+
         if self._presence_table is None:
-            self._presence_table = {
-                pid: (entry.ppid, entry.command)
-                for pid, entry in self.entries.items()
-                if entry.command and not entry.stat.startswith("Z")
-            }
+            table = {}
+            for pid, entry in self.entries.items():
+                if entry.stat.startswith("Z"):
+                    continue
+                cmd = self._full_command(pid, entry.command)
+                if cmd:
+                    table[pid] = (entry.ppid, cmd)
+            self._presence_table = table
         return self._presence_table
+
+
+_C_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_C_MONTHS = (
+    "", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+_PROC_PIDTBSDINFO = 3
+_SZOMB = 5
+_CTL_KERN = 1
+_KERN_ARGMAX = 8
+_KERN_PROCARGS2 = 49
+
+
+class _DarwinProcBSDInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+class _DarwinLibproc:
+    """Cached ctypes handles for zero-fork macOS process snapshots."""
+
+    def __init__(self) -> None:
+        self.libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+        self.libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        self.libproc.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.libproc.proc_listallpids.restype = ctypes.c_int
+        self.libproc.proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        self.libproc.proc_pidinfo.restype = ctypes.c_int
+        argmax_val = ctypes.c_int(0)
+        argmax_sz = ctypes.c_size_t(ctypes.sizeof(argmax_val))
+        mib = (ctypes.c_int * 2)(_CTL_KERN, _KERN_ARGMAX)
+        if self.libc.sysctl(
+            mib, 2, ctypes.byref(argmax_val), ctypes.byref(argmax_sz), None, 0
+        ) == 0 and argmax_val.value > 0:
+            self.argmax = min(max(argmax_val.value, 65536), 1024 * 1024)
+        else:
+            self.argmax = 262144
+        self._arg_buf = ctypes.create_string_buffer(self.argmax)
+
+    @staticmethod
+    def format_lstart(tvsec: int) -> str:
+        local = time.localtime(tvsec)
+        return (
+            f"{_C_WEEKDAYS[local.tm_wday]} {_C_MONTHS[local.tm_mon]} "
+            f"{local.tm_mday:2d} {local.tm_hour:02d}:{local.tm_min:02d}:"
+            f"{local.tm_sec:02d} {local.tm_year:04d}"
+        )
+
+    def read_command(self, pid: int) -> str | None:
+        mib = (ctypes.c_int * 3)(_CTL_KERN, _KERN_PROCARGS2, pid)
+        size = ctypes.c_size_t(self.argmax)
+        if self.libc.sysctl(
+            mib, 3, self._arg_buf, ctypes.byref(size), None, 0
+        ) != 0 or size.value < 4:
+            return None
+        raw = self._arg_buf.raw[:size.value]
+        argc = struct.unpack_from("<i", raw, 0)[0]
+        if argc <= 0:
+            return None
+        nul = raw.find(b"\x00", 4)
+        if nul < 0:
+            return None
+        pos = nul
+        while pos < len(raw) and raw[pos] == 0:
+            pos += 1
+        args: list[str] = []
+        for _ in range(argc):
+            if pos >= len(raw):
+                break
+            end = raw.find(b"\x00", pos)
+            if end < 0:
+                args.append(raw[pos:].decode("utf-8", "replace"))
+                break
+            args.append(raw[pos:end].decode("utf-8", "replace"))
+            pos = end + 1
+        return " ".join(args).strip() if args else None
+
+    def capture(self) -> ProcessSnapshot | None:
+        count = self.libproc.proc_listallpids(None, 0)
+        if count <= 0:
+            return None
+        capacity = count + 128
+        pids = (ctypes.c_int * capacity)()
+        actual = self.libproc.proc_listallpids(pids, ctypes.sizeof(pids))
+        if actual <= 0:
+            return None
+        entries: dict[int, ProcessEntry] = {}
+        info = _DarwinProcBSDInfo()
+        info_size = ctypes.sizeof(info)
+        for index in range(min(actual, capacity)):
+            pid = int(pids[index])
+            if pid <= 0:
+                continue
+            if self.libproc.proc_pidinfo(
+                pid, _PROC_PIDTBSDINFO, 0, ctypes.byref(info), info_size
+            ) != info_size:
+                continue
+            raw_tdev = int(info.e_tdev)
+            if raw_tdev in (0, 0xFFFFFFFF):
+                tdev = "??"
+                tdev_pair = None
+            else:
+                major = (raw_tdev >> 24) & 0xFF
+                minor = raw_tdev & 0xFFFFFF
+                tdev = f"{major}/{minor}"
+                tdev_pair = (major, minor)
+            if info.pbi_status == _SZOMB:
+                proc_stat = "Z"
+            elif info.pbi_pgid != 0 and info.pbi_pgid == info.e_tpgid:
+                proc_stat = "S+"
+            else:
+                proc_stat = "S"
+            raw_name = info.pbi_name or info.pbi_comm
+            command = raw_name.decode("utf-8", "replace").strip()
+            entries[pid] = ProcessEntry(
+                pid=pid,
+                ppid=int(info.pbi_ppid),
+                lstart=self.format_lstart(int(info.pbi_start_tvsec)),
+                tdev=tdev,
+                tdev_pair=tdev_pair,
+                stat=proc_stat,
+                command=command,
+            )
+        if not entries:
+            return None
+        return ProcessSnapshot(entries, command_resolver=self.read_command)
+
+
+_DARWIN_LIBPROC: _DarwinLibproc | None = None
+_DARWIN_LIBPROC_FAILED = False
+
+
+def _capture_process_snapshot_darwin() -> ProcessSnapshot | None:
+    global _DARWIN_LIBPROC, _DARWIN_LIBPROC_FAILED
+    if _DARWIN_LIBPROC_FAILED:
+        return None
+    if _DARWIN_LIBPROC is None:
+        try:
+            _DARWIN_LIBPROC = _DarwinLibproc()
+        except OSError:
+            _DARWIN_LIBPROC_FAILED = True
+            return None
+    try:
+        return _DARWIN_LIBPROC.capture()
+    except OSError:
+        return None
 
 
 def parse_process_snapshot(
@@ -749,6 +1029,13 @@ def capture_process_snapshot(
     environment: Mapping[str, str] | None = None,
 ) -> ProcessSnapshot | None:
     env = dict(os.environ if environment is None else environment)
+    if (
+        sys.platform == "darwin"
+        and env.get("AIPANE_DISABLE_LIBPROC") != "1"
+    ):
+        darwin_snapshot = _capture_process_snapshot_darwin()
+        if darwin_snapshot is not None:
+            return darwin_snapshot
     env["LC_ALL"] = "C"
     try:
         completed = subprocess.run(
@@ -1458,6 +1745,9 @@ class AgentActivity:
         self.process_exists = process_exists or process_is_running
         self.process_tty = process_tty or globals()["process_tty"]
         self._repair_candidates: dict[str, tuple[str, ...]] = {}
+        self._idle_resolve_cache: dict[
+            str, tuple[tuple[object, ...], float, ActivityView, int | None]
+        ] = {}
 
     def report(
         self,
@@ -1617,6 +1907,105 @@ class AgentActivity:
             )
         return self._inspection(pane)
 
+    @staticmethod
+    def _stat_token(path: Path) -> tuple[int, int, int, int] | None:
+        try:
+            info = path.lstat()
+        except OSError:
+            return None
+        return (info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size)
+
+    def _idle_cache_fingerprint(
+        self,
+        pane: PaneActivity,
+        process_snapshot: ProcessSnapshot | None,
+        *,
+        cached_pid: int | None = None,
+    ) -> tuple[object, ...] | None:
+        if process_snapshot is None:
+            return None
+        if pane.current_command == "agy":
+            from agy_sessions import runtime_path
+
+            rt_path = runtime_path(
+                pane.pane_id,
+                pane.socket_path,
+                pane.server_pid,
+                self.environment,
+            )
+            rt_tok = self._stat_token(rt_path)
+            if rt_tok is None:
+                return ("agy", pane, None, None)
+            if cached_pid is None:
+                return None
+            entry = process_snapshot.entries.get(cached_pid)
+            proc_sig = (
+                (entry.ppid, entry.lstart, entry.tdev_pair, entry.stat, entry.command)
+                if entry is not None
+                else None
+            )
+            return ("agy", pane, rt_tok, cached_pid, proc_sig)
+
+        if _is_codex_command(pane.current_command):
+            record = _record_object(pane.record)
+            if record is None or record.get("reported") != "idle":
+                return None
+            process = record.get("process")
+            root = record.get("root")
+            if not isinstance(process, dict) or not isinstance(root, dict):
+                return None
+            pid = process.get("pid")
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                return None
+            transcript_value = root.get("transcript_path")
+            home_value = root.get("codex_home")
+            if not isinstance(transcript_value, str) or not transcript_value:
+                return None
+            if not isinstance(home_value, str) or not home_value:
+                return None
+            entry = process_snapshot.entries.get(pid)
+            proc_sig = (
+                (entry.ppid, entry.lstart, entry.tdev_pair, entry.stat)
+                if entry is not None
+                else None
+            )
+            codex_home = Path(home_value).expanduser()
+            transcript = Path(transcript_value).expanduser()
+            watched = (
+                transcript,
+                codex_home,
+                codex_home / "thread_history_1.sqlite",
+                codex_home / "thread_history_1.sqlite-wal",
+                codex_home / "goals_1.sqlite",
+                codex_home / "goals_1.sqlite-wal",
+                codex_home / "sqlite" / "goals_1.sqlite",
+                codex_home / "sqlite" / "goals_1.sqlite-wal",
+                codex_home / "state_5.sqlite",
+                codex_home / "state_5.sqlite-wal",
+            )
+            return (
+                "codex",
+                pane,
+                proc_sig,
+                tuple(self._stat_token(path) for path in watched),
+            )
+        return None
+
+    def _agy_runtime_pid(self, pane: PaneActivity) -> int | None:
+        from agy_sessions import _read, runtime_path
+
+        rt_path = runtime_path(
+            pane.pane_id,
+            pane.socket_path,
+            pane.server_pid,
+            self.environment,
+        )
+        record = _read(rt_path)
+        if not record:
+            return None
+        pid = record.get("pid")
+        return pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 else None
+
     def reconcile(
         self,
         *,
@@ -1640,6 +2029,9 @@ class AgentActivity:
         for pane_id in tuple(self._repair_candidates):
             if pane_id not in live_ids:
                 self._repair_candidates.pop(pane_id, None)
+        for pane_id in tuple(self._idle_resolve_cache):
+            if pane_id not in live_ids:
+                self._idle_resolve_cache.pop(pane_id, None)
 
         candidate_panes = [
             listed
@@ -1658,6 +2050,7 @@ class AgentActivity:
         ):
             process_snapshot = capture_process_snapshot(self.environment)
 
+        now = time.monotonic()
         busy = False
         changed = False
         errors: list[str] = []
@@ -1666,12 +2059,55 @@ class AgentActivity:
             marked_busy = bool(pane.marker) and pane.marker == pane.current_command
             if not listed.attached:
                 self._repair_candidates.pop(pane.pane_id, None)
+                self._idle_resolve_cache.pop(pane.pane_id, None)
                 continue
             if not (pane.marker or pane.reporter or pane.record):
                 self._repair_candidates.pop(pane.pane_id, None)
+                self._idle_resolve_cache.pop(pane.pane_id, None)
                 continue
 
-            view = self._resolve(pane, process_snapshot=process_snapshot)
+            view = None
+            if not marked_busy and process_snapshot is not None:
+                cached = self._idle_resolve_cache.get(pane.pane_id)
+                if cached is not None:
+                    cached_fp, cached_at, cached_view, cached_pid = cached
+                    if now - cached_at < IDLE_RESOLVE_RECHECK_INTERVAL:
+                        current_fp = self._idle_cache_fingerprint(
+                            pane,
+                            process_snapshot,
+                            cached_pid=cached_pid,
+                        )
+                        if current_fp is not None and current_fp == cached_fp:
+                            view = cached_view
+            if view is None:
+                view = self._resolve(pane, process_snapshot=process_snapshot)
+                if (
+                    not marked_busy
+                    and view.state == "idle"
+                    and not view.repairable
+                    and process_snapshot is not None
+                ):
+                    agy_pid = (
+                        self._agy_runtime_pid(pane)
+                        if pane.current_command == "agy"
+                        else None
+                    )
+                    fp = self._idle_cache_fingerprint(
+                        pane,
+                        process_snapshot,
+                        cached_pid=agy_pid,
+                    )
+                    if fp is not None:
+                        self._idle_resolve_cache[pane.pane_id] = (
+                            fp,
+                            now,
+                            view,
+                            agy_pid,
+                        )
+                    else:
+                        self._idle_resolve_cache.pop(pane.pane_id, None)
+                else:
+                    self._idle_resolve_cache.pop(pane.pane_id, None)
             stable_repair = (
                 bool((_record_object(pane.record) or {}).get("dsh_runtime"))
                 or
@@ -1748,6 +2184,12 @@ class AgentActivity:
             errors=tuple(errors),
             panes=tuple(listed_panes),
             process_snapshot=process_snapshot,
+            client_animation_ready=getattr(
+                adapter, "last_client_animation_ready", None
+            ),
+            clients_need_os_theme=getattr(
+                adapter, "last_clients_need_os_theme", None
+            ),
         )
 
     def clear(self, target: str) -> bool:

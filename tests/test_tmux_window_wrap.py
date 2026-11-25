@@ -2807,7 +2807,14 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             time.sleep(0.02)
         self.fail("animation tick did not advance")
 
-    def source_window_wrap_config(self, animate=True, render_script=SCRIPT):
+    def source_window_wrap_config(
+        self,
+        animate=True,
+        render_script=SCRIPT,
+        *,
+        ignore_screen_lock=True,
+        power_mode="ac",
+    ):
         config_text = CONFIG.read_text().replace(
             "$HOME/.local/bin/tmux-window-wrap",
             str(render_script),
@@ -2823,8 +2830,14 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         # Fixture chrome that real users keep in personal ~/.tmux.conf — not in
         # the published conf fragment. Matches the integration assumptions used
         # before window-wrap was extracted from the full home config.
+        env_lines = ""
+        if ignore_screen_lock:
+            env_lines += "set-environment -g TMUX_WINDOW_WRAP_IGNORE_SCREEN_LOCK 1\n"
+        if power_mode:
+            env_lines += f"set-environment -g TMUX_WINDOW_WRAP_POWER_MODE {power_mode}\n"
         preamble = (
-            "set -g mouse on\n"
+            env_lines
+            + "set -g mouse on\n"
             "set -g base-index 1\n"
             "setw -g pane-base-index 1\n"
             "set -g renumber-windows on\n"
@@ -4739,7 +4752,7 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
             "TMUX_WINDOW_WRAP_GENERATION=#{TMUX_WINDOW_WRAP_GENERATION}",
             "TMUX_WINDOW_WRAP_WINDOWS=#{W:",
             "#{q:window_name}_#{||:#{e|>=:#{n:#{s/0//:#{P:#{pane_synchronized}}}},2},#{&&:#{==:#{window_panes},1},#{pane_synchronized}}}",
-            "#{P:#{&&:#{m/r:^.+$,#{@tmux-window-wrap-activity}},"
+            "#{P:#{&&:#{!=:#{@tmux-window-wrap-activity},},"
             "#{==:#{@tmux-window-wrap-activity},#{pane_current_command}}}}",
             "TMUX_WINDOW_WRAP_CLIENTS=#{L:",
             "#{q:client_name}_#{client_width}",
@@ -4758,6 +4771,19 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         )
         for cache_key in cache_keys:
             self.assertIn(cache_key, render_job.replace("##", "#"))
+        layout_key = self.tmux(
+            "show-options", "-g", "-v", "@tmux-window-wrap-layout-key"
+        ).stdout.strip()
+        self.assertIn("TMUX_WINDOW_WRAP_ACTIVE_DEPENDENT", layout_key)
+        self.assertNotIn("#{m/r:^.+$,#{@tmux-window-wrap-activity}}", layout_key)
+        self.assertEqual(
+            self.tmux("show-options", "-g", "-v", "@tmux-window-wrap-battery-fps").stdout.strip(),
+            "4",
+        )
+        self.assertEqual(
+            self.tmux("show-options", "-g", "-v", "@tmux-window-wrap-low-power-fps").stdout.strip(),
+            "1",
+        )
         self.assertNotIn("#[align=right", second_row)
         self.assertNotIn("#[align=right", third_row)
         self.assertIn("#{E:@tmux-window-wrap-row-0}", first_row)
@@ -4796,6 +4822,287 @@ class WindowWrapTmuxIntegrationTests(unittest.TestCase):
         self.assertNotIn("set -g prefix", conf_text)
         self.assertNotIn("@plugin", conf_text)
         self.assertNotIn("tpm", conf_text.lower())
+
+    def test_animation_pauses_when_status_is_off_and_resumes(self):
+        pane = self.tmux(
+            "display-message", "-p", "-t", "wrap:1", "#{pane_id}",
+        ).stdout.strip()
+        self.set_pane_activity(pane, "busy")
+        self.source_window_wrap_config()
+        _, master_fd = self.attach_client(width=80)
+        self.wait_for_client_count(1)
+        self.wait_for_status_text(master_fd, "▓", timeout=2)
+        self.wait_for_animation_tick_change()
+
+        def tick():
+            return self.tmux(
+                "display-message", "-p", "-t", self.session_id,
+                "#{TMUX_WINDOW_WRAP_ANIMATION_TICK}",
+            ).stdout.strip()
+
+        self.tmux("set-option", "-t", self.session_id, "status", "off")
+        deadline = time.monotonic() + 1.4
+        while time.monotonic() < deadline:
+            self.drain_client_output(master_fd)
+            time.sleep(0.02)
+        paused_tick = tick()
+        time.sleep(0.45)
+        self.assertEqual(
+            tick(), paused_tick,
+            "hidden status=off client kept advancing animation ticks",
+        )
+
+        self.tmux("set-option", "-t", self.session_id, "status", "on")
+        deadline = time.monotonic() + 1.6
+        while tick() == paused_tick and time.monotonic() < deadline:
+            self.drain_client_output(master_fd)
+            time.sleep(0.02)
+        self.assertNotEqual(tick(), paused_tick, "status=on did not resume animation")
+
+    def test_unclipped_window_switch_skips_render_job_while_clipped_rerenders(self):
+        self.source_window_wrap_config(animate=False)
+        _, master_fd = self.attach_client(width=100, height=24)
+        self.wait_for_client_count(1)
+        self.wait_for_active_label(master_fd, "1:手册", timeout=3)
+
+        # Wait for TMUX_WINDOW_WRAP_ACTIVE_DEPENDENT=0 to settle and converge.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            self.drain_client_output(master_fd)
+            dep = self.tmux(
+                "display-message", "-p", "-t", self.session_id,
+                "#{TMUX_WINDOW_WRAP_ACTIVE_DEPENDENT}",
+            ).stdout.strip()
+            key_eq = self.tmux(
+                "display-message", "-p", "-t", self.session_id,
+                "#{==:#{E:@tmux-window-wrap-layout-key},#{TMUX_WINDOW_WRAP_RENDER_KEY}}",
+            ).stdout.strip()
+            if dep == "0" and key_eq == "1":
+                break
+            time.sleep(0.05)
+        self.assertEqual(dep, "0")
+        self.assertEqual(key_eq, "1")
+
+        before_req = int(
+            self.tmux(
+                "show-options", "-t", self.session_id, "-qv",
+                "@tmux-window-wrap-render-request",
+            ).stdout.strip()
+        )
+        for target_index, target_label in (("2", "2:c"), ("1", "1:手册"), ("2", "2:c")):
+            self.drain_client_output(master_fd)
+            self.tmux("select-window", "-t", f"wrap:{target_index}")
+            self.wait_for_active_label(master_fd, target_label, timeout=1.0)
+        time.sleep(0.2)
+        after_req = int(
+            self.tmux(
+                "show-options", "-t", self.session_id, "-qv",
+                "@tmux-window-wrap-render-request",
+            ).stdout.strip()
+        )
+        self.assertEqual(
+            after_req, before_req,
+            "unclipped window switch must not spawn Python render jobs",
+        )
+
+        # Add enough windows to exceed 3 rows (clipped) and confirm ACTIVE_DEPENDENT=1.
+        for idx in range(3, 35):
+            self.tmux("new-window", "-d", "-t", "wrap", "-n", f"longwin{idx:02d}", "sleep 120")
+        deadline = time.monotonic() + 3.0
+        dep_clipped = ""
+        while time.monotonic() < deadline:
+            self.drain_client_output(master_fd)
+            dep_clipped = self.tmux(
+                "display-message", "-p", "-t", self.session_id,
+                "#{TMUX_WINDOW_WRAP_ACTIVE_DEPENDENT}",
+            ).stdout.strip()
+            if dep_clipped == "1":
+                break
+            time.sleep(0.05)
+        self.assertEqual(dep_clipped, "1")
+
+
+class PowerAndBackoffUnitTests(unittest.TestCase):
+    def test_effective_animation_schedule_preserves_symmetric_extremes(self):
+        ns = runpy.run_path(str(SCRIPT))
+        sched = ns["effective_animation_schedule"]
+        next_tick = ns["next_animation_tick"]
+        seq = ns["ACTIVITY_LEVEL_SEQUENCE"]
+
+        self.assertEqual(sched(10, "ac", battery_fps=4, low_power_fps=1), (10.0, 1))
+        self.assertEqual(sched(10, "battery", battery_fps=4, low_power_fps=1), (4.0, 2))
+        self.assertEqual(sched(10, "low_power", battery_fps=4, low_power_fps=1), (1.0, 12))
+        self.assertEqual(sched(10, "low_power", battery_fps=4, low_power_fps=0), (0.0, 1))
+
+        # Every chosen stride must visit both dimmest (0) and brightest (12) levels.
+        for mode, b_fps, l_fps in (
+            ("ac", 4, 1),
+            ("battery", 4, 1),
+            ("battery", 3, 1),
+            ("low_power", 4, 1),
+        ):
+            eff_fps, stride = sched(10, mode, battery_fps=b_fps, low_power_fps=l_fps)
+            self.assertGreater(eff_fps, 0)
+            t = None
+            levels = set()
+            for _ in range(24):
+                t = next_tick(t, stride)
+                levels.add(seq[t])
+            self.assertIn(0, levels)
+            self.assertIn(12, levels)
+
+    def test_layout_depends_on_active_distinguishes_clipped_and_wide_indent(self):
+        ns = runpy.run_path(str(SCRIPT))
+        depends = ns["layout_depends_on_active"]
+        unclipped = {
+            "width": 100, "left_width": 4, "right_width": 0, "active": "@1",
+            "windows": [
+                {"id": f"@{i}", "index": str(i), "name": f"w{i}", "label": f" {i}:w{i} "}
+                for i in range(1, 15)
+            ],
+        }
+        self.assertFalse(depends(unclipped))
+
+        clipped = {
+            "width": 40, "left_width": 4, "right_width": 0, "active": "@1",
+            "windows": [
+                {"id": f"@{i}", "index": str(i), "name": f"window{i}", "label": f" {i}:window{i} "}
+                for i in range(1, 20)
+            ],
+        }
+        self.assertTrue(depends(clipped))
+
+        wide_indent = {
+            "width": 20, "left_width": 10, "right_width": 0, "active": "@1",
+            "windows": [
+                {"id": "@1", "index": "1", "name": "short", "label": " 1:short "},
+                {"id": "@2", "index": "2", "name": "verywidewindow", "label": " 2:verywidewindow "},
+            ],
+        }
+        self.assertTrue(depends(wide_indent))
+
+    def test_animator_pauses_when_screen_locked_and_adapts_battery_fps(self):
+        ns = runpy.run_path(str(SCRIPT))
+        g = ns["animate_status"].__globals__
+        log = mock.Mock(context={"owner": "owner"})
+        ticks = []
+        locked = {"value": False}
+        power = {"mode": "battery"}
+
+        class FakeTime:
+            now = 0.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+            @classmethod
+            def sleep(cls, seconds):
+                cls.now += max(seconds, 0.01)
+
+        def run_tmux(_socket, *arguments):
+            if "TMUX_WINDOW_WRAP_ANIMATION_TICK" in arguments:
+                ticks.append((
+                    round(FakeTime.now, 2),
+                    int(arguments[arguments.index("TMUX_WINDOW_WRAP_ANIMATION_TICK") + 1]),
+                ))
+
+        def probe(_socket, log=None):
+            if FakeTime.now >= 6.0 and FakeTime.now < 10.0:
+                locked["value"] = True
+            else:
+                locked["value"] = False
+            if FakeTime.now >= 13.0:
+                return ("successor", True)
+            return ("owner", True)
+
+        g["time"] = FakeTime
+        g["run_tmux"] = run_tmux
+        g["animation_probe"] = probe
+        g["animation_has_focused_client"] = lambda _socket: True
+        g["refresh_agent_presence"] = lambda _socket: False
+        g["detect_color_scheme"] = lambda: "light"
+        g["invalidate_cache"] = mock.Mock()
+        g["screen_is_locked"] = lambda: locked["value"]
+        g["detect_power_mode"] = lambda: power["mode"]
+
+        reason = ns["animate_status"](
+            "test", 10, log=log, battery_fps=4, low_power_fps=1,
+        )
+        self.assertEqual(reason, "superseded")
+        # Battery 4 FPS uses stride 2 -> ~24 ticks in 0..6s, ZERO ticks during locked 7..10s, resumes after 10s.
+        pre_lock = [t for ts, t in ticks if ts < 6.0]
+        during_lock = [t for ts, t in ticks if 8.0 < ts < 10.0]
+        post_lock = [t for ts, t in ticks if ts >= 10.0]
+        self.assertGreaterEqual(len(pre_lock), 18)
+        self.assertLessEqual(len(pre_lock), 28)
+        self.assertTrue(all((b - a) % 24 == 2 for a, b in zip(pre_lock, pre_lock[1:])))
+        self.assertEqual(during_lock, [])
+        self.assertGreater(len(post_lock), 5)
+
+    def test_animator_idle_probe_backs_off_and_skips_os_theme_when_clients_report_theme(self):
+        ns = runpy.run_path(str(SCRIPT))
+        g = ns["animate_status"].__globals__
+        from agent_activity import ActivityReconcileResult, ListedPaneActivity, PaneActivity
+
+        owner = {}
+        probe_times = []
+        theme_calls = []
+
+        class FakeTime:
+            now = 0.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+            @classmethod
+            def sleep(cls, seconds):
+                cls.now += max(seconds, 0.01)
+
+        def run_tmux(_socket, *arguments, input=None):
+            if arguments[:3] == ("set-environment", "-g", "TMUX_WINDOW_WRAP_ANIMATOR_OWNER"):
+                owner["value"] = arguments[-1]
+            return subprocess.CompletedProcess(["tmux", *arguments], 0, stdout="", stderr="")
+
+        pane = PaneActivity(pane_id="%1", current_command="zsh", pane_pid="100")
+
+        class FakeController:
+            def reconcile(self):
+                probe_times.append(round(FakeTime.now, 2))
+                return ActivityReconcileResult(
+                    owner=owner["value"] if FakeTime.now < 25.0 else "successor",
+                    busy=False,
+                    changed=False,
+                    panes=(ListedPaneActivity(attached=True, pane=pane, agent_marker=""),),
+                    process_snapshot=None,
+                    client_animation_ready=False,
+                    clients_need_os_theme=False,
+                )
+
+        def spy_scheme():
+            theme_calls.append(round(FakeTime.now, 2))
+            return "light"
+
+        g["time"] = FakeTime
+        g["run_tmux"] = run_tmux
+        g["activity_controller"] = lambda _socket: FakeController()
+        g["refresh_agent_presence"] = lambda _socket, **_kw: False
+        g["detect_color_scheme"] = spy_scheme
+        g["invalidate_cache"] = mock.Mock()
+
+        self.assertEqual(ns["animate_status"]("test", 10), "superseded")
+        # After 10s steady idle, probe gaps widen from 1s to 5s.
+        late_gaps = [
+            b - a for a, b in zip(probe_times, probe_times[1:]) if a >= 10.0
+        ]
+        self.assertTrue(late_gaps, f"no post-backoff probes in {probe_times}")
+        self.assertTrue(
+            all(gap >= 4.9 for gap in late_gaps),
+            f"expected 5s idle backoff gaps, got {probe_times}",
+        )
+        # Only the initial startup theme probe runs when clients_need_os_theme is False.
+        self.assertEqual(len(theme_calls), 1, f"unexpected theme probes: {theme_calls}")
 
 
 if __name__ == "__main__":

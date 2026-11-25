@@ -2417,6 +2417,160 @@ class AgentActivityTests(unittest.TestCase):
                 self.assertFalse(third.busy)
                 self.assertEqual(adapter.read("%1").marker, "")
 
+    @unittest.skipUnless(sys.platform == "darwin", "macOS libproc only")
+    def test_darwin_libproc_snapshot_runs_without_ps_fork_and_scopes_presence(self):
+        from agent_activity import capture_process_snapshot
+
+        with mock.patch(
+            "agent_activity.subprocess.run",
+            side_effect=AssertionError("macOS capture_process_snapshot must not fork ps"),
+        ):
+            snap = capture_process_snapshot()
+
+        self.assertIsNotNone(snap)
+        me = snap.entries.get(os.getpid())
+        self.assertIsNotNone(me)
+        self.assertEqual(me.ppid, os.getppid())
+        self.assertEqual(len(me.lstart), 24)
+        self.assertTrue(me.command)
+
+        resolved_pids = []
+        orig_resolver = snap._command_resolver
+
+        def spy_resolver(pid):
+            resolved_pids.append(pid)
+            return orig_resolver(pid)
+
+        snap._command_resolver = spy_resolver
+        scoped = snap.presence_table(root_pids=[os.getpid()])
+        self.assertIn(os.getpid(), scoped)
+        # Only this process (and any direct descendants) should be resolved via sysctl.
+        self.assertLessEqual(len(resolved_pids), 10)
+        self.assertLess(len(scoped), len(snap.entries))
+
+    def test_reconcile_caches_unchanged_idle_codex_and_agy_panes_by_stat(self):
+        import stat as stat_mod
+        from datetime import datetime
+        from agent_activity import parse_process_snapshot
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            codex_home = root / ".codex"
+            agy_state = root / "aipane-state"
+            sid = "019d0000-0000-7000-8000-000000000002"
+            rollout = make_codex_history(
+                codex_home,
+                session_id=sid,
+                lifecycles=[("turn-1", "completed", 1_795_400_000, 1_795_400_005)],
+            )
+            started_at = "Tue Nov 24 01:03:36 2026"
+            started_ts = datetime.strptime(started_at, "%a %b %d %H:%M:%S %Y").timestamp()
+            codex_record = json.dumps(
+                {
+                    "version": 1,
+                    "revision": "rev-idle",
+                    "owner": "codex",
+                    "reported": "idle",
+                    "updated_at": 1_795_400_000_000,
+                    "pane": {
+                        "id": "%1",
+                        "tty": "/dev/ttys075",
+                        "socket": "/tmp/tmux-test",
+                        "server_pid": "999",
+                    },
+                    "process": {"pid": 100, "started_at": started_at},
+                    "root": {
+                        "session_id": sid,
+                        "turn_id": "turn-1",
+                        "transcript_path": str(rollout),
+                        "codex_home": str(codex_home),
+                    },
+                }
+            )
+            pane_codex = PaneActivity(
+                pane_id="%1",
+                current_command="codex",
+                pane_tty="/dev/ttys075",
+                socket_path="/tmp/tmux-test",
+                server_pid="999",
+                pane_pid="100",
+                marker="",
+                reporter="codex",
+                record=codex_record,
+            )
+            pane_agy = PaneActivity(
+                pane_id="%2",
+                current_command="agy",
+                pane_tty="/dev/ttys076",
+                socket_path="/tmp/tmux-test",
+                server_pid="999",
+                pane_pid="200",
+                reporter="agy",
+                record="{}",
+            )
+            env = {
+                "CODEX_HOME": str(codex_home),
+                "AIPANE_STATE_DIR": str(agy_state),
+                "HOME": str(root),
+            }
+            import agy_sessions
+            rt_path = agy_sessions.runtime_path("%2", "/tmp/tmux-test", "999", env)
+            rt_path.parent.mkdir(parents=True, exist_ok=True)
+            rt_payload = {
+                "version": 1,
+                "pid": 200,
+                "started_at": started_ts,
+                "tty": "ttys076",
+                "pane": "%2",
+                "socket": "/tmp/tmux-test",
+                "server": "999",
+                "state": "idle",
+                "cwd": str(root),
+                "session_id": sid,
+            }
+            rt_path.write_text(json.dumps(rt_payload), encoding="utf-8")
+            os.chmod(rt_path, 0o600)
+
+            ps_output = "\n".join(
+                (
+                    f"  100     1 {started_at}    16/75 S+   codex --yolo",
+                    f"  200     1 {started_at}    16/76 S+   agy --mode auto",
+                )
+            )
+            fake_stats = {
+                "/dev/ttys075": mock.Mock(
+                    st_mode=stat_mod.S_IFCHR | 0o620,
+                    st_rdev=os.makedev(16, 75),
+                ),
+                "/dev/ttys076": mock.Mock(
+                    st_mode=stat_mod.S_IFCHR | 0o620,
+                    st_rdev=os.makedev(16, 76),
+                ),
+            }
+            snapshot = parse_process_snapshot(ps_output, stat_fn=fake_stats.__getitem__)
+            adapter = InMemoryActivityAdapter([pane_codex, pane_agy], environment=env)
+            activity = AgentActivity(adapter=adapter, environment=env)
+
+            with (
+                mock.patch("agent_activity.capture_process_snapshot", return_value=snapshot),
+                mock.patch.object(activity, "_resolve", wraps=activity._resolve) as resolve_spy,
+            ):
+                r1 = activity.reconcile()
+                self.assertFalse(r1.busy)
+                self.assertEqual(resolve_spy.call_count, 2)
+
+                # Round 2: unchanged stat fingerprints -> both idle panes hit cache (0 _resolve calls).
+                r2 = activity.reconcile()
+                self.assertFalse(r2.busy)
+                self.assertEqual(resolve_spy.call_count, 2)
+
+                # Mutate agy runtime file to busy -> immediate cache miss and busy=True!
+                rt_payload["state"] = "busy"
+                rt_path.write_text(json.dumps(rt_payload), encoding="utf-8")
+                r3 = activity.reconcile()
+                self.assertTrue(r3.busy)
+                self.assertEqual(resolve_spy.call_count, 3)
+
 
 if __name__ == "__main__":
     unittest.main()
