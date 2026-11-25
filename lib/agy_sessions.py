@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import stat
 import sqlite3
 import subprocess
@@ -193,19 +194,223 @@ def current_session(*, pane_id: str, socket_path: str, server_pid: str,
     return record
 
 
-def session_exists(sid: str, cwd: str, home: Path) -> bool:
+def presence_lock_held(sid: str, home: Path) -> bool | None:
+    """Probe Antigravity's native OS flock on presence/<sid>.lock without mutating it.
+
+    Returns False if unlocked or absent, True if held by a live process,
+    or None if the lock state cannot be safely determined.
+    """
+    if not SID.fullmatch(sid):
+        return None
+    lock_path = home / "presence" / f"{sid}.lock"
+    if not lock_path.exists():
+        return False
+    try:
+        with lock_path.open("rb") as stream:
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            try:
+                return False
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+
+
+def _wal_has_bytes(database: Path) -> bool:
+    wal = database.with_name(database.name + "-wal")
+    try:
+        return wal.is_file() and wal.stat().st_size > 0
+    except OSError:
+        return True
+
+
+def _query_sqlite_state(uri: str, sid: str) -> str:
+    with closing(sqlite3.connect(uri, uri=True, timeout=0.5)) as connection:
+        has_steps = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='steps' LIMIT 1"
+        ).fetchone()
+        if has_steps is None:
+            return "incomplete_shell"
+        if connection.execute("SELECT 1 FROM steps LIMIT 1").fetchone() is None:
+            return "empty_shell"
+        has_meta = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trajectory_meta' LIMIT 1"
+        ).fetchone()
+        if (has_meta is None
+                or connection.execute("SELECT 1 FROM trajectory_meta WHERE cascade_id=? LIMIT 1", (sid,)).fetchone() is None):
+            return "mismatched_meta"
+        return "valid"
+
+
+def _inspect_sqlite_db(database: Path, sid: str) -> str:
+    """Inspect a trajectory SQLite file with WAL consistency and zero side-files on clean DBs."""
+    try:
+        if not database.is_file():
+            return "missing"
+        db_size = database.stat().st_size
+    except OSError:
+        return "busy_or_unreadable"
+
+    wal_nonempty = _wal_has_bytes(database)
+    if db_size == 0 and not wal_nonempty:
+        return "empty_shell"
+
+    try:
+        if wal_nonempty:
+            return _query_sqlite_state(database.as_uri() + "?mode=ro", sid)
+        # Cleanly closed WAL DBs have no non-empty -wal; immutable=1 prevents
+        # SQLite from creating -shm/-wal side-files or acquiring reader locks.
+        state = _query_sqlite_state(database.as_uri() + "?mode=ro&immutable=1", sid)
+        if _wal_has_bytes(database):
+            return _query_sqlite_state(database.as_uri() + "?mode=ro", sid)
+        return state
+    except (sqlite3.Error, OSError):
+        return "busy_or_unreadable"
+
+
+def inspect_conversation_storage(sid: str, home: Path) -> dict:
+    """Classify local storage for an Antigravity CLI conversation ID."""
+    conversations = home / "conversations"
+    database = conversations / f"{sid}.db"
+    proto = conversations / f"{sid}.pb"
+    try:
+        pb_size = proto.stat().st_size if proto.is_file() else 0
+    except OSError:
+        pb_size = 0
+    db_state = _inspect_sqlite_db(database, sid)
+    if db_state == "valid":
+        kind = "sqlite"
+    elif db_state == "missing" and pb_size > 0:
+        kind = "proto"
+    elif db_state in {"empty_shell", "incomplete_shell"} and pb_size > 0:
+        kind = "shadowed_proto"
+    elif db_state in {"empty_shell", "incomplete_shell"}:
+        kind = "empty_db_only"
+    elif db_state == "busy_or_unreadable":
+        kind = "unreadable"
+    else:
+        kind = "none"
+    return {
+        "sid": sid,
+        "kind": kind,
+        "db_state": db_state,
+        "db_path": database,
+        "pb_path": proto,
+        "pb_size": pb_size,
+    }
+
+
+def quarantine_shadowed_db(sid: str, home: Path, environment=None) -> dict | None:
+    """Move an empty/incomplete .db shell into backups when it shadows a non-empty .pb.
+
+    Strictly conservative: requires unlocked native presence flock, zero active
+    aipane session writers, WAL-consistent empty/incomplete DB confirmation, and
+    a non-empty sibling .pb. Moves the main .db first via rename and never deletes.
+    """
+    if not SID.fullmatch(sid):
+        return None
+    storage = inspect_conversation_storage(sid, home)
+    if storage["kind"] != "shadowed_proto":
+        return None
+    if presence_lock_held(sid, home) is not False:
+        return None
+    homes = {str(home)}
+    try:
+        homes.add(str(home.resolve()))
+    except OSError:
+        pass
+    for candidate_home in homes:
+        if session_writers(sid, candidate_home, environment):
+            return None
+    # Re-verify storage state immediately before rename to narrow TOCTOU.
+    storage = inspect_conversation_storage(sid, home)
+    if storage["kind"] != "shadowed_proto":
+        return None
+
+    db_path: Path = storage["db_path"]
+    backups_root = home / "backups" / "orphaned-db"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup_dir = backups_root / f"{stamp}-{sid}"
+    if backup_dir.exists():
+        backup_dir = backups_root / f"{stamp}-{sid}-{uuid.uuid4().hex[:6]}"
+    backups_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    moved: list[str] = []
+    try:
+        # Move main .db first: it is the sole file that makes agy pick Store 1 over .pb.
+        db_path.replace(backup_dir / db_path.name)
+        moved.append(db_path.name)
+    except FileNotFoundError:
+        try:
+            backup_dir.rmdir()
+        except OSError:
+            pass
+        return None
+
+    for suffix in ("-wal", "-shm"):
+        companion = db_path.with_name(db_path.name + suffix)
+        try:
+            if companion.exists():
+                companion.replace(backup_dir / companion.name)
+                moved.append(companion.name)
+        except OSError:
+            pass
+
+    transcript = home / "brain" / sid / ".system_generated/logs/transcript.jsonl"
+    try:
+        has_transcript = transcript.is_file() and transcript.stat().st_size > 0
+    except OSError:
+        has_transcript = False
+    return {
+        "sid": sid,
+        "backup_dir": str(backup_dir),
+        "moved": moved,
+        "db_state": storage["db_state"],
+        "pb_size": storage["pb_size"],
+        "has_transcript": has_transcript,
+    }
+
+
+def _uses_agy_launcher(args: list[str]) -> bool:
+    if not args:
+        return False
+    executable = args[0]
+    if Path(executable).name == "aipane-agy-launch":
+        return True
+    candidate = Path(executable).expanduser()
+    if not candidate.is_absolute():
+        found = shutil.which(executable)
+        if not found:
+            return False
+        candidate = Path(found)
+    try:
+        if candidate.resolve().name == "aipane-agy-launch":
+            return True
+        if candidate.is_file() and candidate.stat().st_size <= 4096:
+            text = candidate.read_text(encoding="utf-8", errors="ignore")
+            if "aipane-agy-launch" in text:
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def session_exists(sid: str, cwd: str, home: Path, *, allow_shadowed: bool = False) -> bool:
     if not SID.fullmatch(sid) or not os.path.isabs(cwd):
         return False
     try:
-        # The picker merges desktop, cloud and CLI entries. Only a local CLI
-        # trajectory database proves that --conversation can restore this ID.
-        database = home / "conversations" / f"{sid}.db"
-        if not database.is_file():
+        # The picker merges desktop, cloud and CLI entries. Require local CLI
+        # trajectory storage (.db or fallback .pb) plus workspace ownership.
+        storage = inspect_conversation_storage(sid, home)
+        allowed = {"sqlite", "proto", "shadowed_proto"} if allow_shadowed else {"sqlite", "proto"}
+        if storage["kind"] not in allowed:
             return False
-        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=1)) as connection:
-            if (connection.execute("SELECT 1 FROM steps LIMIT 1").fetchone() is None
-                    or connection.execute("SELECT 1 FROM trajectory_meta WHERE cascade_id=? LIMIT 1", (sid,)).fetchone() is None):
-                return False
         # Fresh conversations do not appear in the CLI's picker cache until a
         # later cache refresh. Keep the process-verified workspace binding too.
         binding = _read(session_path(sid, home))
@@ -221,7 +426,7 @@ def session_exists(sid: str, cwd: str, home: Path) -> bool:
         normalized = {str(Path(unquote(urlparse(p).path) if p.startswith("file://") else p).resolve()) for p in paths if isinstance(p, str)}
         if (item.get("is_internal") is True or summary.get("Internal") is True
                 or summary.get("AppDataDir") != "antigravity-cli"
-                or str(Path(cwd).resolve()) not in normalized or not database.is_file()):
+                or str(Path(cwd).resolve()) not in normalized):
             return False
         return True
     except (OSError, ValueError, TypeError, KeyError, sqlite3.Error):
@@ -230,9 +435,9 @@ def session_exists(sid: str, cwd: str, home: Path) -> bool:
 
 def resume_command(sid: str, cwd: str, metadata: dict, base="agy") -> str:
     home = Path(metadata.get("agy_home") or cli_home())
-    if not session_exists(sid, cwd, home):
-        raise ValueError("Antigravity session is missing, internal, or belongs to another workspace")
     args = shlex.split(base)
+    if not session_exists(sid, cwd, home, allow_shadowed=_uses_agy_launcher(args)):
+        raise ValueError("Antigravity session is missing, internal, or belongs to another workspace")
     for flag, key, allowed in [("--effort", "agy_effort", EFFORTS), ("--mode", "agy_mode", MODES)]:
         value = metadata.get(key)
         if value:
@@ -249,6 +454,121 @@ def resume_command(sid: str, cwd: str, metadata: dict, base="agy") -> str:
                 raise ValueError(f"invalid Antigravity {key}")
             args.extend([flag, value])
     return shlex.join([*args, "--conversation", sid])
+
+
+def audit_agy_conversations(
+    home: Path,
+    *,
+    log_days: int = 7,
+    orphan_min_age_seconds: int = 600,
+    now: float | None = None,
+    environment=None,
+) -> dict:
+    """Read-only health audit of Antigravity CLI conversation storage and recent lock logs."""
+    current_time = time.time() if now is None else now
+    conversations = home / "conversations"
+    sids: set[str] = set()
+    if conversations.is_dir():
+        for suffix in ("*.db", "*.pb"):
+            for path in conversations.glob(suffix):
+                if SID.fullmatch(path.stem):
+                    sids.add(path.stem)
+
+    counts = {
+        "sqlite": 0,
+        "proto": 0,
+        "shadowed": 0,
+        "suspected_orphans": 0,
+        "unreadable": 0,
+        "total": len(sids),
+    }
+    shadowed: list[dict] = []
+    suspected_orphans: list[dict] = []
+    homes = {str(home)}
+    try:
+        homes.add(str(home.resolve()))
+    except OSError:
+        pass
+
+    for sid in sorted(sids):
+        storage = inspect_conversation_storage(sid, home)
+        kind = storage["kind"]
+        if kind == "sqlite":
+            counts["sqlite"] += 1
+        elif kind == "proto":
+            counts["proto"] += 1
+        elif kind == "shadowed_proto":
+            counts["shadowed"] += 1
+            try:
+                db_size = storage["db_path"].stat().st_size
+            except OSError:
+                db_size = 0
+            shadowed.append({
+                "sid": sid,
+                "db_state": storage["db_state"],
+                "db_size": db_size,
+                "pb_size": storage["pb_size"],
+                "db_path": str(storage["db_path"]),
+                "pb_path": str(storage["pb_path"]),
+            })
+        elif kind == "empty_db_only":
+            transcript = home / "brain" / sid / ".system_generated/logs/transcript.jsonl"
+            try:
+                has_transcript = transcript.is_file() and transcript.stat().st_size > 0
+                st = storage["db_path"].stat()
+                age = max(0.0, current_time - st.st_mtime)
+                db_size = st.st_size
+            except OSError:
+                continue
+            if has_transcript or age < orphan_min_age_seconds:
+                continue
+            if presence_lock_held(sid, home) is not False:
+                continue
+            if any(session_writers(sid, candidate_home, environment) for candidate_home in homes):
+                continue
+            counts["suspected_orphans"] += 1
+            suspected_orphans.append({
+                "sid": sid,
+                "db_state": storage["db_state"],
+                "db_size": db_size,
+                "age_seconds": int(age),
+                "db_path": str(storage["db_path"]),
+            })
+        elif kind == "unreadable":
+            counts["unreadable"] += 1
+
+    log_dir = home / "log"
+    cutoff = current_time - max(1, log_days) * 86400
+    lock_events = {
+        "days": max(1, log_days),
+        "scanned_logs": 0,
+        "database_locked": 0,
+        "another_opener": 0,
+        "new_conversations": 0,
+    }
+    if log_dir.is_dir():
+        for log_file in sorted(log_dir.glob("cli-*.log")):
+            try:
+                if log_file.stat().st_mtime < cutoff:
+                    continue
+                lock_events["scanned_logs"] += 1
+                with log_file.open("r", encoding="utf-8", errors="ignore") as stream:
+                    for line in stream:
+                        if "Creating new cascade trajectory" in line:
+                            lock_events["new_conversations"] += 1
+                        elif "failed to create persistent trajectory in store" in line and "database is locked" in line:
+                            lock_events["database_locked"] += 1
+                        elif "failed to create conversation:" in line and "its database was initialized by another opener" in line:
+                            lock_events["another_opener"] += 1
+            except OSError:
+                continue
+
+    return {
+        "counts": counts,
+        "shadowed": shadowed,
+        "suspected_orphans": suspected_orphans,
+        "lock_events": lock_events,
+    }
 
 
 def recovery_metadata(record: dict) -> dict:

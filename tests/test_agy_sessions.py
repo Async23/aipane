@@ -1,5 +1,6 @@
 """Antigravity lifecycle, session isolation and conservative recovery contracts."""
 
+import fcntl
 import json
 from contextlib import closing
 from functools import partial
@@ -561,6 +562,156 @@ class AntigravityTests(unittest.TestCase):
         first = self.hook("PreToolUse", **payload)[1][0]
         second = self.hook("PreToolUse", **payload)[1][0]
         self.assertEqual(first["token"], second["token"])
+
+    def _seed_empty_db(self, db_path: Path, sid: str = SID, *, mode: str = "empty_shell") -> None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        if mode == "zero_bytes":
+            db_path.write_bytes(b"")
+            return
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            if mode == "incomplete_shell":
+                conn.execute("CREATE TABLE IF NOT EXISTS trajectory_meta(cascade_id TEXT)")
+                conn.execute("INSERT INTO trajectory_meta VALUES(?)", (sid,))
+            else:
+                conn.execute("CREATE TABLE IF NOT EXISTS steps(idx INTEGER PRIMARY KEY)")
+                conn.execute("CREATE TABLE IF NOT EXISTS trajectory_meta(cascade_id TEXT)")
+                conn.execute("INSERT INTO trajectory_meta VALUES(?)", (sid,))
+            conn.commit()
+
+    def test_proto_only_session_is_restorable_with_workspace_checks(self):
+        home = self.durable_session()
+        (home / "conversations" / f"{SID}.db").unlink()
+        pb = home / "conversations" / f"{SID}.pb"
+        pb.write_bytes(b"\x01\x02proto-data")
+
+        self.assertEqual(agy.inspect_conversation_storage(SID, home)["kind"], "proto")
+        self.assertTrue(agy.session_exists(SID, str(self.cwd), home))
+        self.assertFalse(agy.session_exists(SID, str(self.root), home))
+        cmd = agy.resume_command(SID, str(self.cwd), {"agy_home": str(home)})
+        self.assertEqual(shlex.split(cmd), ["agy", "--conversation", SID])
+
+        # Live binding also works without conversation_metadata.json cache.
+        self.status()
+        (home / "cache/conversation_metadata.json").unlink()
+        with patch.dict(os.environ, self.env):
+            self.assertTrue(agy.session_exists(SID, str(self.cwd), home))
+
+        # 0-byte .pb must be rejected.
+        pb.write_bytes(b"")
+        with patch.dict(os.environ, self.env):
+            self.assertFalse(agy.session_exists(SID, str(self.cwd), home))
+
+    def test_shadowed_proto_requires_launcher_base_and_quarantines_safely(self):
+        home = self.durable_session()
+        db_path = home / "conversations" / f"{SID}.db"
+        pb_path = home / "conversations" / f"{SID}.pb"
+        pb_path.write_bytes(b"real-proto-payload" * 16)
+
+        for mode in ("empty_shell", "zero_bytes", "incomplete_shell"):
+            with self.subTest(mode=mode):
+                if db_path.exists():
+                    db_path.unlink()
+                self._seed_empty_db(db_path, mode=mode)
+                self.assertEqual(agy.inspect_conversation_storage(SID, home)["kind"], "shadowed_proto")
+                # Bare native agy cannot self-heal shadowed DBs -> reject.
+                self.assertFalse(agy.session_exists(SID, str(self.cwd), home))
+                with self.assertRaises(ValueError):
+                    agy.resume_command(SID, str(self.cwd), {"agy_home": str(home)}, base="agy")
+                # Launcher base (and shim wrappers exec'ing it) can self-heal -> allow.
+                self.assertTrue(agy.session_exists(SID, str(self.cwd), home, allow_shadowed=True))
+                cmd = agy.resume_command(
+                    SID,
+                    str(self.cwd),
+                    {"agy_home": str(home)},
+                    base="/usr/local/bin/aipane-agy-launch --dangerously-skip-permissions",
+                )
+                self.assertIn("--conversation", shlex.split(cmd))
+
+                shim = self.root / "agy-themed"
+                shim.write_text('#!/bin/sh\nexec "$HOME/.local/bin/aipane-agy-launch" "$@"\n')
+                shim.chmod(0o755)
+                shim_cmd = agy.resume_command(SID, str(self.cwd), {"agy_home": str(home)}, base=str(shim))
+                self.assertIn(str(shim), shim_cmd)
+
+                # Quarantine moves .db* to backup and leaves .pb intact.
+                res = agy.quarantine_shadowed_db(SID, home, environment=self.env)
+                self.assertIsNotNone(res)
+                self.assertFalse(db_path.exists())
+                self.assertTrue(pb_path.exists())
+                backup_dir = Path(res["backup_dir"])
+                self.assertTrue((backup_dir / f"{SID}.db").is_file())
+                self.assertEqual(agy.inspect_conversation_storage(SID, home)["kind"], "proto")
+
+    def test_wal_uncheckpointed_steps_are_not_misclassified_as_empty_shell(self):
+        home = agy.cli_home(self.env)
+        conv = home / "conversations"
+        conv.mkdir(parents=True, exist_ok=True)
+        db_path = conv / f"{SID}.db"
+        pb_path = conv / f"{SID}.pb"
+        pb_path.write_bytes(b"stale-proto")
+
+        # Create clean WAL DB with 0 steps in main file, then insert a step only in -wal.
+        self._seed_empty_db(db_path, mode="empty_shell")
+        before_sidefiles = sorted(p.name for p in conv.iterdir())
+        # Clean WAL inspection must not create -shm/-wal side-files.
+        self.assertEqual(agy.inspect_conversation_storage(SID, home)["kind"], "shadowed_proto")
+        self.assertEqual(sorted(p.name for p in conv.iterdir()), before_sidefiles)
+
+        writer = sqlite3.connect(db_path)
+        self.addCleanup(writer.close)
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("INSERT INTO steps VALUES (1)")
+        writer.commit()
+        self.assertGreater((conv / f"{SID}.db-wal").stat().st_size, 0)
+
+        # Must see the committed WAL step and refuse quarantine!
+        self.assertEqual(agy.inspect_conversation_storage(SID, home)["kind"], "sqlite")
+        self.assertIsNone(agy.quarantine_shadowed_db(SID, home, environment=self.env))
+        self.assertTrue(db_path.is_file())
+
+    def test_quarantine_skips_when_presence_flock_or_corrupt_db_or_active_writer(self):
+        home = agy.cli_home(self.env)
+        conv = home / "conversations"
+        conv.mkdir(parents=True, exist_ok=True)
+        db_path = conv / f"{SID}.db"
+        pb_path = conv / f"{SID}.pb"
+        pb_path.write_bytes(b"real-proto")
+        self._seed_empty_db(db_path, mode="empty_shell")
+
+        # 1. Native presence flock held -> must skip.
+        lock_path = home / "presence" / f"{SID}.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(b"")
+        with lock_path.open("rb") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            try:
+                self.assertTrue(agy.presence_lock_held(SID, home))
+                self.assertIsNone(agy.quarantine_shadowed_db(SID, home, environment=self.env))
+                self.assertTrue(db_path.is_file())
+            finally:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        self.assertFalse(agy.presence_lock_held(SID, home))
+
+        # 2. Active aipane session writer -> must skip.
+        with patch.object(agy, "session_writers", return_value={12345}):
+            self.assertIsNone(agy.quarantine_shadowed_db(SID, home, environment=self.env))
+            self.assertTrue(db_path.is_file())
+
+        # 3. Non-empty corrupt bytes -> fail-safe unreadable, must skip.
+        db_path.write_bytes(b"not-a-valid-sqlite-database-header")
+        self.assertEqual(agy.inspect_conversation_storage(SID, home)["kind"], "unreadable")
+        self.assertIsNone(agy.quarantine_shadowed_db(SID, home, environment=self.env))
+        self.assertTrue(db_path.is_file())
+
+    def test_launcher_zsh_recognizes_resume_aliases(self):
+        (self.root / ".agents/skills").mkdir(parents=True)
+        for flag in (["-r", SID], ["--resume", SID], [f"--resume={SID}"]):
+            with self.subTest(flag=flag):
+                self.assertEqual(
+                    self.launch_args(self.cwd, *flag),
+                    ["--sandbox", "--add-dir", str(self.root), *flag],
+                )
 
 
 if __name__ == "__main__":

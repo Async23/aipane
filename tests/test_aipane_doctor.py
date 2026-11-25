@@ -1,3 +1,4 @@
+import fcntl
 import os
 import hashlib
 import json
@@ -519,6 +520,86 @@ class AipaneDoctorTests(unittest.TestCase):
         failed = self.run_doctor(CODEX_HOME=str(codex_home))
         self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
         self.assertIn("codex_sqlite_rollout_missing", failed.stdout)
+
+    def test_agy_conversations_audit_is_read_only_and_reports_shadowed_orphans_and_locks(self) -> None:
+        import sqlite3
+        from contextlib import closing
+
+        self.configure_core()
+        agy_home = self.home / ".gemini/antigravity-cli"
+        conv = agy_home / "conversations"
+        log_dir = agy_home / "log"
+        conv.mkdir(parents=True)
+        log_dir.mkdir(parents=True)
+
+        sid_ok = "11111111-1111-4111-8111-111111111111"
+        sid_pb = "22222222-2222-4222-8222-222222222222"
+        sid_shadow = "33333333-3333-4333-8333-333333333333"
+        sid_orphan = "44444444-4444-4444-8444-444444444444"
+        sid_fresh = "55555555-5555-4555-8555-555555555555"
+        sid_locked = "66666666-6666-4666-8666-666666666666"
+
+        # 1. Valid cleanly-closed WAL SQLite DB + pure .pb conversation.
+        with closing(sqlite3.connect(conv / f"{sid_ok}.db")) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("CREATE TABLE steps(idx INTEGER PRIMARY KEY)")
+            conn.execute("INSERT INTO steps VALUES(1)")
+            conn.execute("CREATE TABLE trajectory_meta(cascade_id TEXT)")
+            conn.execute("INSERT INTO trajectory_meta VALUES(?)", (sid_ok,))
+            conn.commit()
+        (conv / f"{sid_pb}.pb").write_bytes(b"proto-only-history")
+
+        before_clean = sorted(p.name for p in conv.iterdir())
+        clean = self.run_doctor()
+        self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+        self.assertIn("OK   Antigravity conversations: 1 sqlite, 1 proto, 0 shadowed, 0 suspected orphans", clean.stdout)
+        # Must stay strictly read-only without creating -shm/-wal side-files.
+        self.assertEqual(sorted(p.name for p in conv.iterdir()), before_clean)
+
+        # 2. Add shadowed .db+.pb, old suspected orphan .db, fresh 0-step .db, locked 0-step .db, and lock logs.
+        for sid in (sid_shadow, sid_orphan, sid_fresh, sid_locked):
+            with closing(sqlite3.connect(conv / f"{sid}.db")) as conn:
+                conn.execute("CREATE TABLE steps(idx INTEGER PRIMARY KEY)")
+                conn.execute("CREATE TABLE trajectory_meta(cascade_id TEXT)")
+                conn.execute("INSERT INTO trajectory_meta VALUES(?)", (sid,))
+                conn.commit()
+        (conv / f"{sid_shadow}.pb").write_bytes(b"real-proto" * 20)
+        old_ts = time.time() - 3600
+        os.utime(conv / f"{sid_orphan}.db", (old_ts, old_ts))
+        os.utime(conv / f"{sid_locked}.db", (old_ts, old_ts))
+
+        lock_path = agy_home / "presence" / f"{sid_locked}.lock"
+        lock_path.parent.mkdir(parents=True)
+        lock_path.write_bytes(b"")
+
+        (log_dir / "cli-20261125_120000.log").write_text(
+            "\n".join([
+                "I1125 12:00:01 server.go:1225] Creating new cascade trajectory (agentScript=false)",
+                "E1125 12:00:01 errorreport.go:282] failed to create persistent trajectory in store 1: open backend x.db: set user_version: database is locked",
+                "I1125 12:00:02 server.go:1225] Creating new cascade trajectory (agentScript=false)",
+                "E1125 12:00:02 errorreport.go:282] created trajectory: its database was initialized by another opener",
+                "E1125 12:00:02 server.go:1260] failed to create conversation: created trajectory: its database was initialized by another opener",
+            ]) + "\n",
+            encoding="utf-8",
+        )
+
+        with lock_path.open("rb") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                warned = self.run_doctor()
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+        self.assertEqual(warned.returncode, 0, warned.stdout + warned.stderr)
+        self.assertIn(f"WARN Antigravity shadowed conversation ({sid_shadow})", warned.stdout)
+        self.assertIn(f"WARN Antigravity suspected orphan .db shells: 1", warned.stdout)
+        self.assertIn(sid_orphan, warned.stdout)
+        self.assertNotIn(sid_fresh, warned.stdout)
+        self.assertNotIn(sid_locked, warned.stdout)
+        self.assertIn("database_locked=1, another_opener=1 (out of 2 new conversations)", warned.stdout)
+        # Verify doctor never moved or deleted any conversation file.
+        self.assertTrue((conv / f"{sid_shadow}.db").is_file())
+        self.assertTrue((conv / f"{sid_orphan}.db").is_file())
 
 
 if __name__ == "__main__":

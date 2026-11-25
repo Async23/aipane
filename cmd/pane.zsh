@@ -63,7 +63,7 @@ _aipane_agy_command() {
         _aipane_command_with_args "$AIPANE_AGY_LAUNCH_CMD" "$@"
         return
         ;;
-      -p|-i|--add-dir|--agent|--conversation|--effort|--input-format|--json-schema|\
+      -p|-i|-r|--add-dir|--agent|--conversation|--resume|--effort|--input-format|--json-schema|\
       --log-file|--mode|--model|--output-format|--print|--print-timeout|--project|\
       --prompt|--prompt-interactive|--settings)
         if [[ "${argv[i]}" == *=* ]]; then

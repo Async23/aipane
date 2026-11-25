@@ -575,6 +575,92 @@ class AgyLauncherEndToEndTests(unittest.TestCase):
         self.assertEqual(proc.wait(timeout=4), 0)
         self.assertEqual(self.native_from_pty(out)["args"][-1], "gemini-4-neon-high")
 
+    def _seed_shadowed_session(self, sid: str = SID) -> tuple[Path, Path]:
+        import sqlite3
+        from contextlib import closing
+        conv = self.cli_home / "conversations"
+        conv.mkdir(parents=True, exist_ok=True)
+        db = conv / f"{sid}.db"
+        pb = conv / f"{sid}.pb"
+        with closing(sqlite3.connect(db)) as conn:
+            conn.execute("CREATE TABLE steps(idx INTEGER PRIMARY KEY)")
+            conn.execute("CREATE TABLE trajectory_meta(cascade_id TEXT)")
+            conn.execute("INSERT INTO trajectory_meta VALUES(?)", (sid,))
+            conn.commit()
+        pb.write_bytes(b"real-proto-history" * 10)
+        return db, pb
+
+    def test_launch_quarantines_shadowed_db_on_resume_and_continue(self):
+        for flag_args in (
+            ["--conversation", SID],
+            ["-r", SID],
+            [f"--resume={SID}"],
+        ):
+            with self.subTest(flag_args=flag_args):
+                db, pb = self._seed_shadowed_session(SID)
+                result = subprocess.run(
+                    [sys.executable, str(LAUNCHER), "--model", "gemini-4-neon-xhigh", *flag_args],
+                    cwd=self.home,
+                    env=self.env(),
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("已备份移至", result.stderr)
+                self.assertFalse(db.exists())
+                self.assertTrue(pb.exists())
+
+        # Also works for -c / --continue via cache/last_conversations.json.
+        db, pb = self._seed_shadowed_session(SID)
+        last_conv = self.cli_home / "cache/last_conversations.json"
+        last_conv.parent.mkdir(parents=True, exist_ok=True)
+        last_conv.write_text(json.dumps({str(self.home): SID}), encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(LAUNCHER), "--model", "gemini-4-neon-xhigh", "-c"],
+            cwd=self.home,
+            env=self.env(),
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("已备份移至", result.stderr)
+        self.assertFalse(db.exists())
+        self.assertTrue(pb.exists())
+
+    def test_cancelled_interactive_picker_does_not_touch_shadowed_db(self):
+        db, pb = self._seed_shadowed_session(SID)
+        proc, master = self.spawn_pty(["--conversation", SID], TERM="dumb")
+        self.read_until(proc, master, b"q ")
+        os.write(master, b"q\n")
+        self.assertNotEqual(proc.wait(timeout=3), 0)
+        self.assertTrue(db.exists())
+        self.assertTrue(pb.exists())
+
+    def test_launch_skips_quarantine_when_native_presence_lock_is_held(self):
+        db, pb = self._seed_shadowed_session(SID)
+        lock_path = self.cli_home / "presence" / f"{SID}.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(b"")
+        with lock_path.open("rb") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(LAUNCHER), "--model", "gemini-4-neon-xhigh", "--conversation", SID],
+                    cwd=self.home,
+                    env=self.env(),
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                )
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("已备份移至", result.stderr)
+        self.assertTrue(db.exists())
+        self.assertTrue(pb.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

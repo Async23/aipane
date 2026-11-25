@@ -384,6 +384,71 @@ def inspect_session_storage_drift(
         )
 
 
+def inspect_agy_conversations(
+    audit: Audit,
+    home: Path,
+    *,
+    log_days: int = 7,
+) -> None:
+    """Read-only health check for Antigravity CLI .db/.pb shadowing, orphans, and lock telemetry."""
+    agy_home = home / ".gemini/antigravity-cli"
+    if not (agy_home / "conversations").is_dir() and not (agy_home / "log").is_dir():
+        return
+    lib_dir = Path(__file__).resolve().parents[1] / "lib"
+    if not (lib_dir / "agy_sessions.py").is_file():
+        return
+    if str(lib_dir) not in sys.path:
+        sys.path.insert(0, str(lib_dir))
+    import agy_sessions
+
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    report = agy_sessions.audit_agy_conversations(
+        agy_home,
+        log_days=log_days,
+        environment=env,
+    )
+    counts = report["counts"]
+    shadowed = report["shadowed"]
+    orphans = report["suspected_orphans"]
+    locks = report["lock_events"]
+
+    for item in shadowed:
+        sid = item["sid"]
+        audit.warn(
+            f"Antigravity shadowed conversation ({sid}): {item['db_state']} .db "
+            f"({item['db_size']}B) shadows non-empty .pb ({item['pb_size']}B); "
+            f"backup with: mkdir -p ~/.gemini/antigravity-cli/backups/orphaned-db && "
+            f"mv ~/.gemini/antigravity-cli/conversations/{sid}.db* "
+            f"~/.gemini/antigravity-cli/backups/orphaned-db/"
+        )
+    if orphans:
+        sample = ", ".join(item["sid"] for item in orphans[:5])
+        suffix = f" (+{len(orphans) - 5} more)" if len(orphans) > 5 else ""
+        audit.warn(
+            f"Antigravity suspected orphan .db shells: {len(orphans)} "
+            f"(unlocked 0-step .db without .pb/transcript, age >= 10m): {sample}{suffix}"
+        )
+    if not shadowed:
+        audit.ok(
+            "Antigravity conversations: "
+            f"{counts['sqlite']} sqlite, {counts['proto']} proto, "
+            f"0 shadowed, {counts['suspected_orphans']} suspected orphans"
+        )
+    if locks["database_locked"] or locks["another_opener"]:
+        audit.warn(
+            f"Antigravity lock telemetry (last {locks['days']}d, {locks['scanned_logs']} logs): "
+            f"database_locked={locks['database_locked']}, "
+            f"another_opener={locks['another_opener']} "
+            f"(out of {locks['new_conversations']} new conversations)"
+        )
+    elif locks["scanned_logs"]:
+        audit.ok(
+            f"Antigravity lock telemetry (last {locks['days']}d): "
+            f"0 lock errors across {locks['new_conversations']} new conversations"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="aipane-doctor",
@@ -433,6 +498,11 @@ def main() -> int:
         home,
         days=arguments.session_days,
         check_live_panes=arguments.check_sessions,
+    )
+    inspect_agy_conversations(
+        audit,
+        home,
+        log_days=min(arguments.session_days, 7) if arguments.session_days > 0 else 7,
     )
 
     summary = (

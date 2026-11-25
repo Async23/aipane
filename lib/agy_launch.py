@@ -66,9 +66,11 @@ SUBCOMMANDS = frozenset({
 VALUE_OPTIONS = frozenset({
     "-p",
     "-i",
+    "-r",
     "--add-dir",
     "--agent",
     "--conversation",
+    "--resume",
     "--effort",
     "--input-format",
     "--json-schema",
@@ -216,7 +218,7 @@ def parse_args(argv: list[str]) -> ParsedArgs:
                 settings_values.append(value)
             elif option in ("--route", "--aipane-route"):
                 route = value.strip().lower()
-            elif option == "--conversation":
+            elif option in ("--conversation", "--resume", "-r"):
                 conversation_id = value
                 remaining.extend(consumed)
             elif option == "--add-dir":
@@ -1445,6 +1447,27 @@ def canonicalize_explicit_model_args(
     return args
 
 
+def _maybe_quarantine_shadowed_db(session_id: str | None, env: dict[str, str]) -> None:
+    """Quarantine an empty/incomplete .db shell right before execve when it shadows a .pb."""
+    if not session_id or not agy_sessions.SID.fullmatch(session_id):
+        return
+    try:
+        result = agy_sessions.quarantine_shadowed_db(session_id, cli_home(env), environment=env)
+    except OSError as error:
+        print(
+            f"aipane-agy-launch: 会话 {session_id} 预检隔离失败（{error}），跳过并继续启动",
+            file=sys.stderr,
+        )
+        return
+    if result:
+        note = "（已见 transcript）" if result.get("has_transcript") else ""
+        print(
+            f"aipane-agy-launch: 检测到会话 {session_id} 存在空壳 .db 遮蔽非空 .pb"
+            f"（{result['pb_size']}B{note}），已备份移至 {result['backup_dir']} 后继续恢复",
+            file=sys.stderr,
+        )
+
+
 def launch(argv: list[str], *, launcher_script: Path, env: dict[str, str] | None = None) -> int:
     base_env = dict(os.environ if env is None else env)
     if argv and argv[0] == "--_picker-helper":
@@ -1544,6 +1567,7 @@ def launch(argv: list[str], *, launcher_script: Path, env: dict[str, str] | None
             *model_args,
             *parsed.remaining,
         ]
+        _maybe_quarantine_shadowed_db(session_id, base_env)
         os.execve(str(binary), final_argv, exec_env)
         return 0
 
@@ -1599,5 +1623,6 @@ def launch(argv: list[str], *, launcher_script: Path, env: dict[str, str] | None
         chosen.slug,
         *parsed.remaining,
     ]
+    _maybe_quarantine_shadowed_db(session_id, base_env)
     os.execve(str(binary), final_argv, exec_env)
     return 0
