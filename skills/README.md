@@ -11,7 +11,7 @@
 | 1 | 工作台配套 | `aipane-sessions` | 零索引查询、定位并读取跨 7 个编程 Agent 的本地会话历史与同窗口 tmux pane 交接 | 本机已安装 `aipane-sessions` CLI | [SKILL.md](aipane-sessions/SKILL.md) |
 | 2 | 代码与文档治理 | `aipane-semantic-residue-review` | 概念、状态模型或接口契约变更后，全仓审计旧逻辑、旧假设与过期分支残留 | 无（纯文档，可独立复用） | [SKILL.md](aipane-semantic-residue-review/SKILL.md) |
 | 3 | 代码与文档治理 | `aipane-readme-governance` | 约束 README 只承载稳定入口与权威文档索引，避免多处重复维护 | 无（纯文档，可独立复用） | [SKILL.md](aipane-readme-governance/SKILL.md) |
-| 4 | 独立评审与思考 | `aipane-cold-critique` | 切断长上下文，先让用户确认通道/模型/effort，再用零前情、禁工具的多通道异构模型做对抗挑刺 | Python 3.9+；本地 CLI（与 `aipane` 对齐的 7 个 Agent：`claude`/`codex`/`dsh`/`grok`/`pi`/`kimi`/`agy`）或 OpenAI 兼容 API（可独立复用） | [SKILL.md](aipane-cold-critique/SKILL.md) |
+| 4 | 独立评审与思考 | `aipane-cold-critique` | 切断长上下文，按体裁用零前情、隔离配置的多通道异构模型做对抗挑刺，支持逐路落盘续跑并直接交付校准结论 | Python 3.9+；本地 CLI（与 `aipane` 对齐的 7 个 Agent：`claude`/`codex`/`dsh`/`grok`/`pi`/`kimi`/`agy`）或 OpenAI 兼容 API（可独立复用） | [SKILL.md](aipane-cold-critique/SKILL.md) |
 | 5 | 独立评审与思考 | `aipane-first-principles` | 从底层约束、边界前提与可核验证据分析架构缺陷与方案取舍 | 无（纯文档，可独立复用） | [SKILL.md](aipane-first-principles/SKILL.md) |
 | 6 | 写作与知识库 | `aipane-article-polish` | 将素材、初稿或内部复盘做“领域移植”深度脱敏，改写为公开独立长文 | 无（纯文档，可独立复用） | [SKILL.md](aipane-article-polish/SKILL.md) |
 | 7 | 写作与知识库 | `aipane-obsidian-cli` | 查搜管理走官方 Obsidian CLI（不占 MCP 上下文），写正文走 Agent 原生文件编辑并回读校验 | 官方 `obsidian` CLI（可独立复用） | [SKILL.md](aipane-obsidian-cli/SKILL.md) |

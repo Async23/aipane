@@ -5,7 +5,7 @@
 支持并发调用与 aipane 对齐的 7 个本地编程 Agent CLI 及任意 OpenAI 兼容 API
 （所有 CLI 均在每次新建的独立空临时目录中运行）：
   - claude / grok / pi / dsh（别名 dsh-tui） / openai: 硬禁工具
-  - codex / agy（别名 antigravity） / kimi: 沙箱/提示词约束
+  - codex / agy（别名 antigravity） / kimi: 沙箱/配置隔离 + 提示词约束
 
 可通过 COLD_CRITIQUE_CHANNELS 环境变量配置默认通道列表（逗号或分号分隔）。
 """
@@ -16,6 +16,7 @@ import argparse
 import concurrent.futures
 import contextlib
 import dataclasses
+import hashlib
 import json
 import os
 import pathlib
@@ -34,12 +35,29 @@ try:
 except ImportError:  # pragma: no cover - Python 3.9/3.10 fallback
     tomllib = None  # type: ignore[assignment]
 
-CALIBRATED_PROMPT_PREFIX = (
-    "仅基于下方这段文字做纯文本分析（不要调用任何工具、不要查阅本机文件或历史记录）。\n\n"
-    "找找这段总结里，哪几个概念合并是硬凑的、哪些因果链条经不起推敲，给出最尖锐的反驳；"
-    "如果某部分经得起推敲就直接说明成立，不要为了挑刺而强行编造缺陷。\n\n"
-    "---\n\n"
-)
+PROMPT_PROFILES: dict[str, str] = {
+    "summary": (
+        "仅基于下方这段文字做纯文本分析（不要调用任何工具、不要查阅本机文件或历史记录）。\n\n"
+        "找找这段总结里，哪几个概念合并是硬凑的、哪些因果链条经不起推敲，给出最尖锐的反驳；"
+        "如果某部分经得起推敲就直接说明成立，不要为了挑刺而强行编造缺陷。\n\n"
+        "---\n\n"
+    ),
+    "article": (
+        "仅基于下方这篇文章做纯文本分析（不要调用任何工具、不要查阅本机文件或历史记录）。\n\n"
+        "找找这篇文章里，哪几个概念合并是硬凑的、哪些因果链条经不起推敲、哪些地方遗漏了关键隐含前提、"
+        "哪些跨学科概念借用或类比越过了原理论的适用边界，以及标题或开头结论是否说得比正文证据更满，给出最尖锐的反驳；"
+        "如果某部分经得起推敲就直接说明成立，不要为了挑刺而强行编造缺陷。\n\n"
+        "---\n\n"
+    ),
+    "code": (
+        "仅基于下方提供的代码、设计或对照规范做纯文本分析（不要调用任何工具、不要查阅本机文件或历史记录）。\n\n"
+        "找找这套实现或方案里，哪些抽象或状态边界耦合过紧、哪些故障路径与并发/数据一致性前提经不起推敲、"
+        "哪些重构建议属于过度设计或脱离当前规模边界，给出最尖锐的反驳；"
+        "如果某部分设计经得起推敲或已匹配当前规模就直接说明成立，不要为了挑刺而强行编造缺陷。\n\n"
+        "---\n\n"
+    ),
+}
+CALIBRATED_PROMPT_PREFIX = PROMPT_PROFILES["summary"]
 
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 MODEL_CACHE_TTL_SECONDS = 24 * 3600
@@ -48,6 +66,27 @@ MODEL_SUMMARY_LIMIT = 8
 ARGV_WARN_BYTES_WINDOWS = 7500
 ARGV_WARN_BYTES_POSIX = 100_000
 STD_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+DEFAULT_TIMEOUT_SECONDS = 300
+EFFORT_DEFAULT_TIMEOUTS: dict[str, int] = {
+    "xhigh": 600,
+    "max": 900,
+}
+
+CODEX_DISABLED_FEATURES: tuple[str, ...] = (
+    "hooks",
+    "plugins",
+    "apps",
+    "multi_agent",
+    "shell_tool",
+    "skill_search",
+)
+CODEX_ISOLATION_OVERRIDES: tuple[str, ...] = (
+    'developer_instructions=""',
+    'model_verbosity="medium"',
+    "notify=[]",
+    "check_for_update_on_startup=false",
+)
+CLAUDE_DISABLE_HOOKS_SETTINGS = json.dumps({"disableAllHooks": True}, separators=(",", ":"))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -64,14 +103,46 @@ class BackendInfo:
 
 
 BACKEND_REGISTRY: tuple[BackendInfo, ...] = (
-    BackendInfo("codex", "cli", "codex", "sandbox", "沙箱/提示词约束（-s read-only --ephemeral + 空目录）", True, STD_EFFORTS, "stdin"),
-    BackendInfo("agy", "cli", "agy", "sandbox", "沙箱/提示词约束（--disable-slash-commands + 空目录）", True, STD_EFFORTS, "argv", ("antigravity",)),
-    BackendInfo("claude", "cli", "claude", "hard", '硬禁工具（--tools "" + --strict-mcp-config + --no-session-persistence）', True, STD_EFFORTS, "stdin"),
-    BackendInfo("grok", "cli", "grok", "hard", '硬禁工具（--tools "" + --no-memory --no-subagents --disable-web-search）', True, STD_EFFORTS, "prompt_file"),
-    BackendInfo("dsh", "cli", "dsh", "hard", "硬禁工具（dsh --profile headless + --permission-mode read-only + 临时 --patch 禁用工具插件）", False, (), "stdin", ("dsh-tui",)),
-    BackendInfo("pi", "cli", "pi", "hard", "硬禁工具（--no-tools --no-mcp --no-extensions --no-skills --no-context-files --no-session）", True, ("off", "minimal") + STD_EFFORTS, "stdin"),
-    BackendInfo("kimi", "cli", "kimi", "sandbox", "沙箱/提示词约束（空目录 + 空 --skills-dir + 不传 --auto/--yolo）", False, (), "argv"),
-    BackendInfo("openai", "http", None, "hard", "硬禁工具（纯文本 Chat Completions API，无 tools 字段）", True, STD_EFFORTS[:4], "http_json"),
+    BackendInfo(
+        "codex", "cli", "codex", "sandbox",
+        "沙箱/配置隔离（-s read-only --ephemeral + 禁 shell_tool/hooks/plugins/apps/MCP + 清空个人指令）",
+        True, STD_EFFORTS, "stdin",
+    ),
+    BackendInfo(
+        "agy", "cli", "agy", "sandbox",
+        "沙箱/提示词约束（--sandbox --disable-slash-commands + stream-json stdin + 空目录）",
+        True, STD_EFFORTS, "stdin", ("antigravity",),
+    ),
+    BackendInfo(
+        "claude", "cli", "claude", "hard",
+        '硬禁工具（--tools "" + --strict-mcp-config + --no-session-persistence + disableAllHooks）',
+        True, STD_EFFORTS, "stdin",
+    ),
+    BackendInfo(
+        "grok", "cli", "grok", "hard",
+        '硬禁工具（--tools "" + --no-memory --no-subagents --disable-web-search）',
+        True, STD_EFFORTS, "prompt_file",
+    ),
+    BackendInfo(
+        "dsh", "cli", "dsh", "hard",
+        "硬禁工具（dsh --profile headless + --permission-mode read-only + 临时 --patch 禁用工具插件）",
+        False, (), "stdin", ("dsh-tui",),
+    ),
+    BackendInfo(
+        "pi", "cli", "pi", "hard",
+        "硬禁工具（--no-tools --no-mcp --no-extensions --no-skills --no-context-files --no-session）",
+        True, ("off", "minimal") + STD_EFFORTS, "stdin",
+    ),
+    BackendInfo(
+        "kimi", "cli", "kimi", "sandbox",
+        "沙箱/提示词约束（空目录 + 空 --skills-dir + 不传 --auto/--yolo）",
+        False, (), "argv",
+    ),
+    BackendInfo(
+        "openai", "http", None, "hard",
+        "硬禁工具（纯文本 Chat Completions API，无 tools 字段）",
+        True, STD_EFFORTS[:4], "http_json",
+    ),
 )
 
 BACKEND_MAP: dict[str, BackendInfo] = {b.name: b for b in BACKEND_REGISTRY}
@@ -95,7 +166,10 @@ _HOME_PATH_RE = re.compile(r"(?:/Users/[^/\s`'\"<>]+|/home/[^/\s`'\"<>]+|[A-Za-z
 _ENV_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _EFFORT_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 _TOML_STRING_KV_RE = re.compile(r'^\s*([A-Za-z0-9_.-]+)\s*=\s*"([^"]*)"')
+_TOML_BOOL_KV_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)\s*=\s*(true|false)\b", re.IGNORECASE)
 _TOML_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
+_SAFE_TOML_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -172,6 +246,90 @@ def parse_channel_spec(raw: str) -> ChannelSpec:
     return ChannelSpec(raw=raw, backend=backend, model=model, effort=effort, env_prefix=env_prefix)
 
 
+def resolve_channel_timeout(spec: ChannelSpec, explicit_timeout: int | None = None) -> int:
+    """按显式参数或推理强度决定单通道超时（秒）。"""
+    if explicit_timeout is not None:
+        return explicit_timeout
+    effort = (spec.effort or "").strip().lower()
+    if effort in EFFORT_DEFAULT_TIMEOUTS:
+        return EFFORT_DEFAULT_TIMEOUTS[effort]
+    model_lower = (spec.model or "").strip().lower()
+    for suffix, sec in EFFORT_DEFAULT_TIMEOUTS.items():
+        if model_lower.endswith(f"-{suffix}"):
+            return sec
+    return DEFAULT_TIMEOUT_SECONDS
+
+
+def resolve_model_shorthand(spec: ChannelSpec, candidates: list[str]) -> ChannelSpec:
+    """基于本地候选模型列表做唯一简写解析；多命中报错，零命中原样放行以兼容新上线模型。"""
+    if not spec.model or spec.backend == "openai" or not candidates:
+        return spec
+    query = spec.model.strip()
+    if query in candidates:
+        return spec
+    lower_map = {c.lower(): c for c in candidates}
+    if query.lower() in lower_map:
+        return dataclasses.replace(spec, model=lower_map[query.lower()])
+
+    # 1. If effort is present, prefer candidates ending with <query>-<effort> (e.g., short@high -> vendor-short-high)
+    if spec.effort:
+        eff_q = f"{query}-{spec.effort}".lower()
+        eff_pat = re.compile(rf"(?:^|[/\-_.]){re.escape(eff_q)}$", re.IGNORECASE)
+        eff_hits = [c for c in candidates if eff_pat.search(c)]
+        if len(eff_hits) == 1:
+            return dataclasses.replace(spec, model=eff_hits[0])
+
+    # 2. Boundary-aligned suffix match (e.g., pro -> vendor-pro, v2 -> org/model-v2)
+    suffix_pat = re.compile(rf"(?:^|[/\-_.]){re.escape(query)}$", re.IGNORECASE)
+    suffix_hits = [c for c in candidates if suffix_pat.search(c)]
+    if len(suffix_hits) == 1:
+        return dataclasses.replace(spec, model=suffix_hits[0])
+
+    # 3. General case-insensitive substring match, optionally narrowed by -<effort>
+    sub_hits = [c for c in candidates if query.lower() in c.lower()]
+    if len(sub_hits) == 1:
+        return dataclasses.replace(spec, model=sub_hits[0])
+    if len(sub_hits) > 1 and spec.effort:
+        eff_narrow = [c for c in sub_hits if c.lower().endswith(f"-{spec.effort.lower()}")]
+        if len(eff_narrow) == 1:
+            return dataclasses.replace(spec, model=eff_narrow[0])
+
+    ambiguous = suffix_hits if len(suffix_hits) > 1 else sub_hits
+    if len(ambiguous) > 1:
+        preview = ", ".join(ambiguous[:8])
+        more = f" 等共 {len(ambiguous)} 个" if len(ambiguous) > 8 else ""
+        raise ValueError(
+            f"通道 '{spec.raw}' 中的模型简写 '{query}' 在后端 '{spec.backend}' 匹配到多个候选模型："
+            f"{preview}{more}。请写更精确的模型 ID（或用 --list-models {spec.backend} 查看）。"
+        )
+    return spec
+
+
+def resolve_channel_specs(
+    specs: list[ChannelSpec],
+    *,
+    env: dict[str, str] | None = None,
+    home: pathlib.Path | None = None,
+    allow_live_probe: bool = False,
+) -> list[ChannelSpec]:
+    """批量对指定了 model 的通道执行本地唯一简写解析。"""
+    cache: dict[str, list[str]] = {}
+    resolved: list[ChannelSpec] = []
+    for spec in specs:
+        if not spec.model or spec.backend == "openai":
+            resolved.append(spec)
+            continue
+        if spec.backend not in cache:
+            info = BACKEND_MAP[spec.backend]
+            exe = shutil.which(info.binary) if info.binary else None
+            meta = probe_backend_models(
+                spec.backend, executable=exe, env=env, home=home, allow_live_probe=allow_live_probe
+            )
+            cache[spec.backend] = list(meta.get("models") or [])
+        resolved.append(resolve_model_shorthand(spec, cache[spec.backend]))
+    return resolved
+
+
 def resolve_openai_env(spec: ChannelSpec, env: dict[str, str] | None = None) -> tuple[str, str, str]:
     """解析 OpenAI 兼容后端所需的 (base_url, api_key, model)。"""
     src = os.environ if env is None else env
@@ -211,7 +369,7 @@ def check_argv_prompt_warnings(specs: list[ChannelSpec], full_prompt: str) -> li
             seen.add(spec.backend)
             warnings.append(
                 f"通道 '{spec.backend}' 通过命令行参数传递正文，当前长度 {prompt_bytes} 字节已超过安全阈值 {limit} 字节，"
-                "可能触发操作系统参数长度限制；超长文本建议改用支持 stdin/文件的后端（codex/claude/grok/dsh/pi/openai）。"
+                "可能触发操作系统参数长度限制；超长文本建议改用支持 stdin/文件的后端（codex/agy/claude/grok/dsh/pi/openai）。"
             )
     return warnings
 
@@ -234,6 +392,10 @@ def _dedupe(items: list[str | None]) -> list[str]:
             seen.add(s)
             out.append(s)
     return out
+
+
+def _normalize_slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.strip().lower()).strip("-")
 
 
 def _probe_meta(
@@ -270,6 +432,13 @@ def _read_json(path: pathlib.Path) -> Any:
         return None
 
 
+def _atomic_write_json(path: pathlib.Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def _parse_toml(path: pathlib.Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
@@ -288,11 +457,37 @@ def _parse_toml(path: pathlib.Path) -> dict[str, Any] | None:
             continue
         if m := _TOML_SECTION_RE.match(s):
             section = m.group(1).strip()
+            result.setdefault(section, {})
         elif m := _TOML_STRING_KV_RE.match(s):
             target = result if section is None else result.setdefault(section, {})
             if isinstance(target, dict):
                 target[m.group(1)] = m.group(2)
+        elif m := _TOML_BOOL_KV_RE.match(s):
+            target = result if section is None else result.setdefault(section, {})
+            if isinstance(target, dict):
+                target[m.group(1)] = m.group(2).lower() == "true"
     return result
+
+
+def list_codex_enabled_mcp_servers(home: pathlib.Path | None = None) -> list[str]:
+    """读取 ~/.codex/config.toml 中未显式禁用的 MCP server 名称，用于在冷审时逐项关闭。"""
+    home_dir = home if home is not None else pathlib.Path.home()
+    cfg = _parse_toml(home_dir / ".codex" / "config.toml")
+    if not isinstance(cfg, dict):
+        return []
+    names: list[str] = []
+    mcp_table = cfg.get("mcp_servers")
+    if isinstance(mcp_table, dict):
+        for name, entry in mcp_table.items():
+            if isinstance(name, str) and isinstance(entry, dict) and entry.get("enabled") is not False:
+                names.append(name)
+    else:
+        for sec_key, entry in cfg.items():
+            if isinstance(sec_key, str) and sec_key.startswith("mcp_servers."):
+                parts = sec_key.split(".", 2)
+                if len(parts) == 2 and isinstance(entry, dict) and entry.get("enabled") is not False:
+                    names.append(parts[1].strip('"').strip("'"))
+    return _dedupe(names)
 
 
 def _load_ttl_cache(path: pathlib.Path) -> dict[str, Any]:
@@ -301,13 +496,8 @@ def _load_ttl_cache(path: pathlib.Path) -> dict[str, Any]:
 
 
 def _save_ttl_cache(path: pathlib.Path, data: dict[str, Any]) -> None:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
-    except Exception:
-        pass
+    with contextlib.suppress(Exception):
+        _atomic_write_json(path, data)
 
 
 def _probe_codex_local(home: pathlib.Path) -> dict[str, Any]:
@@ -327,10 +517,25 @@ def _probe_claude_local(home: pathlib.Path) -> dict[str, Any]:
     cfg = _read_json(home / ".claude" / "settings.json")
     cfg_dict = cfg if isinstance(cfg, dict) else {}
     env_map = cfg_dict.get("env") if isinstance(cfg_dict.get("env"), dict) else {}
-    models: list[str | None] = [
+
+    picker_models: list[str | None] = []
+    picker = cfg_dict.get("modelPicker")
+    if isinstance(picker, dict) and isinstance(picker.get("options"), list):
+        picker_models = [_clean_str(opt.get("model")) for opt in picker["options"] if isinstance(opt, dict)]
+
+    settings_models: list[str | None] = []
+    if isinstance(cfg_dict.get("modelSettings"), dict):
+        settings_models = [_clean_str(k) for k in cfg_dict["modelSettings"].keys()]
+
+    env_models: list[str | None] = [
         _clean_str(env_map.get(k))
         for k in ("ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL")
-    ] + ["opus", "sonnet", "haiku"]
+    ]
+    fallback_avail: list[str | None] = []
+    if not any(picker_models) and not any(settings_models) and isinstance(cfg_dict.get("availableModels"), list):
+        fallback_avail = [_clean_str(m) for m in cfg_dict["availableModels"]]
+
+    models: list[str | None] = picker_models + settings_models + env_models + fallback_avail + ["opus", "sonnet", "haiku"]
     return _probe_meta(
         _clean_str(cfg_dict.get("model")),
         _clean_str(cfg_dict.get("effortLevel")),
@@ -507,6 +712,19 @@ def _resolve_ttl_models(
     return [], None
 
 
+def _normalize_agy_default_model(default_model: str | None, models: list[str]) -> str | None:
+    """将 agy settings.json 中的显示名（如 'Gemini 4 Neon (XHigh)'）映射为规范 slug。"""
+    if not default_model or not models:
+        return default_model
+    if default_model in models:
+        return default_model
+    norm = _normalize_slug(default_model)
+    for m in models:
+        if _normalize_slug(m) == norm:
+            return m
+    return default_model
+
+
 def probe_backend_models(
     backend: str,
     executable: str | None = None,
@@ -536,7 +754,10 @@ def probe_backend_models(
         ttl_seconds=ttl_seconds,
     )
     if ttl_models and ttl_source:
-        merged = ttl_models if backend == "agy" else _dedupe(
+        if backend == "agy":
+            norm_default = _normalize_agy_default_model(local["default_model"], ttl_models)
+            return {**local, "default_model": norm_default, "models": ttl_models, "model_source": ttl_source}
+        merged = _dedupe(
             ([local["default_model"]] if local["default_model"] else []) + ttl_models + local["models"]
         )
         return {**local, "models": merged, "model_source": ttl_source}
@@ -597,6 +818,54 @@ def detect_available_backends(
     return results
 
 
+def _infer_model_family(backend: str, default_model: str | None) -> str:
+    """推断后端当前默认模型所属模型家族，用于生成真正异构的推荐预设。"""
+    m = (default_model or "").strip().lower()
+    if m:
+        if "gemini" in m:
+            return "gemini"
+        if any(k in m for k in ("gpt-", "gpt5", "gpt6", "codex")) or re.search(r"(?:^|[/-])o[134](?:$|[/-])", m):
+            return "openai"
+        if any(k in m for k in ("claude", "opus", "sonnet", "haiku")):
+            return "anthropic"
+        if "grok" in m:
+            return "xai"
+        if "deepseek" in m:
+            return "deepseek"
+        if "kimi" in m or re.search(r"(?:^|[/-])k[23](?:\.|$|[/-])", m):
+            return "moonshot"
+        if "qwen" in m:
+            return "qwen"
+    fallback = {
+        "codex": "openai",
+        "agy": "gemini",
+        "claude": "anthropic",
+        "grok": "xai",
+        "dsh": "deepseek",
+        "kimi": "moonshot",
+    }
+    return fallback.get(backend, backend)
+
+
+def _select_heterogeneous_backends(avail: list[dict[str, Any]], count: int) -> list[dict[str, Any]]:
+    """优先挑选不同模型家族的可用后端，避免多 CLI 实际指向同一模型家族的“伪异构”。"""
+    chosen: list[dict[str, Any]] = []
+    seen_families: set[str] = set()
+    for item in avail:
+        fam = _infer_model_family(str(item["backend"]), _clean_str(item.get("default_model")))
+        if fam not in seen_families:
+            seen_families.add(fam)
+            chosen.append(item)
+            if len(chosen) >= count:
+                return chosen
+    for item in avail:
+        if item not in chosen:
+            chosen.append(item)
+            if len(chosen) >= count:
+                break
+    return chosen
+
+
 def _preset_channel(item: dict[str, Any], effort: str | None = None) -> str:
     base = str(item.get("default_spec") or item["backend"])
     return f"{base}@{effort}" if (effort and item.get("supports_effort")) else base
@@ -606,7 +875,7 @@ def build_recommended_presets(
     detected: list[dict[str, Any]],
     env: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """基于本机实际可用后端动态生成 2–3 个不写死个人模型名的推荐组合预设。"""
+    """基于本机实际可用后端动态生成 2–3 个不写死个人模型名的真异构推荐组合预设。"""
     src = os.environ if env is None else env
     avail = [item for item in detected if item.get("available")]
     presets: list[dict[str, Any]] = []
@@ -620,17 +889,20 @@ def build_recommended_presets(
         if channels and not any(p["channels"] == channels for p in presets):
             presets.append({"id": len(presets) + 1, "name": name, "channels": channels, "note": note})
 
+    duo = _select_heterogeneous_backends(avail, 2)
+    trio = _select_heterogeneous_backends(avail, 3)
+
     if env_specs:
         add_preset("当前默认配置（COLD_CRITIQUE_CHANNELS）", [s.label for s in env_specs], "沿用环境变量 COLD_CRITIQUE_CHANNELS 设定的通道组合")
-    elif len(avail) >= 2:
-        add_preset("标准异构双通道（推荐）", [_preset_channel(i, "high") for i in avail[:2]], "从本机可用后端自动挑选前 2 个不同 Agent，均衡速度与交叉校验质量")
+    elif len(duo) >= 2:
+        add_preset("标准异构双通道（推荐）", [_preset_channel(i, "high") for i in duo], "从本机可用后端自动挑选 2 个不同模型家族 Agent，均衡速度与交叉校验质量")
     elif len(avail) == 1:
         add_preset("单通道冷审（当前仅检测到 1 个可用后端）", [_preset_channel(avail[0], "high")], "仅检测到 1 个可用后端；建议安装更多 CLI 或配置 OPENAI_API_KEY 以启用异构双审")
 
-    if len(avail) >= 3:
-        add_preset("异构三通道深度盲审", [_preset_channel(i, "high") for i in avail[:3]], "同时拉起 3 个不同 Agent 并发对抗，适合关键决策与定稿前深审")
-    if len(avail) >= 2:
-        add_preset("轻量快速双审", [_preset_channel(i, "low") for i in avail[:2]], "支持 effort 的通道使用 low 强度，耗时更短，适合初稿快速试探")
+    if len(trio) >= 3:
+        add_preset("异构三通道深度盲审", [_preset_channel(i, "high") for i in trio], "同时拉起 3 个优先跨模型家族的 Agent 并发对抗，适合关键决策与定稿前深审")
+    if len(duo) >= 2:
+        add_preset("轻量快速双审", [_preset_channel(i, "low") for i in duo], "支持 effort 的通道使用 low 强度，耗时更短，适合初稿快速试探")
     return presets[:3]
 
 
@@ -642,8 +914,8 @@ def parse_env_channels(env: dict[str, str] | None = None) -> list[ChannelSpec]:
 
 
 def auto_select_channels(env: dict[str, str] | None = None) -> list[ChannelSpec]:
-    detected = detect_available_backends(env=env, include_models=False, allow_live_probe=False)
-    avail = [item for item in detected if item["available"]][:2]
+    detected = detect_available_backends(env=env, include_models=True, allow_live_probe=False)
+    avail = _select_heterogeneous_backends([item for item in detected if item["available"]], 2)
     return [parse_channel_spec(str(item.get("default_spec") or item["backend"])) for item in avail]
 
 
@@ -652,8 +924,24 @@ def auto_select_channels(env: dict[str, str] | None = None) -> list[ChannelSpec]
 # ---------------------------------------------------------------------------
 
 
-def build_codex_command(spec: ChannelSpec, out_path: str, executable: str | None = None) -> list[str]:
+def _format_codex_mcp_disable(server_name: str) -> str:
+    key = server_name if _SAFE_TOML_KEY_RE.match(server_name) else json.dumps(server_name)
+    return f"mcp_servers.{key}.enabled=false"
+
+
+def build_codex_command(
+    spec: ChannelSpec,
+    out_path: str,
+    executable: str | None = None,
+    disabled_mcp_servers: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
     cmd = [executable or "codex", "exec", "--skip-git-repo-check", "-s", "read-only", "--ephemeral"]
+    for feat in CODEX_DISABLED_FEATURES:
+        cmd.extend(["--disable", feat])
+    for override in CODEX_ISOLATION_OVERRIDES:
+        cmd.extend(["-c", override])
+    for srv in disabled_mcp_servers or ():
+        cmd.extend(["-c", _format_codex_mcp_disable(srv)])
     if spec.model:
         cmd.extend(["-m", spec.model])
     if spec.effort:
@@ -662,7 +950,15 @@ def build_codex_command(spec: ChannelSpec, out_path: str, executable: str | None
 
 
 def build_claude_command(spec: ChannelSpec, executable: str | None = None) -> list[str]:
-    cmd = [executable or "claude", "-p", "--tools", "", "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence", "--output-format", "json"]
+    cmd = [
+        executable or "claude", "-p",
+        "--tools", "",
+        "--strict-mcp-config",
+        "--disable-slash-commands",
+        "--no-session-persistence",
+        "--settings", CLAUDE_DISABLE_HOOKS_SETTINGS,
+        "--output-format", "json",
+    ]
     if spec.model:
         cmd.extend(["--model", spec.model])
     if spec.effort:
@@ -670,13 +966,23 @@ def build_claude_command(spec: ChannelSpec, executable: str | None = None) -> li
     return cmd
 
 
-def build_agy_command(spec: ChannelSpec, full_prompt: str, executable: str | None = None) -> list[str]:
-    cmd = [executable or "agy", "--disable-slash-commands", "--output-format", "json"]
+def build_agy_stream_input(full_prompt: str) -> str:
+    return json.dumps({"event": "user", "message": {"role": "user", "content": full_prompt}}, ensure_ascii=False) + "\n"
+
+
+def build_agy_command(spec: ChannelSpec, executable: str | None = None) -> list[str]:
+    cmd = [
+        executable or "agy",
+        "--disable-slash-commands",
+        "--sandbox",
+        "--input-format", "stream-json",
+        "--output-format", "stream-json",
+    ]
     if spec.model:
         cmd.extend(["--model", spec.model])
     if spec.effort:
         cmd.extend(["--effort", spec.effort])
-    return [*cmd, f"--print={full_prompt}"]
+    return cmd
 
 
 def build_grok_command(spec: ChannelSpec, prompt_file: str, executable: str | None = None) -> list[str]:
@@ -760,6 +1066,35 @@ def _parse_last_json_object(raw_out: str) -> dict[str, Any] | None:
     return None
 
 
+def _extract_agy_stream_json(raw_out: str) -> dict[str, Any] | None:
+    """解析 agy --output-format stream-json（兼容器老式单对象 JSON）输出。"""
+    init_model: str | None = None
+    result_obj: dict[str, Any] | None = None
+    for line in raw_out.splitlines():
+        s = line.strip()
+        if not s or not s.startswith("{"):
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        ev = obj.get("event")
+        if ev == "init" and isinstance(obj.get("init"), dict):
+            init_model = _clean_str(obj["init"].get("model")) or init_model
+        elif ev == "result" and isinstance(obj.get("result"), dict):
+            result_obj = obj["result"]
+        elif ev is None and "status" in obj and "response" in obj:
+            result_obj = obj
+    if result_obj is None:
+        return None
+    out = dict(result_obj)
+    if init_model and not out.get("model"):
+        out["model"] = init_model
+    return out
+
+
 def _extract_kimi_stream_json(raw_out: str) -> str:
     parts: list[str] = []
     parsed_any = False
@@ -829,7 +1164,7 @@ def _format_exec_error(exc: Exception, backend: str) -> str:
     if isinstance(exc, OSError) and getattr(exc, "errno", None) in (7, 206):
         return (
             f"命令行参数超出系统长度上限（{exc}）。"
-            f"通道 '{backend}' 通过参数传正文，超长文本请改用 codex/claude/grok/dsh/pi/openai。"
+            f"通道 '{backend}' 通过参数传正文，超长文本请改用 codex/agy/claude/grok/dsh/pi/openai。"
         )
     return str(exc)
 
@@ -859,11 +1194,13 @@ def _run_cli_channel(spec: ChannelSpec, full_prompt: str, timeout_s: int) -> dic
 
             if spec.backend == "codex":
                 out_path = stack.enter_context(_temp_file("cold_critique_codex_", ".txt"))
-                cmd, stdin_text = build_codex_command(spec, out_path, executable=exe), full_prompt
+                mcp_servers = list_codex_enabled_mcp_servers()
+                cmd = build_codex_command(spec, out_path, executable=exe, disabled_mcp_servers=mcp_servers)
+                stdin_text = full_prompt
             elif spec.backend == "claude":
                 cmd, stdin_text = build_claude_command(spec, executable=exe), full_prompt
             elif spec.backend == "agy":
-                cmd = build_agy_command(spec, full_prompt, executable=exe)
+                cmd, stdin_text = build_agy_command(spec, executable=exe), build_agy_stream_input(full_prompt)
             elif spec.backend == "grok":
                 pf = stack.enter_context(_temp_file("cold_critique_grok_", ".txt", full_prompt))
                 cmd = build_grok_command(spec, pf, executable=exe)
@@ -905,10 +1242,16 @@ def _run_cli_channel(spec: ChannelSpec, full_prompt: str, timeout_s: int) -> dic
                     if resp := _extract_kimi_stream_json(raw_out):
                         return _ok_result(spec, resp, elapsed)
                 elif spec.backend == "agy" and raw_out:
-                    parsed = _parse_last_json_object(raw_out)
+                    parsed = _extract_agy_stream_json(raw_out)
                     if parsed and parsed.get("status") == "SUCCESS":
                         if resp := str(parsed.get("response") or "").strip():
-                            return _ok_result(spec, resp, float(parsed.get("duration_seconds", elapsed)), usage=parsed.get("usage"))
+                            return _ok_result(
+                                spec,
+                                resp,
+                                float(parsed.get("duration_seconds", elapsed)),
+                                model=_clean_str(parsed.get("model")) or spec.model,
+                                usage=parsed.get("usage"),
+                            )
                 elif spec.backend in ("claude", "grok") and raw_out:
                     parsed = _parse_last_json_object(raw_out)
                     if parsed is None:
@@ -965,6 +1308,84 @@ def run_channel(spec: ChannelSpec, full_prompt: str, timeout_s: int) -> dict[str
 
 
 # ---------------------------------------------------------------------------
+# 逐路原子落盘与失败通道续跑（--out-dir / --resume）
+# ---------------------------------------------------------------------------
+
+
+def _channel_result_filename(label: str, occurrence: int = 1) -> str:
+    safe = _SAFE_FILENAME_RE.sub("_", label).strip("._") or "channel"
+    suffix = f"_{occurrence}" if occurrence > 1 else ""
+    return f"{safe}{suffix}.json"
+
+
+def build_channel_result_paths(specs: list[ChannelSpec], out_dir: pathlib.Path) -> list[pathlib.Path]:
+    counts: dict[str, int] = {}
+    paths: list[pathlib.Path] = []
+    for spec in specs:
+        counts[spec.label] = counts.get(spec.label, 0) + 1
+        paths.append(out_dir / _channel_result_filename(spec.label, counts[spec.label]))
+    return paths
+
+
+def _load_resumable_result(path: pathlib.Path, spec: ChannelSpec, prompt_sha256: str) -> dict[str, Any] | None:
+    data = _read_json(path)
+    if not isinstance(data, dict):
+        return None
+    if (
+        data.get("ok") is True
+        and bool(str(data.get("response") or "").strip())
+        and data.get("channel") == spec.label
+        and data.get("prompt_sha256") == prompt_sha256
+    ):
+        reused = dict(data)
+        reused["resumed"] = True
+        return reused
+    return None
+
+
+def execute_channels(
+    specs: list[ChannelSpec],
+    full_prompt: str,
+    *,
+    explicit_timeout: int | None = None,
+    out_dir: pathlib.Path | None = None,
+    resume: bool = False,
+    clean_text: str | None = None,
+    prefix: str | None = None,
+) -> tuple[list[dict[str, Any]], str]:
+    """并发执行全部通道；指定 out_dir 时每路完成即原子落盘，支持 --resume 仅重跑未成功通道。"""
+    prompt_sha256 = hashlib.sha256(full_prompt.encode("utf-8")).hexdigest()
+    result_paths: list[pathlib.Path | None] = [None] * len(specs)
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if clean_text is not None:
+            (out_dir / "input.md").write_text(clean_text, encoding="utf-8")
+        if prefix is not None:
+            (out_dir / "prompt.txt").write_text(prefix, encoding="utf-8")
+        result_paths = list(build_channel_result_paths(specs, out_dir))
+
+    def _run_one(idx: int) -> dict[str, Any]:
+        spec = specs[idx]
+        rpath = result_paths[idx]
+        if resume and rpath is not None:
+            if cached := _load_resumable_result(rpath, spec, prompt_sha256):
+                cached["result_file"] = str(rpath)
+                return cached
+        timeout_s = resolve_channel_timeout(spec, explicit_timeout)
+        res = run_channel(spec, full_prompt, timeout_s)
+        res["timeout_seconds"] = timeout_s
+        if rpath is not None:
+            persisted = {**res, "prompt_sha256": prompt_sha256}
+            _atomic_write_json(rpath, persisted)
+            res["result_file"] = str(rpath)
+        return res
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(specs)) as ex:
+        results = list(ex.map(_run_one, range(len(specs))))
+    return results, prompt_sha256
+
+
+# ---------------------------------------------------------------------------
 # CLI 参数与入口
 # ---------------------------------------------------------------------------
 
@@ -976,12 +1397,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--file", "-f", help="待审 Markdown/文本文件路径（省略时从 stdin 读取）")
     parser.add_argument(
         "--channel", "-c", action="append", dest="channels",
-        help="指定评审通道，可重复传入并发执行（支持同后端多开）。格式：<backend>[:<model>][@<effort>][#<ENV_PREFIX>]。",
+        help="指定评审通道，可重复传入并发执行（支持同后端多开与本地唯一模型简写）。格式：<backend>[:<model>][@<effort>][#<ENV_PREFIX>]。",
     )
-    parser.add_argument("--prompt-file", help="可选自定义评审前缀提示词文件路径（默认使用内置双边校准提示词）")
+    parser.add_argument(
+        "--profile", choices=tuple(PROMPT_PROFILES.keys()), default="summary",
+        help="内置评审前缀模板：summary（默认对话/方案总结）、article（公开长文）、code（代码/架构对照）",
+    )
+    parser.add_argument("--prompt-file", help="可选自定义评审前缀提示词文件路径（优先级高于 --profile）")
     parser.add_argument("--raw", action="store_true", help="跳过剥壳，保留原始 frontmatter、参考资料与外链")
     parser.add_argument("--redact-paths", action="store_true", help="将文本中的本机用户目录路径替换为 <HOME>")
-    parser.add_argument("--timeout", type=int, default=300, help="单通道超时时间（秒，默认 300）")
+    parser.add_argument(
+        "--timeout", type=int, default=None,
+        help="单通道超时时间（秒；省略时按 effort 自动设值：常规 300s、xhigh 600s、max 900s）",
+    )
+    parser.add_argument("--out-dir", help="结果落盘目录：保存剥壳输入、每路完成后立即落盘单通道 JSON 及 summary.json")
+    parser.add_argument("--resume", action="store_true", help="配合 --out-dir 使用：复用已成功且输入未变的通道结果，仅补跑失败/缺失通道")
     parser.add_argument("--json", action="store_true", help="以 JSON 格式输出结果")
     parser.add_argument("--dry-run", action="store_true", help="仅打印剥壳统计、长度预警与已选通道，不实际调用模型")
     parser.add_argument("--list-backends", action="store_true", help="检查本机可用后端、隔离级别、模型摘要与动态推荐预设并退出")
@@ -994,7 +1424,7 @@ def _print_backends_human(detected: list[dict[str, Any]], presets: list[dict[str
     print("可用后端速查：")
     for item in detected:
         mark = "可用" if item["available"] else "未就绪"
-        iso = "硬禁工具" if item["isolation_level"] == "hard" else "沙箱/提示词约束"
+        iso = "硬禁工具" if item["isolation_level"] == "hard" else "沙箱/配置隔离"
         eff = f"支持({'/'.join(item['effort_values'])})" if item["supports_effort"] else "不支持"
         alias = f"（别名: {', '.join(item['aliases'])}）" if item.get("aliases") else ""
         print(f"- {item['backend']}{alias} [{mark}] | 隔离: {iso} | effort: {eff} | 默认模型: {item.get('default_model') or '默认'}")
@@ -1066,8 +1496,12 @@ def main(argv: list[str] | None = None) -> int:
             _print_backends_human(detected, presets, env_raw)
         return 0
 
+    if args.resume and not args.out_dir:
+        parser.error("--resume 需要同时指定 --out-dir。")
+
     try:
-        specs = [parse_channel_spec(c) for c in args.channels] if args.channels else (parse_env_channels() or auto_select_channels())
+        raw_specs = [parse_channel_spec(c) for c in args.channels] if args.channels else (parse_env_channels() or auto_select_channels())
+        specs = resolve_channel_specs(raw_specs, allow_live_probe=False)
     except ValueError as exc:
         parser.error(str(exc))
     if not specs:
@@ -1083,21 +1517,28 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("请通过 --file <路径> 指定待审文件，或通过标准输入传入文本。")
         raw_text = sys.stdin.read()
 
-    prefix = (pathlib.Path(args.prompt_file).read_text(encoding="utf-8").rstrip() + "\n\n---\n\n") if args.prompt_file else CALIBRATED_PROMPT_PREFIX
+    prefix = (
+        pathlib.Path(args.prompt_file).read_text(encoding="utf-8").rstrip() + "\n\n---\n\n"
+        if args.prompt_file
+        else PROMPT_PROFILES[args.profile]
+    )
     clean_text = (_HOME_PATH_RE.sub("<HOME>", raw_text.strip()) if args.redact_paths else raw_text.strip()) if args.raw else strip_markdown_shell(raw_text, redact_paths=args.redact_paths)
     if not clean_text:
         parser.error("剥壳后的待审正文为空。")
 
     full_prompt = prefix + clean_text
     argv_warnings = check_argv_prompt_warnings(specs, full_prompt)
+    timeouts = {s.label: resolve_channel_timeout(s, args.timeout) for s in specs}
 
     if args.dry_run:
         print(json.dumps({
+            "profile": "custom" if args.prompt_file else args.profile,
             "raw_chars": len(raw_text),
             "clean_chars": len(clean_text),
             "prompt_chars": len(full_prompt),
             "prompt_bytes": len(full_prompt.encode("utf-8")),
             "channels": [s.label for s in specs],
+            "timeouts": timeouts,
             "single_channel_warning": len(specs) == 1,
             "warnings": argv_warnings,
             "preview_head": full_prompt[:280],
@@ -1105,15 +1546,34 @@ def main(argv: list[str] | None = None) -> int:
         }, ensure_ascii=False, indent=2))
         return 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(specs)) as ex:
-        results = list(ex.map(lambda s: run_channel(s, full_prompt, args.timeout), specs))
+    out_dir_path = pathlib.Path(args.out_dir) if args.out_dir else None
+    results, prompt_sha256 = execute_channels(
+        specs,
+        full_prompt,
+        explicit_timeout=args.timeout,
+        out_dir=out_dir_path,
+        resume=args.resume,
+        clean_text=clean_text,
+        prefix=prefix,
+    )
     any_ok = any(r.get("ok") for r in results)
 
+    summary_payload: dict[str, Any] = {
+        "profile": "custom" if args.prompt_file else args.profile,
+        "input_chars": len(clean_text),
+        "channels_count": len(specs),
+        "prompt_sha256": prompt_sha256,
+        "results": results,
+    }
+    if out_dir_path is not None:
+        summary_payload["out_dir"] = str(out_dir_path)
+        summary_payload["input_file"] = str(out_dir_path / "input.md")
+        _atomic_write_json(out_dir_path / "summary.json", summary_payload)
+    if argv_warnings:
+        summary_payload["warnings"] = argv_warnings
+
     if args.json:
-        out: dict[str, Any] = {"input_chars": len(clean_text), "channels_count": len(specs), "results": results}
-        if argv_warnings:
-            out["warnings"] = argv_warnings
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+        print(json.dumps(summary_payload, ensure_ascii=False, indent=2))
         return 0 if any_ok else 1
 
     for warn in argv_warnings:
@@ -1122,8 +1582,9 @@ def main(argv: list[str] | None = None) -> int:
         print("提示：当前仅运行了单通道冷审；若需异构交叉校验，请再追加一个不同模型通道（-c）。\n")
     for res in results:
         print("=" * 70)
+        tag = " (resumed)" if res.get("resumed") else ""
         if res["ok"]:
-            print(f"[{res['channel']}] model={res['model']} | duration={res['duration_seconds']}s | chars={res['chars']}")
+            print(f"[{res['channel']}]{tag} model={res['model']} | duration={res['duration_seconds']}s | chars={res['chars']}")
             print("=" * 70)
             print(res["response"], end="\n\n")
         else:

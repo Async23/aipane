@@ -40,7 +40,7 @@ class StripMarkdownShellTests(unittest.TestCase):
         self.assertEqual(rcc.strip_markdown_shell(raw), "Body text.")
 
 
-class ChannelSpecTests(unittest.TestCase):
+class ChannelSpecAndShorthandTests(unittest.TestCase):
     def test_parse_all_aipane_backends_and_aliases(self):
         s1 = rcc.parse_channel_spec("codex")
         self.assertEqual((s1.backend, s1.model, s1.effort, s1.env_prefix), ("codex", None, None, None))
@@ -88,18 +88,72 @@ class ChannelSpecTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             rcc.parse_channel_spec("openai:gpt-4.1#bad-prefix")
 
+    def test_resolve_model_shorthand_unique_effort_ambiguous_and_passthrough(self):
+        codex_models = ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-astra"]
+        r1 = rcc.resolve_model_shorthand(rcc.parse_channel_spec("codex:6.2-astra@xhigh"), codex_models)
+        self.assertEqual(r1.model, "gpt-6.2-astra")
+        self.assertEqual(r1.label, "codex:gpt-6.2-astra@xhigh")
+
+        claude_models = ["kimi-k3", "kimi-k3.1-pro", "grok-4.7"]
+        r2 = rcc.resolve_model_shorthand(rcc.parse_channel_spec("claude:k3@max"), claude_models)
+        self.assertEqual(r2.model, "kimi-k3")
+
+        agy_models = ["gemini-4-neon-high", "gemini-4-neon-xhigh", "gemini-4-neon-low", "gemini-4-carbon-high"]
+        r3 = rcc.resolve_model_shorthand(rcc.parse_channel_spec("agy:neon@xhigh"), agy_models)
+        self.assertEqual(r3.model, "gemini-4-neon-xhigh")
+
+        # Ambiguous shorthand without effort must fail fast
+        with self.assertRaisesRegex(ValueError, "匹配到多个候选模型"):
+            rcc.resolve_model_shorthand(rcc.parse_channel_spec("agy:neon"), agy_models)
+
+        # Unknown new remote model passes through untouched
+        r4 = rcc.resolve_model_shorthand(rcc.parse_channel_spec("codex:future-model-9@high"), codex_models)
+        self.assertEqual(r4.model, "future-model-9")
+
+    def test_adaptive_channel_timeouts(self):
+        self.assertEqual(rcc.resolve_channel_timeout(rcc.parse_channel_spec("codex@high")), 300)
+        self.assertEqual(rcc.resolve_channel_timeout(rcc.parse_channel_spec("codex@xhigh")), 600)
+        self.assertEqual(rcc.resolve_channel_timeout(rcc.parse_channel_spec("codex@max")), 900)
+        self.assertEqual(rcc.resolve_channel_timeout(rcc.parse_channel_spec("agy:gemini-4-neon-xhigh")), 600)
+        self.assertEqual(rcc.resolve_channel_timeout(rcc.parse_channel_spec("codex@max"), explicit_timeout=420), 420)
+
 
 class CommandBuilderTests(unittest.TestCase):
-    def test_codex_command_enforces_readonly_and_ephemeral(self):
-        spec = rcc.parse_channel_spec("codex:o3@high")
-        cmd = rcc.build_codex_command(spec, "/tmp/out.txt", executable="/usr/local/bin/codex")
+    def test_codex_command_enforces_readonly_ephemeral_and_config_isolation(self):
+        spec = rcc.parse_channel_spec("codex:o3@xhigh")
+        cmd = rcc.build_codex_command(
+            spec,
+            "/tmp/out.txt",
+            executable="/usr/local/bin/codex",
+            disabled_mcp_servers=["chrome-devtools", "custom.srv"],
+        )
         self.assertEqual(cmd[:6], ["/usr/local/bin/codex", "exec", "--skip-git-repo-check", "-s", "read-only", "--ephemeral"])
+        for feat in rcc.CODEX_DISABLED_FEATURES:
+            idx = [i for i, v in enumerate(cmd) if v == "--disable" and i + 1 < len(cmd) and cmd[i + 1] == feat]
+            self.assertTrue(idx, f"missing --disable {feat}")
+        self.assertIn('developer_instructions=""', cmd)
+        self.assertIn('model_verbosity="medium"', cmd)
+        self.assertIn("notify=[]", cmd)
+        self.assertIn("mcp_servers.chrome-devtools.enabled=false", cmd)
+        self.assertIn('mcp_servers."custom.srv".enabled=false', cmd)
         self.assertIn("-m", cmd)
         self.assertIn("o3", cmd)
-        self.assertIn('model_reasoning_effort="high"', cmd)
+        self.assertIn('model_reasoning_effort="xhigh"', cmd)
         self.assertEqual(cmd[-3:], ["-o", "/tmp/out.txt", "-"])
 
-    def test_claude_command_disables_all_tools_and_session(self):
+    def test_list_codex_enabled_mcp_servers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp)
+            (home / ".codex").mkdir()
+            (home / ".codex" / "config.toml").write_text(
+                '[mcp_servers.alpha]\ncommand = "a"\n\n'
+                '[mcp_servers.beta]\ncommand = "b"\nenabled = false\n\n'
+                '[mcp_servers.gamma]\nurl = "https://example.com"\nenabled = true\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(rcc.list_codex_enabled_mcp_servers(home=home), ["alpha", "gamma"])
+
+    def test_claude_command_disables_all_tools_hooks_and_session(self):
         spec = rcc.parse_channel_spec("claude:sonnet@medium")
         cmd = rcc.build_claude_command(spec)
         self.assertIn("--tools", cmd)
@@ -107,20 +161,27 @@ class CommandBuilderTests(unittest.TestCase):
         self.assertIn("--strict-mcp-config", cmd)
         self.assertIn("--disable-slash-commands", cmd)
         self.assertIn("--no-session-persistence", cmd)
+        self.assertIn("--settings", cmd)
+        self.assertEqual(json.loads(cmd[cmd.index("--settings") + 1]), {"disableAllHooks": True})
+        self.assertNotIn("--bare", cmd)
         self.assertIn("--model", cmd)
         self.assertIn("sonnet", cmd)
         self.assertIn("--effort", cmd)
         self.assertIn("medium", cmd)
 
-    def test_agy_command_disables_slash_commands(self):
+    def test_agy_command_uses_sandbox_and_stream_json_stdin(self):
         spec = rcc.parse_channel_spec("agy:demo-model@high")
-        cmd = rcc.build_agy_command(spec, "hello")
+        cmd = rcc.build_agy_command(spec)
         self.assertIn("--disable-slash-commands", cmd)
+        self.assertIn("--sandbox", cmd)
+        self.assertEqual(cmd[cmd.index("--input-format") + 1], "stream-json")
+        self.assertEqual(cmd[cmd.index("--output-format") + 1], "stream-json")
         self.assertIn("--model", cmd)
         self.assertIn("demo-model", cmd)
         self.assertIn("--effort", cmd)
         self.assertIn("high", cmd)
-        self.assertEqual(cmd[-1], "--print=hello")
+        payload = json.loads(rcc.build_agy_stream_input("hello"))
+        self.assertEqual(payload, {"event": "user", "message": {"role": "user", "content": "hello"}})
 
     def test_grok_command_disables_tools_memory_subagents_and_uses_prompt_file(self):
         spec = rcc.parse_channel_spec("grok:grok-4.7@high")
@@ -218,17 +279,26 @@ class OpenAIBackendTests(unittest.TestCase):
 
 
 class HybridModelProbeAndPresetTests(unittest.TestCase):
-    def test_local_probes_and_agy_ttl_cache(self):
+    def test_local_probes_claude_picker_and_agy_slug_normalization(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = pathlib.Path(tmp)
             cache_dir = home / "cache"
             env = {"COLD_CRITIQUE_CACHE_DIR": str(cache_dir)}
 
-            # Populate codex / kimi / pi / grok / agy local files
             (home / ".codex").mkdir()
             (home / ".codex" / "config.toml").write_text('model = "gpt-test"\nmodel_reasoning_effort = "high"\n', encoding="utf-8")
             (home / ".codex" / "models_cache.json").write_text(
                 json.dumps({"models": [{"slug": "gpt-test"}, {"slug": "gpt-alt"}]}), encoding="utf-8"
+            )
+            (home / ".claude").mkdir()
+            (home / ".claude" / "settings.json").write_text(
+                json.dumps({
+                    "model": "gcp/gemini-4-argon",
+                    "modelPicker": {"options": [{"model": "kimi-k3"}, {"model": "deepseek-v4-pro"}]},
+                    "modelSettings": {"qwen3.8-max": {}},
+                    "availableModels": ["shadow-ignored"],
+                }),
+                encoding="utf-8",
             )
             (home / ".kimi-code").mkdir()
             (home / ".kimi-code" / "config.toml").write_text(
@@ -244,12 +314,19 @@ class HybridModelProbeAndPresetTests(unittest.TestCase):
             )
             (home / ".gemini" / "antigravity-cli").mkdir(parents=True)
             (home / ".gemini" / "antigravity-cli" / "settings.json").write_text(
-                json.dumps({"model": "Gemini 4 Argon (High)"}), encoding="utf-8"
+                json.dumps({"model": "Gemini 4 Neon (XHigh)"}), encoding="utf-8"
             )
 
             codex_meta = rcc.probe_backend_models("codex", home=home, env=env)
             self.assertEqual(codex_meta["default_model"], "gpt-test")
             self.assertIn("gpt-alt", codex_meta["models"])
+
+            claude_meta = rcc.probe_backend_models("claude", home=home, env=env)
+            self.assertEqual(claude_meta["default_model"], "gcp/gemini-4-argon")
+            self.assertIn("kimi-k3", claude_meta["models"])
+            self.assertIn("deepseek-v4-pro", claude_meta["models"])
+            self.assertIn("qwen3.8-max", claude_meta["models"])
+            self.assertNotIn("shadow-ignored", claude_meta["models"])
 
             kimi_meta = rcc.probe_backend_models("kimi", home=home, env=env)
             self.assertEqual(kimi_meta["default_model"], "kimi-code/k3")
@@ -259,26 +336,25 @@ class HybridModelProbeAndPresetTests(unittest.TestCase):
             self.assertEqual(pi_meta["default_model"], "p1/m1")
             self.assertIn("m2", pi_meta["models"])
 
-            # agy live probe writes TTL cache; second call hits cache without invoking subprocess
             fake_agy_out = "Fetching available models...\ngemini-4-neon-xhigh\tGemini 4 Neon (XHigh)\nclaude-opus-5-5-high\tClaude Opus\n"
             with mock.patch("subprocess.run", return_value=mock.Mock(returncode=0, stdout=fake_agy_out, stderr="")) as mrun:
                 first = rcc.probe_backend_models("agy", executable="/usr/local/bin/agy", home=home, env=env)
                 self.assertEqual(first["model_source"], "live_probe")
+                self.assertEqual(first["default_model"], "gemini-4-neon-xhigh")
                 self.assertEqual(first["models"], ["gemini-4-neon-xhigh", "claude-opus-5-5-high"])
                 self.assertEqual(mrun.call_count, 1)
 
                 second = rcc.probe_backend_models("agy", executable="/usr/local/bin/agy", home=home, env=env)
                 self.assertEqual(second["model_source"], "ttl_cache")
+                self.assertEqual(second["default_model"], "gemini-4-neon-xhigh")
                 self.assertEqual(mrun.call_count, 1)
 
-                # Explicit refresh bypasses TTL cache
                 third = rcc.probe_backend_models(
                     "agy", executable="/usr/local/bin/agy", home=home, env=env, refresh_models=True
                 )
                 self.assertEqual(third["model_source"], "live_probe")
                 self.assertEqual(mrun.call_count, 2)
 
-                # Expired TTL triggers refresh
                 cache_file = rcc.get_cache_file_path(env=env, home=home)
                 doc = json.loads(cache_file.read_text(encoding="utf-8"))
                 doc["backends"]["agy"]["fetched_at"] = time.time() - (rcc.MODEL_CACHE_TTL_SECONDS + 10)
@@ -287,18 +363,19 @@ class HybridModelProbeAndPresetTests(unittest.TestCase):
                 self.assertEqual(fourth["model_source"], "live_probe")
                 self.assertEqual(mrun.call_count, 3)
 
-    def test_build_recommended_presets_dynamic_and_env_override(self):
+    def test_build_recommended_presets_avoids_same_family_false_heterogeneity(self):
         fake_detected = [
-            {"backend": "codex", "available": True, "supports_effort": True},
-            {"backend": "dsh", "available": True, "supports_effort": False},
-            {"backend": "grok", "available": True, "supports_effort": True},
-            {"backend": "kimi", "available": False, "supports_effort": False},
+            {"backend": "codex", "available": True, "supports_effort": True, "default_model": "gpt-6.2-astra"},
+            {"backend": "agy", "available": True, "supports_effort": True, "default_model": "gemini-4-neon-xhigh"},
+            {"backend": "claude", "available": True, "supports_effort": True, "default_model": "gcp/gemini-4-argon"},
+            {"backend": "grok", "available": True, "supports_effort": True, "default_model": "grok-4.7"},
         ]
         presets = rcc.build_recommended_presets(fake_detected, env={})
         self.assertEqual(len(presets), 3)
-        self.assertEqual(presets[0]["channels"], ["codex@high", "dsh"])
-        self.assertEqual(presets[1]["channels"], ["codex@high", "dsh", "grok@high"])
-        self.assertEqual(presets[2]["channels"], ["codex@low", "dsh"])
+        self.assertEqual(presets[0]["channels"], ["codex@high", "agy@high"])
+        # Preset 2 must skip claude (also gemini) and pick grok (xai) for true 3-family heterogeneity
+        self.assertEqual(presets[1]["channels"], ["codex@high", "agy@high", "grok@high"])
+        self.assertEqual(presets[2]["channels"], ["codex@low", "agy@low"])
 
         env_presets = rcc.build_recommended_presets(
             fake_detected, env={"COLD_CRITIQUE_CHANNELS": "pi:m1@high,pi:m2@high"}
@@ -306,19 +383,25 @@ class HybridModelProbeAndPresetTests(unittest.TestCase):
         self.assertEqual(env_presets[0]["channels"], ["pi:m1@high", "pi:m2@high"])
 
 
-class CliIntegrationTests(unittest.TestCase):
-    def test_dry_run_supports_duplicate_backend_and_argv_warning(self):
+class CliIntegrationAndPersistenceTests(unittest.TestCase):
+    def test_dry_run_profiles_adaptive_timeouts_and_argv_warning(self):
         long_text = "测试正文内容。" * 20000  # > 100 KB UTF-8
         fake_stdin = io.StringIO(long_text)
         fake_stdin.isatty = lambda: False  # type: ignore[attr-defined]
         buf = io.StringIO()
         with mock.patch.object(sys, "stdin", fake_stdin), mock.patch.object(sys, "stdout", buf):
-            rc = rcc.main(["-c", "pi:m1@high", "-c", "pi:m2@low", "-c", "kimi", "--dry-run"])
+            rc = rcc.main(["--profile", "article", "-c", "pi:m1@xhigh", "-c", "agy:demo@max", "-c", "kimi", "--dry-run"])
         self.assertEqual(rc, 0)
         out = json.loads(buf.getvalue())
-        self.assertEqual(out["channels"], ["pi:m1@high", "pi:m2@low", "kimi"])
+        self.assertEqual(out["profile"], "article")
+        self.assertEqual(out["channels"], ["pi:m1@xhigh", "agy:demo@max", "kimi"])
+        self.assertEqual(out["timeouts"], {"pi:m1@xhigh": 600, "agy:demo@max": 900, "kimi": 300})
+        self.assertIn("跨学科概念借用", out["preview_head"])
         self.assertFalse(out["single_channel_warning"])
-        self.assertTrue(any("kimi" in w for w in out["warnings"]))
+        # Only kimi uses argv now; agy uses stream-json stdin so must not warn
+        self.assertEqual(len(out["warnings"]), 1)
+        self.assertIn("通道 'kimi'", out["warnings"][0])
+        self.assertNotIn("通道 'agy'", out["warnings"][0])
 
     def test_env_channels_used_when_cli_channels_omitted(self):
         fake_stdin = io.StringIO("待审正文内容\n")
@@ -331,6 +414,77 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         out = json.loads(buf.getvalue())
         self.assertEqual(out["channels"], ["codex@xhigh", "agy:gemini-4-neon-xhigh"])
+
+    def test_out_dir_atomic_persistence_and_resume_skips_succeeded_channels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = pathlib.Path(tmp) / "run1"
+            target = pathlib.Path(tmp) / "target.md"
+            target.write_text("测试待审命题正文。\n", encoding="utf-8")
+
+            calls: list[tuple[str, int]] = []
+
+            def fake_run_channel(spec: rcc.ChannelSpec, full_prompt: str, timeout_s: int):
+                calls.append((spec.label, timeout_s))
+                if spec.backend == "grok" and len(calls) <= 2:
+                    return rcc._err_result(spec, "timed out after 600s", 600.0)
+                return rcc._ok_result(spec, f"critique from {spec.label}", 12.5)
+
+            with mock.patch.object(rcc, "run_channel", side_effect=fake_run_channel):
+                buf1 = io.StringIO()
+                with mock.patch.object(sys, "stdout", buf1):
+                    rc1 = rcc.main([
+                        "--profile", "code",
+                        "--file", str(target),
+                        "--out-dir", str(out_dir),
+                        "--json",
+                        "-c", "codex@xhigh",
+                        "-c", "grok@xhigh",
+                    ])
+                self.assertEqual(rc1, 0)
+                out1 = json.loads(buf1.getvalue())
+                self.assertTrue((out_dir / "input.md").is_file())
+                self.assertTrue((out_dir / "prompt.txt").is_file())
+                self.assertTrue((out_dir / "summary.json").is_file())
+                self.assertEqual(len(calls), 2)
+                self.assertTrue(out1["results"][0]["ok"])
+                self.assertFalse(out1["results"][1]["ok"])
+
+                # Resume must skip succeeded codex@xhigh and only rerun failed grok@xhigh
+                buf2 = io.StringIO()
+                with mock.patch.object(sys, "stdout", buf2):
+                    rc2 = rcc.main([
+                        "--profile", "code",
+                        "--file", str(target),
+                        "--out-dir", str(out_dir),
+                        "--resume",
+                        "--timeout", "720",
+                        "--json",
+                        "-c", "codex@xhigh",
+                        "-c", "grok@xhigh",
+                    ])
+                self.assertEqual(rc2, 0)
+                out2 = json.loads(buf2.getvalue())
+                self.assertEqual(len(calls), 3)
+                self.assertEqual(calls[2], ("grok@xhigh", 720))
+                self.assertTrue(out2["results"][0]["resumed"])
+                self.assertTrue(out2["results"][1]["ok"])
+                self.assertFalse(out2["results"][1].get("resumed", False))
+
+                # Changing input content must invalidate cache even with --resume
+                target.write_text("修改后的待审正文。\n", encoding="utf-8")
+                buf3 = io.StringIO()
+                with mock.patch.object(sys, "stdout", buf3):
+                    rc3 = rcc.main([
+                        "--profile", "code",
+                        "--file", str(target),
+                        "--out-dir", str(out_dir),
+                        "--resume",
+                        "--json",
+                        "-c", "codex@xhigh",
+                        "-c", "grok@xhigh",
+                    ])
+                self.assertEqual(rc3, 0)
+                self.assertEqual(len(calls), 5)
 
     def test_all_seven_cli_backends_run_in_fresh_empty_workdir_with_utf8(self):
         seen_cwds: list[str] = []
@@ -348,14 +502,18 @@ class CliIntegrationTests(unittest.TestCase):
                 pathlib.Path(out_path).write_text("codex critique", encoding="utf-8")
                 return mock.Mock(returncode=0, stdout="", stderr="")
             if exe_name.startswith("claude"):
+                self.assertIn("--settings", cmd)
                 return mock.Mock(returncode=0, stdout=json.dumps({"result": "claude critique"}), stderr="")
             if exe_name.startswith("agy"):
-                self.assertEqual(kwargs.get("stdin"), rcc.subprocess.DEVNULL)
-                return mock.Mock(
-                    returncode=0,
-                    stdout=json.dumps({"status": "SUCCESS", "response": "agy critique"}),
-                    stderr="",
-                )
+                self.assertIn("--sandbox", cmd)
+                sent = json.loads(kwargs.get("input", ""))
+                self.assertEqual(sent["event"], "user")
+                self.assertEqual(sent["message"]["content"], "prompt")
+                ndjson = "\n".join([
+                    json.dumps({"event": "init", "init": {"model": "gemini-4-neon-xhigh"}}),
+                    json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "agy critique", "duration_seconds": 3.2}}),
+                ])
+                return mock.Mock(returncode=0, stdout=ndjson, stderr="")
             if exe_name.startswith("grok"):
                 self.assertEqual(kwargs.get("stdin"), rcc.subprocess.DEVNULL)
                 pf = cmd[cmd.index("--prompt-file") + 1]
@@ -373,7 +531,7 @@ class CliIntegrationTests(unittest.TestCase):
                 self.assertEqual(kwargs.get("stdin"), rcc.subprocess.DEVNULL)
                 sk = cmd[cmd.index("--skills-dir") + 1]
                 self.assertEqual(os.listdir(sk), [])
-                ndjson = '\n'.join([
+                ndjson = "\n".join([
                     json.dumps({"role": "meta", "type": "system.version"}),
                     json.dumps({"role": "assistant", "content": "kimi critique"}),
                 ])
@@ -387,7 +545,7 @@ class CliIntegrationTests(unittest.TestCase):
 
         with mock.patch("shutil.which", side_effect=lambda b: f"/mock/bin/{b}"), mock.patch(
             "subprocess.run", side_effect=fake_run
-        ):
+        ), mock.patch.object(rcc, "list_codex_enabled_mcp_servers", return_value=[]):
             results = [
                 rcc.run_channel(rcc.parse_channel_spec(ch), "prompt", 30)
                 for ch in ("codex", "claude", "agy", "grok", "pi", "kimi", "dsh")
@@ -403,6 +561,7 @@ class CliIntegrationTests(unittest.TestCase):
             "kimi critique",
             "dsh critique",
         ])
+        self.assertEqual(results[2]["model"], "gemini-4-neon-xhigh")
         self.assertEqual(results[3]["model"], "grok-4.7-build")
         self.assertEqual(len(set(seen_cwds)), 7)
         for d in seen_cwds:
