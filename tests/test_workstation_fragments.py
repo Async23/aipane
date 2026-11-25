@@ -9,6 +9,7 @@ import json
 import os
 import pty
 import re
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -2209,7 +2210,11 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
             )
 
             # --- Part B: Real 3-row tmux-window-wrap stale-screen guard + live cross-row drag ---
-            with tempfile.TemporaryDirectory() as fake_home:
+            fake_home = tempfile.mkdtemp(prefix="aipane-wrap-drag-")
+            w_pid = None
+            w_fd = None
+            wt = None
+            try:
                 bin_dir = Path(fake_home) / ".local" / "bin"
                 bin_dir.mkdir(parents=True)
                 os.symlink(WRAP_BIN, bin_dir / "tmux-window-wrap")
@@ -2226,171 +2231,183 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                         env=wrap_env,
                     )
 
-                w_pid = None
-                w_fd = None
-                try:
-                    wt(
-                        "-f", "/dev/null", "new-session", "-d", "-s", "w",
-                        "-n", "alpha", "-x", "28", "-y", "20", "sleep 120",
+                wt(
+                    "-f", "/dev/null", "new-session", "-d", "-s", "w",
+                    "-n", "alpha", "-x", "28", "-y", "20", "sleep 120",
+                )
+                wt("source-file", str(TMUX_WS))
+                wt("source-file", str(TMUX_WRAP))
+                wt("set-option", "-g", "status-right", "")
+                wt("move-window", "-r", "-t", "w")
+                for name in ("bravo", "charlie", "delta", "echo", "foxtrot"):
+                    wt("new-window", "-d", "-t", "w", "-n", name, "sleep 120")
+                wt("select-window", "-t", "w:1")
+
+                w_pid, w_fd = pty.fork()
+                if w_pid == 0:
+                    termios.tcsetwinsize(0, (20, 28))
+                    os.execvpe(
+                        "tmux", ["tmux", "-L", f"{socket}-wrap", "attach-session", "-t", "w"],
+                        wrap_env,
                     )
-                    wt("source-file", str(TMUX_WS))
-                    wt("source-file", str(TMUX_WRAP))
-                    wt("set-option", "-g", "status-right", "")
-                    wt("move-window", "-r", "-t", "w")
-                    for name in ("bravo", "charlie", "delta", "echo", "foxtrot"):
-                        wt("new-window", "-d", "-t", "w", "-n", name, "sleep 120")
-                    wt("select-window", "-t", "w:1")
+                os.set_blocking(w_fd, False)
 
-                    w_pid, w_fd = pty.fork()
-                    if w_pid == 0:
-                        termios.tcsetwinsize(0, (20, 28))
-                        os.execvpe(
-                            "tmux", ["tmux", "-L", f"{socket}-wrap", "attach-session", "-t", "w"],
-                            wrap_env,
-                        )
-                    os.set_blocking(w_fd, False)
-
-                    def drain_w():
-                        while True:
-                            try:
-                                if not os.read(w_fd, 65536):
-                                    break
-                            except BlockingIOError:
-                                break
-
-                    def wait_w(pred, timeout=4.0):
-                        deadline = time.monotonic() + timeout
-                        while time.monotonic() < deadline:
-                            drain_w()
-                            if pred():
-                                return True
-                            time.sleep(0.03)
-                        return pred()
-
-                    def w_order():
-                        lines = wt("list-windows", "-t", "w", "-F", "#{window_index}\t#{window_name}").stdout.splitlines()
-                        return [(int(i), n) for i, n in (ln.split("\t", 1) for ln in lines)]
-
-                    def w_row(n: int) -> str:
-                        return wt("show-option", "-t", "w", "-qv", f"@tmux-window-wrap-row-{n}").stdout.strip()
-
-                    def label_coords(rows_text: list[str], prefix_width: int = 3) -> dict[int, tuple[int, int]]:
-                        coords: dict[int, tuple[int, int]] = {}
-                        for r_idx in range(3):
-                            expanded = wt(
-                                "display-message", "-p", "-t", "w",
-                                f"#{{E:@tmux-window-wrap-row-{r_idx}}}",
-                            ).stdout.rstrip("\n")
-                            col = (prefix_width + 1) if r_idx == 0 else 1
-                            pos = 0
-                            cur_slot = None
-                            while pos < len(expanded):
-                                if expanded.startswith("#[", pos):
-                                    end = expanded.find("]", pos)
-                                    if end == -1:
-                                        break
-                                    tag = expanded[pos + 2:end]
-                                    if tag.startswith("range=window|"):
-                                        cur_slot = int(tag.split("|", 1)[1])
-                                    elif tag == "norange":
-                                        cur_slot = None
-                                    pos = end + 1
-                                    continue
-                                if cur_slot is not None and cur_slot not in coords and expanded[pos] != " ":
-                                    coords[cur_slot] = (col, 18 + r_idx)
-                                col += 1
-                                pos += 1
-                        return coords
-
-                    self.assertTrue(
-                        wait_w(
-                            lambda: wt("show-option", "-t", "w", "-qv", "status").stdout.strip() == "3"
-                            and all(f"range=window|{i}]" in (w_row(0) + w_row(1) + w_row(2)) for i in range(1, 7)),
-                            timeout=5.0,
-                        ),
-                        f"tmux-window-wrap did not render all 6 slots across 3 rows: status={wt('show-option', '-t', 'w', '-qv', 'status').stdout!r} rows={[w_row(i) for i in range(3)]!r}",
-                    )
-                    # Snapshot the pre-swap rendered rows so we can deterministically exercise
-                    # the stale-screen window where tmux order changed before wrap repaints.
-                    stale_rows = [w_row(0), w_row(1), w_row(2)]
-                    stale_coords = label_coords(stale_rows)
-                    self.assertIn(2, stale_coords)
-                    self.assertIn(4, stale_coords)
-                    self.assertIn(6, stale_coords)
-
-                    # Reorder alpha → echo in tmux, then pin the stale rows briefly (and point
-                    # render key to layout key so the background renderer stays paused for this check).
-                    wt("swap-window", "-d", "-s", "w:=1", "-t", "w:=2", ";",
-                       "swap-window", "-d", "-s", "w:=2", "-t", "w:=3", ";",
-                       "swap-window", "-d", "-s", "w:=3", "-t", "w:=4", ";",
-                       "swap-window", "-d", "-s", "w:=4", "-t", "w:=5")
-                    for r_idx, text in enumerate(stale_rows):
-                        wt("set-option", "-t", "w", f"@tmux-window-wrap-row-{r_idx}", text)
-                    cur_key = wt("display-message", "-p", "-t", "w", "#{E:@tmux-window-wrap-layout-key}").stdout.strip()
-                    wt("set-environment", "-h", "-t", "w", "TMUX_WINDOW_WRAP_RENDER_KEY", cur_key)
-                    wt("refresh-client", "-S")
-                    time.sleep(0.1)
-                    drain_w()
-                    order_before_stale = w_order()
-                    active_before_stale = wt("display-message", "-p", "-t", "w", "#{window_name}").stdout.strip()
-                    self.assertEqual(active_before_stale, "alpha")
-                    # Slot 2 now holds `charlie`, while the stale row still displays `2:bravo`.
-                    # Attempting to drag slot 2 → slot 4 must be ignored (neither move nor switch).
-                    x2, y2 = stale_coords[2]
-                    x4, y4 = stale_coords[4]
-                    os.write(
-                        w_fd,
-                        f"\x1b[<0;{x2};{y2}M\x1b[<32;{x4};{y4}M\x1b[<0;{x4};{y4}m".encode(),
-                    )
-                    time.sleep(0.2)
-                    drain_w()
-                    self.assertEqual(w_order(), order_before_stale, "stale wrap screen allowed wrong-window drag")
-                    self.assertEqual(
-                        wt("display-message", "-p", "-t", "w", "#{window_name}").stdout.strip(),
-                        "alpha",
-                        "stale wrap screen switched active window to wrong slot",
-                    )
-
-                    # Now allow wrap to refresh to the real layout and verify live cross-row drag works!
-                    wt("set-environment", "-h", "-t", "w", "TMUX_WINDOW_WRAP_RENDER_KEY", "stale-trigger")
-                    wt("refresh-client", "-S")
-                    self.assertTrue(
-                        wait_w(
-                            lambda: "#{==:#{window_id}," + wt("display-message", "-p", "-t", "w:=6", "#{window_id}").stdout.strip() + "},#[range=window|6]" in (w_row(0) + w_row(1) + w_row(2))
-                            and "#{==:#{window_id}," + wt("display-message", "-p", "-t", "w:=1", "#{window_id}").stdout.strip() + "},#[range=window|1]" in (w_row(0) + w_row(1) + w_row(2)),
-                            timeout=4.0,
-                        ),
-                        "tmux-window-wrap did not refresh after reorder",
-                    )
-                    fresh_coords = label_coords([w_row(0), w_row(1), w_row(2)])
-                    x1, y1 = fresh_coords[1]
-                    x6, y6 = fresh_coords[6]
-                    self.assertNotEqual(y1, y6, f"expected slot 1 and slot 6 on different rows: {fresh_coords}")
-                    time.sleep(0.35)
-                    os.write(
-                        w_fd,
-                        f"\x1b[<0;{x6};{y6}M\x1b[<32;{x1};{y1}M\x1b[<0;{x1};{y1}m".encode(),
-                    )
-                    self.assertTrue(
-                        wait_w(
-                            lambda: w_order() == [
-                                (1, "foxtrot"), (2, "bravo"), (3, "charlie"),
-                                (4, "delta"), (5, "echo"), (6, "alpha"),
-                            ],
-                            timeout=3.0,
-                        ),
-                        f"real 3-row wrap cross-row drag failed, got {w_order()}",
-                    )
-                finally:
-                    if w_fd is not None:
-                        os.close(w_fd)
-                    if w_pid is not None:
+                def drain_w():
+                    while True:
                         try:
-                            os.kill(w_pid, signal.SIGHUP)
-                        except ProcessLookupError:
-                            pass
-                        os.waitpid(w_pid, 0)
+                            if not os.read(w_fd, 65536):
+                                break
+                        except BlockingIOError:
+                            break
+
+                def wait_w(pred, timeout=4.0):
+                    deadline = time.monotonic() + timeout
+                    while time.monotonic() < deadline:
+                        drain_w()
+                        if pred():
+                            return True
+                        time.sleep(0.03)
+                    return pred()
+
+                def w_order():
+                    lines = wt("list-windows", "-t", "w", "-F", "#{window_index}\t#{window_name}").stdout.splitlines()
+                    return [(int(i), n) for i, n in (ln.split("\t", 1) for ln in lines)]
+
+                def w_row(n: int) -> str:
+                    return wt("show-option", "-t", "w", "-qv", f"@tmux-window-wrap-row-{n}").stdout.strip()
+
+                def label_coords(rows_text: list[str], prefix_width: int = 3) -> dict[int, tuple[int, int]]:
+                    coords: dict[int, tuple[int, int]] = {}
+                    for r_idx in range(3):
+                        expanded = wt(
+                            "display-message", "-p", "-t", "w",
+                            f"#{{E:@tmux-window-wrap-row-{r_idx}}}",
+                        ).stdout.rstrip("\n")
+                        col = (prefix_width + 1) if r_idx == 0 else 1
+                        pos = 0
+                        cur_slot = None
+                        while pos < len(expanded):
+                            if expanded.startswith("#[", pos):
+                                end = expanded.find("]", pos)
+                                if end == -1:
+                                    break
+                                tag = expanded[pos + 2:end]
+                                if tag.startswith("range=window|"):
+                                    cur_slot = int(tag.split("|", 1)[1])
+                                elif tag == "norange":
+                                    cur_slot = None
+                                pos = end + 1
+                                continue
+                            if cur_slot is not None and cur_slot not in coords and expanded[pos] != " ":
+                                coords[cur_slot] = (col, 18 + r_idx)
+                            col += 1
+                            pos += 1
+                    return coords
+
+                self.assertTrue(
+                    wait_w(
+                        lambda: wt("show-option", "-t", "w", "-qv", "status").stdout.strip() == "3"
+                        and all(f"range=window|{i}]" in (w_row(0) + w_row(1) + w_row(2)) for i in range(1, 7)),
+                        timeout=5.0,
+                    ),
+                    f"tmux-window-wrap did not render all 6 slots across 3 rows: status={wt('show-option', '-t', 'w', '-qv', 'status').stdout!r} rows={[w_row(i) for i in range(3)]!r}",
+                )
+                # Snapshot the pre-swap rendered rows so we can deterministically exercise
+                # the stale-screen window where tmux order changed before wrap repaints.
+                stale_rows = [w_row(0), w_row(1), w_row(2)]
+                stale_coords = label_coords(stale_rows)
+                self.assertIn(2, stale_coords)
+                self.assertIn(4, stale_coords)
+                self.assertIn(6, stale_coords)
+
+                # Reorder alpha → echo in tmux, then pin the stale rows briefly (and point
+                # render key to layout key so the background renderer stays paused for this check).
+                wt("swap-window", "-d", "-s", "w:=1", "-t", "w:=2", ";",
+                   "swap-window", "-d", "-s", "w:=2", "-t", "w:=3", ";",
+                   "swap-window", "-d", "-s", "w:=3", "-t", "w:=4", ";",
+                   "swap-window", "-d", "-s", "w:=4", "-t", "w:=5")
+                for r_idx, text in enumerate(stale_rows):
+                    wt("set-option", "-t", "w", f"@tmux-window-wrap-row-{r_idx}", text)
+                cur_key = wt("display-message", "-p", "-t", "w", "#{E:@tmux-window-wrap-layout-key}").stdout.strip()
+                wt("set-environment", "-h", "-t", "w", "TMUX_WINDOW_WRAP_RENDER_KEY", cur_key)
+                wt("refresh-client", "-S")
+                time.sleep(0.1)
+                drain_w()
+                order_before_stale = w_order()
+                active_before_stale = wt("display-message", "-p", "-t", "w", "#{window_name}").stdout.strip()
+                self.assertEqual(active_before_stale, "alpha")
+                # Slot 2 now holds `charlie`, while the stale row still displays `2:bravo`.
+                # Attempting to drag slot 2 → slot 4 must be ignored (neither move nor switch).
+                x2, y2 = stale_coords[2]
+                x4, y4 = stale_coords[4]
+                os.write(
+                    w_fd,
+                    f"\x1b[<0;{x2};{y2}M\x1b[<32;{x4};{y4}M\x1b[<0;{x4};{y4}m".encode(),
+                )
+                time.sleep(0.2)
+                drain_w()
+                self.assertEqual(w_order(), order_before_stale, "stale wrap screen allowed wrong-window drag")
+                self.assertEqual(
+                    wt("display-message", "-p", "-t", "w", "#{window_name}").stdout.strip(),
+                    "alpha",
+                    "stale wrap screen switched active window to wrong slot",
+                )
+
+                # Now allow wrap to refresh to the real layout and verify live cross-row drag works!
+                wt("set-environment", "-h", "-t", "w", "TMUX_WINDOW_WRAP_RENDER_KEY", "stale-trigger")
+                wt("refresh-client", "-S")
+                self.assertTrue(
+                    wait_w(
+                        lambda: "#{==:#{window_id}," + wt("display-message", "-p", "-t", "w:=6", "#{window_id}").stdout.strip() + "},#[range=window|6]" in (w_row(0) + w_row(1) + w_row(2))
+                        and "#{==:#{window_id}," + wt("display-message", "-p", "-t", "w:=1", "#{window_id}").stdout.strip() + "},#[range=window|1]" in (w_row(0) + w_row(1) + w_row(2)),
+                        timeout=4.0,
+                    ),
+                    "tmux-window-wrap did not refresh after reorder",
+                )
+                fresh_coords = label_coords([w_row(0), w_row(1), w_row(2)])
+                x1, y1 = fresh_coords[1]
+                x6, y6 = fresh_coords[6]
+                self.assertNotEqual(y1, y6, f"expected slot 1 and slot 6 on different rows: {fresh_coords}")
+                time.sleep(0.35)
+                os.write(
+                    w_fd,
+                    f"\x1b[<0;{x6};{y6}M\x1b[<32;{x1};{y1}M\x1b[<0;{x1};{y1}m".encode(),
+                )
+                self.assertTrue(
+                    wait_w(
+                        lambda: w_order() == [
+                            (1, "foxtrot"), (2, "bravo"), (3, "charlie"),
+                            (4, "delta"), (5, "echo"), (6, "alpha"),
+                        ],
+                        timeout=3.0,
+                    ),
+                    f"real 3-row wrap cross-row drag failed, got {w_order()}",
+                )
+            finally:
+                if w_fd is not None:
+                    os.close(w_fd)
+                if w_pid is not None:
+                    try:
+                        os.kill(w_pid, signal.SIGHUP)
+                    except ProcessLookupError:
+                        pass
+                    os.waitpid(w_pid, 0)
+                if wt is not None:
                     wt("kill-server", check=False)
+                # Detached run-shell tmux-window-wrap children can still flush state
+                # files into fake_home/.local/state/aipane briefly after kill-server.
+                cleanup_deadline = time.monotonic() + 2.0
+                while Path(fake_home).exists():
+                    try:
+                        shutil.rmtree(fake_home)
+                        break
+                    except FileNotFoundError:
+                        break
+                    except OSError:
+                        if time.monotonic() >= cleanup_deadline:
+                            shutil.rmtree(fake_home, ignore_errors=True)
+                            break
+                        time.sleep(0.05)
         finally:
             for pid, fd in procs:
                 try:
