@@ -70,6 +70,7 @@ ln -sf "$AIPANE_ROOT/bin/tmux-session-picker" ~/.local/bin/tmux-session-picker
 ln -sf "$AIPANE_ROOT/bin/tmux-close-window-popup" ~/.local/bin/tmux-close-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
 ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
+ln -sf "$AIPANE_ROOT/bin/tmux-layout-cycle" ~/.local/bin/tmux-layout-cycle
 ln -sf "$AIPANE_ROOT/bin/tmux-pane-sync" ~/.local/bin/tmux-pane-sync
 ln -sf "$AIPANE_ROOT/bin/aipane-activity" ~/.local/bin/aipane-activity
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
@@ -103,6 +104,7 @@ source-file ~/.aipane/conf/tmux-window-wrap.conf
 | `bin/tmux-session-picker` | 交互式 AI 会话与窗格拾取器弹窗（`Cmd+Opt+P` / `prefix+Q`） |
 | `bin/tmux-colour-palette` | 终端索引色表（`0–255`） |
 | `bin/tmux-window-jump` | 同数字连按、精确 index 的窗口选择器 |
+| `bin/tmux-layout-cycle` | 3 态布局循环与 4+ 窗格列优先网格切换器（`prefix Space`） |
 | `bin/tmux-pane-sync` | pane 级 `synchronize-panes` 子集广播与无弹窗数字直选控制器 |
 | `bin/tmux-window-wrap` | 渲染 CLI |
 | `bin/aipane-activity` | Agent Activity CLI |

@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""Cycle curated tmux window layouts with a column-major grid for 4+ panes.
+
+Layout cycle:
+  - 2 panes: even-horizontal <-> tiled (top-bottom)
+  - 3 panes: main-vertical -> tiled (2 top, 1 bottom) -> even-horizontal
+  - 4+ panes: main-vertical -> column-major grid -> even-horizontal
+
+For 4+ panes, the grid uses cols = ceil(sqrt(n)) columns and distributes panes
+evenly across columns (left columns receive any remainder, keeping column
+heights within 1 pane of each other) in current pane-index order (top-to-bottom
+within each column, then left-to-right across columns):
+  - 4 panes: [2, 2]       -> 1/2 | 3/4
+  - 5 panes: [2, 2, 1]    -> 1/2 | 3/4 | 5
+  - 6 panes: [2, 2, 2]    -> 1/2 | 3/4 | 5/6
+  - 7 panes: [3, 2, 2]    -> 1/2/3 | 4/5 | 6/7
+  - 8 panes: [3, 3, 2]    -> 1/2/3 | 4/5/6 | 7/8
+  - 9 panes: [3, 3, 3]    -> 1/2/3 | 4/5/6 | 7/8/9
+
+State detection inspects the layout tree structure (ignoring pane dimensions),
+so manually resized layouts still advance to the next state in the cycle. Any
+layout outside the curated three states (including row-major tiled or custom
+nested splits) normalizes directly to the grid state (tiled for 3 panes,
+column-major grid for 4+ panes).
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+
+WINDOW_ID_RE = re.compile(r"^@[0-9]+$")
+PANE_ID_RE = re.compile(r"^%([0-9]+)$")
+V1_PREFIX_RE = re.compile(r"^[0-9a-fA-F]{4},")
+V1_GEOM_RE = re.compile(r"([0-9]+)x([0-9]+),([0-9]+),([0-9]+)")
+V1_INT_RE = re.compile(r"[0-9]+")
+SEP = "\x1f"
+
+
+@dataclass(frozen=True)
+class LayoutNode:
+    kind: str  # "p", "h", or "v"
+    children: tuple["LayoutNode", ...] = ()
+
+
+def tmux_bin() -> str:
+    return os.environ.get("AIPANE_TMUX_BIN", "tmux")
+
+
+def run_tmux(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [tmux_bin(), *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _parse_v2_node(raw: object) -> LayoutNode | None:
+    if not isinstance(raw, dict):
+        return None
+    kind = raw.get("t")
+    if kind == "p":
+        return LayoutNode("p")
+    if kind in ("h", "v"):
+        raw_children = raw.get("c")
+        if not isinstance(raw_children, list) or not raw_children:
+            return None
+        children: list[LayoutNode] = []
+        for item in raw_children:
+            child = _parse_v2_node(item)
+            if child is None:
+                return None
+            children.append(child)
+        return LayoutNode(kind, tuple(children))
+    return None
+
+
+def _parse_v1_node(text: str, pos: int) -> tuple[LayoutNode | None, int]:
+    match = V1_GEOM_RE.match(text, pos)
+    if not match:
+        return None, pos
+    pos = match.end()
+    if pos >= len(text):
+        return None, pos
+    marker = text[pos]
+    if marker == ",":
+        pos += 1
+        id_match = V1_INT_RE.match(text, pos)
+        if not id_match:
+            return None, pos
+        return LayoutNode("p"), id_match.end()
+    if marker in ("{", "["):
+        kind = "h" if marker == "{" else "v"
+        closing = "}" if marker == "{" else "]"
+        pos += 1
+        children: list[LayoutNode] = []
+        while True:
+            child, pos = _parse_v1_node(text, pos)
+            if child is None:
+                return None, pos
+            children.append(child)
+            if pos >= len(text):
+                return None, pos
+            sep = text[pos]
+            if sep == ",":
+                pos += 1
+                continue
+            if sep == closing:
+                return LayoutNode(kind, tuple(children)), pos + 1
+            return None, pos
+    return None, pos
+
+
+def parse_layout(layout: str) -> LayoutNode | None:
+    stripped = layout.strip()
+    if not stripped:
+        return None
+    if stripped.startswith("{"):
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return _parse_v2_node(payload.get("L"))
+    prefix = V1_PREFIX_RE.match(stripped)
+    if not prefix:
+        return None
+    node, end = _parse_v1_node(stripped, prefix.end())
+    if node is None or end != len(stripped):
+        return None
+    return node
+
+
+def column_counts(pane_count: int) -> list[int]:
+    if pane_count <= 0:
+        return []
+    cols = math.isqrt(pane_count)
+    if cols * cols < pane_count:
+        cols += 1
+    base, rem = divmod(pane_count, cols)
+    return [base + (1 if idx < rem else 0) for idx in range(cols)]
+
+
+def _all_leaves(nodes: tuple[LayoutNode, ...]) -> bool:
+    return all(node.kind == "p" for node in nodes)
+
+
+def is_column_tiled(root: LayoutNode, pane_count: int) -> bool:
+    if pane_count < 4 or root.kind != "h":
+        return False
+    expected = column_counts(pane_count)
+    if len(root.children) != len(expected):
+        return False
+    for child, count in zip(root.children, expected):
+        if count == 1:
+            if child.kind != "p":
+                return False
+        else:
+            if child.kind != "v" or len(child.children) != count or not _all_leaves(child.children):
+                return False
+    return True
+
+
+def classify_layout(root: LayoutNode | None, pane_count: int) -> str:
+    if root is None or pane_count <= 1:
+        return "other"
+
+    if pane_count == 2:
+        if root.kind == "h" and len(root.children) == 2 and _all_leaves(root.children):
+            return "even-horizontal"
+        if root.kind == "v" and len(root.children) == 2 and _all_leaves(root.children):
+            return "tiled"
+        return "other"
+
+    if root.kind == "h" and len(root.children) == pane_count and _all_leaves(root.children):
+        return "even-horizontal"
+
+    if (
+        root.kind == "h"
+        and len(root.children) == 2
+        and root.children[0].kind == "p"
+        and root.children[1].kind == "v"
+        and len(root.children[1].children) == pane_count - 1
+        and _all_leaves(root.children[1].children)
+    ):
+        return "main-vertical"
+
+    if pane_count == 3:
+        if (
+            root.kind == "v"
+            and len(root.children) == 2
+            and root.children[0].kind == "h"
+            and len(root.children[0].children) == 2
+            and _all_leaves(root.children[0].children)
+            and root.children[1].kind == "p"
+        ):
+            return "tiled"
+        return "other"
+
+    if is_column_tiled(root, pane_count):
+        return "column-tiled"
+
+    return "other"
+
+
+def next_target(current: str, pane_count: int) -> str | None:
+    if pane_count <= 1:
+        return None
+    if pane_count == 2:
+        return "tiled" if current == "even-horizontal" else "even-horizontal"
+    if pane_count == 3:
+        if current == "even-horizontal":
+            return "main-vertical"
+        if current == "main-vertical":
+            return "tiled"
+        if current == "tiled":
+            return "even-horizontal"
+        return "tiled"
+    if current == "even-horizontal":
+        return "main-vertical"
+    if current == "main-vertical":
+        return "column-tiled"
+    if current == "column-tiled":
+        return "even-horizontal"
+    return "column-tiled"
+
+
+def layout_checksum(body: str) -> str:
+    csum = 0
+    for byte in body.encode("ascii"):
+        csum = ((csum >> 1) | ((csum & 1) << 15)) & 0xFFFF
+        csum = (csum + byte) & 0xFFFF
+    return f"{csum:04x}"
+
+
+def split_span(total: int, count: int) -> list[int] | None:
+    if count <= 0:
+        return None
+    usable = total - (count - 1)
+    if usable < count:
+        return None
+    base, rem = divmod(usable, count)
+    return [base + (1 if idx < rem else 0) for idx in range(count)]
+
+
+def build_column_tiled_v1(width: int, height: int, pane_ids: list[int]) -> str | None:
+    pane_count = len(pane_ids)
+    if pane_count < 4 or width <= 0 or height <= 0:
+        return None
+    counts = column_counts(pane_count)
+    col_widths = split_span(width, len(counts))
+    if col_widths is None:
+        return None
+
+    col_parts: list[str] = []
+    x = 0
+    offset = 0
+    for col_w, row_count in zip(col_widths, counts):
+        if row_count == 1:
+            pid = pane_ids[offset]
+            offset += 1
+            col_parts.append(f"{col_w}x{height},{x},0,{pid}")
+        else:
+            row_heights = split_span(height, row_count)
+            if row_heights is None:
+                return None
+            row_parts: list[str] = []
+            y = 0
+            for row_h in row_heights:
+                pid = pane_ids[offset]
+                offset += 1
+                row_parts.append(f"{col_w}x{row_h},{x},{y},{pid}")
+                y += row_h + 1
+            col_parts.append(f"{col_w}x{height},{x},0[{','.join(row_parts)}]")
+        x += col_w + 1
+
+    body = f"{width}x{height},0,0{{{','.join(col_parts)}}}"
+    return f"{layout_checksum(body)},{body}"
+
+
+def query_window_state(window_id: str) -> tuple[int, int, str, list[int]] | None:
+    meta = run_tmux(
+        "display-message",
+        "-p",
+        "-t",
+        window_id,
+        f"#{{window_width}}{SEP}#{{window_height}}{SEP}#{{window_layout}}",
+    )
+    if meta.returncode != 0:
+        return None
+    parts = meta.stdout.rstrip("\r\n").split(SEP, 2)
+    if len(parts) != 3:
+        return None
+    try:
+        width = int(parts[0])
+        height = int(parts[1])
+    except ValueError:
+        return None
+    layout = parts[2]
+
+    panes_proc = run_tmux(
+        "list-panes",
+        "-t",
+        window_id,
+        "-F",
+        f"#{{pane_index}}{SEP}#{{pane_id}}",
+    )
+    if panes_proc.returncode != 0:
+        return None
+    indexed_panes: list[tuple[int, int]] = []
+    for line in panes_proc.stdout.splitlines():
+        cols = line.split(SEP, 1)
+        if len(cols) != 2:
+            continue
+        match = PANE_ID_RE.match(cols[1].strip())
+        if not match:
+            continue
+        try:
+            pane_index = int(cols[0])
+        except ValueError:
+            continue
+        indexed_panes.append((pane_index, int(match.group(1))))
+    indexed_panes.sort(key=lambda item: item[0])
+    pane_ids = [pid for _, pid in indexed_panes]
+    return width, height, layout, pane_ids
+
+
+def cycle_window(window_id: str) -> int:
+    if not WINDOW_ID_RE.match(window_id):
+        return 1
+    state = query_window_state(window_id)
+    if state is None:
+        return 1
+    width, height, layout, pane_ids = state
+    pane_count = len(pane_ids)
+    if pane_count <= 1:
+        return 0
+
+    current = classify_layout(parse_layout(layout), pane_count)
+    target = next_target(current, pane_count)
+    if target is None:
+        return 0
+
+    if target == "column-tiled":
+        custom = build_column_tiled_v1(width, height, pane_ids)
+        if custom is not None:
+            applied = run_tmux("select-layout", "-t", window_id, custom)
+            if applied.returncode == 0:
+                return 0
+        fallback = run_tmux("select-layout", "-t", window_id, "tiled")
+        return 0 if fallback.returncode == 0 else 1
+
+    applied = run_tmux("select-layout", "-t", window_id, target)
+    return 0 if applied.returncode == 0 else 1
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        sys.stderr.write("usage: tmux-layout-cycle <window_id>\n")
+        return 2
+    return cycle_window(argv[1])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

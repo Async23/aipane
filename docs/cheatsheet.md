@@ -97,7 +97,7 @@ otherwise `10`, but does not advance on repeats.
 |-----|--------|
 | `prefix \|` or `\` | split left-right |
 | `prefix -` | split top-bottom |
-| `prefix Space` | cycle `main-vertical` (50%) → `tiled` → `even-horizontal` (2 panes: L-R ↔ T-B) |
+| `prefix Space` | cycle `main-vertical` (50%) → grid (`tiled` for 3 panes; column-major `cols = ceil(sqrt(n))` grid for 4+ panes via `tmux-layout-cycle`, e.g. `1/2 \| 3/4`) → `even-horizontal` (2 panes: L-R ↔ T-B) |
 
 ## Resize (no prefix)
 

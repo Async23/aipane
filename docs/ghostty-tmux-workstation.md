@@ -24,6 +24,7 @@ Optional terminal shell for multi-agent CLI work. **Not** loaded by `init.zsh`.
 | `bin/tmux-close-window-popup` | stable-target close confirmation with mouse and keyboard input |
 | `bin/tmux-colour-palette` | indexed terminal colour palette (`0–255`) |
 | `bin/tmux-window-jump` | repeated-digit exact-index window selector |
+| `bin/tmux-layout-cycle` | curated 3-way layout cycler with column-major grid for 4+ panes (`prefix Space`) |
 | `bin/tmux-pane-sync` | per-pane `synchronize-panes` controller & no-popup numeric `sync-pick` |
 | `bin/aipane-activity` | Agent Activity CLI |
 | `bin/tmux-window-wrap` | renderer (symlink to `~/.local/bin`) |
@@ -41,6 +42,7 @@ ln -sf "$AIPANE_ROOT/bin/tmux-session-picker" ~/.local/bin/tmux-session-picker
 ln -sf "$AIPANE_ROOT/bin/tmux-close-window-popup" ~/.local/bin/tmux-close-window-popup
 ln -sf "$AIPANE_ROOT/bin/tmux-colour-palette" ~/.local/bin/tmux-colour-palette
 ln -sf "$AIPANE_ROOT/bin/tmux-window-jump" ~/.local/bin/tmux-window-jump
+ln -sf "$AIPANE_ROOT/bin/tmux-layout-cycle" ~/.local/bin/tmux-layout-cycle
 ln -sf "$AIPANE_ROOT/bin/tmux-pane-sync" ~/.local/bin/tmux-pane-sync
 ln -sf "$AIPANE_ROOT/bin/aipane-activity" ~/.local/bin/aipane-activity
 ln -sf "$AIPANE_ROOT/bin/tmux-window-wrap" ~/.local/bin/tmux-window-wrap
