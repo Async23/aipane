@@ -7,9 +7,10 @@ closed disk sessions without blocking initial input.
 
 Actions:
   Enter    Inject selected reference(s) safely into origin pane via bracketed
-           paste (single: '<agent>:<sid>'; multi: '<agent>:<sid> (<loc>) ...')
+           paste (default: '<agent>:<sid>'; raw after Ctrl+F: '<sid>')
   Tab      Toggle multi-select
-  Ctrl+Y   Copy '<agent>:<sid>' ref(s) to macOS clipboard + tmux paste buffer
+  Ctrl+F   Toggle output format between '<agent>:<sid>' and raw '<sid>'
+  Ctrl+Y   Copy ref(s) or raw sid(s) to macOS clipboard + tmux paste buffer
   Ctrl+G   Jump focus to the selected live tmux pane
   Esc      Cancel without side effects
 """
@@ -22,6 +23,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -76,7 +78,16 @@ def _clip(text: str, limit: int) -> str:
     return clean[: limit - 1] + "…"
 
 
-def _pane_sort_key(p: live_sessions.LivePaneSession) -> tuple[str, int, int, str]:
+def _spatial_sort_key(p: live_sessions.LivePaneSession) -> tuple[int, int, int, str]:
+    """Order panes visually top-to-bottom, left-to-right within a window."""
+    try:
+        pane_num = int(p.pane_index)
+    except ValueError:
+        pane_num = 99999
+    return (p.pane_top, p.pane_left, pane_num, p.pane_id)
+
+
+def _pane_sort_key(p: live_sessions.LivePaneSession) -> tuple[str, int, int, int, int, str]:
     try:
         win_num = int(p.window_index)
     except ValueError:
@@ -85,7 +96,7 @@ def _pane_sort_key(p: live_sessions.LivePaneSession) -> tuple[str, int, int, str
         pane_num = int(p.pane_index)
     except ValueError:
         pane_num = 99999
-    return (p.session_name, win_num, pane_num, p.pane_id)
+    return (p.session_name, win_num, p.pane_top, p.pane_left, pane_num, p.pane_id)
 
 
 def format_live_row(
@@ -137,28 +148,29 @@ def format_disk_row(entry: dict[str, Any], now_ts: float) -> str:
     return "\t".join(("disk", "-", tag, sid, loc_tag, display))
 
 
-def format_injection_payload(rows: list[list[str]]) -> str:
-    """Format Option B (human+machine readable):
+def format_injection_payload(rows: list[list[str]], *, raw: bool = False) -> str:
+    """Format uniform refs ('<agent>:<sid>') or raw sids ('<sid>') for single-line paste.
 
-    - Single selection: '<agent>:<sid>'
-    - Multi selection:  single-line space-separated '<agent>:<sid> (<loc>)'
-      so multi-pane handoffs never embed newlines that could submit a TUI prompt.
+    Emits space-separated tokens without embedded newlines so multi-pane handoffs
+    never submit a TUI prompt prematurely. When raw=True, outputs the verbatim
+    session_id field (preserving storage-domain prefixes such as 'ide/<uuid>').
     """
-    valid = [r for r in rows if len(r) >= 5 and r[2] and r[3]]
-    if not valid:
-        return ""
-    if len(valid) == 1:
-        _, _, tag, sid, _ = valid[0][:5]
-        return f"{tag}:{sid}"
     parts: list[str] = []
-    for row in valid:
-        _, _, tag, sid, loc = row[:5]
-        parts.append(f"{tag}:{sid} ({loc})" if loc else f"{tag}:{sid}")
-    return "  ".join(parts)
+    for row in rows:
+        if len(row) < 4:
+            continue
+        tag, sid = row[2], row[3]
+        if not sid:
+            continue
+        if raw:
+            parts.append(sid)
+        elif tag:
+            parts.append(f"{tag}:{sid}")
+    return " ".join(parts)
 
 
-def format_copy_payload(rows: list[list[str]]) -> str:
-    """Format newline-separated '<agent>:<sid>' refs for clipboard copy."""
+def format_copy_payload(rows: list[list[str]], *, raw: bool = False) -> str:
+    """Format newline-separated '<agent>:<sid>' refs or verbatim '<sid>' values for clipboard copy."""
     refs: list[str] = []
     for row in rows:
         if len(row) < 4:
@@ -166,7 +178,10 @@ def format_copy_payload(rows: list[list[str]]) -> str:
         tag, sid = row[2], row[3]
         if not sid:
             continue
-        refs.append(f"{tag}:{sid}" if tag else sid)
+        if raw:
+            refs.append(sid)
+        else:
+            refs.append(f"{tag}:{sid}" if tag else sid)
     return "\n".join(refs)
 
 
@@ -238,8 +253,7 @@ def _stream_candidates(
     seen_live: set[tuple[str, str]] = set()
     try:
         live = live_sessions.list_live_panes(only_agents=True, environment=env)
-        in_win_siblings: list[live_sessions.LivePaneSession] = []
-        in_win_self: list[live_sessions.LivePaneSession] = []
+        in_win: list[live_sessions.LivePaneSession] = []
         other_win: list[live_sessions.LivePaneSession] = []
 
         for item in live:
@@ -247,20 +261,16 @@ def _stream_candidates(
                 continue
             seen_live.add((item.agent, item.session_id))
             if origin_window and item.window_id == origin_window:
-                if origin_pane and item.pane_id == origin_pane:
-                    in_win_self.append(item)
-                else:
-                    in_win_siblings.append(item)
+                in_win.append(item)
             else:
                 other_win.append(item)
 
-        in_win_siblings.sort(key=_pane_sort_key)
+        in_win.sort(key=_spatial_sort_key)
         other_win.sort(key=_pane_sort_key)
 
-        for item in in_win_siblings:
-            stream.write(format_live_row(item, in_origin_window=True, is_origin_pane=False) + "\n")
-        for item in in_win_self:
-            stream.write(format_live_row(item, in_origin_window=True, is_origin_pane=True) + "\n")
+        for item in in_win:
+            is_self = bool(origin_pane and item.pane_id == origin_pane)
+            stream.write(format_live_row(item, in_origin_window=True, is_origin_pane=is_self) + "\n")
         for item in other_win:
             stream.write(format_live_row(item, in_origin_window=False, is_origin_pane=False) + "\n")
         stream.flush()
@@ -314,58 +324,76 @@ def main() -> int:
 
     columns = shutil.get_terminal_size((120, 30)).columns
     preview_window = "right:48%:wrap:border-left" if columns >= 100 else "down:42%:wrap:border-top"
-    footer = "Enter Inject · Tab Multi · ^Y Copy Ref · ^G Jump · Esc Cancel"
+    footer_ref = "Enter Inject (agent:sid) · ^Y Copy · ^F Format · Tab Multi · ^G Jump · Esc"
+    footer_raw = "Enter Inject (sid) · ^Y Copy (sid) · ^F Format · Tab Multi · ^G Jump · Esc"
 
-    fzf_env = env.copy()
-    fzf_env.pop("FZF_DEFAULT_OPTS", None)
-    fzf_env.pop("FZF_DEFAULT_OPTS_FILE", None)
+    with tempfile.TemporaryDirectory(prefix="aipane-picker-") as tmp_dir:
+        raw_flag = Path(tmp_dir) / "raw"
+        raw_flag_q = shlex.quote(str(raw_flag))
+        toggle_fmt_cmd = (
+            f"if [ -f {raw_flag_q} ]; then "
+            f"rm -f {raw_flag_q}; "
+            f"printf '%s' {shlex.quote(f'change-prompt(› )+change-footer({footer_ref})')}; "
+            f"else "
+            f": > {raw_flag_q}; "
+            f"printf '%s' {shlex.quote(f'change-prompt([RAW] › )+change-footer({footer_raw})')}; "
+            f"fi"
+        )
 
-    fzf_args = [
-        fzf_bin,
-        "--ansi",
-        "--multi",
-        "--layout=reverse",
-        "--border=none",
-        "--info=inline-right",
-        "--delimiter=\t",
-        "--with-nth=6",
-        "--prompt=› ",
-        "--pointer=▸",
-        "--marker=✓",
-        f"--footer={footer}",
-        "--footer-border=none",
-        "--expect=ctrl-y,ctrl-g",
-        "--bind=esc:abort,ctrl-u:clear-query,tab:toggle+down,btab:toggle+up",
-        f"--preview={preview_cmd}",
-        f"--preview-window={preview_window}",
-    ]
+        fzf_env = env.copy()
+        fzf_env.pop("FZF_DEFAULT_OPTS", None)
+        fzf_env.pop("FZF_DEFAULT_OPTS_FILE", None)
+        fzf_env["AIPANE_PICKER_RAW_FLAG"] = str(raw_flag)
 
-    proc = subprocess.Popen(
-        fzf_args,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        text=True,
-        env=fzf_env,
-    )
-    assert proc.stdin is not None and proc.stdout is not None
+        fzf_args = [
+            fzf_bin,
+            "--ansi",
+            "--multi",
+            "--layout=reverse",
+            "--border=none",
+            "--info=inline-right",
+            "--delimiter=\t",
+            "--with-nth=6",
+            "--prompt=› ",
+            "--pointer=▸",
+            "--marker=✓",
+            f"--footer={footer_ref}",
+            "--footer-border=none",
+            "--with-shell=/bin/sh -c",
+            "--expect=ctrl-y,ctrl-g",
+            "--bind=esc:abort,ctrl-u:clear-query,tab:toggle+down,btab:toggle+up",
+            f"--bind=ctrl-f:transform:{toggle_fmt_cmd}",
+            f"--preview={preview_cmd}",
+            f"--preview-window={preview_window}",
+        ]
 
-    include_disk = env.get("AIPANE_PICKER_SKIP_DISK", "0") != "1"
-    feeder = threading.Thread(
-        target=_stream_candidates,
-        kwargs={
-            "stream": proc.stdin,
-            "origin_pane": origin_pane,
-            "origin_window": origin_window,
-            "env": env,
-            "include_disk": include_disk,
-        },
-        daemon=True,
-    )
-    feeder.start()
+        proc = subprocess.Popen(
+            fzf_args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            env=fzf_env,
+        )
+        assert proc.stdin is not None and proc.stdout is not None
 
-    stdout_text = proc.stdout.read()
-    returncode = proc.wait()
-    feeder.join(timeout=0.5)
+        include_disk = env.get("AIPANE_PICKER_SKIP_DISK", "0") != "1"
+        feeder = threading.Thread(
+            target=_stream_candidates,
+            kwargs={
+                "stream": proc.stdin,
+                "origin_pane": origin_pane,
+                "origin_window": origin_window,
+                "env": env,
+                "include_disk": include_disk,
+            },
+            daemon=True,
+        )
+        feeder.start()
+
+        stdout_text = proc.stdout.read()
+        returncode = proc.wait()
+        feeder.join(timeout=0.5)
+        raw_mode = raw_flag.is_file()
 
     if returncode in (1, 130):
         return 0
@@ -389,7 +417,7 @@ def main() -> int:
         return 0
 
     if action_key == "ctrl-y":
-        copy_text = format_copy_payload(selected_rows)
+        copy_text = format_copy_payload(selected_rows, raw=raw_mode)
         if not copy_text:
             return 0
         sinks = live_sessions.copy_text_to_clipboard(copy_text, environment=env)
@@ -400,13 +428,17 @@ def main() -> int:
             row = selected_rows[0]
             sid = row[3]
             short_sid = f"{sid[:8]}…{sid[-4:]}" if len(sid) > 15 else sid
-            _display_message(env, f"Copied [{row[2]} · {row[4]}] {short_sid}")
+            if raw_mode:
+                _display_message(env, f"Copied {short_sid} (raw) [{row[2]} · {row[4]}]")
+            else:
+                _display_message(env, f"Copied {row[2]}:{short_sid} [{row[4]}]")
         else:
-            _display_message(env, f"Copied {len(selected_rows)} session refs")
+            label = "raw session IDs" if raw_mode else "session refs"
+            _display_message(env, f"Copied {len(selected_rows)} {label}")
         return 0
 
-    # Default action (Enter): inject Option B format safely into origin pane.
-    payload = format_injection_payload(selected_rows)
+    # Default action (Enter): inject refs (or raw sids when toggled via Ctrl+F) into origin pane.
+    payload = format_injection_payload(selected_rows, raw=raw_mode)
     if not payload:
         return 0
     if inject_into_pane(origin_pane, payload, env):
@@ -415,7 +447,8 @@ def main() -> int:
     # Safe fallback when origin pane is in copy-mode or disappeared: copy instead of losing selection.
     sinks = live_sessions.copy_text_to_clipboard(payload, environment=env)
     if sinks:
-        _display_message(env, f"Origin pane unavailable for paste; copied {len(selected_rows)} ref(s) to clipboard")
+        label = "raw ID(s)" if raw_mode else "ref(s)"
+        _display_message(env, f"Origin pane unavailable for paste; copied {len(selected_rows)} {label} to clipboard")
         return 0
     _display_message(env, "Session picker: could not inject or copy selection")
     return 1

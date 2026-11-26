@@ -31,6 +31,7 @@ LAYOUT_CYCLE_BIN = ROOT / "bin" / "tmux-layout-cycle"
 PANE_SYNC_BIN = ROOT / "bin" / "tmux-pane-sync"
 RENAME_BIN = ROOT / "bin" / "tmux-rename-window-popup"
 PICKER_BIN = ROOT / "bin" / "tmux-session-picker"
+SESSION_PICK_BIN = ROOT / "bin" / "tmux-session-pick"
 COLOUR_PALETTE_BIN = ROOT / "bin" / "tmux-colour-palette"
 CHEATSHEET = ROOT / "docs" / "cheatsheet.md"
 WS_DOC = ROOT / "docs" / "ghostty-tmux-workstation.md"
@@ -43,6 +44,7 @@ class GhosttyFragmentTests(unittest.TestCase):
         self.assertNotIn("keybind = cmd+s=unbind", text)
         self.assertIn("keybind = super+alt+p=text:\\x00Q", text)
         self.assertIn("keybind = super+alt+y=text:\\x00y", text)
+        self.assertIn("keybind = super+alt+shift+y=text:\\x00Y", text)
         self.assertIn("keybind = cmd+t=text:\\x00c", text)
         self.assertIn("keybind = cmd+d=text:\\x00|", text)
         self.assertIn("keybind = cmd+b=text:\\x00T", text)
@@ -873,6 +875,8 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
         self.assertTrue(os.access(RENAME_BIN, os.X_OK))
         self.assertTrue(PICKER_BIN.is_file())
         self.assertTrue(os.access(PICKER_BIN, os.X_OK))
+        self.assertTrue(SESSION_PICK_BIN.is_file())
+        self.assertTrue(os.access(SESSION_PICK_BIN, os.X_OK))
         self.assertTrue(COLOUR_PALETTE_BIN.is_file())
         # stay a fragment: no TPM / no personal home paths
         self.assertNotIn("@plugin", text)
@@ -974,6 +978,25 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
             self.assertRegex(sync_pick_keys, re.compile(r"sync-pick\s+q\s+.*cancel"))
             self.assertRegex(sync_pick_keys, re.compile(r"sync-pick\s+Escape\s+.*cancel"))
             self.assertRegex(sync_pick_keys, re.compile(r"sync-pick\s+Any\s+.*switch-client -T sync-pick"))
+            self.assertRegex(keys, re.compile(r"prefix\s+Y\s+.*tmux-session-pick.*enter"))
+            session_pick_keys = subprocess.run(
+                ["tmux", "-L", socket, "list-keys", "-T", "session-pick"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertRegex(session_pick_keys, re.compile(r"session-pick\s+Enter\s+.*commit"))
+            self.assertRegex(session_pick_keys, re.compile(r"session-pick\s+Space\s+.*pick-current"))
+            self.assertRegex(session_pick_keys, re.compile(r"session-pick\s+o\s+.*pick-others"))
+            self.assertRegex(session_pick_keys, re.compile(r"session-pick\s+a\s+.*pick-all"))
+            self.assertRegex(session_pick_keys, re.compile(r"session-pick\s+c\s+.*pick-clear"))
+            self.assertRegex(session_pick_keys, re.compile(r"session-pick\s+f\s+.*toggle-format"))
+            self.assertRegex(session_pick_keys, re.compile(r"session-pick\s+q\s+.*cancel"))
+            self.assertRegex(session_pick_keys, re.compile(r"session-pick\s+Escape\s+.*cancel"))
+            self.assertRegex(session_pick_keys, re.compile(r"session-pick\s+MouseDown1Pane\s+.*pick-pane"))
+            self.assertRegex(session_pick_keys, re.compile(r"session-pick\s+MouseDown1Border\s+.*pick-pane"))
+            self.assertRegex(session_pick_keys, re.compile(r"session-pick\s+DoubleClick1Border\s+.*switch-client -T session-pick"))
+            self.assertRegex(session_pick_keys, re.compile(r"session-pick\s+Any\s+.*switch-client -T session-pick"))
             self.assertRegex(
                 keys,
                 re.compile(r"prefix\s+T\s+.*status.*run-shell -b -c /.*set-option status off"),
@@ -2726,6 +2749,7 @@ class DocsPointerTests(unittest.TestCase):
         self.assertIn("| `Cmd+S` | prefix only |", cheatsheet)
         self.assertIn("| `Cmd+Opt+P` | interactive session & pane picker popup", cheatsheet)
         self.assertIn("| `Cmd+Opt+Y` | copy current pane's AI session ref (`<agent>:<id>`) to clipboard |", cheatsheet)
+        self.assertIn("| `Cmd+Opt+Shift+Y` | in-place spatial multi-pane AI session copy pick", cheatsheet)
         self.assertIn("| `Cmd+I` | centered popup rename window |", cheatsheet)
         self.assertIn("| `Cmd+B` | toggle tmux statusline |", cheatsheet)
         self.assertIn("| `prefix T` / `Cmd+B` | toggle current session statusline |", cheatsheet)

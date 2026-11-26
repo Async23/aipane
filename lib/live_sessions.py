@@ -82,6 +82,8 @@ class RawPane:
     pane_pid: str
     activity_record: str
     pane_in_mode: bool = False
+    pane_top: int = 0
+    pane_left: int = 0
 
     @property
     def coord(self) -> str:
@@ -120,6 +122,8 @@ class LivePaneSession:
     pane_in_mode: bool = False
     active_path: str = ""
     storage_root: str = ""
+    pane_top: int = 0
+    pane_left: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -235,6 +239,8 @@ def _pane_format() -> str:
             "#{pane_pid}",
             f"#{{{ACTIVITY_RECORD_OPTION}}}",
             "#{pane_in_mode}",
+            "#{pane_top}",
+            "#{pane_left}",
             # Keep #{pane_current_path} last: on tmux 3.8+, slow FUSE/cloud-mount
             # cwd lookups exceeding FORMAT_TIME_LIMIT (100ms) truncate trailing tokens.
             "#{pane_current_path}",
@@ -242,9 +248,24 @@ def _pane_format() -> str:
     )
 
 
+def _safe_int(raw: str, default: int = 0) -> int:
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 def _parse_raw_pane(line: str) -> RawPane | None:
-    fields = line.split(FIELD_SEP, 16)
-    if len(fields) != 17 or not fields[0]:
+    fields = line.split(FIELD_SEP, 18)
+    if len(fields) == 19 and fields[0]:
+        pane_top = _safe_int(fields[16])
+        pane_left = _safe_int(fields[17])
+        cwd = fields[18]
+    elif len(fields) == 17 and fields[0]:
+        pane_top = 0
+        pane_left = 0
+        cwd = fields[16]
+    else:
         return None
     return RawPane(
         pane_id=fields[0],
@@ -256,7 +277,7 @@ def _parse_raw_pane(line: str) -> RawPane | None:
         pane_active=fields[6] == "1",
         window_active=fields[7] == "1",
         current_command=fields[8],
-        cwd=fields[16],
+        cwd=cwd,
         pane_tty=fields[9],
         pane_title=fields[10],
         socket_path=fields[11],
@@ -264,12 +285,15 @@ def _parse_raw_pane(line: str) -> RawPane | None:
         pane_pid=fields[13],
         activity_record=fields[14],
         pane_in_mode=fields[15] == "1",
+        pane_top=pane_top,
+        pane_left=pane_left,
     )
 
 
 def list_raw_panes(
     *,
     target: str | None = None,
+    window_id: str | None = None,
     environment: Mapping[str, str] | None = None,
     tmux_runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None,
 ) -> list[RawPane]:
@@ -277,6 +301,8 @@ def list_raw_panes(
     cmd = _tmux_command(env)
     if target:
         args = [*cmd, "display-message", "-p", "-t", target, _pane_format()]
+    elif window_id:
+        args = [*cmd, "list-panes", "-t", window_id, "-F", _pane_format()]
     else:
         args = [*cmd, "list-panes", "-a", "-F", _pane_format()]
     try:
@@ -1037,12 +1063,15 @@ def _resolve_single_raw_pane(
         pane_in_mode=pane.pane_in_mode,
         active_path=active_path,
         storage_root=storage_root,
+        pane_top=pane.pane_top,
+        pane_left=pane.pane_left,
     )
 
 
 def list_live_panes(
     *,
     target: str | None = None,
+    window_id: str | None = None,
     only_agents: bool = False,
     environment: Mapping[str, str] | None = None,
     home: Path | None = None,
@@ -1057,7 +1086,7 @@ def list_live_panes(
     exists_fn = process_exists or _default_process_exists
     current_pane_id = env.get("TMUX_PANE", "")
 
-    raw_panes = list_raw_panes(target=target, environment=env, tmux_runner=tmux_runner)
+    raw_panes = list_raw_panes(target=target, window_id=window_id, environment=env, tmux_runner=tmux_runner)
     if not raw_panes:
         return []
 

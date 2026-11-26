@@ -96,15 +96,27 @@ class LiveSessionsUnitTests(unittest.TestCase):
     def test_pane_format_queries_pane_current_path_last(self) -> None:
         fmt = live_mod._pane_format()
         fields = fmt.split(live_mod.FIELD_SEP)
-        self.assertEqual(len(fields), 17)
+        self.assertEqual(len(fields), 19)
+        self.assertEqual(fields[-3], "#{pane_top}")
+        self.assertEqual(fields[-2], "#{pane_left}")
         self.assertEqual(fields[-1], "#{pane_current_path}")
-        raw = _make_raw_line("%42", cwd="/Users/demo/CloudDrives/BaiduPan/sub dir", in_mode="1")
-        parsed = live_mod._parse_raw_pane(raw)
-        self.assertIsNotNone(parsed)
-        assert parsed is not None
-        self.assertEqual(parsed.pane_id, "%42")
-        self.assertEqual(parsed.cwd, "/Users/demo/CloudDrives/BaiduPan/sub dir")
-        self.assertTrue(parsed.pane_in_mode)
+        # Legacy 17-field lines stay parseable for existing unit mocks.
+        raw_legacy = _make_raw_line("%42", cwd="/Users/demo/CloudDrives/BaiduPan/sub dir", in_mode="1")
+        parsed_legacy = live_mod._parse_raw_pane(raw_legacy)
+        self.assertIsNotNone(parsed_legacy)
+        assert parsed_legacy is not None
+        self.assertEqual(parsed_legacy.pane_id, "%42")
+        self.assertEqual(parsed_legacy.cwd, "/Users/demo/CloudDrives/BaiduPan/sub dir")
+        self.assertTrue(parsed_legacy.pane_in_mode)
+        self.assertEqual((parsed_legacy.pane_top, parsed_legacy.pane_left), (0, 0))
+        # Current 19-field format preserves spatial coordinates and trailing cwd.
+        parts = raw_legacy.split(live_mod.FIELD_SEP)
+        raw_19 = live_mod.FIELD_SEP.join((*parts[:-1], "12", "48", parts[-1]))
+        parsed_19 = live_mod._parse_raw_pane(raw_19)
+        self.assertIsNotNone(parsed_19)
+        assert parsed_19 is not None
+        self.assertEqual((parsed_19.pane_top, parsed_19.pane_left), (12, 48))
+        self.assertEqual(parsed_19.cwd, "/Users/demo/CloudDrives/BaiduPan/sub dir")
 
     def test_resolves_all_seven_agents_and_rejects_plain_node(self) -> None:
         agy_sid = "11111111-1111-4111-8111-111111111111"
@@ -897,7 +909,7 @@ class PickerAndTmuxIntegrationTests(unittest.TestCase):
             env=self.env,
         )
 
-    def test_picker_formatting_option_b(self) -> None:
+    def test_picker_formatting_and_spatial_order(self) -> None:
         picker = _load_picker_module()
         single = [["live", "%1", "agy", "1111-aaaa", "0:4.1", "display"]]
         multi = [
@@ -910,13 +922,49 @@ class PickerAndTmuxIntegrationTests(unittest.TestCase):
         self.assertNotIn("\n", multi_out)
         self.assertEqual(
             multi_out,
-            "agy:1111-aaaa (0:4.1)  codex:2222-bbbb (0:4.3)  agy:ide/3333-cccc (IDE)",
+            "agy:1111-aaaa codex:2222-bbbb agy:ide/3333-cccc",
         )
         self.assertEqual(picker.format_copy_payload(single), "agy:1111-aaaa")
         self.assertEqual(
             picker.format_copy_payload(multi),
             "agy:1111-aaaa\ncodex:2222-bbbb\nagy:ide/3333-cccc",
         )
+        # Raw mode outputs verbatim session_id (preserving storage domain prefixes like ide/<uuid>).
+        self.assertEqual(picker.format_injection_payload(single, raw=True), "1111-aaaa")
+        self.assertEqual(
+            picker.format_injection_payload(multi, raw=True),
+            "1111-aaaa 2222-bbbb ide/3333-cccc",
+        )
+        self.assertEqual(picker.format_copy_payload(single, raw=True), "1111-aaaa")
+        self.assertEqual(
+            picker.format_copy_payload(multi, raw=True),
+            "1111-aaaa\n2222-bbbb\nide/3333-cccc",
+        )
+
+        # Visual (pane_top, pane_left) ordering keeps self in its true screen position.
+        p_br = live_mod.LivePaneSession(
+            pane_id="%4", coord="0:1.4", session_name="0", window_id="@1", window_index="1",
+            window_name="w", pane_index="4", pane_active=False, window_active=True,
+            current_command="agy", cwd="/tmp", pane_tty="/dev/ttys4", pane_title="br",
+            agent="antigravity", agent_alias="agy", session_id="sid-4", title="br",
+            authority="agy_runtime", pane_top=15, pane_left=60,
+        )
+        p_tl_self = live_mod.LivePaneSession(
+            pane_id="%1", coord="0:1.1", session_name="0", window_id="@1", window_index="1",
+            window_name="w", pane_index="1", pane_active=True, window_active=True,
+            current_command="agy", cwd="/tmp", pane_tty="/dev/ttys1", pane_title="tl",
+            agent="antigravity", agent_alias="agy", session_id="sid-1", title="tl",
+            authority="agy_runtime", pane_top=0, pane_left=0,
+        )
+        p_tr = live_mod.LivePaneSession(
+            pane_id="%2", coord="0:1.2", session_name="0", window_id="@1", window_index="1",
+            window_name="w", pane_index="2", pane_active=False, window_active=True,
+            current_command="codex", cwd="/tmp", pane_tty="/dev/ttys2", pane_title="tr",
+            agent="codex", agent_alias="codex", session_id="sid-2", title="tr",
+            authority="codex_lsof", pane_top=0, pane_left=60,
+        )
+        ordered = sorted([p_br, p_tr, p_tl_self], key=picker._spatial_sort_key)
+        self.assertEqual([p.pane_id for p in ordered], ["%1", "%2", "%4"])
 
     def test_picker_enter_injects_without_clobbering_default_buffer_and_ctrl_y_copies_ref(self) -> None:
         node_bin = shutil.which("node")
@@ -1006,6 +1054,93 @@ class PickerAndTmuxIntegrationTests(unittest.TestCase):
         self.assertEqual(code_fail, 1)
         self.assertFalse(out_fail["ok"])
         self.assertEqual(self.tmux("show-buffer").stdout, dsh_sid)
+
+        # Real fzf end-to-end test: Ctrl+F toggles [RAW] prompt & copies/injects bare sid.
+        real_fzf = shutil.which("fzf")
+        if real_fzf:
+            fzf_env = {
+                **run_env,
+                "AIPANE_FZF_BIN": real_fzf,
+                "TERM": "xterm-256color",
+            }
+            for mode_key, expect_buf, expect_pane in (
+                (b"\x19", dsh_sid, None),        # Ctrl+F then Ctrl+Y -> raw copy
+                (b"\r", None, dsh_sid),          # Ctrl+F then Enter -> raw inject
+            ):
+                if expect_buf is not None:
+                    self.tmux("set-buffer", "BEFORE_RAW_FZF")
+                if expect_pane is not None:
+                    self.tmux("send-keys", "-t", self.p1, "Enter")
+                pid, mfd = pty.fork()
+                if pid == 0:
+                    termios.tcsetwinsize(0, (30, 120))
+                    os.execvpe(str(PICKER_BIN), [str(PICKER_BIN)], fzf_env)
+                try:
+                    os.set_blocking(mfd, False)
+                    buf = bytearray()
+                    deadline = time.monotonic() + 3.0
+                    while time.monotonic() < deadline:
+                        try:
+                            chunk = os.read(mfd, 65536)
+                            if chunk:
+                                buf.extend(chunk)
+                        except (BlockingIOError, OSError):
+                            pass
+                        if b"dsh" in buf:
+                            break
+                        time.sleep(0.02)
+                    self.assertIn(b"dsh", buf)
+                    # Press Ctrl+F to switch to [RAW] format.
+                    os.write(mfd, b"\x06")
+                    deadline = time.monotonic() + 3.0
+                    while time.monotonic() < deadline:
+                        try:
+                            chunk = os.read(mfd, 65536)
+                            if chunk:
+                                buf.extend(chunk)
+                        except (BlockingIOError, OSError):
+                            pass
+                        if b"[RAW]" in buf:
+                            break
+                        time.sleep(0.02)
+                    self.assertIn(b"[RAW]", buf)
+                    os.write(mfd, mode_key)
+                    for _ in range(100):
+                        try:
+                            chunk = os.read(mfd, 65536)
+                            if chunk:
+                                buf.extend(chunk)
+                        except (BlockingIOError, OSError):
+                            pass
+                        done_pid, _ = os.waitpid(pid, os.WNOHANG)
+                        if done_pid:
+                            break
+                        time.sleep(0.02)
+                    else:
+                        os.kill(pid, signal.SIGKILL)
+                        os.waitpid(pid, 0)
+                        self.fail("real fzf picker did not exit after Ctrl+F action")
+                finally:
+                    try:
+                        os.close(mfd)
+                    except OSError:
+                        pass
+                if expect_buf is not None:
+                    self.assertEqual(self.tmux("show-buffer").stdout, expect_buf)
+                if expect_pane is not None:
+                    deadline = time.monotonic() + 2.0
+                    cap = ""
+                    while time.monotonic() < deadline:
+                        cap = self.tmux("capture-pane", "-p", "-t", self.p1).stdout
+                        if expect_pane in cap:
+                            break
+                        time.sleep(0.05)
+                    self.assertIn(expect_pane, cap)
+                    # Verify bare sid was injected on its own line without agent prefix.
+                    self.assertTrue(
+                        any(line.strip() == expect_pane for line in cap.splitlines()),
+                        f"expected raw sid line {expect_pane!r} in pane capture:\n{cap}",
+                    )
 
     def test_double_click_border_copies_inactive_pane_without_changing_focus(self) -> None:
         node_bin = shutil.which("node")

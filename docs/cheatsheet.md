@@ -10,8 +10,9 @@ also send complete prefix+key chords.
 | Key | Action |
 |-----|--------|
 | `Cmd+S` | prefix only |
-| `Cmd+Opt+P` | interactive session & pane picker popup (`Enter` inject, `Tab` multi, `^Y` copy `<agent>:<id>`, `^G` jump) |
+| `Cmd+Opt+P` | interactive session & pane picker popup (`Enter` inject, `Tab` multi, `^Y` copy, `^F` toggle `agent:sid`/`sid`, `^G` jump) |
 | `Cmd+Opt+Y` | copy current pane's AI session ref (`<agent>:<id>`) to clipboard |
+| `Cmd+Opt+Shift+Y` | in-place spatial multi-pane AI session copy pick in current window (`1-9`/click/`Space`, `o` others, `a` all, `c` clear, `f` toggle cyan `agent:sid` / magenta raw `sid`, `Enter` copy) |
 | `Cmd+T` | new window |
 | `Cmd+W` | kill pane; centered confirm when the last pane runs an AI Tool |
 | `Cmd+D` / `Cmd+Shift+D` | split L-R / T-B |
@@ -159,6 +160,7 @@ unchanged; numbers beyond the buffer select its final line.
 | `prefix T` / `Cmd+B` | toggle current session statusline |
 | `prefix Q` / `Cmd+Opt+P` | interactive session & pane picker popup |
 | `prefix y` / `Cmd+Opt+Y` | copy current pane's AI session ref (`<agent>:<id>`) to clipboard |
+| `prefix Y` / `Cmd+Opt+Shift+Y` | in-place spatial multi-pane AI session copy pick (`1-9`/click/`Space`, `o` others, `a` all, `c` clear, `f` toggle cyan `agent:sid` / magenta raw `sid`, `Enter` copy, `Esc`/`q` cancel) |
 | double-click pane top bar | copy that pane's AI session ref (`<agent>:<id>`) without changing focus |
 | double-click status window label | zoom that window's pane |
 | multi-line window list | `tmux-window-wrap` when labels overflow |

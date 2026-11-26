@@ -1,0 +1,796 @@
+#!/usr/bin/env python3
+"""In-place, no-popup spatial multi-pane AI session copy controller for tmux.
+
+Mirrors tmux-pane-sync's direct spatial selection gesture (1-9 / mouse click)
+in a distinct read-only cyan mode while preserving strict boundaries:
+  - Never mutates synchronize-panes or @aipane-sync-picking.
+  - Enforces one active session-pick owner per tmux window.
+  - Snapshots (pane_id, agent, session_id) on entry and writes per-pane
+    @aipane-session-tag for zero-fork border rendering.
+  - Re-verifies selected panes on Enter commit; aborts without touching the
+    clipboard if any selected pane exited or switched to a different session.
+  - Restores pre-entry zoom only on explicit cancel/commit (or window switch),
+    never on user-driven pane navigation, split, or manual resize.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import secrets
+import shlex
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
+
+ROOT = Path(__file__).resolve().parents[1]
+LIB_DIR = ROOT / "lib"
+if str(LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(LIB_DIR))
+
+import live_sessions  # noqa: E402
+
+WINDOW_ID_RE = re.compile(r"^@[0-9]+$")
+PANE_ID_RE = re.compile(r"^%[0-9]+$")
+CLIENT_PID_RE = re.compile(r"^[0-9]+$")
+SEP = "\x1f"
+
+
+def _tmux_cmd() -> list[str]:
+    if os.environ.get("AIPANE_TMUX"):
+        return shlex.split(os.environ["AIPANE_TMUX"]) or ["tmux"]
+    return [os.environ.get("AIPANE_TMUX_BIN", "tmux")]
+
+
+def _live_env() -> dict[str, str]:
+    env = dict(os.environ)
+    if not env.get("AIPANE_TMUX") and env.get("AIPANE_TMUX_BIN"):
+        env["AIPANE_TMUX"] = shlex.join(_tmux_cmd())
+    return env
+
+
+def _server_digest() -> str:
+    tmux_env = os.environ.get("TMUX", "")
+    if tmux_env:
+        key_src = tmux_env.split(",", 2)[0]
+    elif os.environ.get("AIPANE_TMUX"):
+        key_src = os.environ["AIPANE_TMUX"]
+    else:
+        key_src = f"uid-{os.getuid()}"
+    return hashlib.sha256(key_src.encode("utf-8")).hexdigest()[:12]
+
+
+def _state_file_path() -> Path:
+    return Path(tempfile.gettempdir()) / f"aipane-session-pick-{_server_digest()}.json"
+
+
+@contextmanager
+def state_lock():
+    if fcntl is None:
+        yield
+        return
+    lock_path = Path(tempfile.gettempdir()) / f"aipane-session-pick-{_server_digest()}.lock"
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def run_tmux(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [*_tmux_cmd(), *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def run_tmux_batch(commands: list[list[str]]) -> subprocess.CompletedProcess[str] | None:
+    if not commands:
+        return None
+    argv: list[str] = []
+    for idx, cmd in enumerate(commands):
+        if idx > 0:
+            argv.append(";")
+        argv.extend(cmd)
+    return run_tmux(*argv)
+
+
+def display_msg(client_name: str, text: str) -> None:
+    if client_name:
+        run_tmux("display-message", "-c", client_name, "--", text)
+    else:
+        run_tmux("display-message", "--", text)
+
+
+def refresh_client(client_name: str) -> None:
+    if client_name:
+        run_tmux("refresh-client", "-t", client_name, ";", "refresh-client", "-S", "-t", client_name)
+    else:
+        run_tmux("refresh-client", "-S")
+
+
+def switch_client_table(client_name: str, table: str) -> None:
+    if client_name:
+        run_tmux("switch-client", "-c", client_name, "-T", table)
+    else:
+        run_tmux("switch-client", "-T", table)
+
+
+def env_name(client_pid: str) -> str:
+    return f"AIPANE_SESSION_PICK_{client_pid}"
+
+
+def load_store() -> dict[str, Any]:
+    path = _state_file_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("windows"), dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"windows": {}}
+
+
+def save_store(data: dict[str, Any]) -> None:
+    path = _state_file_path()
+    windows = data.get("windows")
+    if not isinstance(windows, dict) or not windows:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def list_live_clients() -> dict[str, str]:
+    """Return {client_pid: client_name} for attached tmux clients."""
+    res = run_tmux("list-clients", "-F", f"#{{client_pid}}{SEP}#{{client_name}}")
+    if res.returncode != 0:
+        return {}
+    out: dict[str, str] = {}
+    for line in res.stdout.splitlines():
+        parts = line.split(SEP, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            out[parts[0]] = parts[1]
+    return out
+
+
+def list_window_panes(window_id: str) -> list[dict[str, str]]:
+    fmt = SEP.join(
+        (
+            "#{pane_id}",
+            "#{pane_index}",
+            "#{pane_active}",
+            "#{window_zoomed_flag}",
+        )
+    )
+    completed = run_tmux("list-panes", "-t", window_id, "-F", fmt)
+    if completed.returncode != 0:
+        return []
+    panes: list[dict[str, str]] = []
+    for line in completed.stdout.splitlines():
+        parts = line.split(SEP)
+        if len(parts) != 4:
+            continue
+        panes.append(
+            {
+                "id": parts[0],
+                "index": parts[1],
+                "active": parts[2],
+                "zoomed": parts[3],
+            }
+        )
+    return panes
+
+
+def get_window_option(window_id: str, name: str) -> str:
+    completed = run_tmux("show-options", "-wqv", "-t", window_id, name)
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout.rstrip("\n")
+
+
+def parse_pane_id_list(raw: str, allowed_ids: set[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for token in raw.split():
+        if token in allowed_ids and token not in seen:
+            seen.add(token)
+            result.append(token)
+    return result
+
+
+def ordered_subset(panes: list[dict[str, str]], selected: set[str]) -> list[str]:
+    return [pane["id"] for pane in panes if pane["id"] in selected]
+
+
+def format_draft_value(pane_ids: list[str]) -> str:
+    if not pane_ids:
+        return " "
+    return " " + " ".join(pane_ids) + " "
+
+
+def write_draft(window_id: str, pane_ids: list[str]) -> None:
+    run_tmux_batch(
+        [
+            ["set-option", "-w", "-t", window_id, "@aipane-session-draft", format_draft_value(pane_ids)],
+            ["set-option", "-w", "-t", window_id, "@aipane-session-draft-count", str(len(pane_ids))],
+        ]
+    )
+
+
+def restore_zoom_if_needed(window_id: str, was_zoomed: int, origin_pane: str) -> None:
+    if was_zoomed != 1:
+        return
+    panes = list_window_panes(window_id)
+    if len(panes) < 2:
+        return
+    if panes[0]["zoomed"] == "1":
+        return
+    alive_ids = {p["id"] for p in panes}
+    cmds: list[list[str]] = []
+    if origin_pane and origin_pane in alive_ids:
+        cmds.append(["select-pane", "-t", origin_pane])
+    cmds.append(["resize-pane", "-Z", "-t", window_id])
+    run_tmux_batch(cmds)
+
+
+def _clear_pane_tags(pane_ids: list[str], window_id: str) -> None:
+    targets: list[str] = []
+    seen: set[str] = set()
+    for pid in pane_ids:
+        if pid and PANE_ID_RE.fullmatch(pid) and pid not in seen:
+            seen.add(pid)
+            targets.append(pid)
+    if window_id and WINDOW_ID_RE.fullmatch(window_id):
+        for p in list_window_panes(window_id):
+            pid = p["id"]
+            if pid not in seen:
+                seen.add(pid)
+                targets.append(pid)
+    # Unset individually so one dead/moved pane never aborts cleanup for the rest.
+    for pid in targets:
+        run_tmux("set-option", "-p", "-u", "-t", pid, "@aipane-session-tag")
+
+
+def _teardown_entry(
+    store: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    client_name_override: str = "",
+    restore_zoom: bool = True,
+    switch_to_root: bool = True,
+) -> None:
+    wid = str(entry.get("window_id") or "")
+    cpid = str(entry.get("client_pid") or "")
+    cname = client_name_override or str(entry.get("client_name") or "")
+    was_zoomed = int(entry.get("was_zoomed") or 0)
+    origin_pane = str(entry.get("origin_pane") or "")
+    tracked = list(entry.get("tracked_panes") or [])
+
+    # Remove from store and clear hook env FIRST so resize-pane -Z cannot re-enter hooks.
+    store["windows"].pop(wid, None)
+    save_store(store)
+
+    if cpid and CLIENT_PID_RE.fullmatch(cpid):
+        run_tmux("set-environment", "-gu", env_name(cpid))
+    _clear_pane_tags(tracked, wid)
+    if wid and WINDOW_ID_RE.fullmatch(wid):
+        run_tmux("set-option", "-wu", "-t", wid, "@aipane-session-fmt")
+        run_tmux("set-option", "-wu", "-t", wid, "@aipane-session-origin")
+        run_tmux("set-option", "-wu", "-t", wid, "@aipane-session-draft-count")
+        run_tmux("set-option", "-wu", "-t", wid, "@aipane-session-valid-count")
+        run_tmux("set-option", "-wu", "-t", wid, "@aipane-session-draft")
+
+    if switch_to_root and cname:
+        switch_client_table(cname, "root")
+    if restore_zoom and wid and was_zoomed:
+        restore_zoom_if_needed(wid, was_zoomed, origin_pane)
+    if cname:
+        refresh_client(cname)
+    else:
+        run_tmux("refresh-client", "-S")
+
+
+def _find_entry_for_client(store: dict[str, Any], client_pid: str) -> dict[str, Any] | None:
+    for entry in store["windows"].values():
+        if isinstance(entry, dict) and str(entry.get("client_pid") or "") == client_pid:
+            return entry
+    return None
+
+
+def _prune_dead_clients(store: dict[str, Any]) -> None:
+    live_clients = list_live_clients()
+    live_pids = set(live_clients.keys())
+    stale_entries = [
+        entry
+        for entry in list(store["windows"].values())
+        if isinstance(entry, dict) and str(entry.get("client_pid") or "") not in live_pids
+    ]
+    for entry in stale_entries:
+        _teardown_entry(store, entry, restore_zoom=True, switch_to_root=False)
+
+    # Also scrub any orphaned AIPANE_SESSION_PICK_* env vars.
+    env_res = run_tmux("show-environment", "-gh")
+    if env_res.returncode == 0:
+        for line in env_res.stdout.splitlines():
+            if not line.startswith("AIPANE_SESSION_PICK_") or "=" not in line:
+                continue
+            name = line.split("=", 1)[0]
+            pid = name.removeprefix("AIPANE_SESSION_PICK_")
+            if pid not in live_pids or _find_entry_for_client(store, pid) is None:
+                run_tmux("set-environment", "-gu", name)
+
+
+def _cancel_sync_pick_if_active(client_pid: str, client_name: str) -> None:
+    """If this client has an active sync-pick draft, cancel it cleanly without touching live sync."""
+    if not CLIENT_PID_RE.fullmatch(client_pid):
+        return
+    sync_env = f"AIPANE_SYNC_PICK_{client_pid}"
+    probe = run_tmux("show-environment", "-gh", sync_env)
+    if probe.returncode != 0 or f"{sync_env}=" not in probe.stdout:
+        return
+    candidate = os.environ.get("AIPANE_PANE_SYNC_BIN")
+    sync_bin = Path(candidate) if candidate else (ROOT / "bin" / "tmux-pane-sync")
+    if sync_bin.is_file() and os.access(sync_bin, os.X_OK):
+        args = [str(sync_bin), "cancel", "--quiet", client_pid]
+        if client_name:
+            args.append(client_name)
+        subprocess.run(args, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_enter(window_id: str, client_pid: str, client_name: str) -> int:
+    if not WINDOW_ID_RE.fullmatch(window_id) or not CLIENT_PID_RE.fullmatch(client_pid):
+        switch_client_table(client_name, "root")
+        return 2
+
+    store = load_store()
+    _prune_dead_clients(store)
+
+    # Re-pressing Cmd+Opt+Shift+Y (prefix+Y) while already picking in this window cancels cleanly.
+    existing_client = _find_entry_for_client(store, client_pid)
+    if existing_client is not None:
+        if str(existing_client.get("window_id")) == window_id:
+            _teardown_entry(store, existing_client, client_name_override=client_name, restore_zoom=True)
+            display_msg(client_name, "Session pick cancelled")
+            return 0
+        # Clean stale pick owned by this client in another window before starting a new one.
+        _teardown_entry(
+            store,
+            existing_client,
+            client_name_override=client_name,
+            restore_zoom=True,
+            switch_to_root=False,
+        )
+
+    # Single active session-pick owner per window.
+    existing_window = store["windows"].get(window_id)
+    if isinstance(existing_window, dict) and str(existing_window.get("client_pid") or "") != client_pid:
+        switch_client_table(client_name, "root")
+        display_msg(client_name, "Session pick already active in this window")
+        return 0
+
+    # Mutually exclude sync-pick draft on this client without touching live synchronize-panes.
+    _cancel_sync_pick_if_active(client_pid, client_name)
+
+    panes = list_window_panes(window_id)
+    if not panes:
+        switch_client_table(client_name, "root")
+        return 0
+
+    live = live_sessions.list_live_panes(window_id=window_id, only_agents=False, environment=_live_env())
+    valid_panes: dict[str, dict[str, str]] = {}
+    for item in live:
+        tag = item.agent_alias or item.agent
+        if tag and item.session_id:
+            valid_panes[item.pane_id] = {
+                "agent": tag,
+                "sid": item.session_id,
+                "coord": item.coord,
+            }
+
+    if not valid_panes:
+        switch_client_table(client_name, "root")
+        display_msg(client_name, "No active AI sessions in this window")
+        return 0
+
+    was_zoomed = 1 if panes[0]["zoomed"] == "1" else 0
+    origin_pane = next((p["id"] for p in panes if p["active"] == "1"), panes[0]["id"])
+    tracked_panes = [p["id"] for p in panes]
+    token = secrets.token_hex(4)
+
+    # Unzoom BEFORE persisting pick state / env so after-resize-pane cannot self-cancel.
+    if was_zoomed:
+        run_tmux("resize-pane", "-Z", "-t", window_id)
+
+    entry = {
+        "window_id": window_id,
+        "client_pid": client_pid,
+        "client_name": client_name,
+        "token": token,
+        "was_zoomed": was_zoomed,
+        "origin_pane": origin_pane,
+        "fmt": "ref",
+        "tracked_panes": tracked_panes,
+        "valid_panes": valid_panes,
+    }
+    store["windows"][window_id] = entry
+    save_store(store)
+
+    # Always force @aipane-session-fmt to "ref" on entry so leftover raw state never leaks.
+    cmds: list[list[str]] = [
+        ["set-option", "-w", "-t", window_id, "@aipane-session-fmt", "ref"],
+        ["set-option", "-w", "-t", window_id, "@aipane-session-origin", origin_pane],
+        ["set-option", "-w", "-t", window_id, "@aipane-session-draft", " "],
+        ["set-option", "-w", "-t", window_id, "@aipane-session-draft-count", "0"],
+        ["set-option", "-w", "-t", window_id, "@aipane-session-valid-count", str(len(valid_panes))],
+        ["set-environment", "-gh", env_name(client_pid), f"{window_id}|{token}"],
+    ]
+    for p in panes:
+        pid = p["id"]
+        if pid in valid_panes:
+            cmds.append(["set-option", "-p", "-t", pid, "@aipane-session-tag", valid_panes[pid]["agent"]])
+        else:
+            cmds.append(["set-option", "-p", "-u", "-t", pid, "@aipane-session-tag"])
+    if client_name:
+        cmds.append(["switch-client", "-c", client_name, "-T", "session-pick"])
+    else:
+        cmds.append(["switch-client", "-T", "session-pick"])
+    run_tmux_batch(cmds)
+    refresh_client(client_name)
+    return 0
+
+
+def _load_active_pick(
+    store: dict[str, Any],
+    window_id: str,
+    client_pid: str,
+    client_name: str,
+) -> tuple[dict[str, Any], list[dict[str, str]], list[str]] | None:
+    entry = _find_entry_for_client(store, client_pid)
+    if entry is None or str(entry.get("window_id") or "") != window_id:
+        if entry is not None:
+            _teardown_entry(store, entry, client_name_override=client_name, restore_zoom=False)
+        else:
+            switch_client_table(client_name, "root")
+        return None
+    panes = list_window_panes(window_id)
+    if not panes:
+        _teardown_entry(store, entry, client_name_override=client_name, restore_zoom=False)
+        return None
+    alive_ids = {p["id"] for p in panes}
+    valid_ids = set((entry.get("valid_panes") or {}).keys()) & alive_ids
+    draft = parse_pane_id_list(get_window_option(window_id, "@aipane-session-draft"), valid_ids)
+    return entry, panes, draft
+
+
+def cmd_pick_action(
+    action: str,
+    window_id: str,
+    client_pid: str,
+    client_name: str,
+    target_arg: str = "",
+) -> int:
+    store = load_store()
+    loaded = _load_active_pick(store, window_id, client_pid, client_name)
+    if loaded is None:
+        return 0
+    entry, panes, draft = loaded
+    valid_map: dict[str, dict[str, str]] = entry.get("valid_panes") or {}
+    alive_ids = {p["id"] for p in panes}
+    valid_ids = set(valid_map.keys()) & alive_ids
+    origin_pane = str(entry.get("origin_pane") or "")
+    selected = set(draft)
+    notice = ""
+
+    if action == "pick-index":
+        match = next((p for p in panes if p["index"] == target_arg), None)
+        if match is None:
+            notice = f"No pane {target_arg}"
+        elif match["id"] not in valid_ids:
+            notice = f"Pane {target_arg} has no active AI session"
+        elif match["id"] in selected:
+            selected.remove(match["id"])
+        else:
+            selected.add(match["id"])
+    elif action == "pick-pane":
+        match = next((p for p in panes if p["id"] == target_arg), None)
+        if match is None:
+            notice = "Pane is not in this window"
+        elif target_arg not in valid_ids:
+            notice = f"Pane {match['index']} has no active AI session"
+        elif target_arg in selected:
+            selected.remove(target_arg)
+        else:
+            selected.add(target_arg)
+    elif action == "pick-current":
+        match = next((p for p in panes if p["id"] == origin_pane), None)
+        if match is None:
+            notice = "Origin pane is no longer in this window"
+        elif origin_pane not in valid_ids:
+            notice = f"Pane {match['index']} has no active AI session"
+        elif origin_pane in selected:
+            selected.remove(origin_pane)
+        else:
+            selected.add(origin_pane)
+    elif action == "pick-others":
+        others = {pid for pid in valid_ids if pid != origin_pane}
+        if not others:
+            notice = "No other AI panes in this window"
+        else:
+            selected = others
+    elif action == "pick-all":
+        selected = set(valid_ids)
+    elif action == "pick-clear":
+        selected.clear()
+
+    ordered = ordered_subset(panes, selected)
+    write_draft(window_id, ordered)
+    switch_client_table(client_name, "session-pick")
+    refresh_client(client_name)
+    if notice:
+        display_msg(client_name, notice)
+    return 0
+
+
+def cmd_toggle_format(window_id: str, client_pid: str, client_name: str) -> int:
+    store = load_store()
+    loaded = _load_active_pick(store, window_id, client_pid, client_name)
+    if loaded is None:
+        return 0
+    entry, _, _ = loaded
+    current_fmt = str(entry.get("fmt") or "ref")
+    next_fmt = "raw" if current_fmt != "raw" else "ref"
+    entry["fmt"] = next_fmt
+    save_store(store)
+    run_tmux("set-option", "-w", "-t", window_id, "@aipane-session-fmt", next_fmt)
+    switch_client_table(client_name, "session-pick")
+    refresh_client(client_name)
+    return 0
+
+
+def cmd_commit(window_id: str, client_pid: str, client_name: str) -> int:
+    store = load_store()
+    entry = _find_entry_for_client(store, client_pid)
+    if entry is None:
+        switch_client_table(client_name, "root")
+        return 0
+
+    pick_wid = str(entry.get("window_id") or "")
+    valid_map: dict[str, dict[str, str]] = dict(entry.get("valid_panes") or {})
+    panes = list_window_panes(pick_wid)
+    index_by_id = {p["id"]: p["index"] for p in panes}
+    alive_ids = {p["id"] for p in panes}
+    raw_draft = get_window_option(pick_wid, "@aipane-session-draft")
+    # Preserve any selected IDs that may have exited so we report them rather than silently dropping.
+    raw_selected: list[str] = []
+    seen: set[str] = set()
+    for tok in raw_draft.split():
+        if tok in valid_map and tok not in seen:
+            seen.add(tok)
+            raw_selected.append(tok)
+
+    # Order alive selected panes by current window pane order; append any missing ones at the end.
+    selected = [p["id"] for p in panes if p["id"] in seen] + [pid for pid in raw_selected if pid not in alive_ids]
+
+    if not selected:
+        _teardown_entry(store, entry, client_name_override=client_name, restore_zoom=True)
+        display_msg(client_name, "Session copy cancelled (no panes selected)")
+        return 0
+
+    # Re-verify authoritative live session_id and write clipboard BEFORE tearing
+    # down the cyan pick chrome so an immediate Cmd+V after borders clear never races.
+    live_env = _live_env()
+    fresh_list = live_sessions.list_live_panes(window_id=pick_wid, only_agents=False, environment=live_env)
+    fresh_by_id = {item.pane_id: item for item in fresh_list}
+
+    verified_items: list[live_sessions.LivePaneSession] = []
+    problems: list[str] = []
+    for pid in selected:
+        expected = valid_map[pid]
+        pane_label = f"#{index_by_id[pid]}" if pid in index_by_id else pid
+        fresh = fresh_by_id.get(pid)
+        if fresh is None:
+            problems.append(f"pane {pane_label} exited")
+            continue
+        fresh_tag = fresh.agent_alias or fresh.agent
+        if not fresh.session_id or fresh_tag != expected["agent"] or fresh.session_id != expected["sid"]:
+            problems.append(f"pane {pane_label} session changed")
+            continue
+        verified_items.append(fresh)
+
+    if problems:
+        _teardown_entry(store, entry, client_name_override=client_name, restore_zoom=True)
+        summary = ", ".join(problems[:3])
+        if len(problems) > 3:
+            summary += f" (+{len(problems) - 3})"
+        display_msg(client_name, f"Copy aborted: {summary} — re-pick")
+        return 0
+
+    fmt = "raw" if str(entry.get("fmt") or "ref") == "raw" else "ref"
+    if fmt == "raw":
+        lines = [item.session_id for item in verified_items]
+    else:
+        lines = [f"{(item.agent_alias or item.agent)}:{item.session_id}" for item in verified_items]
+    payload = "\n".join(lines)
+    sinks = live_sessions.copy_text_to_clipboard(payload, environment=live_env)
+    _teardown_entry(store, entry, client_name_override=client_name, restore_zoom=True)
+    if not sinks:
+        display_msg(client_name, "Session pick: clipboard copy failed")
+        return 1
+
+    if len(verified_items) == 1:
+        item = verified_items[0]
+        sid = item.session_id
+        short_sid = f"{sid[:8]}…{sid[-4:]}" if len(sid) > 15 else sid
+        tag = item.agent_alias or item.agent
+        title_part = ""
+        if item.title:
+            clipped = item.title if len(item.title) <= 36 else item.title[:35] + "…"
+            title_part = f' "{clipped}"'
+        if fmt == "raw":
+            display_msg(client_name, f"Copied {short_sid} (raw) [{tag} · {item.coord}{title_part}]")
+        else:
+            display_msg(client_name, f"Copied {tag}:{short_sid} [{item.coord}{title_part}]")
+    else:
+        parts = [f"#{item.pane_index} {item.agent_alias or item.agent}" for item in verified_items[:4]]
+        more = f" +{len(verified_items) - 4}" if len(verified_items) > 4 else ""
+        label = "raw session IDs" if fmt == "raw" else "session refs"
+        display_msg(client_name, f"Copied {len(verified_items)} {label} ({', '.join(parts)}{more})")
+    return 0
+
+
+def cmd_cancel(
+    client_pid: str,
+    client_name: str,
+    *,
+    quiet: bool = False,
+    restore_zoom: bool = True,
+) -> int:
+    store = load_store()
+    entry = _find_entry_for_client(store, client_pid) if CLIENT_PID_RE.fullmatch(client_pid) else None
+    if entry is not None:
+        _teardown_entry(
+            store,
+            entry,
+            client_name_override=client_name,
+            restore_zoom=restore_zoom,
+            switch_to_root=True,
+        )
+        if not quiet:
+            display_msg(client_name, "Session pick cancelled")
+        return 0
+
+    if CLIENT_PID_RE.fullmatch(client_pid):
+        run_tmux("set-environment", "-gu", env_name(client_pid))
+    if client_name:
+        switch_client_table(client_name, "root")
+        refresh_client(client_name)
+    return 0
+
+
+def cmd_cancel_window(
+    window_id: str,
+    *,
+    quiet: bool = False,
+    restore_zoom: bool = False,
+) -> int:
+    if not WINDOW_ID_RE.fullmatch(window_id):
+        return 2
+    store = load_store()
+    entry = store["windows"].get(window_id)
+    if isinstance(entry, dict):
+        cname = str(entry.get("client_name") or "")
+        _teardown_entry(
+            store,
+            entry,
+            client_name_override=cname,
+            restore_zoom=restore_zoom,
+            switch_to_root=True,
+        )
+        if not quiet and cname:
+            display_msg(cname, "Session pick cancelled (pane layout changed)")
+        return 0
+
+    # Defensive cleanup even if store file was already gone.
+    _clear_pane_tags([], window_id)
+    run_tmux("set-option", "-wu", "-t", window_id, "@aipane-session-fmt")
+    run_tmux("set-option", "-wu", "-t", window_id, "@aipane-session-origin")
+    run_tmux("set-option", "-wu", "-t", window_id, "@aipane-session-draft-count")
+    run_tmux("set-option", "-wu", "-t", window_id, "@aipane-session-valid-count")
+    run_tmux("set-option", "-wu", "-t", window_id, "@aipane-session-draft")
+    return 0
+
+
+def cmd_prune_clients() -> int:
+    store = load_store()
+    _prune_dead_clients(store)
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        return 2
+    action = argv[0]
+    args = argv[1:]
+    try:
+        with state_lock():
+            if action == "enter" and len(args) == 3:
+                return cmd_enter(args[0], args[1], args[2])
+            if action in {"pick-index", "pick-pane"} and len(args) == 4:
+                return cmd_pick_action(action, args[1], args[2], args[3], target_arg=args[0])
+            if action in {"pick-current", "pick-others", "pick-all", "pick-clear"} and len(args) == 3:
+                return cmd_pick_action(action, args[0], args[1], args[2])
+            if action == "toggle-format" and len(args) == 3:
+                return cmd_toggle_format(args[0], args[1], args[2])
+            if action == "commit" and len(args) == 3:
+                return cmd_commit(args[0], args[1], args[2])
+            if action == "cancel":
+                quiet = False
+                restore_zoom = True
+                rest = list(args)
+                while rest and rest[0].startswith("--"):
+                    flag = rest.pop(0)
+                    if flag == "--quiet":
+                        quiet = True
+                    elif flag == "--no-restore-zoom":
+                        restore_zoom = False
+                    else:
+                        return 2
+                if len(rest) == 1:
+                    return cmd_cancel(rest[0], "", quiet=quiet, restore_zoom=restore_zoom)
+                if len(rest) == 2:
+                    return cmd_cancel(rest[0], rest[1], quiet=quiet, restore_zoom=restore_zoom)
+                return 2
+            if action == "cancel-window":
+                quiet = False
+                restore_zoom = False
+                rest = list(args)
+                while rest and rest[0].startswith("--"):
+                    flag = rest.pop(0)
+                    if flag == "--quiet":
+                        quiet = True
+                    elif flag == "--restore-zoom":
+                        restore_zoom = True
+                    elif flag == "--no-restore-zoom":
+                        restore_zoom = False
+                    else:
+                        return 2
+                if len(rest) == 1:
+                    return cmd_cancel_window(rest[0], quiet=quiet, restore_zoom=restore_zoom)
+                return 2
+            if action == "prune-clients" and not args:
+                return cmd_prune_clients()
+    except Exception:
+        # Never leave a tmux client trapped in the modal session-pick key table.
+        if action in {"enter", "commit", "cancel", "pick-current", "pick-others", "pick-all", "pick-clear", "toggle-format"} and len(args) >= 3:
+            switch_client_table(args[-1], "root")
+        raise
+    print(f"tmux-session-pick: invalid arguments: {argv!r}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
