@@ -68,8 +68,8 @@ ARGV_WARN_BYTES_POSIX = 100_000
 STD_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_TIMEOUT_SECONDS = 300
 EFFORT_DEFAULT_TIMEOUTS: dict[str, int] = {
-    "xhigh": 600,
-    "max": 900,
+    "xhigh": 900,
+    "max": 1200,
 }
 
 CODEX_DISABLED_FEATURES: tuple[str, ...] = (
@@ -246,18 +246,66 @@ def parse_channel_spec(raw: str) -> ChannelSpec:
     return ChannelSpec(raw=raw, backend=backend, model=model, effort=effort, env_prefix=env_prefix)
 
 
-def resolve_channel_timeout(spec: ChannelSpec, explicit_timeout: int | None = None) -> int:
-    """按显式参数或推理强度决定单通道超时（秒）。"""
-    if explicit_timeout is not None:
-        return explicit_timeout
-    effort = (spec.effort or "").strip().lower()
-    if effort in EFFORT_DEFAULT_TIMEOUTS:
-        return EFFORT_DEFAULT_TIMEOUTS[effort]
-    model_lower = (spec.model or "").strip().lower()
+def _timeout_from_effort_or_model(effort: str | None, model: str | None) -> int | None:
+    eff = (effort or "").strip().lower()
+    if eff in EFFORT_DEFAULT_TIMEOUTS:
+        return EFFORT_DEFAULT_TIMEOUTS[eff]
+    model_slug = _normalize_slug(model or "")
     for suffix, sec in EFFORT_DEFAULT_TIMEOUTS.items():
-        if model_lower.endswith(f"-{suffix}"):
+        if model_slug.endswith(f"-{suffix}"):
             return sec
+    return None
+
+
+def resolve_channel_timeout(
+    spec: ChannelSpec,
+    explicit_timeout: int | None = None,
+    *,
+    default_model: str | None = None,
+    default_effort: str | None = None,
+) -> int | None:
+    """按显式参数或推理强度决定单通道超时（秒）；explicit_timeout=0 时返回 None（不设超时）。"""
+    if explicit_timeout is not None:
+        if explicit_timeout < 0:
+            raise ValueError("超时时间不能为负数（0 表示不设超时）。")
+        return None if explicit_timeout == 0 else explicit_timeout
+    if (matched := _timeout_from_effort_or_model(spec.effort, spec.model)) is not None:
+        return matched
+    if spec.effort is None:
+        fallback_model = default_model if spec.model is None else None
+        if (matched := _timeout_from_effort_or_model(default_effort, fallback_model)) is not None:
+            return matched
     return DEFAULT_TIMEOUT_SECONDS
+
+
+def probe_local_timeout_defaults(
+    specs: list[ChannelSpec],
+    *,
+    env: dict[str, str] | None = None,
+    home: pathlib.Path | None = None,
+) -> dict[tuple[str, str | None], tuple[str | None, str | None]]:
+    """按后端零开销读取本地默认 (default_model, default_effort)，供未显式传 effort 时的超时判定。"""
+    defaults: dict[tuple[str, str | None], tuple[str | None, str | None]] = {}
+    for spec in specs:
+        key = (spec.backend, spec.env_prefix)
+        if spec.effort is not None or key in defaults:
+            continue
+        if spec.backend == "openai":
+            src = os.environ if env is None else env
+            if spec.env_prefix:
+                model = _clean_str(src.get(f"{spec.env_prefix}_MODEL"))
+            else:
+                model = _clean_str(src.get("COLD_CRITIQUE_OPENAI_MODEL")) or _clean_str(src.get("OPENAI_MODEL"))
+            defaults[key] = (model, None)
+        else:
+            meta = probe_backend_models(
+                spec.backend, executable=None, env=env, home=home, allow_live_probe=False
+            )
+            defaults[key] = (
+                _clean_str(meta.get("default_model")),
+                _clean_str(meta.get("default_effort")),
+            )
+    return defaults
 
 
 def resolve_model_shorthand(spec: ChannelSpec, candidates: list[str]) -> ChannelSpec:
@@ -1183,7 +1231,7 @@ def _temp_file(prefix: str, suffix: str, content: str | None = None):
                 os.remove(path)
 
 
-def _run_cli_channel(spec: ChannelSpec, full_prompt: str, timeout_s: int) -> dict[str, Any]:
+def _run_cli_channel(spec: ChannelSpec, full_prompt: str, timeout_s: int | None) -> dict[str, Any]:
     t0 = time.time()
     exe = resolve_cli_executable(BACKEND_MAP[spec.backend].binary or spec.backend)
     try:
@@ -1269,7 +1317,7 @@ def _run_cli_channel(spec: ChannelSpec, full_prompt: str, timeout_s: int) -> dic
         return _err_result(spec, _format_exec_error(exc, spec.backend), time.time() - t0)
 
 
-def _run_openai(spec: ChannelSpec, full_prompt: str, timeout_s: int) -> dict[str, Any]:
+def _run_openai(spec: ChannelSpec, full_prompt: str, timeout_s: int | None) -> dict[str, Any]:
     t0 = time.time()
     try:
         base_url, api_key, model = resolve_openai_env(spec)
@@ -1299,7 +1347,7 @@ def _run_openai(spec: ChannelSpec, full_prompt: str, timeout_s: int) -> dict[str
         return _err_result(spec, str(exc), time.time() - t0, model=model)
 
 
-def run_channel(spec: ChannelSpec, full_prompt: str, timeout_s: int) -> dict[str, Any]:
+def run_channel(spec: ChannelSpec, full_prompt: str, timeout_s: int | None) -> dict[str, Any]:
     if spec.backend == "openai":
         return _run_openai(spec, full_prompt, timeout_s)
     if spec.backend in BACKEND_MAP:
@@ -1348,12 +1396,20 @@ def execute_channels(
     full_prompt: str,
     *,
     explicit_timeout: int | None = None,
+    timeout_defaults: dict[tuple[str, str | None], tuple[str | None, str | None]] | None = None,
     out_dir: pathlib.Path | None = None,
     resume: bool = False,
     clean_text: str | None = None,
     prefix: str | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """并发执行全部通道；指定 out_dir 时每路完成即原子落盘，支持 --resume 仅重跑未成功通道。"""
+    if explicit_timeout is not None and explicit_timeout < 0:
+        raise ValueError("超时时间不能为负数（0 表示不设超时）。")
+    defaults_map = (
+        timeout_defaults
+        if timeout_defaults is not None
+        else (probe_local_timeout_defaults(specs) if explicit_timeout is None else {})
+    )
     prompt_sha256 = hashlib.sha256(full_prompt.encode("utf-8")).hexdigest()
     result_paths: list[pathlib.Path | None] = [None] * len(specs)
     if out_dir is not None:
@@ -1371,7 +1427,13 @@ def execute_channels(
             if cached := _load_resumable_result(rpath, spec, prompt_sha256):
                 cached["result_file"] = str(rpath)
                 return cached
-        timeout_s = resolve_channel_timeout(spec, explicit_timeout)
+        def_model, def_effort = defaults_map.get((spec.backend, spec.env_prefix), (None, None))
+        timeout_s = resolve_channel_timeout(
+            spec,
+            explicit_timeout,
+            default_model=def_model,
+            default_effort=def_effort,
+        )
         res = run_channel(spec, full_prompt, timeout_s)
         res["timeout_seconds"] = timeout_s
         if rpath is not None:
@@ -1408,7 +1470,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--redact-paths", action="store_true", help="将文本中的本机用户目录路径替换为 <HOME>")
     parser.add_argument(
         "--timeout", type=int, default=None,
-        help="单通道超时时间（秒；省略时按 effort 自动设值：常规 300s、xhigh 600s、max 900s）",
+        help="单通道超时时间（秒；0 表示不设超时；省略时按 effort 自动设值：常规 300s、xhigh 900s、max 1200s）",
     )
     parser.add_argument("--out-dir", help="结果落盘目录：保存剥壳输入、每路完成后立即落盘单通道 JSON 及 summary.json")
     parser.add_argument("--resume", action="store_true", help="配合 --out-dir 使用：复用已成功且输入未变的通道结果，仅补跑失败/缺失通道")
@@ -1496,6 +1558,9 @@ def main(argv: list[str] | None = None) -> int:
             _print_backends_human(detected, presets, env_raw)
         return 0
 
+    if args.timeout is not None and args.timeout < 0:
+        parser.error("--timeout 必须为大于等于 0 的整数（0 表示不设超时）。")
+
     if args.resume and not args.out_dir:
         parser.error("--resume 需要同时指定 --out-dir。")
 
@@ -1528,7 +1593,16 @@ def main(argv: list[str] | None = None) -> int:
 
     full_prompt = prefix + clean_text
     argv_warnings = check_argv_prompt_warnings(specs, full_prompt)
-    timeouts = {s.label: resolve_channel_timeout(s, args.timeout) for s in specs}
+    timeout_defaults = probe_local_timeout_defaults(specs) if args.timeout is None else {}
+    timeouts = {
+        s.label: resolve_channel_timeout(
+            s,
+            args.timeout,
+            default_model=timeout_defaults.get((s.backend, s.env_prefix), (None, None))[0],
+            default_effort=timeout_defaults.get((s.backend, s.env_prefix), (None, None))[1],
+        )
+        for s in specs
+    }
 
     if args.dry_run:
         print(json.dumps({
@@ -1551,6 +1625,7 @@ def main(argv: list[str] | None = None) -> int:
         specs,
         full_prompt,
         explicit_timeout=args.timeout,
+        timeout_defaults=timeout_defaults,
         out_dir=out_dir_path,
         resume=args.resume,
         clean_text=clean_text,

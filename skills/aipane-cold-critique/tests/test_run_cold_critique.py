@@ -112,10 +112,48 @@ class ChannelSpecAndShorthandTests(unittest.TestCase):
 
     def test_adaptive_channel_timeouts(self):
         self.assertEqual(rcc.resolve_channel_timeout(rcc.parse_channel_spec("codex@high")), 300)
-        self.assertEqual(rcc.resolve_channel_timeout(rcc.parse_channel_spec("codex@xhigh")), 600)
-        self.assertEqual(rcc.resolve_channel_timeout(rcc.parse_channel_spec("codex@max")), 900)
-        self.assertEqual(rcc.resolve_channel_timeout(rcc.parse_channel_spec("agy:gemini-4-neon-xhigh")), 600)
+        self.assertEqual(rcc.resolve_channel_timeout(rcc.parse_channel_spec("codex@xhigh")), 900)
+        self.assertEqual(rcc.resolve_channel_timeout(rcc.parse_channel_spec("codex@max")), 1200)
+        self.assertEqual(rcc.resolve_channel_timeout(rcc.parse_channel_spec("agy:gemini-4-neon-xhigh")), 900)
         self.assertEqual(rcc.resolve_channel_timeout(rcc.parse_channel_spec("codex@max"), explicit_timeout=420), 420)
+        self.assertIsNone(rcc.resolve_channel_timeout(rcc.parse_channel_spec("codex@max"), explicit_timeout=0))
+        with self.assertRaises(ValueError):
+            rcc.resolve_channel_timeout(rcc.parse_channel_spec("codex@high"), explicit_timeout=-1)
+
+        # Bare backend inherits local default model suffix (including raw display name) and default effort
+        self.assertEqual(
+            rcc.resolve_channel_timeout(rcc.parse_channel_spec("agy"), default_model="Gemini 4 Neon (XHigh)"),
+            900,
+        )
+        self.assertEqual(
+            rcc.resolve_channel_timeout(rcc.parse_channel_spec("codex"), default_effort="xhigh"),
+            900,
+        )
+        self.assertEqual(
+            rcc.resolve_channel_timeout(rcc.parse_channel_spec("pi"), default_effort="max"),
+            1200,
+        )
+        self.assertEqual(
+            rcc.resolve_channel_timeout(rcc.parse_channel_spec("codex:gpt-6.2-astra"), default_effort="xhigh"),
+            900,
+        )
+        # Explicit @effort overrides local defaults instead of being widened by them
+        self.assertEqual(
+            rcc.resolve_channel_timeout(
+                rcc.parse_channel_spec("agy@high"),
+                default_model="gemini-4-neon-xhigh",
+                default_effort="xhigh",
+            ),
+            300,
+        )
+        # Explicit non-xhigh model does not inherit local default model suffix
+        self.assertEqual(
+            rcc.resolve_channel_timeout(
+                rcc.parse_channel_spec("agy:gemini-4-neon-low"),
+                default_model="gemini-4-neon-xhigh",
+            ),
+            300,
+        )
 
 
 class CommandBuilderTests(unittest.TestCase):
@@ -389,13 +427,15 @@ class CliIntegrationAndPersistenceTests(unittest.TestCase):
         fake_stdin = io.StringIO(long_text)
         fake_stdin.isatty = lambda: False  # type: ignore[attr-defined]
         buf = io.StringIO()
-        with mock.patch.object(sys, "stdin", fake_stdin), mock.patch.object(sys, "stdout", buf):
+        with mock.patch.object(sys, "stdin", fake_stdin), mock.patch.object(sys, "stdout", buf), mock.patch.object(
+            rcc, "probe_local_timeout_defaults", return_value={}
+        ):
             rc = rcc.main(["--profile", "article", "-c", "pi:m1@xhigh", "-c", "agy:demo@max", "-c", "kimi", "--dry-run"])
         self.assertEqual(rc, 0)
         out = json.loads(buf.getvalue())
         self.assertEqual(out["profile"], "article")
         self.assertEqual(out["channels"], ["pi:m1@xhigh", "agy:demo@max", "kimi"])
-        self.assertEqual(out["timeouts"], {"pi:m1@xhigh": 600, "agy:demo@max": 900, "kimi": 300})
+        self.assertEqual(out["timeouts"], {"pi:m1@xhigh": 900, "agy:demo@max": 1200, "kimi": 300})
         self.assertIn("跨学科概念借用", out["preview_head"])
         self.assertFalse(out["single_channel_warning"])
         # Only kimi uses argv now; agy uses stream-json stdin so must not warn
@@ -566,6 +606,106 @@ class CliIntegrationAndPersistenceTests(unittest.TestCase):
         self.assertEqual(len(set(seen_cwds)), 7)
         for d in seen_cwds:
             self.assertFalse(os.path.exists(d))
+
+    def test_probe_local_timeout_defaults_and_zero_timeout_execution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp)
+            (home / ".codex").mkdir()
+            (home / ".codex" / "config.toml").write_text('model = "gpt-test"\nmodel_reasoning_effort = "xhigh"\n', encoding="utf-8")
+            (home / ".gemini" / "antigravity-cli").mkdir(parents=True)
+            (home / ".gemini" / "antigravity-cli" / "settings.json").write_text(
+                json.dumps({"model": "Gemini 4 Neon (XHigh)"}), encoding="utf-8"
+            )
+            env = {
+                "COLD_CRITIQUE_CACHE_DIR": str(home / "cache"),
+                "OPENAI_API_KEY": "sk-fake",
+                "OPENAI_MODEL": "demo-max",
+            }
+            specs = [
+                rcc.parse_channel_spec("codex"),
+                rcc.parse_channel_spec("agy"),
+                rcc.parse_channel_spec("openai"),
+                rcc.parse_channel_spec("codex@high"),
+            ]
+            with mock.patch("subprocess.run") as msub:
+                defaults = rcc.probe_local_timeout_defaults(specs, env=env, home=home)
+                self.assertEqual(msub.call_count, 0)
+
+            self.assertEqual(
+                rcc.resolve_channel_timeout(
+                    specs[0],
+                    default_model=defaults[("codex", None)][0],
+                    default_effort=defaults[("codex", None)][1],
+                ),
+                900,
+            )
+            self.assertEqual(
+                rcc.resolve_channel_timeout(
+                    specs[1],
+                    default_model=defaults[("agy", None)][0],
+                    default_effort=defaults[("agy", None)][1],
+                ),
+                900,
+            )
+            self.assertEqual(
+                rcc.resolve_channel_timeout(
+                    specs[2],
+                    default_model=defaults[("openai", None)][0],
+                    default_effort=defaults[("openai", None)][1],
+                ),
+                1200,
+            )
+            self.assertEqual(
+                rcc.resolve_channel_timeout(
+                    specs[3],
+                    default_model=defaults[("codex", None)][0],
+                    default_effort=defaults[("codex", None)][1],
+                ),
+                300,
+            )
+
+        # CLI --timeout 0 -> None in dry-run, negative rejected
+        fake_stdin = io.StringIO("待审内容\n")
+        fake_stdin.isatty = lambda: False  # type: ignore[attr-defined]
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stdin", fake_stdin), mock.patch.object(sys, "stdout", buf):
+            rc = rcc.main(["-c", "pi:m1@xhigh", "--timeout", "0", "--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(buf.getvalue())["timeouts"], {"pi:m1@xhigh": None})
+
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                rcc.main(["-c", "pi:m1@xhigh", "--timeout", "-1", "--dry-run"])
+            self.assertEqual(cm.exception.code, 2)
+
+        # End-to-end --timeout 0 passes timeout=None to subprocess.run and urlopen
+        seen_sub_timeouts: list[object] = []
+
+        def fake_sub_run(cmd, **kwargs):
+            seen_sub_timeouts.append(kwargs.get("timeout"))
+            return mock.Mock(returncode=0, stdout="pi ok\n", stderr="")
+
+        fake_resp = mock.MagicMock()
+        fake_resp.read.return_value = json.dumps({
+            "model": "gpt-4.1",
+            "choices": [{"message": {"role": "assistant", "content": "openai ok"}}],
+        }).encode("utf-8")
+        fake_resp.__enter__.return_value = fake_resp
+
+        with mock.patch.dict("os.environ", {"OPENAI_API_KEY": "sk-fake"}, clear=True), mock.patch(
+            "shutil.which", return_value="/mock/bin/pi"
+        ), mock.patch("subprocess.run", side_effect=fake_sub_run), mock.patch(
+            "urllib.request.urlopen", return_value=fake_resp
+        ) as mocked_open:
+            results, _ = rcc.execute_channels(
+                [rcc.parse_channel_spec("pi"), rcc.parse_channel_spec("openai:gpt-4.1")],
+                "prompt",
+                explicit_timeout=0,
+            )
+            self.assertTrue(all(r["ok"] for r in results), results)
+            self.assertEqual([r["timeout_seconds"] for r in results], [None, None])
+            self.assertEqual(seen_sub_timeouts, [None])
+            self.assertIsNone(mocked_open.call_args.kwargs.get("timeout"))
 
 
 if __name__ == "__main__":

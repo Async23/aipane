@@ -31,7 +31,7 @@ argument-hint: "[可选：新问题、文件路径、指定通道/模型，或�
 
 ## 3. 脚本调用
 
-仅依赖 Python 3.9+ 标准库。通道语法：`<backend>[:<model>][@<effort>][#<ENV_PREFIX>]`（完整参数见 `--help`）。未显式传 `--timeout` 时脚本按 effort 自动放大默认超时（常规 300s、`xhigh` 600s、`max` 900s）。
+仅依赖 Python 3.9+ 标准库。通道语法：`<backend>[:<model>][@<effort>][#<ENV_PREFIX>]`（完整参数见 `--help`）。未显式传 `--timeout` 时脚本按 effort 自动放大默认超时（常规 300s、`xhigh` 900s、`max` 1200s；`--timeout 0` 表示不设超时）。
 
 ```bash
 # 探测可用后端、隔离级别、模型摘要与真异构推荐预设
