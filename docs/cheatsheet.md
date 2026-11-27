@@ -127,7 +127,7 @@ Inside `sync-pick` (draft-only until `Enter`; live sync is untouched while picki
 | `Enter` | commit draft (`< 2` clears to off; focuses first synced pane if current is outside) |
 | `Esc` / `q` / `Ctrl-C` / `Cmd+Opt+I` | cancel draft and restore pre-entry zoom |
 
-Status & borders: in `sync-pick`, pane borders turn yellow, drafted panes show a wide yellow `★ [#P ✓] SELECTED` top banner, and `status-right` displays a yellow `PICK k/n` pill (without recolouring the window-list background). When live broadcast is active (`>= 2` panes), synced panes show red `▶ ▶ ▶` in their top bar and `status-right` shows yellow `SYNC k/n` (or `SYNC(other) k/n` when focused on a solo pane while siblings remain synced); window labels show `▶`. A pane manually locked via `tmux select-pane -d` still displays a red-background `OFF` badge in its pane bar.
+Status & borders: in `sync-pick`, pane borders turn yellow, drafted panes show a wide yellow `★ [#P ✓] SELECTED` top banner, and `status-right` displays a yellow `PICK k/n` pill (without recolouring the window-list background). When live broadcast is active (`>= 2` panes), synced panes show red `▶ ▶ ▶` in their top bar and `status-right` shows yellow `SYNC k/n` (or `SYNC(other) k/n` when focused on a solo pane while siblings remain synced); window labels show `▶`. Set `set -g @aipane-sync-badge off` to hide the live `SYNC` / `SYNC(other)` status-right pills while keeping `PICK` hints and the pane/window `▶` markers. A pane manually locked via `tmux select-pane -d` still displays a red-background `OFF` badge in its pane bar.
 
 ## Copy mode
 

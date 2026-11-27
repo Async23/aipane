@@ -423,6 +423,36 @@ class TmuxPaneSyncTests(unittest.TestCase):
         )
         self.assertNotIn("▶", completed_orphan.stdout)
 
+    def test_sync_badge_off_hides_live_pills_while_keeping_pick_hint(self) -> None:
+        wid, panes = self.start_session(pane_count=3)
+        # Pre-setting @aipane-sync-badge off must survive re-sourcing tmux-workstation.conf.
+        self.tmux("set-option", "-g", "@aipane-sync-badge", "off")
+        self.tmux("source-file", str(TMUX_WS))
+        self.assertEqual(self.tmux("show-options", "-gqv", "@aipane-sync-badge").stdout.strip(), "off")
+
+        # sync-pick mode still shows the transient PICK hint even when live badge is off.
+        self.send_bytes(b"\x00B")
+        self.assertTrue(self.wait_until(lambda: self.key_table() == "sync-pick"))
+        self.send_bytes(b"1")
+        self.assertTrue(self.wait_until(lambda: self.window_opt(wid, "@aipane-sync-draft-count") == "1"))
+        self.send_bytes(b"3")
+        self.assertTrue(self.wait_until(lambda: self.window_opt(wid, "@aipane-sync-draft-count") == "2"))
+        self.assertIn("PICK 2/3", self.tmux("display-message", "-p", "-t", panes[0], "#{E:@aipane-sync-status}").stdout)
+
+        # Commit {1, 3}: live SYNC and SYNC(other) status-right pills are hidden; pane ▶ ▶ ▶ remains.
+        self.send_bytes(b"\r")
+        self.assertTrue(self.wait_until(lambda: self.key_table() == "root" and sum(self.pane_sync_map(wid).values()) == 2))
+        self.assertEqual(self.tmux("display-message", "-p", "-t", panes[0], "#{E:@aipane-sync-status}").stdout.strip(), "")
+        self.assertIn("▶ ▶ ▶", self.tmux("display-message", "-p", "-t", panes[0], "#{E:pane-border-format}").stdout)
+        self.tmux("select-pane", "-t", panes[1])
+        self.assertEqual(self.tmux("display-message", "-p", "-t", panes[1], "#{E:@aipane-sync-status}").stdout.strip(), "")
+
+        # Toggling back to on restores live pills immediately.
+        self.tmux("set-option", "-g", "@aipane-sync-badge", "on")
+        self.assertIn("SYNC(other) 2/3", self.tmux("display-message", "-p", "-t", panes[1], "#{E:@aipane-sync-status}").stdout)
+        self.tmux("select-pane", "-t", panes[0])
+        self.assertIn("SYNC 2/3", self.tmux("display-message", "-p", "-t", panes[0], "#{E:@aipane-sync-status}").stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
