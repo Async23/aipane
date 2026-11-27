@@ -9,6 +9,7 @@ import json
 import os
 import pty
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -32,6 +33,7 @@ PANE_SYNC_BIN = ROOT / "bin" / "tmux-pane-sync"
 RENAME_BIN = ROOT / "bin" / "tmux-rename-window-popup"
 PICKER_BIN = ROOT / "bin" / "tmux-session-picker"
 SESSION_PICK_BIN = ROOT / "bin" / "tmux-session-pick"
+CLOSE_POPUP_BIN = ROOT / "bin" / "tmux-close-window-popup"
 COLOUR_PALETTE_BIN = ROOT / "bin" / "tmux-colour-palette"
 CHEATSHEET = ROOT / "docs" / "cheatsheet.md"
 WS_DOC = ROOT / "docs" / "ghostty-tmux-workstation.md"
@@ -853,7 +855,11 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
         self.assertIn("tmux-session-picker", text)
         self.assertIn("AIPANE_PICKER_ORIGIN_PANE=#{pane_id}", text)
         self.assertIn("bind y run-shell", text)
-        self.assertIn("DoubleClick1Border", text)
+        self.assertIn("unbind -n DoubleClick1Status", text)
+        self.assertIn("unbind -n MouseDown1Border", text)
+        self.assertIn("bind -n DoubleClick1Border resize-pane -Z -t =", text)
+        self.assertIn("bind -n MouseDown3Border display-menu", text)
+        self.assertIn("bind -n M-MouseDown3Border display-menu", text)
         self.assertIn("unbind A", text)
         self.assertNotIn("bind A display-popup", text)
         self.assertIn("bind , run-shell -C", text)
@@ -977,6 +983,10 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
             self.assertRegex(sync_pick_keys, re.compile(r"sync-pick\s+Enter\s+.*commit"))
             self.assertRegex(sync_pick_keys, re.compile(r"sync-pick\s+q\s+.*cancel"))
             self.assertRegex(sync_pick_keys, re.compile(r"sync-pick\s+Escape\s+.*cancel"))
+            self.assertRegex(sync_pick_keys, re.compile(r"sync-pick\s+MouseDown1Border\s+.*pick-pane"))
+            self.assertRegex(sync_pick_keys, re.compile(r"sync-pick\s+DoubleClick1Border\s+.*switch-client -T sync-pick"))
+            self.assertRegex(sync_pick_keys, re.compile(r"sync-pick\s+MouseDown3Border\s+.*switch-client -T sync-pick"))
+            self.assertRegex(sync_pick_keys, re.compile(r"sync-pick\s+M-MouseDown3Border\s+.*switch-client -T sync-pick"))
             self.assertRegex(sync_pick_keys, re.compile(r"sync-pick\s+Any\s+.*switch-client -T sync-pick"))
             self.assertRegex(keys, re.compile(r"prefix\s+Y\s+.*tmux-session-pick.*enter"))
             session_pick_keys = subprocess.run(
@@ -996,6 +1006,8 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
             self.assertRegex(session_pick_keys, re.compile(r"session-pick\s+MouseDown1Pane\s+.*pick-pane"))
             self.assertRegex(session_pick_keys, re.compile(r"session-pick\s+MouseDown1Border\s+.*pick-pane"))
             self.assertRegex(session_pick_keys, re.compile(r"session-pick\s+DoubleClick1Border\s+.*switch-client -T session-pick"))
+            self.assertRegex(session_pick_keys, re.compile(r"session-pick\s+MouseDown3Border\s+.*switch-client -T session-pick"))
+            self.assertRegex(session_pick_keys, re.compile(r"session-pick\s+M-MouseDown3Border\s+.*switch-client -T session-pick"))
             self.assertRegex(session_pick_keys, re.compile(r"session-pick\s+Any\s+.*switch-client -T session-pick"))
             self.assertRegex(
                 keys,
@@ -1046,11 +1058,16 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 (r"M-S-J", r"resize-pane -D 2"),
                 (r"M-S-K", r"resize-pane -U 2"),
                 (r"M-S-L", r"resize-pane -R 2"),
+                (r"DoubleClick1Border", r"resize-pane -Z -t ="),
+                (r"MouseDown3Border", r"display-menu.*Copy Session Ref.*Copy Raw Session ID"),
+                (r"M-MouseDown3Border", r"display-menu.*Copy Session Ref.*Copy Raw Session ID"),
             ):
                 self.assertRegex(
                     root_keys,
                     re.compile(rf"root\s+{key_name}\s+{cmd_pattern}"),
                 )
+            self.assertNotRegex(root_keys, re.compile(r"root\s+DoubleClick1Status\b"))
+            self.assertNotRegex(root_keys, re.compile(r"root\s+MouseDown1Border\b"))
             fmt0 = subprocess.run(
                 [
                     "tmux",
@@ -1833,7 +1850,6 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 "list-clients", "-t", "drag", "-F", "#{client_pid}",
             ).stdout.strip().splitlines()[0]
             drag_var = f"AIPANE_STATUS_DRAG_{client_pid}"
-            dbl_var = f"AIPANE_STATUS_DBLCLICK_{client_pid}"
             time.sleep(0.15)
             drain()
 
@@ -1937,8 +1953,8 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
             self.assertEqual(window_order(), [(1, "AAA"), (2, "BBB"), (3, "CCC"), (4, "DDD")])
             tmux("send-keys", "-t", pane1, "-X", "cancel")
 
-            # 6. Click A then 40ms later drag B→D must NOT zoom C via delayed DoubleClick1Status,
-            # while a real same-tab double-click still zooms.
+            # 6. Click A then 40ms later drag B→D must NOT zoom any window, and
+            # double-clicking a status tab must NOT zoom either (zoom lives on pane borders).
             for idx in (1, 2, 3, 4):
                 tmux("split-window", "-d", "-t", f"drag:{idx}", "sleep 120")
             time.sleep(0.35)
@@ -1965,9 +1981,8 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
                 if line.endswith(":1")
             ]
             self.assertEqual(zoomed, [], f"click-then-drag triggered stray zoom: {zoomed}")
-            self.assertIsNone(global_env(dbl_var))
 
-            # Restore order AAA BBB CCC DDD, then test real same-tab double-click zoom.
+            # Restore order AAA BBB CCC DDD, then verify same-tab double-click does NOT zoom.
             send_drag(21, 30, 9, 30)
             self.assertTrue(
                 wait_until(
@@ -1980,16 +1995,15 @@ class TmuxWorkstationFragmentTests(unittest.TestCase):
             send_release(3, 30)
             send_press(3, 30)
             send_release(3, 30)
-            self.assertTrue(
-                wait_until(
-                    lambda: tmux(
-                        "display-message", "-p", "-t", "drag:1", "#{window_zoomed_flag}"
-                    ).stdout.strip() == "1",
-                    timeout=2.0,
-                ),
-                "double-click on same status tab did not zoom pane",
+            time.sleep(0.45)
+            drain()
+            self.assertEqual(
+                tmux(
+                    "display-message", "-p", "-t", "drag:1", "#{window_zoomed_flag}"
+                ).stdout.strip(),
+                "0",
+                "double-click on status tab unexpectedly zoomed pane",
             )
-            tmux("resize-pane", "-Z", "-t", "drag:1")
 
             # 7. Rapid 3 consecutive drags at ~45ms intervals (hits SecondClick + TripleClick).
             time.sleep(0.35)
@@ -2727,6 +2741,178 @@ class ColourPalettePopupTests(unittest.TestCase):
                     capture_output=True,
                 )
 
+    def test_pane_border_double_click_zoom_and_right_click_menu(self):
+        socket = f"ws-border-mouse-{os.getpid()}-{id(self)}"
+        environment = {**os.environ, "TERM": "xterm-256color"}
+        master_fd = None
+        child_pid = None
+
+        def tmux(*args: str, check: bool = True):
+            return subprocess.run(
+                ["tmux", "-L", socket, *args],
+                check=check,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+        def drain() -> None:
+            assert master_fd is not None
+            while True:
+                ready, _, _ = select.select([master_fd], [], [], 0.01)
+                if not ready:
+                    break
+                try:
+                    if not os.read(master_fd, 4096):
+                        break
+                except BlockingIOError:
+                    break
+
+        def wait_until(predicate, timeout: float = 3.0) -> bool:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                drain()
+                if predicate():
+                    return True
+                time.sleep(0.02)
+            return predicate()
+
+        def pane_ids() -> list[str]:
+            return tmux("list-panes", "-t", "bm:1", "-F", "#{pane_id}").stdout.splitlines()
+
+        def active_pane() -> str:
+            return tmux("display-message", "-p", "-t", "bm:1", "#{pane_id}").stdout.strip()
+
+        def is_zoomed() -> bool:
+            return tmux("display-message", "-p", "-t", "bm:1", "#{window_zoomed_flag}").stdout.strip() == "1"
+
+        def popup_count(client: str) -> int:
+            return sum(
+                (": display-popup" in line and "-x C -y C" in line)
+                for line in tmux("show-messages", "-t", client).stdout.splitlines()
+            )
+
+        with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
+            d2_real = os.path.realpath(d2)
+            try:
+                tmux(
+                    "-f", "/dev/null", "new-session", "-d", "-s", "bm",
+                    "-c", d1, "-x", "100", "-y", "30", "sleep 120",
+                )
+                tmux("source-file", str(TMUX_WS))
+                tmux("move-window", "-r", "-t", "bm")
+                # Force detector to treat panes as agents so last-pane Close opens confirmation popup.
+                fake_agent = Path(d1) / "fake-agent-detector"
+                fake_agent.write_text("#!/bin/sh\necho active\n", encoding="utf-8")
+                fake_agent.chmod(0o755)
+                tmux("set-option", "-g", "@aipane-agent-status-command", str(fake_agent))
+                tmux("set-option", "-g", "@aipane-close-window-popup-command", str(CLOSE_POPUP_BIN))
+
+                p1 = active_pane()
+                p2 = tmux(
+                    "split-window", "-h", "-P", "-F", "#{pane_id}",
+                    "-t", p1, "-c", d2, "sleep 120",
+                ).stdout.strip()
+                tmux("select-pane", "-t", p1)
+                p2_left = int(tmux("display-message", "-p", "-t", p2, "#{pane_left}").stdout.strip())
+                x_p2 = p2_left + 4
+
+                child_pid, master_fd = pty.fork()
+                if child_pid == 0:
+                    termios.tcsetwinsize(0, (30, 100))
+                    os.execvpe(
+                        "tmux", ["tmux", "-L", socket, "attach-session", "-t", "bm"],
+                        environment,
+                    )
+                os.set_blocking(master_fd, False)
+                self.assertTrue(
+                    wait_until(lambda: bool(tmux("list-clients", "-t", "bm").stdout.strip())),
+                    "client did not attach",
+                )
+                client = tmux("list-clients", "-t", "bm", "-F", "#{client_name}").stdout.strip().splitlines()[0]
+                time.sleep(0.15)
+                drain()
+
+                # 1. Single-click inactive p2 top bar must NOT steal focus.
+                os.write(master_fd, f"\x1b[<0;{x_p2};1M\x1b[<0;{x_p2};1m".encode())
+                time.sleep(0.35)
+                drain()
+                self.assertEqual(active_pane(), p1)
+                self.assertFalse(is_zoomed())
+
+                # 2. Double-click inactive p2 top bar activates and zooms p2; double-click again unzooms.
+                for _ in range(2):
+                    os.write(master_fd, f"\x1b[<0;{x_p2};1M\x1b[<0;{x_p2};1m".encode())
+                    time.sleep(0.05)
+                self.assertTrue(
+                    wait_until(lambda: active_pane() == p2 and is_zoomed()),
+                    "double-clicking inactive pane top bar did not activate and zoom it",
+                )
+                time.sleep(0.35)
+                for _ in range(2):
+                    os.write(master_fd, b"\x1b[<0;10;1M\x1b[<0;10;1m")
+                    time.sleep(0.05)
+                self.assertTrue(
+                    wait_until(lambda: not is_zoomed()),
+                    "double-clicking zoomed pane top bar did not unzoom",
+                )
+
+                # 3. Right-click inactive p2 top bar -> 'h' splits p2 in p2's cwd.
+                tmux("select-pane", "-t", p1)
+                time.sleep(0.35)
+                os.write(master_fd, f"\x1b[<2;{x_p2};1M\x1b[<2;{x_p2};1m".encode())
+                time.sleep(0.15)
+                os.write(master_fd, b"h")
+                self.assertTrue(
+                    wait_until(lambda: len(pane_ids()) == 3),
+                    "border right-click Split Right did not create a third pane",
+                )
+                p3 = [pid for pid in pane_ids() if pid not in (p1, p2)][0]
+                p3_cwd = os.path.realpath(
+                    tmux("display-message", "-p", "-t", p3, "#{pane_current_path}").stdout.strip()
+                )
+                self.assertEqual(p3_cwd, d2_real)
+
+                # 4. Right-click inactive p2 top bar -> 'X' kills p2 immediately (keeps p1 and p3).
+                tmux("select-pane", "-t", p1)
+                p2_left_now = int(tmux("display-message", "-p", "-t", p2, "#{pane_left}").stdout.strip())
+                time.sleep(0.35)
+                os.write(master_fd, f"\x1b[<2;{p2_left_now + 4};1M\x1b[<2;{p2_left_now + 4};1m".encode())
+                time.sleep(0.15)
+                os.write(master_fd, b"X")
+                self.assertTrue(
+                    wait_until(lambda: p2 not in pane_ids() and p1 in pane_ids()),
+                    f"border right-click Close did not kill inactive pane {p2}: {pane_ids()}",
+                )
+
+                # 5. Last pane Close via border right-click opens AI-guarded centered close popup.
+                tmux("kill-pane", "-t", p3)
+                self.assertEqual(pane_ids(), [p1])
+                before_popups = popup_count(client)
+                time.sleep(0.35)
+                os.write(master_fd, b"\x1b[<2;10;1M\x1b[<2;10;1m")
+                time.sleep(0.15)
+                os.write(master_fd, b"X")
+                self.assertTrue(
+                    wait_until(lambda: popup_count(client) > before_popups),
+                    "last-pane border right-click Close did not open guarded confirmation popup",
+                )
+                self.assertEqual(pane_ids(), [p1], "guarded last pane was killed without confirmation")
+            finally:
+                if master_fd is not None:
+                    os.close(master_fd)
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGHUP)
+                    except ProcessLookupError:
+                        pass
+                    os.waitpid(child_pid, 0)
+                subprocess.run(
+                    ["tmux", "-L", socket, "kill-server"],
+                    check=False,
+                    capture_output=True,
+                )
+
 
 class DocsPointerTests(unittest.TestCase):
     def test_docs_exist_and_name_public_confs(self):
@@ -2753,6 +2939,9 @@ class DocsPointerTests(unittest.TestCase):
         self.assertIn("| `Cmd+I` | centered popup rename window |", cheatsheet)
         self.assertIn("| `Cmd+B` | toggle tmux statusline |", cheatsheet)
         self.assertIn("| `prefix T` / `Cmd+B` | toggle current session statusline |", cheatsheet)
+        self.assertIn("| double-click pane top bar | zoom / unzoom that pane |", cheatsheet)
+        self.assertIn("| right-click pane top bar | pane menu", cheatsheet)
+        self.assertNotIn("double-click status window label", cheatsheet)
         self.assertIn("red-background `OFF` badge", cheatsheet)
         self.assertIn(
             "| `prefix P` | indexed colour palette "

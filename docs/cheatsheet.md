@@ -161,6 +161,6 @@ unchanged; numbers beyond the buffer select its final line.
 | `prefix Q` / `Cmd+Opt+P` | interactive session & pane picker popup |
 | `prefix y` / `Cmd+Opt+Y` | copy current pane's AI session ref (`<agent>:<id>`) to clipboard |
 | `prefix Y` / `Cmd+Opt+Shift+Y` | in-place spatial multi-pane AI session copy pick (`1-9`/click/`Space`, `o` others, `a` all, `c` clear, `f` toggle cyan `agent:sid` / magenta raw `sid`, `Enter` copy, `Esc`/`q` cancel) |
-| double-click pane top bar | copy that pane's AI session ref (`<agent>:<id>`) without changing focus |
-| double-click status window label | zoom that window's pane |
+| double-click pane top bar | zoom / unzoom that pane |
+| right-click pane top bar | pane menu (zoom, copy AI session ref / raw ID without changing focus, split, AI-guarded close) |
 | multi-line window list | `tmux-window-wrap` when labels overflow |

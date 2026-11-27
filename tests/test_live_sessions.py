@@ -1142,10 +1142,10 @@ class PickerAndTmuxIntegrationTests(unittest.TestCase):
                         f"expected raw sid line {expect_pane!r} in pane capture:\n{cap}",
                     )
 
-    def test_double_click_border_copies_inactive_pane_without_changing_focus(self) -> None:
+    def test_border_right_click_menu_copies_inactive_pane_without_changing_focus(self) -> None:
         node_bin = shutil.which("node")
         if not node_bin:
-            self.skipTest("node is required for border double-click integration test")
+            self.skipTest("node is required for border right-click menu integration test")
 
         self.tmux("source-file", str(TMUX_WS))
         p2 = self.tmux(
@@ -1197,11 +1197,12 @@ class PickerAndTmuxIntegrationTests(unittest.TestCase):
                 if self.tmux("list-clients").stdout.strip():
                     break
                 time.sleep(0.02)
-            for _ in range(2):
-                os.write(master_fd, f"\x1b[<0;{click_x};1M\x1b[<0;{click_x};1m".encode())
-                time.sleep(0.05)
 
+            # Right-click inactive p2's top border → 'y' (Copy Session Ref) without changing focus.
             expected_ref = f"dsh:{dsh_sid}"
+            os.write(master_fd, f"\x1b[<2;{click_x};1M\x1b[<2;{click_x};1m".encode())
+            time.sleep(0.15)
+            os.write(master_fd, b"y")
             deadline = time.monotonic() + 3.0
             copied = ""
             while time.monotonic() < deadline:
@@ -1219,6 +1220,24 @@ class PickerAndTmuxIntegrationTests(unittest.TestCase):
                     "0",
                     f"pane {pid} unexpectedly entered view-mode after yank",
                 )
+
+            # Option+right-click inactive p2's top border → 'r' (Copy Raw Session ID) without changing focus.
+            time.sleep(0.35)
+            os.write(master_fd, f"\x1b[<10;{click_x};1M\x1b[<10;{click_x};1m".encode())
+            time.sleep(0.15)
+            os.write(master_fd, b"r")
+            deadline = time.monotonic() + 3.0
+            copied_raw = ""
+            while time.monotonic() < deadline:
+                copied_raw = self.tmux("show-buffer", check=False).stdout.strip()
+                if copied_raw == dsh_sid:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(copied_raw, dsh_sid)
+            self.assertEqual(
+                self.tmux("display-message", "-p", "-t", self.w1, "#{pane_id}").stdout.strip(),
+                self.p1,
+            )
 
             # Also verify prefix+y on the active AI pane p2 copies cleanly without view-mode.
             self.tmux("select-pane", "-t", p2)

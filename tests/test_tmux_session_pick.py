@@ -339,13 +339,19 @@ class TmuxSessionPickTests(unittest.TestCase):
         self.send(fd, f"\x1b[<0;{p1_left + 3};{p1_top + 2}M\x1b[<0;{p1_left + 3};{p1_top + 2}m".encode())
         self.assertTrue(self.wait_until(lambda: self.window_opt(wid, "@aipane-session-draft-count") == "1"))
 
-        # Double-clicking p4's top border inside session-pick must NOT fall through to root's yank!
+        # Double-clicking or right-clicking p4's top border inside session-pick must NOT
+        # fall through to root's zoom or border menu!
         p4_left = int(self.tmux("display-message", "-p", "-t", p4, "#{pane_left}").stdout.strip())
         p4_top = int(self.tmux("display-message", "-p", "-t", p4, "#{pane_top}").stdout.strip())
         for _ in range(2):
             self.send(fd, f"\x1b[<0;{p4_left + 4};{p4_top + 1}M\x1b[<0;{p4_left + 4};{p4_top + 1}m".encode())
             time.sleep(0.04)
+        time.sleep(0.4)
+        self.assertFalse(self.is_zoomed(wid))
+        self.assertEqual(self.key_table(), "session-pick")
+        self.send(fd, f"\x1b[<2;{p4_left + 4};{p4_top + 1}M\x1b[<2;{p4_left + 4};{p4_top + 1}m".encode())
         time.sleep(0.15)
+        self.assertEqual(self.key_table(), "session-pick")
         self.assertEqual(self.paste_buffer(), "UNTOUCHED")
 
         # Cancel with q -> live synchronize-panes broadcast remains untouched.

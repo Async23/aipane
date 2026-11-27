@@ -117,7 +117,8 @@ set -g @aipane-close-window-popup-command '/absolute/path/to/tmux-close-window-p
 ```
 
 The window tab's right-click menu (including Option/right-click) uses the same
-check for **Kill**. Because this action closes the entire window, it checks
+check for **Kill**, and the pane top bar's right-click menu uses the same
+last-pane check for **Close**. Because **Kill** closes the entire window, it checks
 every pane in that window and asks for confirmation if any pane contains an
 AI Tool or cannot be classified. A window containing only verified non-Agent
 panes closes immediately. The clicked window remains the target, even when it
